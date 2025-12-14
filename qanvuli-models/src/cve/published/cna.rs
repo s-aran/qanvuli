@@ -10,7 +10,7 @@ use crate::cve::published::{
     provider_metadata::ProviderMetadata, reference::Reference, tag::Tag,
     taxonomy_mapping::TaxonomyMapping, timeline::Timeline,
 };
-use crate::datetime_deserialize::deserialize_cve_timestamp;
+use qanvuli_utils::datetime_deserialize::deserialize_cve_timestamp;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

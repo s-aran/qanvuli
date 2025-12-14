@@ -13,7 +13,7 @@ fn add_timezone_if_missing(s: String) -> String {
     }
 }
 
-pub(crate) fn deserialize_cve_timestamp<'de, D>(
+pub fn deserialize_cve_timestamp<'de, D>(
     deserializer: D,
 ) -> Result<Option<DateTime<FixedOffset>>, D::Error>
 where
@@ -29,7 +29,7 @@ where
     ))
 }
 
-pub(crate) fn deserialize_required_cve_timestamp<'de, D>(
+pub fn deserialize_required_cve_timestamp<'de, D>(
     deserializer: D,
 ) -> Result<DateTime<FixedOffset>, D::Error>
 where

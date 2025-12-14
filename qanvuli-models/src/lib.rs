@@ -1,8 +1,39 @@
-mod cve;
-mod datetime_deserialize;
+pub mod cve;
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+use anyhow::{Error, Result, anyhow};
+use cve::{
+    base::{cve_metadata::CveState, root::CveRoot},
+    published::root::CveRoot as PublishedCveRoot,
+    rejected::root::CveRoot as RejectedCveRoot,
+};
+use qanvuli_utils::datetime_deserialize;
+
+#[derive(Debug)]
+pub enum CveStatusData {
+    Published(PublishedCveRoot),
+    Rejected(RejectedCveRoot),
+}
+
+pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
+    let buf = src.into();
+    let cve: CveRoot = serde_json::from_str(&buf).unwrap();
+    match cve.cve_metadata.state {
+        CveState::Published => {
+            let deserialized = match serde_json::from_str::<PublishedCveRoot>(&buf) {
+                Ok(r) => r,
+                Err(e) => return Err(anyhow!(e)),
+            };
+            Ok(CveStatusData::Published(deserialized))
+        }
+        CveState::Rejected => {
+            let deserialized = match serde_json::from_str::<RejectedCveRoot>(&buf) {
+                Ok(r) => r,
+                Err(e) => return Err(anyhow!(e)),
+            };
+            Ok(CveStatusData::Rejected(deserialized))
+        }
+        CveState::Reserved => panic!("unexpected reserved state."),
+    }
 }
 
 #[cfg(test)]
@@ -13,12 +44,6 @@ mod tests {
     use crate::cve::rejected::root::CveRoot as RejectedCveRoot;
 
     use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
 
     use glob::MatchOptions;
     use glob::glob_with;
