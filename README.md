@@ -1,2 +1,2 @@
-# sucve-core
+# qanvuli
 CVE List with SQLite3
