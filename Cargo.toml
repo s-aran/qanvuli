@@ -4,13 +4,7 @@ version = "0.1.0"
 
 
 [workspace]
-members = [
-    "qanvuli-collector",
-    "qanvuli-core",
-    "qanvuli-db",
-    "qanvuli-models", "qanvuli-test",
-    "qanvuli-utils",
-]
+members = ["collector", "core", "db", "models", "test", "utils"]
 resolver = "2"
 
 [profile.release]

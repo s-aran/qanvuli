@@ -22,5 +22,5 @@ simd-json = { version = "0.17.0", features = ["ahash"] }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["rt-multi-thread"] }
 
-qanvuli-models = { version = "*", path = "../qanvuli-models" }
-qanvuli-utils = { version = "*", path = "../qanvuli-utils" }
+qanvuli-models = { version = "*", path = "../models" }
+qanvuli-utils = { version = "*", path = "../utils" }

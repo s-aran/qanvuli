@@ -1,0 +1,10 @@
+[package]
+name = "qanvuli-test"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+# qanvuli-core = { version = "*", path = "../core" }
+qanvuli-collector = { version = "*", path = "../collector" }
+qanvuli-utils = { version = "*", path = "../utils" }
+qanvuli-models = { version = "*", path = "../models" }
