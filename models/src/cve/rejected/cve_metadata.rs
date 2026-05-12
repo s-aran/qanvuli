@@ -1,6 +1,5 @@
 use chrono::DateTime;
 use chrono::FixedOffset;
-use chrono::Utc;
 use serde::Deserialize;
 
 use crate::cve::base::cve_metadata::CveState;
