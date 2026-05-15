@@ -1,4 +1,5 @@
 pub mod cve;
+pub mod cwe;
 
 use anyhow::{Error, Result, anyhow};
 use cve::{
