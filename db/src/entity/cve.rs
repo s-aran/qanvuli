@@ -18,22 +18,36 @@ pub struct Model {
     pub title: String,
     #[sea_orm(column_type = "Text", nullable)]
     pub description_en: Option<String>,
-    pub cvss_score: Option<Decimal>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cvss_severity: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cvss_vector: Option<String>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub products_json: Option<Json>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub vendors_json: Option<Json>,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub cwe_id_description_json: Option<Json>,
     #[sea_orm(column_type = "Text")]
     pub raw_json: Json,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(has_many = "super::cve_affected::Entity")]
+    CveAffected,
+    #[sea_orm(has_many = "super::cve_cvss::Entity")]
+    CveCvss,
+    #[sea_orm(has_many = "super::cve_cwe::Entity")]
+    CveCwe,
+}
+
+impl Related<super::cve_affected::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CveAffected.def()
+    }
+}
+
+impl Related<super::cve_cvss::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CveCvss.def()
+    }
+}
+
+impl Related<super::cve_cwe::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::CveCwe.def()
+    }
+}
 
 impl ActiveModelBehavior for ActiveModel {}

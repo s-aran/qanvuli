@@ -16,6 +16,10 @@ sea-orm = { version = "1.1.19", features = [
     "sqlx-sqlite",
     "with-uuid",
 ] }
+sea-orm-migration = { version = "1.1.19", features = [
+    "runtime-tokio-rustls",
+    "sqlx-sqlite",
+] }
 serde = { version = "1.0.228", features = ["derive", "serde_derive"] }
 serde_json = "1.0.145"
 simd-json = { version = "0.17.0", features = ["ahash"] }
