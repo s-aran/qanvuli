@@ -8,6 +8,8 @@ use cve::{
     rejected::root::CveRoot as RejectedCveRoot,
 };
 use qanvuli_utils::datetime_deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
 #[derive(Debug)]
 pub enum CveStatusData {
@@ -15,25 +17,81 @@ pub enum CveStatusData {
     Rejected(RejectedCveRoot),
 }
 
+#[derive(Debug, Clone)]
+pub struct RawCveRecord<T> {
+    pub content: T,
+    pub raw_json: Value,
+}
+
+pub type RawPublishedCveRecord = RawCveRecord<PublishedCveRoot>;
+pub type RawRejectedCveRecord = RawCveRecord<RejectedCveRoot>;
+pub type RawCveStatusRecord = RawCveRecord<CveStatusData>;
+
+impl<T> RawCveRecord<T> {
+    pub fn content(&self) -> &T {
+        &self.content
+    }
+
+    pub fn raw_json(&self) -> &Value {
+        &self.raw_json
+    }
+
+    pub fn into_parts(self) -> (T, Value) {
+        (self.content, self.raw_json)
+    }
+}
+
+pub fn parse_with_raw<T>(bytes: &[u8]) -> Result<RawCveRecord<T>, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    let raw_json: Value = serde_json::from_slice(bytes)?;
+    let content: T = serde_json::from_value(raw_json.clone())?;
+
+    Ok(RawCveRecord { content, raw_json })
+}
+
+pub fn parse_str_with_raw<T>(s: &str) -> Result<RawCveRecord<T>, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
+    let raw_json: Value = serde_json::from_str(s)?;
+    let content: T = serde_json::from_value(raw_json.clone())?;
+
+    Ok(RawCveRecord { content, raw_json })
+}
+
 pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
+    Ok(parse_json_with_raw(src)?.content)
+}
+
+pub fn parse_json_with_raw(src: impl Into<String>) -> Result<RawCveStatusRecord, Error> {
     let buf = src.into();
-    let cve: CveRoot = serde_json::from_str(&buf).unwrap();
+    let raw_json: Value = serde_json::from_str(&buf)?;
+    let cve: CveRoot = serde_json::from_value(raw_json.clone())?;
+
     match cve.cve_metadata.state {
         CveState::Published => {
-            let deserialized = match serde_json::from_str::<PublishedCveRoot>(&buf) {
+            let deserialized = match serde_json::from_value::<PublishedCveRoot>(raw_json.clone()) {
                 Ok(r) => r,
                 Err(e) => return Err(anyhow!(e)),
             };
-            Ok(CveStatusData::Published(deserialized))
+            Ok(RawCveRecord {
+                content: CveStatusData::Published(deserialized),
+                raw_json,
+            })
         }
         CveState::Rejected => {
-            let deserialized = match serde_json::from_str::<RejectedCveRoot>(&buf) {
+            let deserialized = match serde_json::from_value::<RejectedCveRoot>(raw_json.clone()) {
                 Ok(r) => r,
                 Err(e) => return Err(anyhow!(e)),
             };
-            Ok(CveStatusData::Rejected(deserialized))
+            Ok(RawCveRecord {
+                content: CveStatusData::Rejected(deserialized),
+                raw_json,
+            })
         }
-        CveState::Reserved => panic!("unexpected reserved state."),
+        CveState::Reserved => Err(anyhow!("unexpected reserved state.")),
     }
 }
 
@@ -48,8 +106,81 @@ mod tests {
 
     use glob::MatchOptions;
     use glob::glob_with;
+    use serde::Deserialize;
+    use serde_json::value::RawValue;
     use std::fs::File;
     use std::io::Read;
+
+    const CVE_JSON: &str = r#"{
+        "dataType": "CVE_RECORD",
+        "dataVersion": "5.1.0",
+        "cveMetadata": {
+            "cveId": "CVE-2024-0001",
+            "assignerOrgId": "00000000-0000-4000-8000-000000000000",
+            "state": "PUBLISHED"
+        },
+        "containers": {
+            "cna": {
+                "providerMetadata": {
+                    "orgId": "00000000-0000-4000-8000-000000000000"
+                },
+                "descriptions": [
+                    {
+                        "lang": "en",
+                        "value": "Example vulnerability."
+                    }
+                ],
+                "affected": [
+                    {
+                        "vendor": "Example Vendor",
+                        "product": "Example Product"
+                    }
+                ],
+                "references": [
+                    {
+                        "url": "https://example.com/advisory"
+                    }
+                ]
+            }
+        }
+    }"#;
+
+    #[test]
+    fn test_parse_json_with_raw_json() {
+        let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
+
+        assert_eq!(parsed.raw_json()["cveMetadata"]["cveId"], "CVE-2024-0001");
+        assert_eq!(parsed.content().cve_metadata.cve_id, "CVE-2024-0001");
+    }
+
+    #[test]
+    fn test_raw_json_getter_returns_original_json_value() {
+        let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
+        let expected_raw_json: Value = serde_json::from_str(CVE_JSON).unwrap();
+
+        assert_eq!(parsed.raw_json(), &expected_raw_json);
+        assert_eq!(
+            parsed.raw_json()["containers"]["cna"]["affected"][0]["vendor"],
+            "Example Vendor"
+        );
+    }
+
+    #[test]
+    fn test_raw_parse_str_with_raw() {
+        let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
+        let (content, raw_json) = parsed.into_parts();
+
+        assert_eq!(content.cve_metadata.cve_id, "CVE-2024-0001");
+        assert_eq!(raw_json["cveMetadata"]["cveId"], "CVE-2024-0001");
+    }
+
+    #[test]
+    fn test_parse_json_with_raw() {
+        let parsed = parse_json_with_raw(CVE_JSON).unwrap();
+
+        assert_eq!(parsed.raw_json()["cveMetadata"]["cveId"], "CVE-2024-0001");
+        assert!(matches!(parsed.content(), CveStatusData::Published(_)));
+    }
 
     #[test]
     fn test_json() {
