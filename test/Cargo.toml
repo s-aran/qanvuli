@@ -9,4 +9,5 @@ qanvuli-collector = { version = "*", path = "../collector" }
 qanvuli-db = { version = "*", path = "../db" }
 qanvuli-utils = { version = "*", path = "../utils" }
 qanvuli-models = { version = "*", path = "../models" }
+rayon = "1.11"
 tokio = { version = "1.52.3", features = ["rt"] }

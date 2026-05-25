@@ -3,9 +3,11 @@ pub mod migration;
 
 use entity::{cve, cve_affected, cve_cvss, cve_cwe};
 use migration::Migrator;
+use std::collections::HashSet;
+
 use qanvuli_models::{
-    CveStatusData, RawCveRecord, cve::base::cve_metadata::CveState,
-    cve::published::cna_description::CnaDescription,
+    CveStatusData, RawCveRecord, cna_affected_raw_values, cna_cvss_raw_values, cna_cwe_raw_values,
+    cve::base::cve_metadata::CveState, cve::published::cna_description::CnaDescription,
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
@@ -13,6 +15,34 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sea_orm_migration::prelude::MigratorTrait;
+use serde_json::Value;
+
+pub struct CveActiveModels {
+    pub cve_id: String,
+    pub cve: cve::ActiveModel,
+    pub cvss_rows: Vec<cve_cvss::ActiveModel>,
+    pub affected_rows: Vec<cve_affected::ActiveModel>,
+    pub cwe_rows: Vec<cve_cwe::ActiveModel>,
+}
+
+impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
+    fn from(value: RawCveRecord<CveStatusData>) -> Self {
+        let raw_json = value.raw_json().clone();
+        let cve_id = raw_json
+            .pointer("/cveMetadata/cveId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+
+        Self {
+            cve_id: cve_id.clone(),
+            cve: cve::ActiveModel::from(value),
+            cvss_rows: cvss_active_models(&cve_id, &raw_json),
+            affected_rows: affected_active_models(&cve_id, &raw_json),
+            cwe_rows: cwe_active_models(&cve_id, &raw_json),
+        }
+    }
+}
 
 impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
     fn from(value: RawCveRecord<CveStatusData>) -> Self {
@@ -64,6 +94,74 @@ impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
     }
 }
 
+fn cvss_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cvss::ActiveModel> {
+    cna_cvss_raw_values(raw_json)
+        .into_iter()
+        .map(|cvss| cve_cvss::ActiveModel {
+            cve_id: Set(cve_id.to_owned()),
+            version: Set(json_string(&cvss.raw_json, "version").unwrap_or(cvss.cvss_key)),
+            base_score: Set(cvss.raw_json.get("baseScore").and_then(Value::as_f64)),
+            base_severity: Set(json_string(&cvss.raw_json, "baseSeverity")),
+            vector_string: Set(json_string(&cvss.raw_json, "vectorString")),
+            source: Set(Some("cna".to_owned())),
+            raw_json: Set(cvss.raw_json),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn affected_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_affected::ActiveModel> {
+    cna_affected_raw_values(raw_json)
+        .into_iter()
+        .map(|affected| cve_affected::ActiveModel {
+            cve_id: Set(cve_id.to_owned()),
+            vendor: Set(json_string(&affected, "vendor")),
+            product: Set(json_string_or_json(&affected, "product")),
+            package_name: Set(json_string(&affected, "packageName")),
+            collection_url: Set(json_string(&affected, "collectionURL")),
+            default_status: Set(json_string(&affected, "defaultStatus")),
+            raw_json: Set(affected),
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn cwe_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cwe::ActiveModel> {
+    let mut seen = HashSet::new();
+
+    cna_cwe_raw_values(raw_json)
+        .into_iter()
+        .filter_map(|cwe| {
+            let cwe_id = json_string(&cwe, "cweId")?;
+            if !seen.insert(cwe_id.clone()) {
+                return None;
+            }
+
+            Some(cve_cwe::ActiveModel {
+                cve_id: Set(cve_id.to_owned()),
+                cwe_id: Set(cwe_id),
+                description: Set(json_string(&cwe, "description")),
+            })
+        })
+        .collect()
+}
+
+fn json_string(value: &Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn json_string_or_json(value: &Value, key: &str) -> Option<String> {
+    value.get(key).map(|value| {
+        value
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| value.to_string())
+    })
+}
+
 fn cve_state_to_string(state: &CveState) -> String {
     match state {
         CveState::Reserved => "RESERVED",
@@ -88,6 +186,16 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
         "PRAGMA foreign_keys = ON;".to_owned(),
     ))
     .await?;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA journal_mode = WAL;".to_owned(),
+    ))
+    .await?;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA synchronous = NORMAL;".to_owned(),
+    ))
+    .await?;
     Ok(db)
 }
 
@@ -101,24 +209,98 @@ pub async fn rebuild_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
 }
 
 pub async fn upsert_cve(db: &DatabaseConnection, model: cve::ActiveModel) -> Result<(), DbErr> {
+    upsert_cve_on(db, model).await
+}
+
+async fn upsert_cve_on<C>(db: &C, model: cve::ActiveModel) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
     cve::Entity::insert(model)
-        .on_conflict(
-            OnConflict::column(cve::Column::CveId)
-                .update_columns([
-                    cve::Column::State,
-                    cve::Column::PublishedAt,
-                    cve::Column::UpdatedAt,
-                    cve::Column::Serial,
-                    cve::Column::Title,
-                    cve::Column::DescriptionEn,
-                    cve::Column::RawJson,
-                ])
-                .to_owned(),
-        )
+        .on_conflict(cve_upsert_conflict())
         .exec(db)
         .await?;
 
     Ok(())
+}
+
+pub async fn upsert_cve_models(
+    db: &DatabaseConnection,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    if models.is_empty() {
+        return Ok(0);
+    }
+
+    let txn = db.begin().await?;
+    let mut cve_ids = Vec::with_capacity(models.len());
+    let mut cve_rows = Vec::with_capacity(models.len());
+    let mut cvss_rows = Vec::new();
+    let mut affected_rows = Vec::new();
+    let mut cwe_rows = Vec::new();
+
+    for models in models {
+        cve_ids.push(models.cve_id.clone());
+        cve_rows.push(models.cve);
+        cvss_rows.extend(models.cvss_rows);
+        affected_rows.extend(models.affected_rows);
+        cwe_rows.extend(models.cwe_rows);
+    }
+
+    let inserted = cve_rows.len();
+
+    for chunk in cve_rows.chunks(50) {
+        cve::Entity::insert_many(chunk.iter().cloned())
+            .on_conflict(cve_upsert_conflict())
+            .exec(&txn)
+            .await?;
+    }
+
+    cve_cvss::Entity::delete_many()
+        .filter(cve_cvss::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .exec(&txn)
+        .await?;
+    cve_affected::Entity::delete_many()
+        .filter(cve_affected::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .exec(&txn)
+        .await?;
+    cve_cwe::Entity::delete_many()
+        .filter(cve_cwe::Column::CveId.is_in(cve_ids))
+        .exec(&txn)
+        .await?;
+
+    for chunk in cvss_rows.chunks(100) {
+        cve_cvss::Entity::insert_many(chunk.iter().cloned())
+            .exec(&txn)
+            .await?;
+    }
+    for chunk in affected_rows.chunks(100) {
+        cve_affected::Entity::insert_many(chunk.iter().cloned())
+            .exec(&txn)
+            .await?;
+    }
+    for chunk in cwe_rows.chunks(300) {
+        cve_cwe::Entity::insert_many(chunk.iter().cloned())
+            .exec(&txn)
+            .await?;
+    }
+
+    txn.commit().await?;
+    Ok(inserted)
+}
+
+fn cve_upsert_conflict() -> OnConflict {
+    OnConflict::column(cve::Column::CveId)
+        .update_columns([
+            cve::Column::State,
+            cve::Column::PublishedAt,
+            cve::Column::UpdatedAt,
+            cve::Column::Serial,
+            cve::Column::Title,
+            cve::Column::DescriptionEn,
+            cve::Column::RawJson,
+        ])
+        .to_owned()
 }
 
 pub async fn replace_cve_children(
@@ -258,7 +440,30 @@ mod tests {
                 "affected": [
                     {
                         "vendor": "Example Vendor",
-                        "product": "Example Product"
+                        "product": "Example Product",
+                        "defaultStatus": "affected"
+                    }
+                ],
+                "metrics": [
+                    {
+                        "format": "CVSS",
+                        "cvssV3_1": {
+                            "version": "3.1",
+                            "baseScore": 9.8,
+                            "baseSeverity": "CRITICAL",
+                            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                        }
+                    }
+                ],
+                "problemTypes": [
+                    {
+                        "descriptions": [
+                            {
+                                "lang": "en",
+                                "cweId": "CWE-79",
+                                "description": "Cross-site Scripting"
+                            }
+                        ]
                     }
                 ],
                 "references": [
@@ -296,6 +501,49 @@ mod tests {
             Some("Example vulnerability.")
         );
         assert_eq!(active_model.raw_json.unwrap(), expected_raw_json);
+    }
+
+    #[test]
+    fn raw_cve_record_converts_to_all_active_models() {
+        let raw_record = parse_json_with_raw(CVE_JSON).unwrap();
+        let models = CveActiveModels::from(raw_record);
+
+        assert_eq!(models.cve_id, "CVE-2024-0001");
+        assert_eq!(models.cvss_rows.len(), 1);
+        assert_eq!(models.affected_rows.len(), 1);
+        assert_eq!(models.cwe_rows.len(), 1);
+
+        let cvss = models.cvss_rows.into_iter().next().unwrap();
+        assert_eq!(cvss.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(cvss.version.unwrap(), "3.1");
+        assert_eq!(cvss.base_score.unwrap(), Some(9.8));
+        assert_eq!(cvss.base_severity.unwrap().as_deref(), Some("CRITICAL"));
+        assert_eq!(
+            cvss.vector_string.unwrap().as_deref(),
+            Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+        );
+        assert_eq!(cvss.raw_json.unwrap()["version"], "3.1");
+
+        let affected = models.affected_rows.into_iter().next().unwrap();
+        assert_eq!(affected.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(affected.vendor.unwrap().as_deref(), Some("Example Vendor"));
+        assert_eq!(
+            affected.product.unwrap().as_deref(),
+            Some("Example Product")
+        );
+        assert_eq!(
+            affected.default_status.unwrap().as_deref(),
+            Some("affected")
+        );
+        assert_eq!(affected.raw_json.unwrap()["vendor"], "Example Vendor");
+
+        let cwe = models.cwe_rows.into_iter().next().unwrap();
+        assert_eq!(cwe.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(cwe.cwe_id.unwrap(), "CWE-79");
+        assert_eq!(
+            cwe.description.unwrap().as_deref(),
+            Some("Cross-site Scripting")
+        );
     }
 
     #[test]
@@ -377,6 +625,37 @@ mod tests {
 
             let affected_count = cve_affected::Entity::find().count(&db).await.unwrap();
             assert_eq!(affected_count, 1);
+        });
+    }
+
+    #[test]
+    fn upsert_cve_models_writes_parent_and_children() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let db = connect_database("sqlite::memory:").await.unwrap();
+            initialize_schema(&db).await.unwrap();
+
+            let models = CveActiveModels::from(parse_json_with_raw(CVE_JSON).unwrap());
+            let inserted = upsert_cve_models(&db, vec![models]).await.unwrap();
+            assert_eq!(inserted, 1);
+
+            let found = find_cve_by_id(&db, "CVE-2024-0001").await.unwrap().unwrap();
+            assert_eq!(found.cve_id, "CVE-2024-0001");
+
+            let by_cwe = search_cves_by_cwe(&db, &["CWE-79".to_owned()], 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(by_cwe.len(), 1);
+
+            let by_product =
+                search_cves_by_vendor_product(&db, Some("Example Vendor"), Some("Product"), 10, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(by_product.len(), 1);
         });
     }
 }

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::{Asset, Release};
+use std::io::Write;
 
 pub const GITHUB_OWNER: &str = "CVEProject";
 pub const GITHUB_REPO: &str = "cvelistV5";
@@ -18,7 +19,12 @@ impl GitHubReleaseFile {
     }
 
     pub fn download(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let content = reqwest::blocking::get(&self.url)?.bytes()?;
+        let content = reqwest::blocking::Client::new()
+            .get(&self.url)
+            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .send()?
+            .error_for_status()?
+            .bytes()?;
         Ok(content.to_vec())
     }
 
@@ -35,8 +41,14 @@ impl GitHubReleaseFile {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = self.download()?;
-        std::fs::write(path, bytes)?;
+        let mut response = reqwest::blocking::Client::new()
+            .get(&self.url)
+            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .send()?
+            .error_for_status()?;
+        let mut file = std::fs::File::create(path)?;
+        std::io::copy(&mut response, &mut file)?;
+        file.flush()?;
         Ok(())
     }
 
@@ -47,6 +59,13 @@ impl GitHubReleaseFile {
 
     pub fn download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.name.clone();
+        if self.size > 0 {
+            if let Ok(metadata) = std::fs::metadata(&filename) {
+                if metadata.len() == self.size {
+                    return Ok(());
+                }
+            }
+        }
         self.download_as(filename)
     }
 }

@@ -95,6 +95,64 @@ pub fn parse_json_with_raw(src: impl Into<String>) -> Result<RawCveStatusRecord,
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawCvssValue {
+    pub metric_index: usize,
+    pub cvss_key: String,
+    pub raw_json: Value,
+}
+
+pub fn cna_affected_raw_values(raw_json: &Value) -> Vec<Value> {
+    raw_json
+        .pointer("/containers/cna/affected")
+        .and_then(Value::as_array)
+        .map(|affected| affected.to_vec())
+        .unwrap_or_default()
+}
+
+pub fn cna_cvss_raw_values(raw_json: &Value) -> Vec<RawCvssValue> {
+    let Some(metrics) = raw_json
+        .pointer("/containers/cna/metrics")
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    metrics
+        .iter()
+        .enumerate()
+        .flat_map(|(metric_index, metric)| {
+            ["cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"]
+                .into_iter()
+                .filter_map(move |cvss_key| {
+                    metric.get(cvss_key).map(|raw_json| RawCvssValue {
+                        metric_index,
+                        cvss_key: cvss_key.to_owned(),
+                        raw_json: raw_json.clone(),
+                    })
+                })
+        })
+        .collect()
+}
+
+pub fn cna_cwe_raw_values(raw_json: &Value) -> Vec<Value> {
+    raw_json
+        .pointer("/containers/cna/problemTypes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|problem_type| {
+            problem_type
+                .get("descriptions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter(|description| description.get("cweId").is_some())
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::cve::base::cve_metadata::CveState;
@@ -106,8 +164,6 @@ mod tests {
 
     use glob::MatchOptions;
     use glob::glob_with;
-    use serde::Deserialize;
-    use serde_json::value::RawValue;
     use std::fs::File;
     use std::io::Read;
 
@@ -180,6 +236,59 @@ mod tests {
 
         assert_eq!(parsed.raw_json()["cveMetadata"]["cveId"], "CVE-2024-0001");
         assert!(matches!(parsed.content(), CveStatusData::Published(_)));
+    }
+
+    #[test]
+    fn test_extracts_cna_child_raw_json_values() {
+        let src = r#"{
+            "containers": {
+                "cna": {
+                    "affected": [
+                        {
+                            "vendor": "Example Vendor",
+                            "product": "Example Product"
+                        }
+                    ],
+                    "metrics": [
+                        {
+                            "format": "CVSS",
+                            "cvssV3_1": {
+                                "version": "3.1",
+                                "baseScore": 9.8,
+                                "baseSeverity": "CRITICAL",
+                                "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+                            }
+                        }
+                    ],
+                    "problemTypes": [
+                        {
+                            "descriptions": [
+                                {
+                                    "lang": "en",
+                                    "cweId": "CWE-79",
+                                    "description": "Cross-site Scripting"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let raw_json: Value = serde_json::from_str(src).unwrap();
+
+        let affected = cna_affected_raw_values(&raw_json);
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0]["vendor"], "Example Vendor");
+
+        let cvss = cna_cvss_raw_values(&raw_json);
+        assert_eq!(cvss.len(), 1);
+        assert_eq!(cvss[0].metric_index, 0);
+        assert_eq!(cvss[0].cvss_key, "cvssV3_1");
+        assert_eq!(cvss[0].raw_json["version"], "3.1");
+
+        let cwe = cna_cwe_raw_values(&raw_json);
+        assert_eq!(cwe.len(), 1);
+        assert_eq!(cwe[0]["cweId"], "CWE-79");
     }
 
     #[test]

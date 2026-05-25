@@ -1,4 +1,8 @@
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::{Read, Seek},
+    path::PathBuf,
+};
 
 use anyhow::Error;
 use glob::{MatchOptions, glob_with};
@@ -41,18 +45,40 @@ impl FileStorageTrait for ActualStorage {
     }
 }
 
+trait ReadSeek: Read + Seek {}
+
+impl<T> ReadSeek for T where T: Read + Seek {}
+
 pub struct ZipStorage {
-    stream: zip::ZipArchive<std::io::BufReader<File>>,
+    stream: zip::ZipArchive<Box<dyn ReadSeek>>,
 }
 
 impl ZipStorage {
     pub fn new(filename: impl Into<String>) -> Self {
         // TODO: error handling
-        let file = std::fs::File::open(filename.into()).unwrap();
+        let filename = filename.into();
+        let file = std::fs::File::open(&filename).unwrap();
         let reader = std::io::BufReader::new(file);
-        Self {
-            stream: zip::ZipArchive::new(reader).unwrap(),
+        let mut stream = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>).unwrap();
+        if stream.len() == 1 {
+            let name = stream.by_index(0).unwrap().name().to_owned();
+            if name.ends_with(".zip") && !archive_has_cve_json(&stream) {
+                let inner_filename = format!("{filename}.inner.zip");
+                if std::fs::metadata(&inner_filename).is_err() {
+                    eprintln!("extracting nested zip: {name} -> {inner_filename}");
+                    let mut extracted = std::fs::File::create(&inner_filename).unwrap();
+                    let mut entry = stream.by_index(0).unwrap();
+                    std::io::copy(&mut entry, &mut extracted).unwrap();
+                }
+
+                let file = std::fs::File::open(inner_filename).unwrap();
+                let reader = std::io::BufReader::new(file);
+                let inner = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>).unwrap();
+                return Self { stream: inner };
+            }
         }
+
+        Self { stream }
     }
 }
 
@@ -67,7 +93,7 @@ impl FileStorageTrait for ZipStorage {
     }
 
     fn enum_json_list(&self) -> impl Iterator<Item = String> {
-        let re = Regex::new(".*/CVE-[0-9]{4}-[0-9]+.json$").unwrap();
+        let re = cve_json_regex();
         self.stream
             .file_names()
             .filter(move |e| {
@@ -79,6 +105,15 @@ impl FileStorageTrait for ZipStorage {
             })
             .map(|e| e.to_owned())
     }
+}
+
+fn archive_has_cve_json(stream: &zip::ZipArchive<Box<dyn ReadSeek>>) -> bool {
+    let re = cve_json_regex();
+    stream.file_names().any(|name| re.is_match(name))
+}
+
+fn cve_json_regex() -> Regex {
+    Regex::new(r"(^|.*/)CVE-[0-9]{4}-[0-9]+\.json$").unwrap()
 }
 
 #[cfg(test)]
