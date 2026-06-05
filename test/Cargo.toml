@@ -9,5 +9,8 @@ qanvuli-collector = { version = "*", path = "../collector" }
 qanvuli-db = { version = "*", path = "../db" }
 qanvuli-utils = { version = "*", path = "../utils" }
 qanvuli-models = { version = "*", path = "../models" }
+md5 = { package = "md-5", version = "0.10.6" }
 rayon = "1.11"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 tokio = { version = "1.52.3", features = ["rt"] }

@@ -1,7 +1,8 @@
 pub mod entity;
 pub mod migration;
 
-use entity::{cve, cve_affected, cve_cvss, cve_cwe};
+use chrono::Utc;
+use entity::{cve, cve_affected, cve_cvss, cve_cwe, read_json_file};
 use migration::Migrator;
 use std::collections::HashSet;
 
@@ -11,11 +12,17 @@ use qanvuli_models::{
 };
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DbBackend, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
+    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use sea_orm_migration::prelude::MigratorTrait;
 use serde_json::Value;
+
+const CVE_CHUNK_SIZE: usize = 2000;
+const CVSS_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
+const AFFECTED_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
+const CWE_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 6;
+const READ_JSON_FILE_CHUNK_SIZE: usize = 1000;
 
 pub struct CveActiveModels {
     pub cve_id: String,
@@ -23,6 +30,11 @@ pub struct CveActiveModels {
     pub cvss_rows: Vec<cve_cvss::ActiveModel>,
     pub affected_rows: Vec<cve_affected::ActiveModel>,
     pub cwe_rows: Vec<cve_cwe::ActiveModel>,
+}
+
+pub struct ReadJsonFileRecord {
+    pub filename: String,
+    pub md5hash: String,
 }
 
 impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
@@ -179,6 +191,279 @@ fn description_en(descriptions: &[CnaDescription]) -> Option<String> {
         .map(|description| description.value.clone())
 }
 
+pub struct CveDatabase {
+    db: DatabaseConnection,
+}
+
+impl CveDatabase {
+    pub async fn connect(database_url: &str) -> Result<Self, DbErr> {
+        Ok(Self {
+            db: connect_database(database_url).await?,
+        })
+    }
+
+    pub async fn new_async(database_url: &str) -> Result<Self, DbErr> {
+        Self::connect(database_url).await
+    }
+
+    pub fn connection(&self) -> &DatabaseConnection {
+        &self.db
+    }
+
+    pub fn into_connection(self) -> DatabaseConnection {
+        self.db
+    }
+
+    pub async fn close(self) -> Result<(), DbErr> {
+        self.db.close().await
+    }
+
+    pub async fn initialize_schema(&self) -> Result<(), DbErr> {
+        Migrator::up(&self.db, None).await
+    }
+
+    pub async fn rebuild_schema(&self) -> Result<(), DbErr> {
+        Migrator::down(&self.db, None).await?;
+        self.initialize_schema().await
+    }
+
+    pub async fn upsert_cve(&self, model: cve::ActiveModel) -> Result<(), DbErr> {
+        upsert_cve_on(&self.db, model).await
+    }
+
+    pub async fn upsert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin().await?;
+        let mut inserted = 0usize;
+        let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+
+        for model in models {
+            batch.push(model);
+            if batch.len() == CVE_CHUNK_SIZE {
+                inserted += upsert_cve_model_batch(&txn, std::mem::take(&mut batch)).await?;
+                batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+            }
+        }
+
+        if !batch.is_empty() {
+            inserted += upsert_cve_model_batch(&txn, batch).await?;
+        }
+
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn replace_all_cve_models(
+        &self,
+        models: Vec<CveActiveModels>,
+    ) -> Result<usize, DbErr> {
+        let txn = self.db.begin().await?;
+
+        clear_cve_tables_on(&txn).await?;
+        let inserted = insert_cve_models_on(&txn, models).await?;
+
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn clear_cve_tables(&self) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        clear_cve_tables_on(&txn).await?;
+        txn.commit().await
+    }
+
+    pub async fn insert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin().await?;
+        let inserted = insert_cve_models_on(&txn, models).await?;
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn replace_cve_children(
+        &self,
+        cve_id: &str,
+        cvss_rows: Vec<cve_cvss::ActiveModel>,
+        affected_rows: Vec<cve_affected::ActiveModel>,
+        cwe_rows: Vec<cve_cwe::ActiveModel>,
+    ) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+
+        cve_cvss::Entity::delete_many()
+            .filter(cve_cvss::Column::CveId.eq(cve_id))
+            .exec(&txn)
+            .await?;
+        cve_affected::Entity::delete_many()
+            .filter(cve_affected::Column::CveId.eq(cve_id))
+            .exec(&txn)
+            .await?;
+        cve_cwe::Entity::delete_many()
+            .filter(cve_cwe::Column::CveId.eq(cve_id))
+            .exec(&txn)
+            .await?;
+
+        if !cvss_rows.is_empty() {
+            cve_cvss::Entity::insert_many(cvss_rows).exec(&txn).await?;
+        }
+        if !affected_rows.is_empty() {
+            cve_affected::Entity::insert_many(affected_rows)
+                .exec(&txn)
+                .await?;
+        }
+        if !cwe_rows.is_empty() {
+            cve_cwe::Entity::insert_many(cwe_rows).exec(&txn).await?;
+        }
+
+        txn.commit().await
+    }
+
+    pub async fn get_all(&self) -> Result<Vec<cve::Model>, DbErr> {
+        cve::Entity::find()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn find_cve_by_id(&self, cve_id: &str) -> Result<Option<cve::Model>, DbErr> {
+        cve::Entity::find_by_id(cve_id.to_owned())
+            .one(&self.db)
+            .await
+    }
+
+    pub async fn search_cves_by_cwe(
+        &self,
+        cwe_ids: &[String],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
+        if cwe_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        cve::Entity::find()
+            .inner_join(cve_cwe::Entity)
+            .filter(cve_cwe::Column::CweId.is_in(cwe_ids.iter().cloned()))
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cves_by_vendor_product(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
+        let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
+
+        if let Some(vendor) = vendor {
+            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        }
+        if let Some(product) = product {
+            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+        }
+
+        query
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cves_by_text(
+        &self,
+        query: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
+        let pattern = like_pattern(query);
+
+        cve::Entity::find()
+            .filter(
+                cve::Column::CveId
+                    .like(pattern.clone())
+                    .or(cve::Column::Title.like(pattern.clone()))
+                    .or(cve::Column::DescriptionEn.like(pattern)),
+            )
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn mark_json_file_read(&self, filename: &str, md5hash: &str) -> Result<(), DbErr> {
+        self.mark_json_files_read(vec![ReadJsonFileRecord {
+            filename: filename.to_owned(),
+            md5hash: md5hash.to_owned(),
+        }])
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn mark_json_files_read(
+        &self,
+        files: Vec<ReadJsonFileRecord>,
+    ) -> Result<usize, DbErr> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let count = files.len();
+        let mut rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
+
+        for file in files {
+            rows.push(read_json_file::ActiveModel {
+                created_at: Set(now.clone()),
+                updated_at: Set(now.clone()),
+                filename: Set(file.filename),
+                md5hash: Set(file.md5hash),
+            });
+
+            if rows.len() == READ_JSON_FILE_CHUNK_SIZE {
+                insert_read_json_file_rows(std::mem::take(&mut rows), &self.db).await?;
+                rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
+            }
+        }
+
+        if !rows.is_empty() {
+            insert_read_json_file_rows(rows, &self.db).await?;
+        }
+
+        Ok(count)
+    }
+
+    pub async fn find_read_json_file(
+        &self,
+        filename: &str,
+        md5hash: &str,
+    ) -> Result<Option<read_json_file::Model>, DbErr> {
+        read_json_file::Entity::find()
+            .filter(read_json_file::Column::Filename.eq(filename))
+            .filter(read_json_file::Column::Md5hash.eq(md5hash))
+            .one(&self.db)
+            .await
+    }
+}
+
 pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, DbErr> {
     let db = Database::connect(database_url).await?;
     db.execute(Statement::from_string(
@@ -199,19 +484,6 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
     Ok(db)
 }
 
-pub async fn initialize_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
-    Migrator::up(db, None).await
-}
-
-pub async fn rebuild_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
-    Migrator::down(db, None).await?;
-    initialize_schema(db).await
-}
-
-pub async fn upsert_cve(db: &DatabaseConnection, model: cve::ActiveModel) -> Result<(), DbErr> {
-    upsert_cve_on(db, model).await
-}
-
 async fn upsert_cve_on<C>(db: &C, model: cve::ActiveModel) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
@@ -224,15 +496,10 @@ where
     Ok(())
 }
 
-pub async fn upsert_cve_models(
-    db: &DatabaseConnection,
+async fn upsert_cve_model_batch(
+    txn: &DatabaseTransaction,
     models: Vec<CveActiveModels>,
 ) -> Result<usize, DbErr> {
-    if models.is_empty() {
-        return Ok(0);
-    }
-
-    let txn = db.begin().await?;
     let mut cve_ids = Vec::with_capacity(models.len());
     let mut cve_rows = Vec::with_capacity(models.len());
     let mut cvss_rows = Vec::new();
@@ -249,44 +516,138 @@ pub async fn upsert_cve_models(
 
     let inserted = cve_rows.len();
 
-    for chunk in cve_rows.chunks(50) {
+    for chunk in cve_rows.chunks(CVE_CHUNK_SIZE) {
         cve::Entity::insert_many(chunk.iter().cloned())
             .on_conflict(cve_upsert_conflict())
-            .exec(&txn)
+            .exec(txn)
             .await?;
     }
 
     cve_cvss::Entity::delete_many()
         .filter(cve_cvss::Column::CveId.is_in(cve_ids.iter().cloned()))
-        .exec(&txn)
+        .exec(txn)
         .await?;
     cve_affected::Entity::delete_many()
         .filter(cve_affected::Column::CveId.is_in(cve_ids.iter().cloned()))
-        .exec(&txn)
+        .exec(txn)
         .await?;
     cve_cwe::Entity::delete_many()
         .filter(cve_cwe::Column::CveId.is_in(cve_ids))
-        .exec(&txn)
+        .exec(txn)
         .await?;
 
-    for chunk in cvss_rows.chunks(100) {
+    for chunk in cvss_rows.chunks(CVSS_CHUNK_SIZE) {
         cve_cvss::Entity::insert_many(chunk.iter().cloned())
-            .exec(&txn)
+            .exec(txn)
             .await?;
     }
-    for chunk in affected_rows.chunks(100) {
+    for chunk in affected_rows.chunks(AFFECTED_CHUNK_SIZE) {
         cve_affected::Entity::insert_many(chunk.iter().cloned())
-            .exec(&txn)
+            .exec(txn)
             .await?;
     }
-    for chunk in cwe_rows.chunks(300) {
+    for chunk in cwe_rows.chunks(CWE_CHUNK_SIZE) {
         cve_cwe::Entity::insert_many(chunk.iter().cloned())
-            .exec(&txn)
+            .exec(txn)
             .await?;
     }
 
-    txn.commit().await?;
     Ok(inserted)
+}
+
+async fn insert_cve_models_on(
+    txn: &DatabaseTransaction,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    let mut inserted = 0usize;
+    let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+
+    for models in models {
+        batch.push(models);
+        if batch.len() == CVE_CHUNK_SIZE {
+            inserted += insert_cve_model_batch(txn, std::mem::take(&mut batch)).await?;
+            batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+        }
+    }
+
+    if !batch.is_empty() {
+        inserted += insert_cve_model_batch(txn, batch).await?;
+    }
+
+    Ok(inserted)
+}
+
+async fn insert_cve_model_batch(
+    txn: &DatabaseTransaction,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    let mut cve_rows = Vec::with_capacity(models.len());
+    let mut cvss_rows = Vec::new();
+    let mut affected_rows = Vec::new();
+    let mut cwe_rows = Vec::new();
+
+    for models in models {
+        cve_rows.push(models.cve);
+        cvss_rows.extend(models.cvss_rows);
+        affected_rows.extend(models.affected_rows);
+        cwe_rows.extend(models.cwe_rows);
+    }
+
+    let inserted = cve_rows.len();
+
+    insert_cve_rows(txn, cve_rows).await?;
+
+    for chunk in cvss_rows.chunks(CVSS_CHUNK_SIZE) {
+        insert_cvss_rows(txn, chunk.to_vec()).await?;
+    }
+    for chunk in affected_rows.chunks(AFFECTED_CHUNK_SIZE) {
+        insert_affected_rows(txn, chunk.to_vec()).await?;
+    }
+    for chunk in cwe_rows.chunks(CWE_CHUNK_SIZE) {
+        insert_cwe_rows(txn, chunk.to_vec()).await?;
+    }
+
+    Ok(inserted)
+}
+
+async fn clear_cve_tables_on(txn: &DatabaseTransaction) -> Result<(), DbErr> {
+    cve_cwe::Entity::delete_many().exec(txn).await?;
+    cve_affected::Entity::delete_many().exec(txn).await?;
+    cve_cvss::Entity::delete_many().exec(txn).await?;
+    cve::Entity::delete_many().exec(txn).await?;
+    Ok(())
+}
+
+async fn insert_cve_rows(
+    txn: &DatabaseTransaction,
+    rows: Vec<cve::ActiveModel>,
+) -> Result<(), DbErr> {
+    cve::Entity::insert_many(rows).exec(txn).await?;
+    Ok(())
+}
+
+async fn insert_cvss_rows(
+    txn: &DatabaseTransaction,
+    rows: Vec<cve_cvss::ActiveModel>,
+) -> Result<(), DbErr> {
+    cve_cvss::Entity::insert_many(rows).exec(txn).await?;
+    Ok(())
+}
+
+async fn insert_affected_rows(
+    txn: &DatabaseTransaction,
+    rows: Vec<cve_affected::ActiveModel>,
+) -> Result<(), DbErr> {
+    cve_affected::Entity::insert_many(rows).exec(txn).await?;
+    Ok(())
+}
+
+async fn insert_cwe_rows(
+    txn: &DatabaseTransaction,
+    rows: Vec<cve_cwe::ActiveModel>,
+) -> Result<(), DbErr> {
+    cve_cwe::Entity::insert_many(rows).exec(txn).await?;
+    Ok(())
 }
 
 fn cve_upsert_conflict() -> OnConflict {
@@ -303,6 +664,71 @@ fn cve_upsert_conflict() -> OnConflict {
         .to_owned()
 }
 
+fn read_json_file_upsert_conflict() -> OnConflict {
+    OnConflict::columns([
+        read_json_file::Column::Filename,
+        read_json_file::Column::Md5hash,
+    ])
+    .update_column(read_json_file::Column::UpdatedAt)
+    .to_owned()
+}
+
+async fn insert_read_json_file_rows(
+    rows: Vec<read_json_file::ActiveModel>,
+    db: &DatabaseConnection,
+) -> Result<(), DbErr> {
+    read_json_file::Entity::insert_many(rows)
+        .on_conflict(read_json_file_upsert_conflict())
+        .exec(db)
+        .await?;
+
+    Ok(())
+}
+
+pub async fn initialize_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
+    Migrator::up(db, None).await
+}
+
+pub async fn rebuild_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
+    Migrator::down(db, None).await?;
+    initialize_schema(db).await
+}
+
+pub async fn upsert_cve(db: &DatabaseConnection, model: cve::ActiveModel) -> Result<(), DbErr> {
+    upsert_cve_on(db, model).await
+}
+
+pub async fn upsert_cve_models(
+    db: &DatabaseConnection,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    CveDatabase { db: db.clone() }
+        .upsert_cve_models(models)
+        .await
+}
+
+pub async fn replace_all_cve_models(
+    db: &DatabaseConnection,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    CveDatabase { db: db.clone() }
+        .replace_all_cve_models(models)
+        .await
+}
+
+pub async fn clear_cve_tables(db: &DatabaseConnection) -> Result<(), DbErr> {
+    CveDatabase { db: db.clone() }.clear_cve_tables().await
+}
+
+pub async fn insert_cve_models(
+    db: &DatabaseConnection,
+    models: Vec<CveActiveModels>,
+) -> Result<usize, DbErr> {
+    CveDatabase { db: db.clone() }
+        .insert_cve_models(models)
+        .await
+}
+
 pub async fn replace_cve_children(
     db: &DatabaseConnection,
     cve_id: &str,
@@ -310,49 +736,20 @@ pub async fn replace_cve_children(
     affected_rows: Vec<cve_affected::ActiveModel>,
     cwe_rows: Vec<cve_cwe::ActiveModel>,
 ) -> Result<(), DbErr> {
-    let txn = db.begin().await?;
-
-    cve_cvss::Entity::delete_many()
-        .filter(cve_cvss::Column::CveId.eq(cve_id))
-        .exec(&txn)
-        .await?;
-    cve_affected::Entity::delete_many()
-        .filter(cve_affected::Column::CveId.eq(cve_id))
-        .exec(&txn)
-        .await?;
-    cve_cwe::Entity::delete_many()
-        .filter(cve_cwe::Column::CveId.eq(cve_id))
-        .exec(&txn)
-        .await?;
-
-    if !cvss_rows.is_empty() {
-        cve_cvss::Entity::insert_many(cvss_rows).exec(&txn).await?;
-    }
-    if !affected_rows.is_empty() {
-        cve_affected::Entity::insert_many(affected_rows)
-            .exec(&txn)
-            .await?;
-    }
-    if !cwe_rows.is_empty() {
-        cve_cwe::Entity::insert_many(cwe_rows).exec(&txn).await?;
-    }
-
-    txn.commit().await
+    CveDatabase { db: db.clone() }
+        .replace_cve_children(cve_id, cvss_rows, affected_rows, cwe_rows)
+        .await
 }
 
 pub async fn get_all(db: &DatabaseConnection) -> Result<Vec<cve::Model>, DbErr> {
-    cve::Entity::find()
-        .order_by_desc(cve::Column::PublishedAt)
-        .order_by_asc(cve::Column::CveId)
-        .all(db)
-        .await
+    CveDatabase { db: db.clone() }.get_all().await
 }
 
 pub async fn find_cve_by_id(
     db: &DatabaseConnection,
     cve_id: &str,
 ) -> Result<Option<cve::Model>, DbErr> {
-    cve::Entity::find_by_id(cve_id.to_owned()).one(db).await
+    CveDatabase { db: db.clone() }.find_cve_by_id(cve_id).await
 }
 
 pub async fn search_cves_by_cwe(
@@ -361,19 +758,8 @@ pub async fn search_cves_by_cwe(
     limit: u64,
     offset: u64,
 ) -> Result<Vec<cve::Model>, DbErr> {
-    if cwe_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    cve::Entity::find()
-        .inner_join(cve_cwe::Entity)
-        .filter(cve_cwe::Column::CweId.is_in(cwe_ids.iter().cloned()))
-        .distinct()
-        .order_by_desc(cve::Column::PublishedAt)
-        .order_by_asc(cve::Column::CveId)
-        .limit(limit)
-        .offset(offset)
-        .all(db)
+    CveDatabase { db: db.clone() }
+        .search_cves_by_cwe(cwe_ids, limit, offset)
         .await
 }
 
@@ -384,25 +770,52 @@ pub async fn search_cves_by_vendor_product(
     limit: u64,
     offset: u64,
 ) -> Result<Vec<cve::Model>, DbErr> {
-    let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
-
-    if let Some(vendor) = vendor {
-        query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-    }
-    if let Some(product) = product {
-        query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-    }
-
-    query
-        .distinct()
-        .order_by_desc(cve::Column::PublishedAt)
-        .order_by_asc(cve::Column::CveId)
-        .limit(limit)
-        .offset(offset)
-        .all(db)
+    CveDatabase { db: db.clone() }
+        .search_cves_by_vendor_product(vendor, product, limit, offset)
         .await
 }
 
+pub async fn search_cves_by_text(
+    db: &DatabaseConnection,
+    query: &str,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<cve::Model>, DbErr> {
+    CveDatabase { db: db.clone() }
+        .search_cves_by_text(query, limit, offset)
+        .await
+}
+
+pub async fn mark_json_file_read(
+    db: &DatabaseConnection,
+    filename: &str,
+    md5hash: &str,
+) -> Result<(), DbErr> {
+    CveDatabase { db: db.clone() }
+        .mark_json_file_read(filename, md5hash)
+        .await
+}
+
+pub async fn mark_json_files_read(
+    db: &DatabaseConnection,
+    files: Vec<ReadJsonFileRecord>,
+) -> Result<usize, DbErr> {
+    CveDatabase { db: db.clone() }
+        .mark_json_files_read(files)
+        .await
+}
+
+pub async fn find_read_json_file(
+    db: &DatabaseConnection,
+    filename: &str,
+    md5hash: &str,
+) -> Result<Option<read_json_file::Model>, DbErr> {
+    CveDatabase { db: db.clone() }
+        .find_read_json_file(filename, md5hash)
+        .await
+}
+
+#[inline]
 fn like_pattern(value: &str) -> String {
     format!("%{value}%")
 }
@@ -656,6 +1069,42 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(by_product.len(), 1);
+        });
+    }
+
+    #[test]
+    fn mark_json_file_read_upserts_processed_file() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+
+            db.mark_json_file_read("cves/CVE-2024-0001.json", "0123456789abcdef")
+                .await
+                .unwrap();
+            db.mark_json_file_read("cves/CVE-2024-0001.json", "0123456789abcdef")
+                .await
+                .unwrap();
+
+            let found = db
+                .find_read_json_file("cves/CVE-2024-0001.json", "0123456789abcdef")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.filename, "cves/CVE-2024-0001.json");
+            assert_eq!(found.md5hash, "0123456789abcdef");
+            assert!(!found.created_at.is_empty());
+            assert!(!found.updated_at.is_empty());
+
+            let count = read_json_file::Entity::find()
+                .count(db.connection())
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
         });
     }
 }

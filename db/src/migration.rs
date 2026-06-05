@@ -1,4 +1,4 @@
-use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe};
+use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, read_json_file};
 use sea_orm::Schema;
 use sea_orm_migration::prelude::*;
 
@@ -7,7 +7,10 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(M20260516CreateCveTables)]
+        vec![
+            Box::new(M20260516CreateCveTables),
+            Box::new(M20260604CreateReadJsonFileTable),
+        ]
     }
 }
 
@@ -147,6 +150,66 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .name("idx_cve_cwe_cwe_id")
             .table(cve_cwe::Entity)
             .col(cve_cwe::Column::CweId)
+            .if_not_exists()
+            .to_owned(),
+    ]
+}
+
+pub struct M20260604CreateReadJsonFileTable;
+
+impl MigrationName for M20260604CreateReadJsonFileTable {
+    fn name(&self) -> &str {
+        "m20260604_create_read_json_file_table"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260604CreateReadJsonFileTable {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+
+        manager
+            .create_table(
+                schema
+                    .create_table_from_entity(read_json_file::Entity)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await?;
+
+        for statement in read_json_file_index_statements() {
+            manager.create_index(statement).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(read_json_file::Entity)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+fn read_json_file_index_statements() -> Vec<IndexCreateStatement> {
+    vec![
+        Index::create()
+            .name("idx_read_json_file_filename")
+            .table(read_json_file::Entity)
+            .col(read_json_file::Column::Filename)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_read_json_file_filename_md5hash_unique")
+            .table(read_json_file::Entity)
+            .col(read_json_file::Column::Filename)
+            .col(read_json_file::Column::Md5hash)
+            .unique()
             .if_not_exists()
             .to_owned(),
     ]

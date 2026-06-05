@@ -4,3 +4,4 @@ pub use super::cve::Entity as Cve;
 pub use super::cve_affected::Entity as CveAffected;
 pub use super::cve_cvss::Entity as CveCvss;
 pub use super::cve_cwe::Entity as CveCwe;
+pub use super::read_json_file::Entity as ReadJsonFile;
