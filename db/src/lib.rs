@@ -3,6 +3,7 @@ pub mod migration;
 
 use chrono::Utc;
 use entity::{cve, cve_affected, cve_cvss, cve_cwe, read_json_file};
+use md5::{Digest, Md5};
 use migration::Migrator;
 use std::collections::HashSet;
 
@@ -13,9 +14,11 @@ use qanvuli_models::{
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction, DbBackend,
-    DbErr, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
+    DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use sea_orm_migration::prelude::MigratorTrait;
+use serde::Serialize;
 use serde_json::Value;
 
 const CVE_CHUNK_SIZE: usize = 2000;
@@ -35,6 +38,25 @@ pub struct CveActiveModels {
 pub struct ReadJsonFileRecord {
     pub filename: String,
     pub md5hash: String,
+}
+
+impl ReadJsonFileRecord {
+    pub fn from_content(filename: impl Into<String>, content: &[u8]) -> Self {
+        Self {
+            filename: filename.into(),
+            md5hash: md5_hex(content),
+        }
+    }
+}
+
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
+pub struct CveSummary {
+    pub cve_id: String,
+    pub state: String,
+    pub published_at: String,
+    pub updated_at: String,
+    pub title: String,
+    pub description_en: Option<String>,
 }
 
 impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
@@ -163,6 +185,12 @@ fn json_string(value: &Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 fn json_string_or_json(value: &Value, key: &str) -> Option<String> {
@@ -359,6 +387,31 @@ impl CveDatabase {
             .await
     }
 
+    pub async fn search_cve_summaries_by_cwe(
+        &self,
+        cwe_ids: &[String],
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        if cwe_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .inner_join(cve_cwe::Entity)
+            .filter(cve_cwe::Column::CweId.is_in(cwe_ids.iter().cloned()))
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
     pub async fn search_cves_by_vendor_product(
         &self,
         vendor: Option<&str>,
@@ -385,6 +438,77 @@ impl CveDatabase {
             .await
     }
 
+    pub async fn search_cve_summaries_by_vendor_product(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let mut query = cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .inner_join(cve_affected::Entity);
+
+        if let Some(vendor) = vendor {
+            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        }
+        if let Some(product) = product {
+            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+        }
+
+        query
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cve_summaries_by_affected_component(
+        &self,
+        vendor: Option<&str>,
+        component: &str,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let pattern = like_pattern(component);
+        let mut query = cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .inner_join(cve_affected::Entity)
+            .filter(
+                cve_affected::Column::Product
+                    .like(pattern.clone())
+                    .or(cve_affected::Column::PackageName.like(pattern)),
+            );
+
+        if let Some(vendor) = vendor {
+            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        }
+        if let Some(published_since) = published_since {
+            query = query.filter(cve::Column::PublishedAt.gte(published_since));
+        }
+        if let Some(updated_since) = updated_since {
+            query = query.filter(cve::Column::UpdatedAt.gte(updated_since));
+        }
+
+        query
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
     pub async fn search_cves_by_text(
         &self,
         query: &str,
@@ -404,6 +528,135 @@ impl CveDatabase {
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
             .offset(offset)
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cve_summaries_by_text(
+        &self,
+        query: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let pattern = like_pattern(query);
+
+        cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .filter(
+                cve::Column::CveId
+                    .like(pattern.clone())
+                    .or(cve::Column::Title.like(pattern.clone()))
+                    .or(cve::Column::DescriptionEn.like(pattern)),
+            )
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cve_summaries_by_cvss(
+        &self,
+        min_score: Option<f64>,
+        max_score: Option<f64>,
+        severity: Option<&str>,
+        version: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let mut query = cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .inner_join(cve_cvss::Entity);
+
+        if let Some(min_score) = min_score {
+            query = query.filter(cve_cvss::Column::BaseScore.gte(min_score));
+        }
+        if let Some(max_score) = max_score {
+            query = query.filter(cve_cvss::Column::BaseScore.lte(max_score));
+        }
+        if let Some(severity) = severity {
+            query = query.filter(cve_cvss::Column::BaseSeverity.eq(severity.to_ascii_uppercase()));
+        }
+        if let Some(version) = version {
+            query = query.filter(cve_cvss::Column::Version.eq(version));
+        }
+
+        query
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cve_summaries_by_product_cvss(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        min_score: Option<f64>,
+        severity: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let mut query = cve::Entity::find()
+            .select_only()
+            .columns(summary_columns())
+            .inner_join(cve_affected::Entity)
+            .inner_join(cve_cvss::Entity);
+
+        if let Some(vendor) = vendor {
+            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        }
+        if let Some(product) = product {
+            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+        }
+        if let Some(min_score) = min_score {
+            query = query.filter(cve_cvss::Column::BaseScore.gte(min_score));
+        }
+        if let Some(severity) = severity {
+            query = query.filter(cve_cvss::Column::BaseSeverity.eq(severity.to_ascii_uppercase()));
+        }
+
+        query
+            .distinct()
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
+            .all(&self.db)
+            .await
+    }
+
+    pub async fn search_cve_summaries_by_date(
+        &self,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        let mut query = cve::Entity::find().select_only().columns(summary_columns());
+
+        if let Some(published_since) = published_since {
+            query = query.filter(cve::Column::PublishedAt.gte(published_since));
+        }
+        if let Some(updated_since) = updated_since {
+            query = query.filter(cve::Column::UpdatedAt.gte(updated_since));
+        }
+
+        query
+            .order_by_desc(cve::Column::PublishedAt)
+            .order_by_asc(cve::Column::CveId)
+            .limit(limit)
+            .offset(offset)
+            .into_model::<CveSummary>()
             .all(&self.db)
             .await
     }
@@ -813,6 +1066,17 @@ pub async fn find_read_json_file(
     CveDatabase { db: db.clone() }
         .find_read_json_file(filename, md5hash)
         .await
+}
+
+fn summary_columns() -> [cve::Column; 6] {
+    [
+        cve::Column::CveId,
+        cve::Column::State,
+        cve::Column::PublishedAt,
+        cve::Column::UpdatedAt,
+        cve::Column::Title,
+        cve::Column::DescriptionEn,
+    ]
 }
 
 #[inline]

@@ -1,0 +1,135 @@
+use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
+use serde_json::json;
+
+#[derive(Debug, Default, clap::Args)]
+pub struct Args {
+    #[arg(long = "cve", value_name = "ID")]
+    cve_id: Option<String>,
+    #[arg(long, value_name = "QUERY")]
+    text: Option<String>,
+    #[arg(long)]
+    vendor: Option<String>,
+    #[arg(long)]
+    product: Option<String>,
+    #[arg(long)]
+    component: Option<String>,
+    #[arg(long = "cwe", value_name = "CWE_ID")]
+    cwe_ids: Vec<String>,
+    #[arg(long)]
+    min_score: Option<f64>,
+    #[arg(long)]
+    max_score: Option<f64>,
+    #[arg(long)]
+    severity: Option<String>,
+    #[arg(long)]
+    version: Option<String>,
+    #[arg(long)]
+    published_since: Option<String>,
+    #[arg(long, alias = "since")]
+    updated_since: Option<String>,
+    #[arg(long)]
+    limit: Option<u64>,
+    #[arg(long)]
+    offset: Option<u64>,
+}
+
+impl Args {
+    fn has_cvss_filter(&self) -> bool {
+        self.min_score.is_some()
+            || self.max_score.is_some()
+            || self.severity.is_some()
+            || self.version.is_some()
+    }
+
+    fn component_name(&self) -> Option<&str> {
+        self.component
+            .as_deref()
+            .or(self.product.as_deref())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn date_filter(&self) -> Result<DateFilter, String> {
+        DateFilter::new(
+            self.published_since.as_deref(),
+            self.updated_since.as_deref(),
+        )
+    }
+}
+
+pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
+    let db = connect_db(db_url).await?;
+    let date_filter = args.date_filter()?;
+
+    if let Some(cve_id) = args.cve_id.as_deref() {
+        let cve = db
+            .find_cve_by_id(cve_id)
+            .await
+            .map_err(|err| format!("failed to fetch {cve_id}: {err}"))?;
+        let cve = cve.map(|cve| {
+            json!({
+                "cve_id": cve.cve_id,
+                "state": cve.state,
+                "published_at": cve.published_at,
+                "updated_at": cve.updated_at,
+                "serial": cve.serial,
+                "title": cve.title,
+                "description_en": cve.description_en,
+                "raw_json": cve.raw_json,
+            })
+        });
+        print_json(&cve)?;
+        db.close()
+            .await
+            .map_err(|err| format!("failed to close database: {err}"))?;
+        return Ok(());
+    }
+
+    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
+    let offset = args.offset.unwrap_or(0);
+    let summaries = if let Some(query) = args.text.as_deref() {
+        db.search_cve_summaries_by_text(query, limit, offset)
+            .await
+            .map_err(|err| format!("failed to search text: {err}"))?
+    } else if !args.cwe_ids.is_empty() {
+        db.search_cve_summaries_by_cwe(&args.cwe_ids, limit, offset)
+            .await
+            .map_err(|err| format!("failed to search CWE: {err}"))?
+    } else if args.has_cvss_filter() {
+        db.search_cve_summaries_by_cvss(
+            args.min_score,
+            args.max_score,
+            args.severity.as_deref(),
+            args.version.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| format!("failed to search CVSS: {err}"))?
+    } else if let Some(component) = args.component_name() {
+        db.search_cve_summaries_by_affected_component(
+            args.vendor.as_deref(),
+            component,
+            date_filter.published_since.as_deref(),
+            date_filter.updated_since.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| format!("failed to search affected component: {err}"))?
+    } else {
+        db.search_cve_summaries_by_date(
+            date_filter.published_since.as_deref(),
+            date_filter.updated_since.as_deref(),
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| format!("failed to search by date: {err}"))?
+    };
+
+    print_json(&summaries)?;
+    db.close()
+        .await
+        .map_err(|err| format!("failed to close database: {err}"))?;
+    Ok(())
+}

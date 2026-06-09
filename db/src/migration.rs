@@ -1,5 +1,5 @@
 use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, read_json_file};
-use sea_orm::Schema;
+use sea_orm::{EntityName, Schema};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -10,6 +10,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(M20260516CreateCveTables),
             Box::new(M20260604CreateReadJsonFileTable),
+            Box::new(M20260605AddSearchIndexes),
         ]
     }
 }
@@ -210,6 +211,86 @@ fn read_json_file_index_statements() -> Vec<IndexCreateStatement> {
             .col(read_json_file::Column::Filename)
             .col(read_json_file::Column::Md5hash)
             .unique()
+            .if_not_exists()
+            .to_owned(),
+    ]
+}
+
+pub struct M20260605AddSearchIndexes;
+
+impl MigrationName for M20260605AddSearchIndexes {
+    fn name(&self) -> &str {
+        "m20260605_add_search_indexes"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260605AddSearchIndexes {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for statement in search_index_statements() {
+            manager.create_index(statement).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, index_name) in [
+            (cve_cvss::Entity.table_ref(), "idx_cve_cvss_base_severity"),
+            (cve_cvss::Entity.table_ref(), "idx_cve_cvss_severity_score"),
+            (cve_cvss::Entity.table_ref(), "idx_cve_cvss_version_score"),
+            (cve::Entity.table_ref(), "idx_cve_published_at_cve_id"),
+            (cve::Entity.table_ref(), "idx_cve_updated_at_cve_id"),
+        ] {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(index_name)
+                        .table(table)
+                        .if_exists()
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+}
+
+fn search_index_statements() -> Vec<IndexCreateStatement> {
+    vec![
+        Index::create()
+            .name("idx_cve_cvss_base_severity")
+            .table(cve_cvss::Entity)
+            .col(cve_cvss::Column::BaseSeverity)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_cvss_severity_score")
+            .table(cve_cvss::Entity)
+            .col(cve_cvss::Column::BaseSeverity)
+            .col(cve_cvss::Column::BaseScore)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_cvss_version_score")
+            .table(cve_cvss::Entity)
+            .col(cve_cvss::Column::Version)
+            .col(cve_cvss::Column::BaseScore)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_published_at_cve_id")
+            .table(cve::Entity)
+            .col(cve::Column::PublishedAt)
+            .col(cve::Column::CveId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_updated_at_cve_id")
+            .table(cve::Entity)
+            .col(cve::Column::UpdatedAt)
+            .col(cve::Column::CveId)
             .if_not_exists()
             .to_owned(),
     ]

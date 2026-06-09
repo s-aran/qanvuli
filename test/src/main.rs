@@ -1,263 +1,92 @@
-use md5::{Digest, Md5};
-use qanvuli_collector::providers::cve::CveRelease;
-use qanvuli_db::{CveActiveModels, CveDatabase, ReadJsonFileRecord};
-use qanvuli_models::parse_json_with_raw;
-use qanvuli_utils::loader::{self, FileStorageTrait};
-use rayon::prelude::*;
-use std::time::{Duration, Instant};
-use tokio::runtime::Runtime;
+mod subcommands;
 
-const DEFAULT_DB_CONNECTION_STRING: &str = "sqlite://./db.sqlite?mode=rwc";
-const INGEST_CHUNK_SIZE: usize = 10000;
+use clap::{CommandFactory, Parser, Subcommand};
+use subcommands::common::DEFAULT_DB_CONNECTION_STRING;
 
 fn main() {
-    let max_chunks = std::env::args()
-        .nth(1)
-        .map(|value| value.parse::<usize>().expect("max chunks must be usize"));
-    let db_connection_string =
-        std::env::var("QANVULI_DB_URL").unwrap_or_else(|_| DEFAULT_DB_CONNECTION_STRING.to_owned());
-    let mut cve = CveRelease::new();
-    if let Err(err) = cve.get() {
-        panic!("failed to fetch CVE release list: {err}");
+    if let Err(err) = run() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let cli = Cli::parse();
+    let db_url = cli.db_url();
+    let command = cli.command.unwrap_or(Command::Help);
+
+    if matches!(command, Command::Help) {
+        print_help();
+        return Ok(());
+    }
+    if matches!(command, Command::Mcp) {
+        return subcommands::mcp::run(db_url);
     }
 
-    println!("{:?}", cve.get_latest_all_file());
-    println!("{:?}", cve.get_latest_delta_file());
-    println!("{:?}", cve.get_latest_delta_midnight_file());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
 
-    let all_asset = if let Some(a) = cve.get_latest_all_file() {
-        a
-    } else {
-        panic!("no all asset");
-    };
-    let delta_asset = if let Some(a) = cve.get_latest_delta_file() {
-        a
-    } else {
-        panic!("no delta asset");
-    };
-
-    if let Err(err) = all_asset.download_as_file() {
-        panic!("failed to download {}: {err}", all_asset.name);
-    };
-    if let Err(err) = delta_asset.download_as_file() {
-        panic!("failed to download {}: {err}", delta_asset.name);
-    };
-
-    // Create the runtime
-    let rt = Runtime::new().unwrap();
-
-    // Get a handle from this runtime
-    let handle = rt.handle();
-
-    // Execute the future, blocking the current thread until completion
-    let db = handle.block_on(async {
-        if let Ok(db) = CveDatabase::connect(&db_connection_string).await {
-            if db.initialize_schema().await.is_err() {
-                panic!("init db schema failed");
-            }
-
-            ingest_zip(
-                &db,
-                "all",
-                &all_asset.name,
-                IngestMode::ReplaceAll,
-                max_chunks,
-            )
-            .await;
-            ingest_zip(
-                &db,
-                "delta",
-                &delta_asset.name,
-                IngestMode::Upsert,
-                max_chunks,
-            )
-            .await;
-
-            db
-        } else {
-            panic!("db connect failed");
+    runtime.block_on(async {
+        match command {
+            Command::Help | Command::Mcp => Ok(()),
+            Command::Init(args) => subcommands::init::run(&db_url, args).await,
+            Command::Update(args) => subcommands::update::run(&db_url, args).await,
+            Command::DownloadCve(args) => subcommands::download_cve::run(args).await,
+            Command::Search(args) => subcommands::search::run(&db_url, args).await,
+            Command::Sbom(args) => subcommands::sbom::run(&db_url, args).await,
         }
-    });
-
-    let _ = handle.block_on(async { db.close().await });
+    })
 }
 
-async fn ingest_zip(
-    db: &CveDatabase,
-    label: &str,
-    asset_name: &str,
-    mode: IngestMode,
-    max_chunks: Option<usize>,
-) {
-    let total_start = Instant::now();
-    let mut storage = loader::ZipStorage::new(format!("./{asset_name}"));
-    let json_paths = storage.enum_json_list().collect::<Vec<String>>();
-    println!(
-        "{label}: asset={asset_name}, json_count={}",
-        json_paths.len()
-    );
-    if matches!(mode, IngestMode::ReplaceAll) {
-        let rebuild_start = Instant::now();
-        if let Err(err) = db.rebuild_schema().await {
-            panic!("{label}: failed to rebuild schema: {err}");
-        }
-        println!("{label}: rebuilt schema in {:?}", rebuild_start.elapsed());
+#[derive(Debug, Parser)]
+#[command(
+    name = "qanvuli-test",
+    version,
+    about = "CVE DB maintenance and search tool",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[arg(long = "db-url", global = true, value_name = "URL")]
+    db_url: Option<String>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+impl Cli {
+    fn db_url(&self) -> String {
+        self.db_url
+            .clone()
+            .or_else(|| std::env::var("QANVULI_DB_URL").ok())
+            .unwrap_or_else(|| DEFAULT_DB_CONNECTION_STRING.to_owned())
     }
-
-    let mut inserted = 0usize;
-    let mut failed = 0usize;
-    let mut timings = IngestTimings::default();
-
-    for (chunk_index, chunk) in json_paths.chunks(INGEST_CHUNK_SIZE).enumerate() {
-        if max_chunks.is_some_and(|max_chunks| chunk_index >= max_chunks) {
-            println!("{label}: stopped after {chunk_index} chunks for profiling");
-            break;
-        }
-
-        let chunk_start = Instant::now();
-        let mut jsons = Vec::with_capacity(chunk.len());
-        let mut read_failed = 0usize;
-
-        let read_start = Instant::now();
-        for json_path in chunk {
-            match storage.get_json(json_path) {
-                Ok(json) => jsons.push((json_path.clone(), json)),
-                Err(err) => {
-                    read_failed += 1;
-                    eprintln!("{label}: failed to read {json_path}: {err}");
-                }
-            }
-        }
-        let read_elapsed = read_start.elapsed();
-        timings.read += read_elapsed;
-
-        let hash_start = Instant::now();
-        let jsons = jsons
-            .into_par_iter()
-            .map(|(json_path, json)| {
-                let md5hash = md5_hex(json.as_bytes());
-                (json_path, json, md5hash)
-            })
-            .collect::<Vec<_>>();
-        let hash_elapsed = hash_start.elapsed();
-        timings.hash += hash_elapsed;
-
-        let parse_start = Instant::now();
-        let parsed = jsons
-            .into_par_iter()
-            .map(|(json_path, json, md5hash)| {
-                let raw_record = parse_json_with_raw(json)
-                    .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
-                let models = CveActiveModels::from(raw_record);
-                if models.cve_id.is_empty() {
-                    return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
-                }
-                Ok((
-                    models,
-                    ReadJsonFileRecord {
-                        filename: json_path,
-                        md5hash,
-                    },
-                ))
-            })
-            .collect::<Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>>();
-        let parse_elapsed = parse_start.elapsed();
-        timings.parse += parse_elapsed;
-
-        let mut models = Vec::new();
-        let mut read_files = Vec::new();
-        let mut parse_failed = 0usize;
-        for result in parsed {
-            match result {
-                Ok((model, read_file)) => {
-                    models.push(model);
-                    read_files.push(read_file);
-                }
-                Err(err) => {
-                    parse_failed += 1;
-                    eprintln!("{err}");
-                }
-            }
-        }
-
-        failed += read_failed + parse_failed;
-
-        let db_write_start = Instant::now();
-        let result = match mode {
-            IngestMode::ReplaceAll => db.insert_cve_models(models).await,
-            IngestMode::Upsert => db.upsert_cve_models(models).await,
-        };
-
-        match result {
-            Ok(count) => {
-                inserted += count;
-                let db_write_elapsed = db_write_start.elapsed();
-                timings.db_write += db_write_elapsed;
-
-                let mark_start = Instant::now();
-                if let Err(err) = db.mark_json_files_read(read_files).await {
-                    eprintln!(
-                        "{label}: failed to mark read json files in chunk {chunk_index}: {err}"
-                    );
-                }
-                let mark_elapsed = mark_start.elapsed();
-                timings.mark_read += mark_elapsed;
-
-                let chunk_elapsed = chunk_start.elapsed();
-                println!(
-                    "{label}: timings chunk={} read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}, total={:?}",
-                    chunk_index,
-                    read_elapsed,
-                    hash_elapsed,
-                    parse_elapsed,
-                    db_write_elapsed,
-                    mark_elapsed,
-                    chunk_elapsed
-                );
-            }
-            Err(err) => {
-                timings.db_write += db_write_start.elapsed();
-                failed += chunk.len();
-                eprintln!("{label}: failed to write chunk {chunk_index}: {err}");
-            }
-        }
-
-        println!(
-            "{label}: progress chunk={}, inserted={}, failed={}",
-            chunk_index, inserted, failed
-        );
-    }
-
-    println!(
-        "{label}: inserted={inserted}, failed={failed}, elapsed={:?}, read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}",
-        total_start.elapsed(),
-        timings.read,
-        timings.hash,
-        timings.parse,
-        timings.db_write,
-        timings.mark_read
-    );
 }
 
-#[derive(Copy, Clone)]
-enum IngestMode {
-    ReplaceAll,
-    Upsert,
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show help. This is also the default mode.
+    Help,
+    /// Initialize the DB from the latest all CVE zip, or only schema with --schema-only.
+    ///
+    /// Full initialization downloads and imports the all-CVE archive, so it can take a while.
+    Init(subcommands::init::Args),
+    /// Apply the latest delta CVE zip to the DB.
+    Update(subcommands::update::Args),
+    /// Download a CVE zip only. It does not touch the DB.
+    DownloadCve(subcommands::download_cve::Args),
+    /// Search existing CVE DB records.
+    Search(subcommands::search::Args),
+    /// Read a GitHub SBOM JSON and report matching CVEs.
+    Sbom(subcommands::sbom::Args),
+    /// Run the MCP server over stdio.
+    Mcp,
 }
 
-#[derive(Default)]
-struct IngestTimings {
-    read: Duration,
-    hash: Duration,
-    parse: Duration,
-    db_write: Duration,
-    mark_read: Duration,
-}
-
-fn md5_hex(bytes: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+fn print_help() {
+    let mut command = Cli::command();
+    command.print_help().expect("failed to print help");
+    println!();
 }
 
 #[cfg(test)]

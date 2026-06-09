@@ -14,7 +14,14 @@ pub struct GitHubReleaseFile {
 
 impl GitHubReleaseFile {
     pub async fn async_download(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let content = reqwest::get(&self.url).await?.bytes().await?;
+        let content = reqwest::Client::new()
+            .get(&self.url)
+            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
         Ok(content.to_vec())
     }
 
@@ -32,8 +39,17 @@ impl GitHubReleaseFile {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bytes = self.async_download().await?;
-        std::fs::write(path, bytes)?;
+        let mut response = reqwest::Client::new()
+            .get(&self.url)
+            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut file = std::fs::File::create(path)?;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)?;
+        }
+        file.flush()?;
         Ok(())
     }
 
@@ -54,6 +70,13 @@ impl GitHubReleaseFile {
 
     pub async fn async_download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.name.clone();
+        if self.size > 0 {
+            if let Ok(metadata) = std::fs::metadata(&filename) {
+                if metadata.len() == self.size {
+                    return Ok(());
+                }
+            }
+        }
         self.async_download_as(filename).await
     }
 
