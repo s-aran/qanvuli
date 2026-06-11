@@ -1,8 +1,10 @@
+use super::common::{IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip};
 use qanvuli_db::entity::cve;
 use qanvuli_db::{CveDatabase, CveSummary};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 
 const PROTOCOL_VERSION: &str = "2025-03-26";
 
@@ -18,9 +20,27 @@ struct JsonRpcRequest {
 
 #[derive(Debug, Deserialize)]
 struct CweArgs {
-    cwe_ids: Vec<String>,
+    #[serde(default)]
+    cwe_ids: Vec<CweArgValue>,
+    cwe_id: Option<CweArgValue>,
     limit: Option<u64>,
     offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CweArgValue {
+    Number(i32),
+    String(String),
+}
+
+impl CweArgValue {
+    fn into_search_value(self) -> String {
+        match self {
+            Self::Number(value) => value.to_string(),
+            Self::String(value) => value,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +89,12 @@ struct DateArgs {
     updated_since: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateDbArgs {
+    zip: Option<String>,
+    max_chunks: Option<usize>,
 }
 
 pub fn run(db_url: String) -> Result<(), String> {
@@ -169,8 +195,11 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
     let value = match name {
         "search_by_cwe" => {
             let args: CweArgs = parse_args(args)?;
+            let limit = limit(args.limit);
+            let offset = offset(args.offset);
+            let cwe_ids = args.search_values();
             let cves = db
-                .search_cve_summaries_by_cwe(&args.cwe_ids, limit(args.limit), offset(args.offset))
+                .search_cve_summaries_by_cwe(&cwe_ids, limit, offset)
                 .await
                 .map_err(|err| err.to_string())?;
             json!(summaries(cves))
@@ -247,6 +276,32 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
                 .map_err(|err| err.to_string())?;
             json!(cve.map(full_cve))
         }
+        "update_db" => {
+            let args: UpdateDbArgs = parse_args(args)?;
+            db.initialize_schema()
+                .await
+                .map_err(|err| format!("failed to initialize schema: {err}"))?;
+
+            let asset_path = if let Some(zip) = args.zip {
+                PathBuf::from(zip)
+            } else {
+                download_latest_asset(ReleaseAssetKind::Delta).await?
+            };
+
+            ingest_zip(
+                db,
+                "delta",
+                &asset_path,
+                IngestMode::Upsert,
+                args.max_chunks,
+            )
+            .await;
+
+            json!({
+                "updated": true,
+                "asset": asset_path.display().to_string(),
+            })
+        }
         _ => return Err(format!("unknown tool: {name}")),
     };
 
@@ -267,6 +322,20 @@ where
     T: for<'de> Deserialize<'de>,
 {
     serde_json::from_value(value).map_err(|err| format!("invalid arguments: {err}"))
+}
+
+impl CweArgs {
+    fn search_values(self) -> Vec<String> {
+        let mut values = self
+            .cwe_ids
+            .into_iter()
+            .map(CweArgValue::into_search_value)
+            .collect::<Vec<_>>();
+        if let Some(cwe_id) = self.cwe_id {
+            values.push(cwe_id.into_search_value());
+        }
+        values
+    }
 }
 
 fn limit(value: Option<u64>) -> u64 {
@@ -322,19 +391,30 @@ fn tools() -> Value {
     json!([
         {
             "name": "search_by_cwe",
-            "description": "Search CVEs by vulnerability type using CWE IDs such as CWE-79 or CWE-89.",
+            "description": "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "cwe_ids": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "CWE IDs to match."
+                        "items": {
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "integer" }
+                            ]
+                        },
+                        "description": "CWE IDs to match. Values may be strings such as CWE-79/CWE79 or integers such as 79."
+                    },
+                    "cwe_id": {
+                        "oneOf": [
+                            { "type": "string" },
+                            { "type": "integer" }
+                        ],
+                        "description": "Single CWE ID to match. Use cwe_ids for multiple values."
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
                     "offset": { "type": "integer", "minimum": 0, "default": 0 }
-                },
-                "required": ["cwe_ids"]
+                }
             }
         },
         {
@@ -415,6 +495,17 @@ fn tools() -> Value {
                     "cve_id": { "type": "string", "description": "CVE ID such as CVE-2024-1000." }
                 },
                 "required": ["cve_id"]
+            }
+        },
+        {
+            "name": "update_db",
+            "description": "Update the CVE database by applying a delta CVE zip. If no zip is provided, the latest delta zip is downloaded from GitHub.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "zip": { "type": "string", "description": "Optional local delta CVE zip path." },
+                    "max_chunks": { "type": "integer", "minimum": 1, "description": "Optional profiling/testing limit. Each chunk contains up to 10000 JSON files." }
+                }
             }
         }
     ])

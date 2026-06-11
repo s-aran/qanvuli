@@ -34,7 +34,9 @@ fn run() -> Result<(), String> {
             Command::Init(args) => subcommands::init::run(&db_url, args).await,
             Command::Update(args) => subcommands::update::run(&db_url, args).await,
             Command::DownloadCve(args) => subcommands::download_cve::run(args).await,
+            Command::Cwe(args) => subcommands::cwe::run(&db_url, args).await,
             Command::Search(args) => subcommands::search::run(&db_url, args).await,
+            Command::Tui(args) => subcommands::tui::run(&db_url, args).await,
             Command::Sbom(args) => subcommands::sbom::run(&db_url, args).await,
         }
     })
@@ -75,8 +77,12 @@ enum Command {
     Update(subcommands::update::Args),
     /// Download a CVE zip only. It does not touch the DB.
     DownloadCve(subcommands::download_cve::Args),
+    /// Search CVEs by one CWE ID, such as CWE-42 or 42.
+    Cwe(subcommands::cwe::Args),
     /// Search existing CVE DB records.
     Search(subcommands::search::Args),
+    /// Open an interactive terminal UI for free-word CVE search.
+    Tui(subcommands::tui::Args),
     /// Read a GitHub SBOM JSON and report matching CVEs.
     Sbom(subcommands::sbom::Args),
     /// Run the MCP server over stdio.

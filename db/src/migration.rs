@@ -1,5 +1,5 @@
-use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, read_json_file};
-use sea_orm::{EntityName, Schema};
+use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
+use sea_orm::{ConnectionTrait, EntityName, Schema};
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -11,6 +11,9 @@ impl MigratorTrait for Migrator {
             Box::new(M20260516CreateCveTables),
             Box::new(M20260604CreateReadJsonFileTable),
             Box::new(M20260605AddSearchIndexes),
+            Box::new(M20260609CreateCweMaster),
+            Box::new(M20260610OptimizeCweSearch),
+            Box::new(M20260610CreateCveSearchFts),
         ]
     }
 }
@@ -55,6 +58,14 @@ impl MigrationTrait for M20260516CreateCveTables {
         manager
             .create_table(
                 schema
+                    .create_table_from_entity(cwe::Entity)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_table(
+                schema
                     .create_table_from_entity(cve_cwe::Entity)
                     .if_not_exists()
                     .to_owned(),
@@ -71,6 +82,7 @@ impl MigrationTrait for M20260516CreateCveTables {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for statement in [
             Table::drop().table(cve_cwe::Entity).if_exists().to_owned(),
+            Table::drop().table(cwe::Entity).if_exists().to_owned(),
             Table::drop()
                 .table(cve_affected::Entity)
                 .if_exists()
@@ -151,6 +163,19 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .name("idx_cve_cwe_cwe_id")
             .table(cve_cwe::Entity)
             .col(cve_cwe::Column::CweId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_cwe_cwe_id_cve_id")
+            .table(cve_cwe::Entity)
+            .col(cve_cwe::Column::CweId)
+            .col(cve_cwe::Column::CveId)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cwe_id")
+            .table(cwe::Entity)
+            .col(cwe::Column::Id)
             .if_not_exists()
             .to_owned(),
     ]
@@ -294,4 +319,259 @@ fn search_index_statements() -> Vec<IndexCreateStatement> {
             .if_not_exists()
             .to_owned(),
     ]
+}
+
+pub struct M20260609CreateCweMaster;
+
+impl MigrationName for M20260609CreateCweMaster {
+    fn name(&self) -> &str {
+        "m20260609_create_cwe_master"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260609CreateCweMaster {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+
+        manager
+            .create_table(
+                schema
+                    .create_table_from_entity(cwe::Entity)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await?;
+
+        if !manager.has_column("cve_cwe", "description").await? {
+            return Ok(());
+        }
+
+        let db = manager.get_connection();
+        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+        db.execute_unprepared(
+            r#"
+            INSERT OR REPLACE INTO cwe (id, description)
+            SELECT DISTINCT
+                CAST(
+                    CASE
+                        WHEN cwe_id LIKE 'CWE-%' THEN substr(cwe_id, 5)
+                        WHEN cwe_id LIKE 'CWE%' THEN substr(cwe_id, 4)
+                        ELSE cwe_id
+                    END
+                    AS INTEGER
+                ) AS id,
+                description
+            FROM cve_cwe
+            WHERE cwe_id GLOB 'CWE-[0-9]*'
+               OR cwe_id GLOB 'CWE[0-9]*'
+               OR cwe_id GLOB '[0-9]*'
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE IF NOT EXISTS cve_cwe_new (
+                cve_id TEXT NOT NULL,
+                cwe_id INTEGER NOT NULL,
+                PRIMARY KEY (cve_id, cwe_id),
+                FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE,
+                FOREIGN KEY (cwe_id) REFERENCES cwe(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT OR IGNORE INTO cve_cwe_new (cve_id, cwe_id)
+            SELECT
+                cve_id,
+                CAST(
+                    CASE
+                        WHEN cwe_id LIKE 'CWE-%' THEN substr(cwe_id, 5)
+                        WHEN cwe_id LIKE 'CWE%' THEN substr(cwe_id, 4)
+                        ELSE cwe_id
+                    END
+                    AS INTEGER
+                ) AS cwe_id
+            FROM cve_cwe
+            WHERE cwe_id GLOB 'CWE-[0-9]*'
+               OR cwe_id GLOB 'CWE[0-9]*'
+               OR cwe_id GLOB '[0-9]*'
+            "#,
+        )
+        .await?;
+        db.execute_unprepared("DROP TABLE cve_cwe").await?;
+        db.execute_unprepared("ALTER TABLE cve_cwe_new RENAME TO cve_cwe")
+            .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_id ON cve_cwe (cve_id)")
+            .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id ON cve_cwe (cwe_id)")
+            .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_id ON cve_cwe (cwe_id, cve_id)",
+        )
+        .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cwe_id ON cwe (id)")
+            .await?;
+        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if !manager.has_table("cve_cwe").await? {
+            return Ok(());
+        }
+
+        let db = manager.get_connection();
+        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE IF NOT EXISTS cve_cwe_old (
+                cve_id TEXT NOT NULL,
+                cwe_id TEXT NOT NULL,
+                description TEXT,
+                PRIMARY KEY (cve_id, cwe_id),
+                FOREIGN KEY (cve_id) REFERENCES cve(cve_id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT OR IGNORE INTO cve_cwe_old (cve_id, cwe_id, description)
+            SELECT cve_cwe.cve_id, 'CWE-' || cve_cwe.cwe_id, cwe.description
+            FROM cve_cwe
+            LEFT JOIN cwe ON cwe.id = cve_cwe.cwe_id
+            "#,
+        )
+        .await?;
+        db.execute_unprepared("DROP TABLE cve_cwe").await?;
+        db.execute_unprepared("ALTER TABLE cve_cwe_old RENAME TO cve_cwe")
+            .await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS cwe").await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_id ON cve_cwe (cve_id)")
+            .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id ON cve_cwe (cwe_id)")
+            .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_id ON cve_cwe (cwe_id, cve_id)",
+        )
+        .await?;
+        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+
+        Ok(())
+    }
+}
+
+pub struct M20260610OptimizeCweSearch;
+
+impl MigrationName for M20260610OptimizeCweSearch {
+    fn name(&self) -> &str {
+        "m20260610_optimize_cwe_search"
+    }
+}
+
+pub struct M20260610CreateCveSearchFts;
+
+impl MigrationName for M20260610CreateCveSearchFts {
+    fn name(&self) -> &str {
+        "m20260610_create_cve_search_fts"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260610CreateCveSearchFts {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let db = manager.get_connection();
+        create_cve_search_fts(db).await?;
+        rebuild_cve_search_fts(db).await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .get_connection()
+            .execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
+            .await?;
+        Ok(())
+    }
+}
+
+async fn create_cve_search_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS cve_search_fts USING fts5(
+            cve_id UNINDEXED,
+            title,
+            description_en,
+            affected,
+            tokenize = 'unicode61'
+        )
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_cve_search_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared("DELETE FROM cve_search_fts").await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_search_fts (cve_id, title, description_en, affected)
+        SELECT
+            cve.cve_id,
+            cve.title,
+            COALESCE(cve.description_en, ''),
+            COALESCE(
+                GROUP_CONCAT(
+                    COALESCE(cve_affected.vendor, '') || ' ' ||
+                    COALESCE(cve_affected.product, '') || ' ' ||
+                    COALESCE(cve_affected.package_name, ''),
+                    ' '
+                ),
+                ''
+            )
+        FROM cve
+        LEFT JOIN cve_affected ON cve_affected.cve_id = cve.cve_id
+        GROUP BY cve.cve_id
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260610OptimizeCweSearch {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_cve_cwe_cwe_id_cve_id")
+                    .table(cve_cwe::Entity)
+                    .col(cve_cwe::Column::CweId)
+                    .col(cve_cwe::Column::CveId)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_cve_cwe_cwe_id_cve_id")
+                    .table(cve_cwe::Entity)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
+    }
 }

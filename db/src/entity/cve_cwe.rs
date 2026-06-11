@@ -7,10 +7,8 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub cve_id: String,
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
-    pub cwe_id: String,
-    #[sea_orm(column_type = "Text", nullable)]
-    pub description: Option<String>,
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub cwe_id: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -23,11 +21,25 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     Cve,
+    #[sea_orm(
+        belongs_to = "super::cwe::Entity",
+        from = "Column::CweId",
+        to = "super::cwe::Column::Id",
+        on_update = "NoAction",
+        on_delete = "Cascade"
+    )]
+    Cwe,
 }
 
 impl Related<super::cve::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Cve.def()
+    }
+}
+
+impl Related<super::cwe::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Cwe.def()
     }
 }
 

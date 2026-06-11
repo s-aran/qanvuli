@@ -104,7 +104,7 @@ pub async fn ingest_zip(
     let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
     eprintln!("{label}: enumerating CVE JSON entries");
     let json_paths = storage.enum_json_list().collect::<Vec<String>>();
-    println!(
+    eprintln!(
         "{label}: asset={}, json_count={}",
         asset_path.display(),
         json_paths.len()
@@ -114,7 +114,7 @@ pub async fn ingest_zip(
         if let Err(err) = db.rebuild_schema().await {
             panic!("{label}: failed to rebuild schema: {err}");
         }
-        println!("{label}: rebuilt schema in {:?}", rebuild_start.elapsed());
+        eprintln!("{label}: rebuilt schema in {:?}", rebuild_start.elapsed());
     }
 
     let mut inserted = 0usize;
@@ -123,7 +123,7 @@ pub async fn ingest_zip(
 
     for (chunk_index, chunk) in json_paths.chunks(INGEST_CHUNK_SIZE).enumerate() {
         if max_chunks.is_some_and(|max_chunks| chunk_index >= max_chunks) {
-            println!("{label}: stopped after {chunk_index} chunks for profiling");
+            eprintln!("{label}: stopped after {chunk_index} chunks for profiling");
             break;
         }
 
@@ -212,7 +212,7 @@ pub async fn ingest_zip(
                 timings.mark_read += mark_elapsed;
 
                 let chunk_elapsed = chunk_start.elapsed();
-                println!(
+                eprintln!(
                     "{label}: timings chunk={} read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}, total={:?}",
                     chunk_index,
                     read_elapsed,
@@ -230,13 +230,13 @@ pub async fn ingest_zip(
             }
         }
 
-        println!(
+        eprintln!(
             "{label}: progress chunk={}, inserted={}, failed={}",
             chunk_index, inserted, failed
         );
     }
 
-    println!(
+    eprintln!(
         "{label}: inserted={inserted}, failed={failed}, elapsed={:?}, read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}",
         total_start.elapsed(),
         timings.read,
