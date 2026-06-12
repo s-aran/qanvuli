@@ -61,6 +61,37 @@ pub struct CveSummary {
     pub description_en: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CveDetail {
+    pub cwes: Vec<CveCweDetail>,
+    pub cvss: Vec<CveCvssDetail>,
+    pub affected: Vec<CveAffectedDetail>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CveCweDetail {
+    pub id: i32,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CveCvssDetail {
+    pub version: String,
+    pub base_score: Option<f64>,
+    pub base_severity: Option<String>,
+    pub vector_string: Option<String>,
+    pub source: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CveAffectedDetail {
+    pub vendor: Option<String>,
+    pub product: Option<String>,
+    pub package_name: Option<String>,
+    pub collection_url: Option<String>,
+    pub default_status: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CveAdvancedSearch {
     pub published_from: Option<String>,
@@ -442,6 +473,59 @@ impl CveDatabase {
         cve::Entity::find_by_id(cve_id.to_owned())
             .one(&self.db)
             .await
+    }
+
+    pub async fn find_cve_detail(&self, cve_id: &str) -> Result<CveDetail, DbErr> {
+        let cwes = cve_cwe::Entity::find()
+            .find_also_related(cwe::Entity)
+            .filter(cve_cwe::Column::CveId.eq(cve_id))
+            .order_by_asc(cve_cwe::Column::CweId)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|(cve_cwe, cwe)| CveCweDetail {
+                id: cve_cwe.cwe_id,
+                description: cwe.and_then(|cwe| cwe.description),
+            })
+            .collect();
+
+        let cvss = cve_cvss::Entity::find()
+            .filter(cve_cvss::Column::CveId.eq(cve_id))
+            .order_by_desc(cve_cvss::Column::BaseScore)
+            .order_by_asc(cve_cvss::Column::Version)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|cvss| CveCvssDetail {
+                version: cvss.version,
+                base_score: cvss.base_score,
+                base_severity: cvss.base_severity,
+                vector_string: cvss.vector_string,
+                source: cvss.source,
+            })
+            .collect();
+
+        let affected = cve_affected::Entity::find()
+            .filter(cve_affected::Column::CveId.eq(cve_id))
+            .order_by_asc(cve_affected::Column::Vendor)
+            .order_by_asc(cve_affected::Column::Product)
+            .all(&self.db)
+            .await?
+            .into_iter()
+            .map(|affected| CveAffectedDetail {
+                vendor: affected.vendor,
+                product: affected.product,
+                package_name: affected.package_name,
+                collection_url: affected.collection_url,
+                default_status: affected.default_status,
+            })
+            .collect();
+
+        Ok(CveDetail {
+            cwes,
+            cvss,
+            affected,
+        })
     }
 
     pub async fn search_cves_by_cwe(
