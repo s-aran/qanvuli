@@ -70,6 +70,23 @@ impl SearchMode {
         .map_err(|err| err.to_string())
     }
 
+    pub(super) async fn count(self, db: &CveDatabase, query: &str) -> Result<u64, String> {
+        match self {
+            Self::FreeText => db.count_cve_summaries_free_text(query).await,
+            Self::Product => {
+                db.count_cve_summaries_by_vendor_product(None, Some(query))
+                    .await
+            }
+            Self::Vendor => {
+                db.count_cve_summaries_by_vendor_product(Some(query), None)
+                    .await
+            }
+            Self::Cwe => db.count_cve_summaries_by_cwe(&[query.to_owned()]).await,
+            Self::Cve => db.count_cve_summaries_by_cve_id_prefix(query).await,
+        }
+        .map_err(|err| err.to_string())
+    }
+
     pub(super) fn footer_text(self) -> &'static str {
         match self {
             Self::FreeText => "Mode: free text",

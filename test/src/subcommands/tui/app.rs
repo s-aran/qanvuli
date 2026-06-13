@@ -2,7 +2,7 @@ use super::{
     TUI_LOAD_MORE_LIMIT,
     form::AdvancedForm,
     mode::SearchMode,
-    search::{SearchRequest, run_search_request},
+    search::{SearchRequest, SearchResult, run_search_request},
 };
 use qanvuli_db::{CveDatabase, CveDetail, CveSummary};
 use ratatui::widgets::ListState;
@@ -17,6 +17,7 @@ pub(super) struct App {
     pub(super) advanced: AdvancedForm,
     pub(super) limit: u64,
     pub(super) results: Vec<CveSummary>,
+    pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
     pub(super) detail: Option<CveDetail>,
@@ -42,7 +43,7 @@ pub(super) enum PaneFocus {
 
 struct PendingSearch {
     kind: SearchKind,
-    handle: JoinHandle<Result<Vec<CveSummary>, String>>,
+    handle: JoinHandle<Result<SearchResult, String>>,
 }
 
 enum SearchKind {
@@ -61,6 +62,7 @@ impl App {
             advanced: AdvancedForm::default(),
             limit,
             results: Vec::new(),
+            total_results: None,
             list_state,
             focus: PaneFocus::Left,
             detail: None,
@@ -95,6 +97,7 @@ impl App {
         let limit = self.limit;
         self.searched_request = request.clone();
         self.exhausted = false;
+        self.total_results = None;
         self.search_started_at = Some(Instant::now());
         self.search = Some(PendingSearch {
             kind: SearchKind::Replace,
@@ -114,6 +117,7 @@ impl App {
         let request = SearchRequest::Advanced(self.advanced.to_search_options());
         self.searched_request = request.clone();
         self.exhausted = false;
+        self.total_results = None;
         self.search_started_at = Some(Instant::now());
         let limit = self.limit;
         self.search = Some(PendingSearch {
@@ -155,15 +159,16 @@ impl App {
 
         let search = self.search.take().expect("search handle disappeared");
         let kind = search.kind;
-        let rows = search
+        let result = search
             .handle
             .await
             .map_err(|err| format!("failed to join search task: {err}"))??;
         self.search_started_at = None;
         match kind {
             SearchKind::Replace => {
-                self.exhausted = rows.len() < self.limit as usize;
-                self.results = rows;
+                self.exhausted = result.rows.len() < self.limit as usize;
+                self.total_results = Some(result.total);
+                self.results = result.rows;
                 self.clear_detail();
                 if self.results.is_empty() {
                     self.list_state.select(None);
@@ -172,8 +177,9 @@ impl App {
                 }
             }
             SearchKind::Append { select_offset } => {
-                self.exhausted = rows.len() < TUI_LOAD_MORE_LIMIT as usize;
-                self.results.extend(rows);
+                self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize;
+                self.total_results = Some(result.total);
+                self.results.extend(result.rows);
                 if self.results.is_empty() {
                     self.list_state.select(None);
                 } else {

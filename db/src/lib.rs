@@ -14,8 +14,8 @@ use qanvuli_models::{
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction,
-    DbBackend, DbErr, EntityTrait, FromQueryResult, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait, Value as SeaValue,
+    DbBackend, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, Statement, TransactionTrait, Value as SeaValue,
 };
 use sea_orm_migration::prelude::MigratorTrait;
 use serde::Serialize;
@@ -68,13 +68,13 @@ pub struct CveDetail {
     pub affected: Vec<CveAffectedDetail>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct CveCweDetail {
     pub id: i32,
     pub description: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct CveCvssDetail {
     pub version: String,
     pub base_score: Option<f64>,
@@ -83,7 +83,7 @@ pub struct CveCvssDetail {
     pub source: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct CveAffectedDetail {
     pub vendor: Option<String>,
     pub product: Option<String>,
@@ -477,49 +477,47 @@ impl CveDatabase {
 
     pub async fn find_cve_detail(&self, cve_id: &str) -> Result<CveDetail, DbErr> {
         let cwes = cve_cwe::Entity::find()
-            .find_also_related(cwe::Entity)
+            .select_only()
+            .column_as(cve_cwe::Column::CweId, "id")
+            .column_as(cwe::Column::Description, "description")
+            .inner_join(cwe::Entity)
             .filter(cve_cwe::Column::CveId.eq(cve_id))
             .order_by_asc(cve_cwe::Column::CweId)
+            .into_model::<CveCweDetail>()
             .all(&self.db)
-            .await?
-            .into_iter()
-            .map(|(cve_cwe, cwe)| CveCweDetail {
-                id: cve_cwe.cwe_id,
-                description: cwe.and_then(|cwe| cwe.description),
-            })
-            .collect();
+            .await?;
 
         let cvss = cve_cvss::Entity::find()
+            .select_only()
+            .columns([
+                cve_cvss::Column::Version,
+                cve_cvss::Column::BaseScore,
+                cve_cvss::Column::BaseSeverity,
+                cve_cvss::Column::VectorString,
+                cve_cvss::Column::Source,
+            ])
             .filter(cve_cvss::Column::CveId.eq(cve_id))
             .order_by_desc(cve_cvss::Column::BaseScore)
             .order_by_asc(cve_cvss::Column::Version)
+            .into_model::<CveCvssDetail>()
             .all(&self.db)
-            .await?
-            .into_iter()
-            .map(|cvss| CveCvssDetail {
-                version: cvss.version,
-                base_score: cvss.base_score,
-                base_severity: cvss.base_severity,
-                vector_string: cvss.vector_string,
-                source: cvss.source,
-            })
-            .collect();
+            .await?;
 
         let affected = cve_affected::Entity::find()
+            .select_only()
+            .columns([
+                cve_affected::Column::Vendor,
+                cve_affected::Column::Product,
+                cve_affected::Column::PackageName,
+                cve_affected::Column::CollectionUrl,
+                cve_affected::Column::DefaultStatus,
+            ])
             .filter(cve_affected::Column::CveId.eq(cve_id))
             .order_by_asc(cve_affected::Column::Vendor)
             .order_by_asc(cve_affected::Column::Product)
+            .into_model::<CveAffectedDetail>()
             .all(&self.db)
-            .await?
-            .into_iter()
-            .map(|affected| CveAffectedDetail {
-                vendor: affected.vendor,
-                product: affected.product,
-                package_name: affected.package_name,
-                collection_url: affected.collection_url,
-                default_status: affected.default_status,
-            })
-            .collect();
+            .await?;
 
         Ok(CveDetail {
             cwes,
@@ -594,6 +592,30 @@ impl CveDatabase {
             .offset(offset)
             .into_model::<CveSummary>()
             .all(&self.db)
+            .await
+    }
+
+    pub async fn count_cve_summaries_by_cwe(&self, cwe_ids: &[String]) -> Result<u64, DbErr> {
+        let cwe_ids = cwe_numbers(cwe_ids);
+        if cwe_ids.is_empty() {
+            return Ok(0);
+        }
+
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            self.ensure_cwe_search_index().await?;
+            return self
+                .count_by_sql(format!(
+                    "SELECT COUNT(DISTINCT cve_id) AS count FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_id WHERE cwe_id IN ({})",
+                    cwe_id_list(&cwe_ids)
+                ))
+                .await;
+        }
+
+        cve::Entity::find()
+            .inner_join(cve_cwe::Entity)
+            .filter(cve_cwe::Column::CweId.is_in(cwe_ids))
+            .distinct()
+            .count(&self.db)
             .await
     }
 
@@ -683,6 +705,23 @@ impl CveDatabase {
             .into_model::<CveSummary>()
             .all(&self.db)
             .await
+    }
+
+    pub async fn count_cve_summaries_by_vendor_product(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+    ) -> Result<u64, DbErr> {
+        let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
+
+        if let Some(vendor) = vendor {
+            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        }
+        if let Some(product) = product {
+            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+        }
+
+        query.distinct().count(&self.db).await
     }
 
     pub async fn search_cve_summaries_by_affected_component(
@@ -844,6 +883,30 @@ impl CveDatabase {
         .await
     }
 
+    pub async fn count_cve_summaries_by_cve_id_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
+        let prefix = prefix.trim().to_ascii_uppercase();
+        let Some(upper_bound) = ascii_prefix_upper_bound(&prefix) else {
+            return Ok(0);
+        };
+
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            return cve::Entity::find()
+                .filter(
+                    cve::Column::CveId
+                        .gte(prefix)
+                        .and(cve::Column::CveId.lt(upper_bound)),
+                )
+                .count(&self.db)
+                .await;
+        }
+
+        self.count_by_statement(
+            "SELECT COUNT(*) AS count FROM cve WHERE cve_id >= ? AND cve_id < ?",
+            vec![SeaValue::from(prefix), SeaValue::from(upper_bound)],
+        )
+        .await
+    }
+
     pub async fn search_cve_summaries_by_date_prefix(
         &self,
         prefix: &str,
@@ -889,6 +952,47 @@ impl CveDatabase {
             ],
         ))
         .all(&self.db)
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_date_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
+        let prefix = prefix.trim();
+        let Some(upper_bound) = ascii_prefix_upper_bound(prefix) else {
+            return Ok(0);
+        };
+
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            let condition = cve::Column::PublishedAt
+                .gte(prefix.to_owned())
+                .and(cve::Column::PublishedAt.lt(upper_bound.clone()))
+                .or(cve::Column::UpdatedAt
+                    .gte(prefix.to_owned())
+                    .and(cve::Column::UpdatedAt.lt(upper_bound)));
+            return cve::Entity::find()
+                .filter(condition)
+                .distinct()
+                .count(&self.db)
+                .await;
+        }
+
+        self.count_by_statement(
+            r#"
+            SELECT COUNT(DISTINCT cve_id) AS count
+            FROM (
+                SELECT cve_id FROM cve INDEXED BY idx_cve_published_at
+                WHERE published_at >= ? AND published_at < ?
+                UNION ALL
+                SELECT cve_id FROM cve INDEXED BY idx_cve_updated_at
+                WHERE updated_at >= ? AND updated_at < ?
+            )
+            "#,
+            vec![
+                SeaValue::from(prefix.to_owned()),
+                SeaValue::from(upper_bound.clone()),
+                SeaValue::from(prefix.to_owned()),
+                SeaValue::from(upper_bound),
+            ],
+        )
         .await
     }
 
@@ -976,6 +1080,44 @@ impl CveDatabase {
         Ok(cves)
     }
 
+    pub async fn count_cve_summaries_free_text(&self, query: &str) -> Result<u64, DbErr> {
+        let query = query.trim();
+        if query.is_empty() {
+            return cve::Entity::find().count(&self.db).await;
+        }
+
+        let cwe_id = cwe_number(query);
+        if is_cve_id_prefix_query(query) {
+            self.count_cve_summaries_by_cve_id_prefix(query).await
+        } else if is_dateish_query(query) {
+            self.count_cve_summaries_by_date_prefix(query).await
+        } else if is_cwe_id_query(query) {
+            let Some(cwe_id) = cwe_id else {
+                return Ok(0);
+            };
+            self.count_cve_summaries_by_cwe(&[cwe_id.to_string()]).await
+        } else if let Some(cwe_id) = cwe_id {
+            self.count_cve_summaries_by_cwe(&[cwe_id.to_string()]).await
+        } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && let Some(fts_query) = fts_query(query)
+        {
+            self.count_cve_summaries_by_fts_text(&fts_query).await
+        } else {
+            let pattern = like_pattern(query);
+            cve::Entity::find()
+                .filter(
+                    cve::Column::CveId
+                        .like(pattern.clone())
+                        .or(cve::Column::Title.like(pattern.clone()))
+                        .or(cve::Column::DescriptionEn.like(pattern.clone()))
+                        .or(cve::Column::PublishedAt.like(pattern.clone()))
+                        .or(cve::Column::UpdatedAt.like(pattern)),
+                )
+                .count(&self.db)
+                .await
+        }
+    }
+
     pub async fn search_cve_summaries_by_fts_text(
         &self,
         query: &str,
@@ -994,6 +1136,15 @@ impl CveDatabase {
             ],
         ))
         .all(&self.db)
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_fts_text(&self, query: &str) -> Result<u64, DbErr> {
+        self.ensure_cve_search_fts().await?;
+        self.count_by_statement(
+            "SELECT COUNT(*) AS count FROM cve_search_fts WHERE cve_search_fts MATCH ?",
+            vec![SeaValue::from(query.to_owned())],
+        )
         .await
     }
 
@@ -1230,6 +1381,77 @@ impl CveDatabase {
             .into_model::<CveSummary>()
             .all(&self.db)
             .await
+    }
+
+    pub async fn count_cve_summaries_advanced(
+        &self,
+        options: &CveAdvancedSearch,
+    ) -> Result<u64, DbErr> {
+        if let Some(cwe) = options.cwe.as_deref().filter(|cwe| !cwe.trim().is_empty())
+            && cwe_number(cwe).is_none()
+        {
+            return Ok(0);
+        }
+
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            if options
+                .cwe
+                .as_deref()
+                .is_some_and(|cwe| !cwe.trim().is_empty())
+            {
+                self.ensure_cwe_search_index().await?;
+            }
+            return self.count_by_sql(advanced_count_sql(options)).await;
+        }
+
+        let mut query = cve::Entity::find();
+
+        if let Some(published_from) = option_text(options.published_from.as_deref()) {
+            query = query.filter(cve::Column::PublishedAt.gte(published_from.to_owned()));
+        }
+        if let Some(published_to) = option_text(options.published_to.as_deref()) {
+            query = query.filter(cve::Column::PublishedAt.lte(published_to.to_owned()));
+        }
+        if let Some(cwe) = option_text(options.cwe.as_deref())
+            && let Some(cwe_id) = cwe_number(cwe)
+        {
+            query = query
+                .inner_join(cve_cwe::Entity)
+                .filter(cve_cwe::Column::CweId.eq(cwe_id));
+        }
+        if option_text(options.vendor.as_deref()).is_some()
+            || option_text(options.product.as_deref()).is_some()
+        {
+            query = query.inner_join(cve_affected::Entity);
+            if let Some(vendor) = option_text(options.vendor.as_deref()) {
+                query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+            }
+            if let Some(product) = option_text(options.product.as_deref()) {
+                query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+            }
+        }
+
+        query.distinct().count(&self.db).await
+    }
+
+    async fn count_by_sql(&self, sql: String) -> Result<u64, DbErr> {
+        self.count_by_statement(&sql, Vec::new()).await
+    }
+
+    async fn count_by_statement(&self, sql: &str, values: Vec<SeaValue>) -> Result<u64, DbErr> {
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                self.db.get_database_backend(),
+                sql,
+                values,
+            ))
+            .await?;
+        let Some(row) = row else {
+            return Ok(0);
+        };
+        let count = row.try_get::<i64>("", "count")?;
+        Ok(count.max(0) as u64)
     }
 
     pub async fn mark_json_file_read(&self, filename: &str, md5hash: &str) -> Result<(), DbErr> {
@@ -1911,6 +2133,51 @@ fn fts_summary_sql() -> &'static str {
 }
 
 fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) -> String {
+    let where_clause = advanced_where_clause(options);
+    let order_by = match options.sort_order {
+        CveSummarySortOrder::PublishedAsc => "cve.published_at ASC, cve.cve_id ASC",
+        CveSummarySortOrder::PublishedDesc => "cve.published_at DESC, cve.cve_id ASC",
+        CveSummarySortOrder::CveIdAsc => "cve.cve_id ASC",
+        CveSummarySortOrder::CveIdDesc => "cve.cve_id DESC",
+        CveSummarySortOrder::RelationRankAsc => "cve.published_at ASC, cve.cve_id ASC",
+        CveSummarySortOrder::RelationRankDesc => "cve.published_at DESC, cve.cve_id ASC",
+        CveSummarySortOrder::ScoreAsc => {
+            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) ASC, cve.published_at DESC, cve.cve_id ASC"
+        }
+        CveSummarySortOrder::ScoreDesc => {
+            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) DESC, cve.published_at DESC, cve.cve_id ASC"
+        }
+    };
+
+    format!(
+        r#"
+        SELECT
+            cve.cve_id,
+            cve.state,
+            cve.published_at,
+            cve.updated_at,
+            cve.title,
+            cve.description_en
+        FROM cve
+        {where_clause}
+        ORDER BY {order_by}
+        LIMIT {limit} OFFSET {offset}
+        "#
+    )
+}
+
+fn advanced_count_sql(options: &CveAdvancedSearch) -> String {
+    let where_clause = advanced_where_clause(options);
+    format!(
+        r#"
+        SELECT COUNT(*) AS count
+        FROM cve
+        {where_clause}
+        "#
+    )
+}
+
+fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     let mut conditions = Vec::new();
 
     if let Some(published_from) = option_text(options.published_from.as_deref()) {
@@ -1945,41 +2212,11 @@ fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) ->
         ));
     }
 
-    let where_clause = if conditions.is_empty() {
+    if conditions.is_empty() {
         String::new()
     } else {
         format!("WHERE {}", conditions.join(" AND "))
-    };
-    let order_by = match options.sort_order {
-        CveSummarySortOrder::PublishedAsc => "cve.published_at ASC, cve.cve_id ASC",
-        CveSummarySortOrder::PublishedDesc => "cve.published_at DESC, cve.cve_id ASC",
-        CveSummarySortOrder::CveIdAsc => "cve.cve_id ASC",
-        CveSummarySortOrder::CveIdDesc => "cve.cve_id DESC",
-        CveSummarySortOrder::RelationRankAsc => "cve.published_at ASC, cve.cve_id ASC",
-        CveSummarySortOrder::RelationRankDesc => "cve.published_at DESC, cve.cve_id ASC",
-        CveSummarySortOrder::ScoreAsc => {
-            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) ASC, cve.published_at DESC, cve.cve_id ASC"
-        }
-        CveSummarySortOrder::ScoreDesc => {
-            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) DESC, cve.published_at DESC, cve.cve_id ASC"
-        }
-    };
-
-    format!(
-        r#"
-        SELECT
-            cve.cve_id,
-            cve.state,
-            cve.published_at,
-            cve.updated_at,
-            cve.title,
-            cve.description_en
-        FROM cve
-        {where_clause}
-        ORDER BY {order_by}
-        LIMIT {limit} OFFSET {offset}
-        "#
-    )
+    }
 }
 
 fn cwe_summary_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {

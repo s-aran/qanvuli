@@ -14,6 +14,7 @@ impl MigratorTrait for Migrator {
             Box::new(M20260609CreateCweMaster),
             Box::new(M20260610OptimizeCweSearch),
             Box::new(M20260610CreateCveSearchFts),
+            Box::new(M20260612OptimizeDetailLookup),
         ]
     }
 }
@@ -574,4 +575,67 @@ impl MigrationTrait for M20260610OptimizeCweSearch {
             )
             .await
     }
+}
+
+pub struct M20260612OptimizeDetailLookup;
+
+impl MigrationName for M20260612OptimizeDetailLookup {
+    fn name(&self) -> &str {
+        "m20260612_optimize_detail_lookup"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260612OptimizeDetailLookup {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for statement in detail_lookup_index_statements() {
+            manager.create_index(statement).await?;
+        }
+        Ok(())
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        for (table, index_name) in [
+            (
+                cve_cvss::Entity.table_ref(),
+                "idx_cve_cvss_cve_id_score_version",
+            ),
+            (
+                cve_affected::Entity.table_ref(),
+                "idx_cve_affected_cve_id_vendor_product",
+            ),
+        ] {
+            manager
+                .drop_index(
+                    Index::drop()
+                        .name(index_name)
+                        .table(table)
+                        .if_exists()
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn detail_lookup_index_statements() -> Vec<IndexCreateStatement> {
+    vec![
+        Index::create()
+            .name("idx_cve_cvss_cve_id_score_version")
+            .table(cve_cvss::Entity)
+            .col(cve_cvss::Column::CveId)
+            .col(cve_cvss::Column::BaseScore)
+            .col(cve_cvss::Column::Version)
+            .if_not_exists()
+            .to_owned(),
+        Index::create()
+            .name("idx_cve_affected_cve_id_vendor_product")
+            .table(cve_affected::Entity)
+            .col(cve_affected::Column::CveId)
+            .col(cve_affected::Column::Vendor)
+            .col(cve_affected::Column::Product)
+            .if_not_exists()
+            .to_owned(),
+    ]
 }

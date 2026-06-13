@@ -64,7 +64,13 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let list = List::new(items)
         .block(
             Block::default()
-                .title(format!("Candidates ({})", app.results.len()))
+                .title(format!(
+                    "Candidates ({}/{})",
+                    app.results.len(),
+                    app.total_results
+                        .map(|total| total.to_string())
+                        .unwrap_or_else(|| "-".to_owned())
+                ))
                 .borders(Borders::ALL)
                 .border_style(focus_style(app.focus == PaneFocus::Left)),
         )
@@ -83,10 +89,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .selected()
         .map(detail_lines)
         .unwrap_or_else(|| vec![Line::from("No results")]);
+    let detail_title = app
+        .selected()
+        .map(|cve| cve.cve_id.as_str())
+        .unwrap_or("CVE");
     let detail = Paragraph::new(detail)
         .block(
             Block::default()
-                .title("CVE")
+                .title(detail_title)
                 .borders(Borders::ALL)
                 .border_style(focus_style(app.focus == PaneFocus::Right)),
         )
@@ -228,10 +238,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 
 fn detail_lines(cve: &CveSummary) -> Vec<Line<'static>> {
     vec![
-        Line::from(vec![
-            Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(cve.cve_id.clone()),
-        ]),
         Line::from(vec![
             Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(cve.state.clone()),
