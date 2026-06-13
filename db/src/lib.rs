@@ -5,7 +5,7 @@ use chrono::Utc;
 use entity::{cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
 use md5::{Digest, Md5};
 use migration::Migrator;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use qanvuli_models::{
     CveStatusData, RawCveRecord, cna_affected_raw_values, cna_cvss_raw_values, cna_cwe_raw_values,
@@ -18,7 +18,7 @@ use sea_orm::{
     QuerySelect, Set, Statement, TransactionTrait, Value as SeaValue,
 };
 use sea_orm_migration::prelude::MigratorTrait;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 const CVE_CHUNK_SIZE: usize = 2000;
@@ -27,6 +27,8 @@ const AFFECTED_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const CWE_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 6;
 const CWE_MASTER_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const READ_JSON_FILE_CHUNK_SIZE: usize = 1000;
+const PUBLISHED_STATE: i32 = 0;
+const REJECTED_STATE: i32 = 1;
 
 pub struct CveActiveModels {
     pub cve_id: String,
@@ -54,11 +56,18 @@ impl ReadJsonFileRecord {
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct CveSummary {
     pub cve_id: String,
-    pub state: String,
+    #[serde(serialize_with = "serialize_cve_state")]
+    pub state: i32,
     pub published_at: String,
     pub updated_at: String,
     pub title: String,
     pub description_en: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CveIdMapping {
+    id: i32,
+    cve_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -99,7 +108,21 @@ pub struct CveAdvancedSearch {
     pub cwe: Option<String>,
     pub product: Option<String>,
     pub vendor: Option<String>,
+    pub state_scope: CveStateScope,
     pub sort_order: CveSummarySortOrder,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CveStateScope {
+    #[default]
+    PublishedOnly,
+    IncludeRejected,
+}
+
+impl CveStateScope {
+    fn includes_rejected(self) -> bool {
+        matches!(self, Self::IncludeRejected)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -147,8 +170,9 @@ impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
                 let title = cna.title.unwrap_or_else(|| cve_id.clone());
 
                 Self {
+                    id: Default::default(),
                     cve_id: Set(cve_id),
-                    state: Set(cve_state_to_string(&metadata.state)),
+                    state: Set(cve_state_to_int(&metadata.state)),
                     published_at: Set(metadata
                         .date_published
                         .map_or_else(String::new, |d| d.to_rfc3339())),
@@ -167,8 +191,9 @@ impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
                 let cve_id = metadata.cve_id;
 
                 Self {
+                    id: Default::default(),
                     cve_id: Set(cve_id.clone()),
-                    state: Set(cve_state_to_string(&metadata.state)),
+                    state: Set(cve_state_to_int(&metadata.state)),
                     published_at: Set(metadata
                         .date_published
                         .map_or_else(String::new, |d| d.to_rfc3339())),
@@ -185,11 +210,11 @@ impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
     }
 }
 
-fn cvss_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cvss::ActiveModel> {
+fn cvss_active_models(_cve_id: &str, raw_json: &Value) -> Vec<cve_cvss::ActiveModel> {
     cna_cvss_raw_values(raw_json)
         .into_iter()
         .map(|cvss| cve_cvss::ActiveModel {
-            cve_id: Set(cve_id.to_owned()),
+            cve_db_id: Set(0),
             version: Set(json_string(&cvss.raw_json, "version").unwrap_or(cvss.cvss_key)),
             base_score: Set(cvss.raw_json.get("baseScore").and_then(Value::as_f64)),
             base_severity: Set(json_string(&cvss.raw_json, "baseSeverity")),
@@ -201,11 +226,11 @@ fn cvss_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cvss::ActiveMod
         .collect()
 }
 
-fn affected_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_affected::ActiveModel> {
+fn affected_active_models(_cve_id: &str, raw_json: &Value) -> Vec<cve_affected::ActiveModel> {
     cna_affected_raw_values(raw_json)
         .into_iter()
         .map(|affected| cve_affected::ActiveModel {
-            cve_id: Set(cve_id.to_owned()),
+            cve_db_id: Set(0),
             vendor: Set(json_string(&affected, "vendor")),
             product: Set(json_string_or_json(&affected, "product")),
             package_name: Set(json_string(&affected, "packageName")),
@@ -217,7 +242,7 @@ fn affected_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_affected::A
         .collect()
 }
 
-fn cwe_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cwe::ActiveModel> {
+fn cwe_active_models(_cve_id: &str, raw_json: &Value) -> Vec<cve_cwe::ActiveModel> {
     let mut seen = HashSet::new();
 
     cna_cwe_raw_values(raw_json)
@@ -229,7 +254,7 @@ fn cwe_active_models(cve_id: &str, raw_json: &Value) -> Vec<cve_cwe::ActiveModel
             }
 
             Some(cve_cwe::ActiveModel {
-                cve_id: Set(cve_id.to_owned()),
+                cve_db_id: Set(0),
                 cwe_id: Set(cwe_id),
             })
         })
@@ -265,7 +290,11 @@ fn json_string(value: &Value, key: &str) -> Option<String> {
 fn md5_hex(bytes: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn json_string_or_json(value: &Value, key: &str) -> Option<String> {
@@ -299,13 +328,19 @@ fn cwe_number(cwe_id: &str) -> Option<i32> {
     number.parse::<i32>().ok().filter(|number| *number > 0)
 }
 
-fn cve_state_to_string(state: &CveState) -> String {
+fn cve_state_to_int(state: &CveState) -> i32 {
     match state {
-        CveState::Reserved => "RESERVED",
-        CveState::Published => "PUBLISHED",
-        CveState::Rejected => "REJECTED",
+        CveState::Reserved | CveState::Published => PUBLISHED_STATE,
+        CveState::Rejected => REJECTED_STATE,
     }
-    .to_owned()
+}
+
+pub fn cve_state_label(state: i32) -> &'static str {
+    match state {
+        PUBLISHED_STATE => "PUBLISHED",
+        REJECTED_STATE => "REJECTED",
+        _ => "UNKNOWN",
+    }
 }
 
 fn description_en(descriptions: &[CnaDescription]) -> Option<String> {
@@ -415,24 +450,29 @@ impl CveDatabase {
     pub async fn replace_cve_children(
         &self,
         cve_id: &str,
-        cvss_rows: Vec<cve_cvss::ActiveModel>,
-        affected_rows: Vec<cve_affected::ActiveModel>,
-        cwe_rows: Vec<cve_cwe::ActiveModel>,
+        mut cvss_rows: Vec<cve_cvss::ActiveModel>,
+        mut affected_rows: Vec<cve_affected::ActiveModel>,
+        mut cwe_rows: Vec<cve_cwe::ActiveModel>,
     ) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
+        let cve_db_id = cve_db_id_by_cve_id(&txn, cve_id).await?;
 
         cve_cvss::Entity::delete_many()
-            .filter(cve_cvss::Column::CveId.eq(cve_id))
+            .filter(cve_cvss::Column::CveDbId.eq(cve_db_id))
             .exec(&txn)
             .await?;
         cve_affected::Entity::delete_many()
-            .filter(cve_affected::Column::CveId.eq(cve_id))
+            .filter(cve_affected::Column::CveDbId.eq(cve_db_id))
             .exec(&txn)
             .await?;
         cve_cwe::Entity::delete_many()
-            .filter(cve_cwe::Column::CveId.eq(cve_id))
+            .filter(cve_cwe::Column::CveDbId.eq(cve_db_id))
             .exec(&txn)
             .await?;
+
+        set_cvss_cve_db_id(&mut cvss_rows, cve_db_id);
+        set_affected_cve_db_id(&mut affected_rows, cve_db_id);
+        set_cwe_cve_db_id(&mut cwe_rows, cve_db_id);
 
         let cwe_master_rows = cwe_rows
             .iter()
@@ -470,18 +510,24 @@ impl CveDatabase {
     }
 
     pub async fn find_cve_by_id(&self, cve_id: &str) -> Result<Option<cve::Model>, DbErr> {
-        cve::Entity::find_by_id(cve_id.to_owned())
+        cve::Entity::find()
+            .filter(cve::Column::CveId.eq(cve_id))
             .one(&self.db)
             .await
     }
 
     pub async fn find_cve_detail(&self, cve_id: &str) -> Result<CveDetail, DbErr> {
+        let Some(cve) = self.find_cve_by_id(cve_id).await? else {
+            return Ok(CveDetail::default());
+        };
+        let cve_db_id = cve.id;
+
         let cwes = cve_cwe::Entity::find()
             .select_only()
             .column_as(cve_cwe::Column::CweId, "id")
             .column_as(cwe::Column::Description, "description")
             .inner_join(cwe::Entity)
-            .filter(cve_cwe::Column::CveId.eq(cve_id))
+            .filter(cve_cwe::Column::CveDbId.eq(cve_db_id))
             .order_by_asc(cve_cwe::Column::CweId)
             .into_model::<CveCweDetail>()
             .all(&self.db)
@@ -496,7 +542,7 @@ impl CveDatabase {
                 cve_cvss::Column::VectorString,
                 cve_cvss::Column::Source,
             ])
-            .filter(cve_cvss::Column::CveId.eq(cve_id))
+            .filter(cve_cvss::Column::CveDbId.eq(cve_db_id))
             .order_by_desc(cve_cvss::Column::BaseScore)
             .order_by_asc(cve_cvss::Column::Version)
             .into_model::<CveCvssDetail>()
@@ -512,7 +558,7 @@ impl CveDatabase {
                 cve_affected::Column::CollectionUrl,
                 cve_affected::Column::DefaultStatus,
             ])
-            .filter(cve_affected::Column::CveId.eq(cve_id))
+            .filter(cve_affected::Column::CveDbId.eq(cve_db_id))
             .order_by_asc(cve_affected::Column::Vendor)
             .order_by_asc(cve_affected::Column::Product)
             .into_model::<CveAffectedDetail>()
@@ -532,6 +578,22 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<cve::Model>, DbErr> {
+        self.search_cves_by_cwe_with_state_scope(
+            cwe_ids,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cves_by_cwe_with_state_scope(
+        &self,
+        cwe_ids: &[String],
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
         let cwe_ids = cwe_numbers(cwe_ids);
         if cwe_ids.is_empty() {
             return Ok(Vec::new());
@@ -541,16 +603,20 @@ impl CveDatabase {
             self.ensure_cwe_search_index().await?;
             return cve::Model::find_by_statement(Statement::from_string(
                 DbBackend::Sqlite,
-                cwe_model_sql(&cwe_ids, limit, offset),
+                cwe_model_sql(&cwe_ids, state_scope, limit, offset),
             ))
             .all(&self.db)
             .await;
         }
 
-        cve::Entity::find()
+        let mut query = cve::Entity::find()
             .inner_join(cve_cwe::Entity)
             .filter(cve_cwe::Column::CweId.is_in(cwe_ids))
-            .distinct()
+            .distinct();
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        query
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -565,6 +631,22 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_cwe_with_state_scope(
+            cwe_ids,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_cwe_with_state_scope(
+        &self,
+        cwe_ids: &[String],
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let cwe_ids = cwe_numbers(cwe_ids);
         if cwe_ids.is_empty() {
             return Ok(Vec::new());
@@ -574,18 +656,22 @@ impl CveDatabase {
             self.ensure_cwe_search_index().await?;
             return CveSummary::find_by_statement(Statement::from_string(
                 DbBackend::Sqlite,
-                cwe_summary_sql(&cwe_ids, limit, offset),
+                cwe_summary_sql(&cwe_ids, state_scope, limit, offset),
             ))
             .all(&self.db)
             .await;
         }
 
-        cve::Entity::find()
+        let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .inner_join(cve_cwe::Entity)
             .filter(cve_cwe::Column::CweId.is_in(cwe_ids))
-            .distinct()
+            .distinct();
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        query
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -596,6 +682,15 @@ impl CveDatabase {
     }
 
     pub async fn count_cve_summaries_by_cwe(&self, cwe_ids: &[String]) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_cwe_with_state_scope(cwe_ids, CveStateScope::PublishedOnly)
+            .await
+    }
+
+    pub async fn count_cve_summaries_by_cwe_with_state_scope(
+        &self,
+        cwe_ids: &[String],
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         let cwe_ids = cwe_numbers(cwe_ids);
         if cwe_ids.is_empty() {
             return Ok(0);
@@ -604,26 +699,25 @@ impl CveDatabase {
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
             self.ensure_cwe_search_index().await?;
             return self
-                .count_by_sql(format!(
-                    "SELECT COUNT(DISTINCT cve_id) AS count FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_id WHERE cwe_id IN ({})",
-                    cwe_id_list(&cwe_ids)
-                ))
+                .count_by_sql(cwe_count_sql(&cwe_ids, state_scope))
                 .await;
         }
 
-        cve::Entity::find()
+        let mut query = cve::Entity::find()
             .inner_join(cve_cwe::Entity)
             .filter(cve_cwe::Column::CweId.is_in(cwe_ids))
-            .distinct()
-            .count(&self.db)
-            .await
+            .distinct();
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        query.count(&self.db).await
     }
 
     async fn ensure_cwe_search_index(&self) -> Result<(), DbErr> {
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
             self.db
                 .execute_unprepared(
-                    "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_id ON cve_cwe (cwe_id, cve_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
                 )
                 .await?;
         }
@@ -658,8 +752,29 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<cve::Model>, DbErr> {
+        self.search_cves_by_vendor_product_with_state_scope(
+            vendor,
+            product,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cves_by_vendor_product_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
         let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(vendor) = vendor {
             query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
         }
@@ -684,11 +799,32 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_vendor_product_with_state_scope(
+            vendor,
+            product,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_vendor_product_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .inner_join(cve_affected::Entity);
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(vendor) = vendor {
             query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
         }
@@ -712,8 +848,25 @@ impl CveDatabase {
         vendor: Option<&str>,
         product: Option<&str>,
     ) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_vendor_product_with_state_scope(
+            vendor,
+            product,
+            CveStateScope::PublishedOnly,
+        )
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_vendor_product_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(vendor) = vendor {
             query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
         }
@@ -733,6 +886,28 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_affected_component_with_state_scope(
+            vendor,
+            component,
+            published_since,
+            updated_since,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_affected_component_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        component: &str,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let pattern = like_pattern(component);
         let mut query = cve::Entity::find()
             .select_only()
@@ -744,6 +919,9 @@ impl CveDatabase {
                     .or(cve_affected::Column::PackageName.like(pattern)),
             );
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(vendor) = vendor {
             query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
         }
@@ -771,15 +949,34 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<cve::Model>, DbErr> {
+        self.search_cves_by_text_with_state_scope(
+            query,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cves_by_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
         let pattern = like_pattern(query);
 
-        cve::Entity::find()
-            .filter(
-                cve::Column::CveId
-                    .like(pattern.clone())
-                    .or(cve::Column::Title.like(pattern.clone()))
-                    .or(cve::Column::DescriptionEn.like(pattern)),
-            )
+        let mut query = cve::Entity::find().filter(
+            cve::Column::CveId
+                .like(pattern.clone())
+                .or(cve::Column::Title.like(pattern.clone()))
+                .or(cve::Column::DescriptionEn.like(pattern)),
+        );
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        query
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -794,10 +991,31 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_text_with_state_scope(
+            query,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let query = query.trim();
         if is_cve_id_prefix_query(query) {
             return self
-                .search_cve_summaries_by_cve_id_prefix(query, limit, offset)
+                .search_cve_summaries_by_cve_id_prefix_with_state_scope(
+                    query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         }
         if is_cwe_id_query(query) {
@@ -805,25 +1023,40 @@ impl CveDatabase {
                 return Ok(Vec::new());
             };
             return self
-                .search_cve_summaries_by_cwe(&[cwe_id.to_string()], limit, offset)
+                .search_cve_summaries_by_cwe_with_state_scope(
+                    &[cwe_id.to_string()],
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         }
         if is_dateish_query(query) {
             return self
-                .search_cve_summaries_by_date_prefix(query, limit, offset)
+                .search_cve_summaries_by_date_prefix_with_state_scope(
+                    query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         }
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
             return self
-                .search_cve_summaries_by_fts_text(&fts_query, limit, offset)
+                .search_cve_summaries_by_fts_text_with_state_scope(
+                    &fts_query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         }
 
         let pattern = like_pattern(query);
 
-        cve::Entity::find()
+        let mut search = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .filter(
@@ -831,7 +1064,11 @@ impl CveDatabase {
                     .like(pattern.clone())
                     .or(cve::Column::Title.like(pattern.clone()))
                     .or(cve::Column::DescriptionEn.like(pattern)),
-            )
+            );
+        if !state_scope.includes_rejected() {
+            search = search.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        search
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -847,20 +1084,40 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_cve_id_prefix_with_state_scope(
+            prefix,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_cve_id_prefix_with_state_scope(
+        &self,
+        prefix: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let prefix = prefix.trim().to_ascii_uppercase();
         let Some(upper_bound) = ascii_prefix_upper_bound(&prefix) else {
             return Ok(Vec::new());
         };
 
         if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
-            return cve::Entity::find()
+            let mut query = cve::Entity::find()
                 .select_only()
                 .columns(summary_columns())
                 .filter(
                     cve::Column::CveId
                         .gte(prefix)
                         .and(cve::Column::CveId.lt(upper_bound)),
-                )
+                );
+            if !state_scope.includes_rejected() {
+                query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            return query
                 .order_by_asc(cve::Column::CveId)
                 .limit(limit)
                 .offset(offset)
@@ -871,7 +1128,7 @@ impl CveDatabase {
 
         CveSummary::find_by_statement(Statement::from_sql_and_values(
             self.db.get_database_backend(),
-            cve_id_prefix_summary_sql(),
+            cve_id_prefix_summary_sql(state_scope),
             vec![
                 SeaValue::from(prefix),
                 SeaValue::from(upper_bound),
@@ -884,24 +1141,37 @@ impl CveDatabase {
     }
 
     pub async fn count_cve_summaries_by_cve_id_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_cve_id_prefix_with_state_scope(
+            prefix,
+            CveStateScope::PublishedOnly,
+        )
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_cve_id_prefix_with_state_scope(
+        &self,
+        prefix: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         let prefix = prefix.trim().to_ascii_uppercase();
         let Some(upper_bound) = ascii_prefix_upper_bound(&prefix) else {
             return Ok(0);
         };
 
         if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
-            return cve::Entity::find()
-                .filter(
-                    cve::Column::CveId
-                        .gte(prefix)
-                        .and(cve::Column::CveId.lt(upper_bound)),
-                )
-                .count(&self.db)
-                .await;
+            let mut query = cve::Entity::find().filter(
+                cve::Column::CveId
+                    .gte(prefix)
+                    .and(cve::Column::CveId.lt(upper_bound)),
+            );
+            if !state_scope.includes_rejected() {
+                query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            return query.count(&self.db).await;
         }
 
         self.count_by_statement(
-            "SELECT COUNT(*) AS count FROM cve WHERE cve_id >= ? AND cve_id < ?",
+            cve_id_prefix_count_sql(state_scope),
             vec![SeaValue::from(prefix), SeaValue::from(upper_bound)],
         )
         .await
@@ -910,6 +1180,22 @@ impl CveDatabase {
     pub async fn search_cve_summaries_by_date_prefix(
         &self,
         prefix: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_date_prefix_with_state_scope(
+            prefix,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_date_prefix_with_state_scope(
+        &self,
+        prefix: &str,
+        state_scope: CveStateScope,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
@@ -925,11 +1211,15 @@ impl CveDatabase {
                 .or(cve::Column::UpdatedAt
                     .gte(prefix.to_owned())
                     .and(cve::Column::UpdatedAt.lt(upper_bound)));
-            return cve::Entity::find()
+            let mut query = cve::Entity::find()
                 .select_only()
                 .columns(summary_columns())
                 .filter(condition)
-                .distinct()
+                .distinct();
+            if !state_scope.includes_rejected() {
+                query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            return query
                 .order_by_desc(cve::Column::PublishedAt)
                 .order_by_asc(cve::Column::CveId)
                 .limit(limit)
@@ -941,7 +1231,7 @@ impl CveDatabase {
 
         CveSummary::find_by_statement(Statement::from_sql_and_values(
             self.db.get_database_backend(),
-            date_prefix_summary_sql(),
+            date_prefix_summary_sql(state_scope),
             vec![
                 SeaValue::from(prefix.to_owned()),
                 SeaValue::from(upper_bound.clone()),
@@ -956,6 +1246,18 @@ impl CveDatabase {
     }
 
     pub async fn count_cve_summaries_by_date_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_date_prefix_with_state_scope(
+            prefix,
+            CveStateScope::PublishedOnly,
+        )
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_date_prefix_with_state_scope(
+        &self,
+        prefix: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         let prefix = prefix.trim();
         let Some(upper_bound) = ascii_prefix_upper_bound(prefix) else {
             return Ok(0);
@@ -968,24 +1270,15 @@ impl CveDatabase {
                 .or(cve::Column::UpdatedAt
                     .gte(prefix.to_owned())
                     .and(cve::Column::UpdatedAt.lt(upper_bound)));
-            return cve::Entity::find()
-                .filter(condition)
-                .distinct()
-                .count(&self.db)
-                .await;
+            let mut query = cve::Entity::find().filter(condition).distinct();
+            if !state_scope.includes_rejected() {
+                query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            return query.count(&self.db).await;
         }
 
         self.count_by_statement(
-            r#"
-            SELECT COUNT(DISTINCT cve_id) AS count
-            FROM (
-                SELECT cve_id FROM cve INDEXED BY idx_cve_published_at
-                WHERE published_at >= ? AND published_at < ?
-                UNION ALL
-                SELECT cve_id FROM cve INDEXED BY idx_cve_updated_at
-                WHERE updated_at >= ? AND updated_at < ?
-            )
-            "#,
+            date_prefix_count_sql(state_scope),
             vec![
                 SeaValue::from(prefix.to_owned()),
                 SeaValue::from(upper_bound.clone()),
@@ -1002,10 +1295,32 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_free_text_with_state_scope(
+            query,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_free_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let query = query.trim();
         if query.is_empty() {
             return self
-                .search_cve_summaries_by_date(None, None, limit, offset)
+                .search_cve_summaries_by_date_with_state_scope(
+                    None,
+                    None,
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         }
 
@@ -1016,14 +1331,24 @@ impl CveDatabase {
         if is_cve_id_prefix_query(query) {
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_cve_id_prefix(query, candidate_limit, 0)
-                    .await?,
+                self.search_cve_summaries_by_cve_id_prefix_with_state_scope(
+                    query,
+                    state_scope,
+                    candidate_limit,
+                    0,
+                )
+                .await?,
             );
         } else if is_dateish_query(query) {
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_date_prefix(query, candidate_limit, 0)
-                    .await?,
+                self.search_cve_summaries_by_date_prefix_with_state_scope(
+                    query,
+                    state_scope,
+                    candidate_limit,
+                    0,
+                )
+                .await?,
             );
         } else if is_cwe_id_query(query) {
             let Some(cwe_id) = cwe_id else {
@@ -1031,25 +1356,40 @@ impl CveDatabase {
             };
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_cwe(&[cwe_id.to_string()], candidate_limit, 0)
-                    .await?,
+                self.search_cve_summaries_by_cwe_with_state_scope(
+                    &[cwe_id.to_string()],
+                    state_scope,
+                    candidate_limit,
+                    0,
+                )
+                .await?,
             );
         } else if let Some(cwe_id) = cwe_id {
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_cwe(&[cwe_id.to_string()], candidate_limit, 0)
-                    .await?,
+                self.search_cve_summaries_by_cwe_with_state_scope(
+                    &[cwe_id.to_string()],
+                    state_scope,
+                    candidate_limit,
+                    0,
+                )
+                .await?,
             );
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
             return self
-                .search_cve_summaries_by_fts_text(&fts_query, limit, offset)
+                .search_cve_summaries_by_fts_text_with_state_scope(
+                    &fts_query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
                 .await;
         } else {
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_cve_free_text(query, candidate_limit, 0)
+                self.search_cve_summaries_by_cve_free_text(query, state_scope, candidate_limit, 0)
                     .await?,
             );
         }
@@ -1060,7 +1400,7 @@ impl CveDatabase {
         {
             append_unique_summaries(
                 &mut cves,
-                self.search_cve_summaries_by_affected_text(query, candidate_limit, 0)
+                self.search_cve_summaries_by_affected_text(query, state_scope, candidate_limit, 0)
                     .await?,
             );
         }
@@ -1081,40 +1421,59 @@ impl CveDatabase {
     }
 
     pub async fn count_cve_summaries_free_text(&self, query: &str) -> Result<u64, DbErr> {
+        self.count_cve_summaries_free_text_with_state_scope(query, CveStateScope::PublishedOnly)
+            .await
+    }
+
+    pub async fn count_cve_summaries_free_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         let query = query.trim();
         if query.is_empty() {
-            return cve::Entity::find().count(&self.db).await;
+            let mut count = cve::Entity::find();
+            if !state_scope.includes_rejected() {
+                count = count.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            return count.count(&self.db).await;
         }
 
         let cwe_id = cwe_number(query);
         if is_cve_id_prefix_query(query) {
-            self.count_cve_summaries_by_cve_id_prefix(query).await
+            self.count_cve_summaries_by_cve_id_prefix_with_state_scope(query, state_scope)
+                .await
         } else if is_dateish_query(query) {
-            self.count_cve_summaries_by_date_prefix(query).await
+            self.count_cve_summaries_by_date_prefix_with_state_scope(query, state_scope)
+                .await
         } else if is_cwe_id_query(query) {
             let Some(cwe_id) = cwe_id else {
                 return Ok(0);
             };
-            self.count_cve_summaries_by_cwe(&[cwe_id.to_string()]).await
+            self.count_cve_summaries_by_cwe_with_state_scope(&[cwe_id.to_string()], state_scope)
+                .await
         } else if let Some(cwe_id) = cwe_id {
-            self.count_cve_summaries_by_cwe(&[cwe_id.to_string()]).await
+            self.count_cve_summaries_by_cwe_with_state_scope(&[cwe_id.to_string()], state_scope)
+                .await
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
-            self.count_cve_summaries_by_fts_text(&fts_query).await
+            self.count_cve_summaries_by_fts_text_with_state_scope(&fts_query, state_scope)
+                .await
         } else {
             let pattern = like_pattern(query);
-            cve::Entity::find()
-                .filter(
-                    cve::Column::CveId
-                        .like(pattern.clone())
-                        .or(cve::Column::Title.like(pattern.clone()))
-                        .or(cve::Column::DescriptionEn.like(pattern.clone()))
-                        .or(cve::Column::PublishedAt.like(pattern.clone()))
-                        .or(cve::Column::UpdatedAt.like(pattern)),
-                )
-                .count(&self.db)
-                .await
+            let mut count = cve::Entity::find().filter(
+                cve::Column::CveId
+                    .like(pattern.clone())
+                    .or(cve::Column::Title.like(pattern.clone()))
+                    .or(cve::Column::DescriptionEn.like(pattern.clone()))
+                    .or(cve::Column::PublishedAt.like(pattern.clone()))
+                    .or(cve::Column::UpdatedAt.like(pattern)),
+            );
+            if !state_scope.includes_rejected() {
+                count = count.filter(cve::Column::State.eq(PUBLISHED_STATE));
+            }
+            count.count(&self.db).await
         }
     }
 
@@ -1124,11 +1483,27 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_fts_text_with_state_scope(
+            query,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_fts_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         self.ensure_cve_search_fts().await?;
 
         CveSummary::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            fts_summary_sql(),
+            fts_summary_sql(state_scope),
             vec![
                 SeaValue::from(query.to_owned()),
                 SeaValue::from(limit as i64),
@@ -1140,9 +1515,18 @@ impl CveDatabase {
     }
 
     pub async fn count_cve_summaries_by_fts_text(&self, query: &str) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_fts_text_with_state_scope(query, CveStateScope::PublishedOnly)
+            .await
+    }
+
+    pub async fn count_cve_summaries_by_fts_text_with_state_scope(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         self.ensure_cve_search_fts().await?;
         self.count_by_statement(
-            "SELECT COUNT(*) AS count FROM cve_search_fts WHERE cve_search_fts MATCH ?",
+            fts_count_sql(state_scope),
             vec![SeaValue::from(query.to_owned())],
         )
         .await
@@ -1151,6 +1535,7 @@ impl CveDatabase {
     async fn search_cve_summaries_by_cve_free_text(
         &self,
         query: &str,
+        state_scope: CveStateScope,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
@@ -1162,10 +1547,14 @@ impl CveDatabase {
             .add(cve::Column::PublishedAt.like(pattern.clone()))
             .add(cve::Column::UpdatedAt.like(pattern));
 
-        cve::Entity::find()
+        let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
-            .filter(condition)
+            .filter(condition);
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        query
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -1178,6 +1567,7 @@ impl CveDatabase {
     async fn search_cve_summaries_by_affected_text(
         &self,
         query: &str,
+        state_scope: CveStateScope,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
@@ -1187,12 +1577,16 @@ impl CveDatabase {
             .add(cve_affected::Column::Product.like(pattern.clone()))
             .add(cve_affected::Column::PackageName.like(pattern));
 
-        let cves = cve::Entity::find()
+        let mut search = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .inner_join(cve_affected::Entity)
             .filter(condition)
-            .distinct()
+            .distinct();
+        if !state_scope.includes_rejected() {
+            search = search.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        let cves = search
             .order_by_desc(cve::Column::PublishedAt)
             .order_by_asc(cve::Column::CveId)
             .limit(limit)
@@ -1213,11 +1607,36 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_cvss_with_state_scope(
+            min_score,
+            max_score,
+            severity,
+            version,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_cvss_with_state_scope(
+        &self,
+        min_score: Option<f64>,
+        max_score: Option<f64>,
+        severity: Option<&str>,
+        version: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .inner_join(cve_cvss::Entity);
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(min_score) = min_score {
             query = query.filter(cve_cvss::Column::BaseScore.gte(min_score));
         }
@@ -1251,12 +1670,37 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_product_cvss_with_state_scope(
+            vendor,
+            product,
+            min_score,
+            severity,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_product_cvss_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        min_score: Option<f64>,
+        severity: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
             .inner_join(cve_affected::Entity)
             .inner_join(cve_cvss::Entity);
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(vendor) = vendor {
             query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
         }
@@ -1288,8 +1732,29 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_date_with_state_scope(
+            published_since,
+            updated_since,
+            CveStateScope::PublishedOnly,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_date_with_state_scope(
+        &self,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let mut query = cve::Entity::find().select_only().columns(summary_columns());
 
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(published_since) = published_since {
             query = query.filter(cve::Column::PublishedAt.gte(published_since));
         }
@@ -1337,6 +1802,9 @@ impl CveDatabase {
 
         let mut query = cve::Entity::find().select_only().columns(summary_columns());
 
+        if !options.state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(published_from) = option_text(options.published_from.as_deref()) {
             query = query.filter(cve::Column::PublishedAt.gte(published_from.to_owned()));
         }
@@ -1406,6 +1874,9 @@ impl CveDatabase {
 
         let mut query = cve::Entity::find();
 
+        if !options.state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
         if let Some(published_from) = option_text(options.published_from.as_deref()) {
             query = query.filter(cve::Column::PublishedAt.gte(published_from.to_owned()));
         }
@@ -1548,62 +2019,56 @@ async fn upsert_cve_model_batch(
 ) -> Result<usize, DbErr> {
     let mut cve_ids = Vec::with_capacity(models.len());
     let mut cve_rows = Vec::with_capacity(models.len());
-    let mut cvss_rows = Vec::new();
-    let mut affected_rows = Vec::new();
-    let mut cwe_master_rows = Vec::new();
-    let mut cwe_rows = Vec::new();
 
-    for models in models {
-        cve_ids.push(models.cve_id.clone());
-        cve_rows.push(models.cve);
-        cvss_rows.extend(models.cvss_rows);
-        affected_rows.extend(models.affected_rows);
-        cwe_master_rows.extend(models.cwe_master_rows);
-        cwe_rows.extend(models.cwe_rows);
+    for model in &models {
+        cve_ids.push(model.cve_id.clone());
+        cve_rows.push(model.cve.clone());
     }
 
     let inserted = cve_rows.len();
 
-    for chunk in cve_rows.chunks(CVE_CHUNK_SIZE) {
-        cve::Entity::insert_many(chunk.iter().cloned())
+    for chunk in take_chunks(cve_rows, CVE_CHUNK_SIZE) {
+        cve::Entity::insert_many(chunk)
             .on_conflict(cve_upsert_conflict())
             .exec(txn)
             .await?;
     }
 
+    let cve_db_ids = cve_db_ids_by_cve_ids(txn, &cve_ids).await?;
+    let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
+        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
+    let cve_db_id_values = cve_ids
+        .iter()
+        .filter_map(|cve_id| cve_db_ids.get(cve_id).copied())
+        .collect::<Vec<_>>();
+
     cve_cvss::Entity::delete_many()
-        .filter(cve_cvss::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .filter(cve_cvss::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
         .exec(txn)
         .await?;
     cve_affected::Entity::delete_many()
-        .filter(cve_affected::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .filter(cve_affected::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
         .exec(txn)
         .await?;
     cve_cwe::Entity::delete_many()
-        .filter(cve_cwe::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .filter(cve_cwe::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
         .exec(txn)
         .await?;
 
-    for chunk in cvss_rows.chunks(CVSS_CHUNK_SIZE) {
-        cve_cvss::Entity::insert_many(chunk.iter().cloned())
-            .exec(txn)
-            .await?;
+    for chunk in take_chunks(cvss_rows, CVSS_CHUNK_SIZE) {
+        cve_cvss::Entity::insert_many(chunk).exec(txn).await?;
     }
-    for chunk in affected_rows.chunks(AFFECTED_CHUNK_SIZE) {
-        cve_affected::Entity::insert_many(chunk.iter().cloned())
-            .exec(txn)
-            .await?;
+    for chunk in take_chunks(affected_rows, AFFECTED_CHUNK_SIZE) {
+        cve_affected::Entity::insert_many(chunk).exec(txn).await?;
     }
-    for chunk in cwe_master_rows.chunks(CWE_MASTER_CHUNK_SIZE) {
-        cwe::Entity::insert_many(chunk.iter().cloned())
+    for chunk in take_chunks(cwe_master_rows, CWE_MASTER_CHUNK_SIZE) {
+        cwe::Entity::insert_many(chunk)
             .on_conflict(cwe_upsert_conflict())
             .exec(txn)
             .await?;
     }
-    for chunk in cwe_rows.chunks(CWE_CHUNK_SIZE) {
-        cve_cwe::Entity::insert_many(chunk.iter().cloned())
-            .exec(txn)
-            .await?;
+    for chunk in take_chunks(cwe_rows, CWE_CHUNK_SIZE) {
+        cve_cwe::Entity::insert_many(chunk).exec(txn).await?;
     }
     upsert_cve_search_fts_rows(txn, &cve_ids).await?;
 
@@ -1638,39 +2103,149 @@ async fn insert_cve_model_batch(
 ) -> Result<usize, DbErr> {
     let mut cve_rows = Vec::with_capacity(models.len());
     let mut cve_ids = Vec::with_capacity(models.len());
-    let mut cvss_rows = Vec::new();
-    let mut affected_rows = Vec::new();
-    let mut cwe_master_rows = Vec::new();
-    let mut cwe_rows = Vec::new();
 
-    for models in models {
-        cve_ids.push(models.cve_id);
-        cve_rows.push(models.cve);
-        cvss_rows.extend(models.cvss_rows);
-        affected_rows.extend(models.affected_rows);
-        cwe_master_rows.extend(models.cwe_master_rows);
-        cwe_rows.extend(models.cwe_rows);
+    for model in &models {
+        cve_ids.push(model.cve_id.clone());
+        cve_rows.push(model.cve.clone());
     }
 
     let inserted = cve_rows.len();
 
     insert_cve_rows(txn, cve_rows).await?;
+    let cve_db_ids = cve_db_ids_by_cve_ids(txn, &cve_ids).await?;
+    let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
+        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
 
-    for chunk in cvss_rows.chunks(CVSS_CHUNK_SIZE) {
-        insert_cvss_rows(txn, chunk.to_vec()).await?;
+    for chunk in take_chunks(cvss_rows, CVSS_CHUNK_SIZE) {
+        insert_cvss_rows(txn, chunk).await?;
     }
-    for chunk in affected_rows.chunks(AFFECTED_CHUNK_SIZE) {
-        insert_affected_rows(txn, chunk.to_vec()).await?;
+    for chunk in take_chunks(affected_rows, AFFECTED_CHUNK_SIZE) {
+        insert_affected_rows(txn, chunk).await?;
     }
-    for chunk in cwe_master_rows.chunks(CWE_MASTER_CHUNK_SIZE) {
-        upsert_cwe_rows(txn, chunk.to_vec()).await?;
+    for chunk in take_chunks(cwe_master_rows, CWE_MASTER_CHUNK_SIZE) {
+        upsert_cwe_rows(txn, chunk).await?;
     }
-    for chunk in cwe_rows.chunks(CWE_CHUNK_SIZE) {
-        insert_cwe_rows(txn, chunk.to_vec()).await?;
+    for chunk in take_chunks(cwe_rows, CWE_CHUNK_SIZE) {
+        insert_cwe_rows(txn, chunk).await?;
     }
     upsert_cve_search_fts_rows(txn, &cve_ids).await?;
 
     Ok(inserted)
+}
+
+fn serialize_cve_state<S>(state: &i32, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(cve_state_label(*state))
+}
+
+type CveChildRows = (
+    Vec<cve_cvss::ActiveModel>,
+    Vec<cve_affected::ActiveModel>,
+    Vec<cwe::ActiveModel>,
+    Vec<cve_cwe::ActiveModel>,
+);
+
+fn child_rows_with_cve_db_ids(
+    models: Vec<CveActiveModels>,
+    cve_db_ids: &HashMap<String, i32>,
+) -> Result<CveChildRows, DbErr> {
+    let mut cvss_rows = Vec::new();
+    let mut affected_rows = Vec::new();
+    let mut cwe_master_rows = Vec::new();
+    let mut cwe_rows = Vec::new();
+
+    for mut model in models {
+        let Some(cve_db_id) = cve_db_ids.get(&model.cve_id).copied() else {
+            return Err(DbErr::Custom(format!(
+                "missing cve.id for {}",
+                model.cve_id
+            )));
+        };
+        set_cvss_cve_db_id(&mut model.cvss_rows, cve_db_id);
+        set_affected_cve_db_id(&mut model.affected_rows, cve_db_id);
+        set_cwe_cve_db_id(&mut model.cwe_rows, cve_db_id);
+        cvss_rows.extend(model.cvss_rows);
+        affected_rows.extend(model.affected_rows);
+        cwe_master_rows.extend(model.cwe_master_rows);
+        cwe_rows.extend(model.cwe_rows);
+    }
+
+    Ok((cvss_rows, affected_rows, cwe_master_rows, cwe_rows))
+}
+
+fn set_cvss_cve_db_id(rows: &mut [cve_cvss::ActiveModel], cve_db_id: i32) {
+    for row in rows {
+        row.cve_db_id = Set(cve_db_id);
+    }
+}
+
+fn set_affected_cve_db_id(rows: &mut [cve_affected::ActiveModel], cve_db_id: i32) {
+    for row in rows {
+        row.cve_db_id = Set(cve_db_id);
+    }
+}
+
+fn set_cwe_cve_db_id(rows: &mut [cve_cwe::ActiveModel], cve_db_id: i32) {
+    for row in rows {
+        row.cve_db_id = Set(cve_db_id);
+    }
+}
+
+fn take_chunks<T>(mut rows: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::with_capacity(rows.len().div_ceil(chunk_size));
+    while rows.len() > chunk_size {
+        let rest = rows.split_off(chunk_size);
+        chunks.push(rows);
+        rows = rest;
+    }
+    chunks.push(rows);
+    chunks
+}
+
+async fn cve_db_id_by_cve_id<C>(db: &C, cve_id: &str) -> Result<i32, DbErr>
+where
+    C: ConnectionTrait,
+{
+    cve::Entity::find()
+        .select_only()
+        .column(cve::Column::Id)
+        .column(cve::Column::CveId)
+        .filter(cve::Column::CveId.eq(cve_id))
+        .into_model::<CveIdMapping>()
+        .one(db)
+        .await?
+        .map(|row| row.id)
+        .ok_or_else(|| DbErr::Custom(format!("missing cve.id for {cve_id}")))
+}
+
+async fn cve_db_ids_by_cve_ids<C>(db: &C, cve_ids: &[String]) -> Result<HashMap<String, i32>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if cve_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = cve::Entity::find()
+        .select_only()
+        .column(cve::Column::Id)
+        .column(cve::Column::CveId)
+        .filter(cve::Column::CveId.is_in(cve_ids.iter().cloned()))
+        .into_model::<CveIdMapping>()
+        .all(db)
+        .await?;
+
+    let mut map = HashMap::with_capacity(rows.len());
+    for row in rows {
+        map.insert(row.cve_id, row.id);
+    }
+    Ok(map)
 }
 
 async fn clear_cve_tables_on(txn: &DatabaseTransaction) -> Result<(), DbErr> {
@@ -1809,7 +2384,7 @@ where
                 ''
             )
         FROM cve
-        LEFT JOIN cve_affected ON cve_affected.cve_id = cve.cve_id
+        LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
         GROUP BY cve.cve_id
         "#,
     )
@@ -1865,7 +2440,7 @@ where
                 ''
             )
         FROM cve
-        LEFT JOIN cve_affected ON cve_affected.cve_id = cve.cve_id
+        LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
         WHERE cve.cve_id IN ({cve_ids})
         GROUP BY cve.cve_id
         "#
@@ -2064,8 +2639,9 @@ fn summary_columns() -> [cve::Column; 6] {
     ]
 }
 
-fn cve_id_prefix_summary_sql() -> &'static str {
-    r#"
+fn cve_id_prefix_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
     SELECT
         cve_id,
         state,
@@ -2078,10 +2654,34 @@ fn cve_id_prefix_summary_sql() -> &'static str {
     ORDER BY cve_id ASC
     LIMIT ? OFFSET ?
     "#
+    } else {
+        r#"
+    SELECT
+        cve_id,
+        state,
+        published_at,
+        updated_at,
+        title,
+        description_en
+    FROM cve
+    WHERE cve_id >= ? AND cve_id < ? AND state = 0
+    ORDER BY cve_id ASC
+    LIMIT ? OFFSET ?
+    "#
+    }
 }
 
-fn date_prefix_summary_sql() -> &'static str {
-    r#"
+fn cve_id_prefix_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        "SELECT COUNT(*) AS count FROM cve WHERE cve_id >= ? AND cve_id < ?"
+    } else {
+        "SELECT COUNT(*) AS count FROM cve WHERE cve_id >= ? AND cve_id < ? AND state = 0"
+    }
+}
+
+fn date_prefix_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
     SELECT DISTINCT
         cve_id,
         state,
@@ -2113,10 +2713,71 @@ fn date_prefix_summary_sql() -> &'static str {
     ORDER BY published_at DESC, cve_id ASC
     LIMIT ? OFFSET ?
     "#
+    } else {
+        r#"
+    SELECT DISTINCT
+        cve_id,
+        state,
+        published_at,
+        updated_at,
+        title,
+        description_en
+    FROM (
+        SELECT
+            cve_id,
+            state,
+            published_at,
+            updated_at,
+            title,
+            description_en
+        FROM cve INDEXED BY idx_cve_published_at
+        WHERE published_at >= ? AND published_at < ? AND state = 0
+        UNION ALL
+        SELECT
+            cve_id,
+            state,
+            published_at,
+            updated_at,
+            title,
+            description_en
+        FROM cve INDEXED BY idx_cve_updated_at
+        WHERE updated_at >= ? AND updated_at < ? AND state = 0
+    )
+    ORDER BY published_at DESC, cve_id ASC
+    LIMIT ? OFFSET ?
+    "#
+    }
 }
 
-fn fts_summary_sql() -> &'static str {
-    r#"
+fn date_prefix_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+            SELECT COUNT(DISTINCT cve_id) AS count
+            FROM (
+                SELECT cve_id FROM cve INDEXED BY idx_cve_published_at
+                WHERE published_at >= ? AND published_at < ?
+                UNION ALL
+                SELECT cve_id FROM cve INDEXED BY idx_cve_updated_at
+                WHERE updated_at >= ? AND updated_at < ?
+            )
+            "#
+    } else {
+        r#"
+            SELECT COUNT(DISTINCT cve_id) AS count
+            FROM (
+                SELECT cve_id FROM cve INDEXED BY idx_cve_published_at
+                WHERE published_at >= ? AND published_at < ? AND state = 0
+                UNION ALL
+                SELECT cve_id FROM cve INDEXED BY idx_cve_updated_at
+                WHERE updated_at >= ? AND updated_at < ? AND state = 0
+            )
+            "#
+    }
+}
+
+fn fts_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
     SELECT
         cve.cve_id,
         cve.state,
@@ -2130,6 +2791,35 @@ fn fts_summary_sql() -> &'static str {
     ORDER BY bm25(cve_search_fts), cve.published_at DESC, cve.cve_id ASC
     LIMIT ? OFFSET ?
     "#
+    } else {
+        r#"
+    SELECT
+        cve.cve_id,
+        cve.state,
+        cve.published_at,
+        cve.updated_at,
+        cve.title,
+        cve.description_en
+    FROM cve_search_fts
+    INNER JOIN cve ON cve.cve_id = cve_search_fts.cve_id
+    WHERE cve_search_fts MATCH ? AND cve.state = 0
+    ORDER BY bm25(cve_search_fts), cve.published_at DESC, cve.cve_id ASC
+    LIMIT ? OFFSET ?
+    "#
+    }
+}
+
+fn fts_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        "SELECT COUNT(*) AS count FROM cve_search_fts WHERE cve_search_fts MATCH ?"
+    } else {
+        r#"
+        SELECT COUNT(*) AS count
+        FROM cve_search_fts
+        INNER JOIN cve ON cve.cve_id = cve_search_fts.cve_id
+        WHERE cve_search_fts MATCH ? AND cve.state = 0
+        "#
+    }
 }
 
 fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) -> String {
@@ -2142,10 +2832,10 @@ fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) ->
         CveSummarySortOrder::RelationRankAsc => "cve.published_at ASC, cve.cve_id ASC",
         CveSummarySortOrder::RelationRankDesc => "cve.published_at DESC, cve.cve_id ASC",
         CveSummarySortOrder::ScoreAsc => {
-            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) ASC, cve.published_at DESC, cve.cve_id ASC"
+            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_db_id = cve.id), -1) ASC, cve.published_at DESC, cve.cve_id ASC"
         }
         CveSummarySortOrder::ScoreDesc => {
-            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_id = cve.cve_id), -1) DESC, cve.published_at DESC, cve.cve_id ASC"
+            "COALESCE((SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_db_id = cve.id), -1) DESC, cve.published_at DESC, cve.cve_id ASC"
         }
     };
 
@@ -2180,6 +2870,9 @@ fn advanced_count_sql(options: &CveAdvancedSearch) -> String {
 fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     let mut conditions = Vec::new();
 
+    if !options.state_scope.includes_rejected() {
+        conditions.push("cve.state = 0".to_owned());
+    }
     if let Some(published_from) = option_text(options.published_from.as_deref()) {
         conditions.push(format!(
             "cve.published_at >= {}",
@@ -2196,18 +2889,18 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
         && let Some(cwe_id) = cwe_number(cwe)
     {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_id WHERE cve_cwe.cwe_id = {cwe_id} AND cve_cwe.cve_id = cve.cve_id)"
+            "EXISTS (SELECT 1 FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id WHERE cve_cwe.cwe_id = {cwe_id} AND cve_cwe.cve_db_id = cve.id)"
         ));
     }
     if let Some(vendor) = option_text(options.vendor.as_deref()) {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_id = cve.cve_id AND cve_affected.vendor LIKE {})",
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
             sql_string_literal(&like_pattern(vendor))
         ));
     }
     if let Some(product) = option_text(options.product.as_deref()) {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_id = cve.cve_id AND cve_affected.product LIKE {})",
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
             sql_string_literal(&like_pattern(product))
         ));
     }
@@ -2219,8 +2912,9 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     }
 }
 
-fn cwe_summary_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
+fn cwe_summary_sql(cwe_ids: &[i32], state_scope: CveStateScope, limit: u64, offset: u64) -> String {
     let distinct = if cwe_ids.len() > 1 { "DISTINCT " } else { "" };
+    let state_filter = state_sql_filter(state_scope, "cve");
     format!(
         r#"
         SELECT {distinct}
@@ -2230,9 +2924,9 @@ fn cwe_summary_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
             cve.updated_at,
             cve.title,
             cve.description_en
-        FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_id
-        INNER JOIN cve ON cve.cve_id = cve_cwe.cve_id
-        WHERE cve_cwe.cwe_id IN ({})
+        FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id
+        INNER JOIN cve ON cve.id = cve_cwe.cve_db_id
+        WHERE cve_cwe.cwe_id IN ({}){state_filter}
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT {} OFFSET {}
         "#,
@@ -2242,11 +2936,13 @@ fn cwe_summary_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
     )
 }
 
-fn cwe_model_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
+fn cwe_model_sql(cwe_ids: &[i32], state_scope: CveStateScope, limit: u64, offset: u64) -> String {
     let distinct = if cwe_ids.len() > 1 { "DISTINCT " } else { "" };
+    let state_filter = state_sql_filter(state_scope, "cve");
     format!(
         r#"
         SELECT {distinct}
+            cve.id,
             cve.cve_id,
             cve.state,
             cve.published_at,
@@ -2255,9 +2951,9 @@ fn cwe_model_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
             cve.title,
             cve.description_en,
             cve.raw_json
-        FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_id
-        INNER JOIN cve ON cve.cve_id = cve_cwe.cve_id
-        WHERE cve_cwe.cwe_id IN ({})
+        FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id
+        INNER JOIN cve ON cve.id = cve_cwe.cve_db_id
+        WHERE cve_cwe.cwe_id IN ({}){state_filter}
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT {} OFFSET {}
         "#,
@@ -2265,6 +2961,33 @@ fn cwe_model_sql(cwe_ids: &[i32], limit: u64, offset: u64) -> String {
         limit,
         offset
     )
+}
+
+fn cwe_count_sql(cwe_ids: &[i32], state_scope: CveStateScope) -> String {
+    if state_scope.includes_rejected() {
+        format!(
+            "SELECT COUNT(DISTINCT cve_db_id) AS count FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id WHERE cwe_id IN ({})",
+            cwe_id_list(cwe_ids)
+        )
+    } else {
+        format!(
+            r#"
+            SELECT COUNT(DISTINCT cve_cwe.cve_db_id) AS count
+            FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id
+            INNER JOIN cve ON cve.id = cve_cwe.cve_db_id
+            WHERE cve_cwe.cwe_id IN ({}) AND cve.state = 0
+            "#,
+            cwe_id_list(cwe_ids)
+        )
+    }
+}
+
+fn state_sql_filter(state_scope: CveStateScope, table_alias: &str) -> String {
+    if state_scope.includes_rejected() {
+        String::new()
+    } else {
+        format!(" AND {table_alias}.state = 0")
+    }
 }
 
 fn cwe_id_list(cwe_ids: &[i32]) -> String {
@@ -2443,7 +3166,7 @@ mod tests {
         let active_model = cve::ActiveModel::from(raw_record);
 
         assert_eq!(active_model.cve_id.unwrap(), "CVE-2024-0001");
-        assert_eq!(active_model.state.unwrap(), "PUBLISHED");
+        assert_eq!(active_model.state.unwrap(), PUBLISHED_STATE);
         assert_eq!(
             active_model.published_at.unwrap(),
             "2024-01-01T00:00:00+00:00"
@@ -2472,7 +3195,7 @@ mod tests {
         assert_eq!(models.cwe_rows.len(), 1);
 
         let cvss = models.cvss_rows.into_iter().next().unwrap();
-        assert_eq!(cvss.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(cvss.cve_db_id.unwrap(), 0);
         assert_eq!(cvss.version.unwrap(), "3.1");
         assert_eq!(cvss.base_score.unwrap(), Some(9.8));
         assert_eq!(cvss.base_severity.unwrap().as_deref(), Some("CRITICAL"));
@@ -2483,7 +3206,7 @@ mod tests {
         assert_eq!(cvss.raw_json.unwrap()["version"], "3.1");
 
         let affected = models.affected_rows.into_iter().next().unwrap();
-        assert_eq!(affected.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(affected.cve_db_id.unwrap(), 0);
         assert_eq!(affected.vendor.unwrap().as_deref(), Some("Example Vendor"));
         assert_eq!(
             affected.product.unwrap().as_deref(),
@@ -2496,7 +3219,7 @@ mod tests {
         assert_eq!(affected.raw_json.unwrap()["vendor"], "Example Vendor");
 
         let cwe = models.cwe_rows.into_iter().next().unwrap();
-        assert_eq!(cwe.cve_id.unwrap(), "CVE-2024-0001");
+        assert_eq!(cwe.cve_db_id.unwrap(), 0);
         assert_eq!(cwe.cwe_id.unwrap(), 79);
         let cwe_master = models.cwe_master_rows.into_iter().next().unwrap();
         assert_eq!(cwe_master.id.unwrap(), 79);
@@ -2550,7 +3273,7 @@ mod tests {
     fn test_summary(cve_id: &str, title: &str) -> CveSummary {
         CveSummary {
             cve_id: cve_id.to_owned(),
-            state: "PUBLISHED".to_owned(),
+            state: PUBLISHED_STATE,
             published_at: "2024-02-01T00:00:00+00:00".to_owned(),
             updated_at: "2024-02-02T00:00:00+00:00".to_owned(),
             title: title.to_owned(),
@@ -2572,8 +3295,9 @@ mod tests {
             upsert_cve(
                 &db,
                 cve::ActiveModel {
+                    id: Default::default(),
                     cve_id: Set("CVE-2026-0001".to_owned()),
-                    state: Set("PUBLISHED".to_owned()),
+                    state: Set(PUBLISHED_STATE),
                     published_at: Set("2026-01-01T00:00:00Z".to_owned()),
                     updated_at: Set("2026-01-02T00:00:00Z".to_owned()),
                     serial: Set(1),
@@ -2589,7 +3313,7 @@ mod tests {
                 &db,
                 "CVE-2026-0001",
                 vec![cve_cvss::ActiveModel {
-                    cve_id: Set("CVE-2026-0001".to_owned()),
+                    cve_db_id: Set(0),
                     version: Set("3.1".to_owned()),
                     base_score: Set(Some(9.8)),
                     base_severity: Set(Some("CRITICAL".to_owned())),
@@ -2599,14 +3323,14 @@ mod tests {
                     ..Default::default()
                 }],
                 vec![cve_affected::ActiveModel {
-                    cve_id: Set("CVE-2026-0001".to_owned()),
+                    cve_db_id: Set(0),
                     vendor: Set(Some("Example Vendor".to_owned())),
                     product: Set(Some("Example Product".to_owned())),
                     raw_json: Set(json!({"vendor": "Example Vendor"})),
                     ..Default::default()
                 }],
                 vec![cve_cwe::ActiveModel {
-                    cve_id: Set("CVE-2026-0001".to_owned()),
+                    cve_db_id: Set(0),
                     cwe_id: Set(79),
                 }],
             )
@@ -2615,7 +3339,7 @@ mod tests {
 
             let found = find_cve_by_id(&db, "CVE-2026-0001").await.unwrap().unwrap();
             assert_eq!(found.cve_id, "CVE-2026-0001");
-            assert_eq!(found.state, "PUBLISHED");
+            assert_eq!(found.state, PUBLISHED_STATE);
             assert_eq!(found.published_at, "2026-01-01T00:00:00Z");
             assert_eq!(found.updated_at, "2026-01-02T00:00:00Z");
             assert_eq!(found.serial, 1);
@@ -2636,6 +3360,71 @@ mod tests {
 
             let affected_count = cve_affected::Entity::find().count(&db).await.unwrap();
             assert_eq!(affected_count, 1);
+        });
+    }
+
+    #[test]
+    fn cve_summary_search_defaults_to_published_only() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+
+            for (cve_id, state, state_label) in [
+                ("CVE-2026-1000", PUBLISHED_STATE, "PUBLISHED"),
+                ("CVE-2026-1001", REJECTED_STATE, "REJECTED"),
+            ] {
+                db.upsert_cve(cve::ActiveModel {
+                    id: Default::default(),
+                    cve_id: Set(cve_id.to_owned()),
+                    state: Set(state),
+                    published_at: Set("2026-01-01T00:00:00Z".to_owned()),
+                    updated_at: Set("2026-01-02T00:00:00Z".to_owned()),
+                    serial: Set(1),
+                    title: Set(format!("{state_label} example")),
+                    description_en: Set(Some("description".to_owned())),
+                    raw_json: Set(json!({"id": cve_id, "state": state_label})),
+                })
+                .await
+                .unwrap();
+            }
+
+            let default = db
+                .search_cve_summaries_by_cve_id_prefix("CVE-2026-100", 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(default.len(), 1);
+            assert_eq!(default[0].state, PUBLISHED_STATE);
+
+            let including_rejected = db
+                .search_cve_summaries_by_cve_id_prefix_with_state_scope(
+                    "CVE-2026-100",
+                    CveStateScope::IncludeRejected,
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(including_rejected.len(), 2);
+
+            let default_count = db
+                .count_cve_summaries_by_cve_id_prefix("CVE-2026-100")
+                .await
+                .unwrap();
+            assert_eq!(default_count, 1);
+
+            let including_rejected_count = db
+                .count_cve_summaries_by_cve_id_prefix_with_state_scope(
+                    "CVE-2026-100",
+                    CveStateScope::IncludeRejected,
+                )
+                .await
+                .unwrap();
+            assert_eq!(including_rejected_count, 2);
         });
     }
 
@@ -2674,7 +3463,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 vec![cve_cwe::ActiveModel {
-                    cve_id: Set("CVE-2024-0001".to_owned()),
+                    cve_db_id: Set(0),
                     cwe_id: Set(79),
                 }],
             )

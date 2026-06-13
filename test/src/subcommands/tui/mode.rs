@@ -1,4 +1,4 @@
-use qanvuli_db::{CveDatabase, CveSummary};
+use qanvuli_db::{CveDatabase, CveStateScope, CveSummary};
 use ratatui::style::Color;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,47 +42,97 @@ impl SearchMode {
         self,
         db: &CveDatabase,
         query: &str,
+        state_scope: CveStateScope,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, String> {
         match self {
             Self::FreeText => {
-                db.search_cve_summaries_free_text(query, limit, offset)
-                    .await
+                db.search_cve_summaries_free_text_with_state_scope(
+                    query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
+                .await
             }
             Self::Product => {
-                db.search_cve_summaries_by_vendor_product(None, Some(query), limit, offset)
-                    .await
+                db.search_cve_summaries_by_vendor_product_with_state_scope(
+                    None,
+                    Some(query),
+                    state_scope,
+                    limit,
+                    offset,
+                )
+                .await
             }
             Self::Vendor => {
-                db.search_cve_summaries_by_vendor_product(Some(query), None, limit, offset)
-                    .await
+                db.search_cve_summaries_by_vendor_product_with_state_scope(
+                    Some(query),
+                    None,
+                    state_scope,
+                    limit,
+                    offset,
+                )
+                .await
             }
             Self::Cwe => {
-                db.search_cve_summaries_by_cwe(&[query.to_owned()], limit, offset)
-                    .await
+                db.search_cve_summaries_by_cwe_with_state_scope(
+                    &[query.to_owned()],
+                    state_scope,
+                    limit,
+                    offset,
+                )
+                .await
             }
             Self::Cve => {
-                db.search_cve_summaries_by_cve_id_prefix(query, limit, offset)
-                    .await
+                db.search_cve_summaries_by_cve_id_prefix_with_state_scope(
+                    query,
+                    state_scope,
+                    limit,
+                    offset,
+                )
+                .await
             }
         }
         .map_err(|err| err.to_string())
     }
 
-    pub(super) async fn count(self, db: &CveDatabase, query: &str) -> Result<u64, String> {
+    pub(super) async fn count(
+        self,
+        db: &CveDatabase,
+        query: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, String> {
         match self {
-            Self::FreeText => db.count_cve_summaries_free_text(query).await,
-            Self::Product => {
-                db.count_cve_summaries_by_vendor_product(None, Some(query))
+            Self::FreeText => {
+                db.count_cve_summaries_free_text_with_state_scope(query, state_scope)
                     .await
+            }
+            Self::Product => {
+                db.count_cve_summaries_by_vendor_product_with_state_scope(
+                    None,
+                    Some(query),
+                    state_scope,
+                )
+                .await
             }
             Self::Vendor => {
-                db.count_cve_summaries_by_vendor_product(Some(query), None)
+                db.count_cve_summaries_by_vendor_product_with_state_scope(
+                    Some(query),
+                    None,
+                    state_scope,
+                )
+                .await
+            }
+            Self::Cwe => {
+                db.count_cve_summaries_by_cwe_with_state_scope(&[query.to_owned()], state_scope)
                     .await
             }
-            Self::Cwe => db.count_cve_summaries_by_cwe(&[query.to_owned()]).await,
-            Self::Cve => db.count_cve_summaries_by_cve_id_prefix(query).await,
+            Self::Cve => {
+                db.count_cve_summaries_by_cve_id_prefix_with_state_scope(query, state_scope)
+                    .await
+            }
         }
         .map_err(|err| err.to_string())
     }

@@ -116,6 +116,7 @@ async fn run_loop(
             }
             KeyCode::F(1) => app.show_help = true,
             KeyCode::F(3) => app.show_advanced = true,
+            KeyCode::F(4) => app.toggle_state_scope(),
             KeyCode::Enter => app.start_search(db.clone()),
             KeyCode::Tab => app.toggle_focus(),
             KeyCode::Left => app.focus_left(),

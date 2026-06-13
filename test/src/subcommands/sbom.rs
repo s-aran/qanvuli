@@ -1,5 +1,5 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
-use qanvuli_db::CveSummary;
+use qanvuli_db::{CveStateScope, CveSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -17,6 +17,8 @@ pub struct Args {
     updated_since: Option<String>,
     #[arg(long)]
     per_package_limit: Option<u64>,
+    #[arg(long)]
+    include_rejected: bool,
 }
 
 impl Args {
@@ -41,15 +43,21 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let packages = load_sbom_packages(args.path()?)?;
     let mut findings = BTreeMap::<String, SbomFinding>::new();
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
+    let state_scope = if args.include_rejected {
+        CveStateScope::IncludeRejected
+    } else {
+        CveStateScope::PublishedOnly
+    };
 
     for package in packages {
         for component in package.search_names() {
             let cves = db
-                .search_cve_summaries_by_affected_component(
+                .search_cve_summaries_by_affected_component_with_state_scope(
                     None,
                     &component,
                     date_filter.published_since.as_deref(),
                     date_filter.updated_since.as_deref(),
+                    state_scope,
                     per_package_limit,
                     0,
                 )

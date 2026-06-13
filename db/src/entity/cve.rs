@@ -5,10 +5,11 @@ use sea_orm::entity::prelude::*;
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq)]
 #[sea_orm(table_name = "cve")]
 pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
+    #[sea_orm(primary_key)]
+    pub id: i32,
+    #[sea_orm(column_type = "Text", unique)]
     pub cve_id: String,
-    #[sea_orm(column_type = "Text")]
-    pub state: String,
+    pub state: i32,
     #[sea_orm(column_type = "Text")]
     pub published_at: String,
     #[sea_orm(column_type = "Text")]

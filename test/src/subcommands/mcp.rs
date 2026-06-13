@@ -1,8 +1,8 @@
 use super::common::{IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip};
 use qanvuli_db::entity::cve;
-use qanvuli_db::{CveDatabase, CveSummary};
+use qanvuli_db::{CveDatabase, CveStateScope, CveSummary, cve_state_label};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use simd_json::{Value, json};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
@@ -25,6 +25,7 @@ struct CweArgs {
     cwe_id: Option<CweArgValue>,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +50,7 @@ struct ProductArgs {
     product: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +58,7 @@ struct TextArgs {
     query: String,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +74,7 @@ struct CvssArgs {
     version: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +85,7 @@ struct ProductCvssArgs {
     severity: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +94,7 @@ struct DateArgs {
     updated_since: Option<String>,
     limit: Option<u64>,
     offset: Option<u64>,
+    include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,9 +203,10 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
             let args: CweArgs = parse_args(args)?;
             let limit = limit(args.limit);
             let offset = offset(args.offset);
+            let state_scope = state_scope(args.include_rejected);
             let cwe_ids = args.search_values();
             let cves = db
-                .search_cve_summaries_by_cwe(&cwe_ids, limit, offset)
+                .search_cve_summaries_by_cwe_with_state_scope(&cwe_ids, state_scope, limit, offset)
                 .await
                 .map_err(|err| err.to_string())?;
             json!(summaries(cves))
@@ -207,9 +214,10 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
         "search_by_product" => {
             let args: ProductArgs = parse_args(args)?;
             let cves = db
-                .search_cve_summaries_by_vendor_product(
+                .search_cve_summaries_by_vendor_product_with_state_scope(
                     args.vendor.as_deref(),
                     args.product.as_deref(),
+                    state_scope(args.include_rejected),
                     limit(args.limit),
                     offset(args.offset),
                 )
@@ -220,7 +228,12 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
         "search_text" => {
             let args: TextArgs = parse_args(args)?;
             let cves = db
-                .search_cve_summaries_by_text(&args.query, limit(args.limit), offset(args.offset))
+                .search_cve_summaries_by_text_with_state_scope(
+                    &args.query,
+                    state_scope(args.include_rejected),
+                    limit(args.limit),
+                    offset(args.offset),
+                )
                 .await
                 .map_err(|err| err.to_string())?;
             json!(summaries(cves))
@@ -228,11 +241,12 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
         "search_by_cvss" => {
             let args: CvssArgs = parse_args(args)?;
             let cves = db
-                .search_cve_summaries_by_cvss(
+                .search_cve_summaries_by_cvss_with_state_scope(
                     args.min_score,
                     args.max_score,
                     args.severity.as_deref(),
                     args.version.as_deref(),
+                    state_scope(args.include_rejected),
                     limit(args.limit),
                     offset(args.offset),
                 )
@@ -243,11 +257,12 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
         "search_product_by_cvss" => {
             let args: ProductCvssArgs = parse_args(args)?;
             let cves = db
-                .search_cve_summaries_by_product_cvss(
+                .search_cve_summaries_by_product_cvss_with_state_scope(
                     args.vendor.as_deref(),
                     args.product.as_deref(),
                     args.min_score,
                     args.severity.as_deref(),
+                    state_scope(args.include_rejected),
                     limit(args.limit),
                     offset(args.offset),
                 )
@@ -258,9 +273,10 @@ async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
         "search_recent" => {
             let args: DateArgs = parse_args(args)?;
             let cves = db
-                .search_cve_summaries_by_date(
+                .search_cve_summaries_by_date_with_state_scope(
                     args.published_since.as_deref(),
                     args.updated_since.as_deref(),
+                    state_scope(args.include_rejected),
                     limit(args.limit),
                     offset(args.offset),
                 )
@@ -346,6 +362,14 @@ fn offset(value: Option<u64>) -> u64 {
     value.unwrap_or(0)
 }
 
+fn state_scope(include_rejected: Option<bool>) -> CveStateScope {
+    if include_rejected.unwrap_or(false) {
+        CveStateScope::IncludeRejected
+    } else {
+        CveStateScope::PublishedOnly
+    }
+}
+
 fn summaries(cves: Vec<CveSummary>) -> Vec<Value> {
     cves.into_iter().map(summary).collect()
 }
@@ -353,7 +377,7 @@ fn summaries(cves: Vec<CveSummary>) -> Vec<Value> {
 fn summary(cve: CveSummary) -> Value {
     json!({
         "cve_id": cve.cve_id,
-        "state": cve.state,
+        "state": cve_state_label(cve.state),
         "published_at": cve.published_at,
         "updated_at": cve.updated_at,
         "title": cve.title,
@@ -364,7 +388,7 @@ fn summary(cve: CveSummary) -> Value {
 fn full_cve(cve: cve::Model) -> Value {
     json!({
         "cve_id": cve.cve_id,
-        "state": cve.state,
+        "state": cve_state_label(cve.state),
         "published_at": cve.published_at,
         "updated_at": cve.updated_at,
         "serial": cve.serial,
@@ -413,7 +437,8 @@ fn tools() -> Value {
                         "description": "Single CWE ID to match. Use cwe_ids for multiple values."
                     },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 }
             }
         },
@@ -426,7 +451,8 @@ fn tools() -> Value {
                     "vendor": { "type": "string", "description": "Affected vendor name or fragment." },
                     "product": { "type": "string", "description": "Affected product name or fragment." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 }
             }
         },
@@ -438,7 +464,8 @@ fn tools() -> Value {
                 "properties": {
                     "query": { "type": "string", "description": "Text to search for." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 },
                 "required": ["query"]
             }
@@ -454,7 +481,8 @@ fn tools() -> Value {
                     "severity": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"], "description": "CVSS base severity." },
                     "version": { "type": "string", "description": "CVSS version, for example 3.1 or 4.0." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 }
             }
         },
@@ -469,7 +497,8 @@ fn tools() -> Value {
                     "min_score": { "type": "number", "minimum": 0, "maximum": 10, "description": "Minimum CVSS base score." },
                     "severity": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"], "description": "CVSS base severity." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 }
             }
         },
@@ -482,7 +511,8 @@ fn tools() -> Value {
                     "published_since": { "type": "string", "description": "Only CVEs published at or after this timestamp, for example 2026-06-01T00:00:00Z." },
                     "updated_since": { "type": "string", "description": "Only CVEs updated at or after this timestamp, for example 2026-06-01T00:00:00Z." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 }
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
                 }
             }
         },

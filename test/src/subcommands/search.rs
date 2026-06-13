@@ -1,4 +1,5 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
+use qanvuli_db::{CveStateScope, cve_state_label};
 use serde_json::json;
 
 #[derive(Debug, Default, clap::Args)]
@@ -31,6 +32,8 @@ pub struct Args {
     limit: Option<u64>,
     #[arg(long)]
     offset: Option<u64>,
+    #[arg(long)]
+    include_rejected: bool,
 }
 
 impl Args {
@@ -68,7 +71,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         let cve = cve.map(|cve| {
             json!({
                 "cve_id": cve.cve_id,
-                "state": cve.state,
+                "state": cve_state_label(cve.state),
                 "published_at": cve.published_at,
                 "updated_at": cve.updated_at,
                 "serial": cve.serial,
@@ -86,40 +89,48 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
 
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let offset = args.offset.unwrap_or(0);
+    let state_scope = if args.include_rejected {
+        CveStateScope::IncludeRejected
+    } else {
+        CveStateScope::PublishedOnly
+    };
     let summaries = if let Some(query) = args.text.as_deref() {
-        db.search_cve_summaries_by_text(query, limit, offset)
+        db.search_cve_summaries_by_text_with_state_scope(query, state_scope, limit, offset)
             .await
             .map_err(|err| format!("failed to search text: {err}"))?
     } else if !args.cwe_ids.is_empty() {
-        db.search_cve_summaries_by_cwe(&args.cwe_ids, limit, offset)
+        db.search_cve_summaries_by_cwe_with_state_scope(&args.cwe_ids, state_scope, limit, offset)
             .await
             .map_err(|err| format!("failed to search CWE: {err}"))?
     } else if args.has_cvss_filter() {
-        db.search_cve_summaries_by_cvss(
+        db.search_cve_summaries_by_cvss_with_state_scope(
             args.min_score,
             args.max_score,
             args.severity.as_deref(),
             args.version.as_deref(),
+            state_scope,
             limit,
             offset,
         )
         .await
         .map_err(|err| format!("failed to search CVSS: {err}"))?
     } else if let Some(component) = args.component_name() {
-        db.search_cve_summaries_by_affected_component(
+        db.search_cve_summaries_by_affected_component_with_state_scope(
             args.vendor.as_deref(),
             component,
             date_filter.published_since.as_deref(),
             date_filter.updated_since.as_deref(),
+            state_scope,
             limit,
             offset,
         )
         .await
         .map_err(|err| format!("failed to search affected component: {err}"))?
     } else {
-        db.search_cve_summaries_by_date(
+        db.search_cve_summaries_by_date_with_state_scope(
             date_filter.published_since.as_deref(),
             date_filter.updated_since.as_deref(),
+            state_scope,
             limit,
             offset,
         )

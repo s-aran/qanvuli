@@ -7,8 +7,7 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    #[sea_orm(column_type = "Text")]
-    pub cve_id: String,
+    pub cve_db_id: i32,
     #[sea_orm(column_type = "Text")]
     pub version: String,
     pub base_score: Option<f64>,
@@ -26,8 +25,8 @@ pub struct Model {
 pub enum Relation {
     #[sea_orm(
         belongs_to = "super::cve::Entity",
-        from = "Column::CveId",
-        to = "super::cve::Column::CveId",
+        from = "Column::CveDbId",
+        to = "super::cve::Column::Id",
         on_update = "NoAction",
         on_delete = "Cascade"
     )]

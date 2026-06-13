@@ -15,6 +15,8 @@ impl MigratorTrait for Migrator {
             Box::new(M20260610OptimizeCweSearch),
             Box::new(M20260610CreateCveSearchFts),
             Box::new(M20260612OptimizeDetailLookup),
+            Box::new(M20260613DropDuplicateReadJsonFileUniqueIndex),
+            Box::new(M20260614RekeyCveTables),
         ]
     }
 }
@@ -113,9 +115,9 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .if_not_exists()
             .to_owned(),
         Index::create()
-            .name("idx_cve_cvss_cve_id")
+            .name("idx_cve_cvss_cve_db_id")
             .table(cve_cvss::Entity)
-            .col(cve_cvss::Column::CveId)
+            .col(cve_cvss::Column::CveDbId)
             .if_not_exists()
             .to_owned(),
         Index::create()
@@ -131,9 +133,9 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .if_not_exists()
             .to_owned(),
         Index::create()
-            .name("idx_cve_affected_cve_id")
+            .name("idx_cve_affected_cve_db_id")
             .table(cve_affected::Entity)
-            .col(cve_affected::Column::CveId)
+            .col(cve_affected::Column::CveDbId)
             .if_not_exists()
             .to_owned(),
         Index::create()
@@ -155,9 +157,9 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .if_not_exists()
             .to_owned(),
         Index::create()
-            .name("idx_cve_cwe_cve_id")
+            .name("idx_cve_cwe_cve_db_id")
             .table(cve_cwe::Entity)
-            .col(cve_cwe::Column::CveId)
+            .col(cve_cwe::Column::CveDbId)
             .if_not_exists()
             .to_owned(),
         Index::create()
@@ -167,10 +169,10 @@ fn index_statements() -> Vec<IndexCreateStatement> {
             .if_not_exists()
             .to_owned(),
         Index::create()
-            .name("idx_cve_cwe_cwe_id_cve_id")
+            .name("idx_cve_cwe_cwe_id_cve_db_id")
             .table(cve_cwe::Entity)
             .col(cve_cwe::Column::CweId)
-            .col(cve_cwe::Column::CveId)
+            .col(cve_cwe::Column::CveDbId)
             .if_not_exists()
             .to_owned(),
         Index::create()
@@ -229,14 +231,6 @@ fn read_json_file_index_statements() -> Vec<IndexCreateStatement> {
             .name("idx_read_json_file_filename")
             .table(read_json_file::Entity)
             .col(read_json_file::Column::Filename)
-            .if_not_exists()
-            .to_owned(),
-        Index::create()
-            .name("idx_read_json_file_filename_md5hash_unique")
-            .table(read_json_file::Entity)
-            .col(read_json_file::Column::Filename)
-            .col(read_json_file::Column::Md5hash)
-            .unique()
             .if_not_exists()
             .to_owned(),
     ]
@@ -424,6 +418,13 @@ impl MigrationTrait for M20260609CreateCweMaster {
         if !manager.has_table("cve_cwe").await? {
             return Ok(());
         }
+        if !manager.has_column("cve_cwe", "cve_id").await? {
+            manager
+                .get_connection()
+                .execute_unprepared("DROP TABLE IF EXISTS cwe")
+                .await?;
+            return Ok(());
+        }
 
         let db = manager.get_connection();
         db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
@@ -540,7 +541,7 @@ where
                 ''
             )
         FROM cve
-        LEFT JOIN cve_affected ON cve_affected.cve_id = cve.cve_id
+        LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
         GROUP BY cve.cve_id
         "#,
     )
@@ -554,10 +555,10 @@ impl MigrationTrait for M20260610OptimizeCweSearch {
         manager
             .create_index(
                 Index::create()
-                    .name("idx_cve_cwe_cwe_id_cve_id")
+                    .name("idx_cve_cwe_cwe_id_cve_db_id")
                     .table(cve_cwe::Entity)
                     .col(cve_cwe::Column::CweId)
-                    .col(cve_cwe::Column::CveId)
+                    .col(cve_cwe::Column::CveDbId)
                     .if_not_exists()
                     .to_owned(),
             )
@@ -568,7 +569,7 @@ impl MigrationTrait for M20260610OptimizeCweSearch {
         manager
             .drop_index(
                 Index::drop()
-                    .name("idx_cve_cwe_cwe_id_cve_id")
+                    .name("idx_cve_cwe_cwe_id_cve_db_id")
                     .table(cve_cwe::Entity)
                     .if_exists()
                     .to_owned(),
@@ -598,11 +599,11 @@ impl MigrationTrait for M20260612OptimizeDetailLookup {
         for (table, index_name) in [
             (
                 cve_cvss::Entity.table_ref(),
-                "idx_cve_cvss_cve_id_score_version",
+                "idx_cve_cvss_cve_db_id_score_version",
             ),
             (
                 cve_affected::Entity.table_ref(),
-                "idx_cve_affected_cve_id_vendor_product",
+                "idx_cve_affected_cve_db_id_vendor_product",
             ),
         ] {
             manager
@@ -622,20 +623,255 @@ impl MigrationTrait for M20260612OptimizeDetailLookup {
 fn detail_lookup_index_statements() -> Vec<IndexCreateStatement> {
     vec![
         Index::create()
-            .name("idx_cve_cvss_cve_id_score_version")
+            .name("idx_cve_cvss_cve_db_id_score_version")
             .table(cve_cvss::Entity)
-            .col(cve_cvss::Column::CveId)
+            .col(cve_cvss::Column::CveDbId)
             .col(cve_cvss::Column::BaseScore)
             .col(cve_cvss::Column::Version)
             .if_not_exists()
             .to_owned(),
         Index::create()
-            .name("idx_cve_affected_cve_id_vendor_product")
+            .name("idx_cve_affected_cve_db_id_vendor_product")
             .table(cve_affected::Entity)
-            .col(cve_affected::Column::CveId)
+            .col(cve_affected::Column::CveDbId)
             .col(cve_affected::Column::Vendor)
             .col(cve_affected::Column::Product)
             .if_not_exists()
             .to_owned(),
     ]
+}
+
+pub struct M20260613DropDuplicateReadJsonFileUniqueIndex;
+
+impl MigrationName for M20260613DropDuplicateReadJsonFileUniqueIndex {
+    fn name(&self) -> &str {
+        "m20260613_drop_duplicate_read_json_file_unique_index"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260613DropDuplicateReadJsonFileUniqueIndex {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_index(
+                Index::drop()
+                    .name("idx_read_json_file_filename_md5hash_unique")
+                    .table(read_json_file::Entity)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_read_json_file_filename_md5hash_unique")
+                    .table(read_json_file::Entity)
+                    .col(read_json_file::Column::Filename)
+                    .col(read_json_file::Column::Md5hash)
+                    .unique()
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+}
+
+pub struct M20260614RekeyCveTables;
+
+impl MigrationName for M20260614RekeyCveTables {
+    fn name(&self) -> &str {
+        "m20260614_rekey_cve_tables"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260614RekeyCveTables {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        if manager.has_column("cve", "id").await? {
+            return Ok(());
+        }
+
+        let db = manager.get_connection();
+        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+        db.execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
+            .await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE cve_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cve_id TEXT NOT NULL UNIQUE,
+                state INTEGER NOT NULL,
+                published_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                serial INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                description_en TEXT,
+                raw_json TEXT NOT NULL
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT INTO cve_new (
+                cve_id, state, published_at, updated_at, serial, title, description_en, raw_json
+            )
+            SELECT
+                cve_id,
+                CASE WHEN state = 'REJECTED' THEN 1 ELSE 0 END,
+                published_at,
+                updated_at,
+                serial,
+                title,
+                description_en,
+                raw_json
+            FROM cve
+            ORDER BY cve_id
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE cve_cvss_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cve_db_id INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                base_score REAL,
+                base_severity TEXT,
+                vector_string TEXT,
+                source TEXT,
+                raw_json TEXT NOT NULL,
+                FOREIGN KEY (cve_db_id) REFERENCES cve(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT INTO cve_cvss_new (
+                cve_db_id, version, base_score, base_severity, vector_string, source, raw_json
+            )
+            SELECT
+                cve_new.id,
+                cve_cvss.version,
+                cve_cvss.base_score,
+                cve_cvss.base_severity,
+                cve_cvss.vector_string,
+                cve_cvss.source,
+                cve_cvss.raw_json
+            FROM cve_cvss
+            INNER JOIN cve_new ON cve_new.cve_id = cve_cvss.cve_id
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE cve_affected_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cve_db_id INTEGER NOT NULL,
+                vendor TEXT,
+                product TEXT,
+                package_name TEXT,
+                collection_url TEXT,
+                default_status TEXT,
+                raw_json TEXT NOT NULL,
+                FOREIGN KEY (cve_db_id) REFERENCES cve(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT INTO cve_affected_new (
+                cve_db_id, vendor, product, package_name, collection_url, default_status, raw_json
+            )
+            SELECT
+                cve_new.id,
+                cve_affected.vendor,
+                cve_affected.product,
+                cve_affected.package_name,
+                cve_affected.collection_url,
+                cve_affected.default_status,
+                cve_affected.raw_json
+            FROM cve_affected
+            INNER JOIN cve_new ON cve_new.cve_id = cve_affected.cve_id
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            CREATE TABLE cve_cwe_new (
+                cve_db_id INTEGER NOT NULL,
+                cwe_id INTEGER NOT NULL,
+                PRIMARY KEY (cve_db_id, cwe_id),
+                FOREIGN KEY (cve_db_id) REFERENCES cve(id) ON DELETE CASCADE,
+                FOREIGN KEY (cwe_id) REFERENCES cwe(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .await?;
+        db.execute_unprepared(
+            r#"
+            INSERT OR IGNORE INTO cve_cwe_new (cve_db_id, cwe_id)
+            SELECT cve_new.id, cve_cwe.cwe_id
+            FROM cve_cwe
+            INNER JOIN cve_new ON cve_new.cve_id = cve_cwe.cve_id
+            "#,
+        )
+        .await?;
+        for table in ["cve_cwe", "cve_affected", "cve_cvss", "cve"] {
+            db.execute_unprepared(&format!("DROP TABLE {table}"))
+                .await?;
+        }
+        db.execute_unprepared("ALTER TABLE cve_new RENAME TO cve")
+            .await?;
+        db.execute_unprepared("ALTER TABLE cve_cvss_new RENAME TO cve_cvss")
+            .await?;
+        db.execute_unprepared("ALTER TABLE cve_affected_new RENAME TO cve_affected")
+            .await?;
+        db.execute_unprepared("ALTER TABLE cve_cwe_new RENAME TO cve_cwe")
+            .await?;
+        recreate_cve_indexes(db).await?;
+        create_cve_search_fts(db).await?;
+        rebuild_cve_search_fts(db).await?;
+        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+        Ok(())
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}
+
+async fn recreate_cve_indexes<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve (published_at)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve (updated_at)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version ON cve_cvss (version)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_score ON cve_cvss (base_score)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_severity ON cve_cvss (base_severity)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss (base_severity, base_score)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version_score ON cve_cvss (version, base_score)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id_score_version ON cve_cvss (cve_db_id, base_score, version)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor ON cve_affected (vendor)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_product ON cve_affected (product)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_package ON cve_affected (package_name)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_db_id ON cve_cwe (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id ON cve_cwe (cwe_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve (published_at, cve_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve (updated_at, cve_id)",
+    ] {
+        db.execute_unprepared(sql).await?;
+    }
+    Ok(())
 }

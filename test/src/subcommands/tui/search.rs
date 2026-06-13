@@ -1,5 +1,5 @@
 use super::mode::SearchMode;
-use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveSummary};
+use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary};
 
 #[derive(Debug)]
 pub(super) struct SearchResult {
@@ -9,7 +9,11 @@ pub(super) struct SearchResult {
 
 #[derive(Clone, Debug)]
 pub(super) enum SearchRequest {
-    Mode { mode: SearchMode, query: String },
+    Mode {
+        mode: SearchMode,
+        query: String,
+        state_scope: CveStateScope,
+    },
     Advanced(CveAdvancedSearch),
 }
 
@@ -20,10 +24,14 @@ pub(super) async fn run_search_request(
     offset: u64,
 ) -> Result<SearchResult, String> {
     match request {
-        SearchRequest::Mode { mode, query } => {
+        SearchRequest::Mode {
+            mode,
+            query,
+            state_scope,
+        } => {
             let (rows, total) = tokio::try_join!(
-                mode.search(&db, &query, limit, offset),
-                mode.count(&db, &query)
+                mode.search(&db, &query, state_scope, limit, offset),
+                mode.count(&db, &query, state_scope)
             )?;
             Ok(SearchResult { rows, total })
         }

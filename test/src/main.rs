@@ -97,7 +97,7 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use qanvuli_db::{CveActiveModels, CveDatabase};
+    use qanvuli_db::{CveActiveModels, CveDatabase, cve_state_label};
     use qanvuli_models::parse_json_with_raw;
 
     const CNA_CVE_JSON: &str = r#"{
@@ -205,7 +205,7 @@ mod tests {
 
             let found = db.find_cve_by_id("CVE-2024-1000").await.unwrap().unwrap();
             assert_eq!(found.cve_id, "CVE-2024-1000");
-            assert_eq!(found.state, "PUBLISHED");
+            assert_eq!(cve_state_label(found.state), "PUBLISHED");
             assert_eq!(found.published_at, "2024-02-01T00:00:00+00:00");
             assert_eq!(found.updated_at, "2024-02-02T00:00:00+00:00");
             assert_eq!(found.serial, 7);

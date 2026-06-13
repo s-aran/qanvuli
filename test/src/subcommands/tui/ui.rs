@@ -1,8 +1,8 @@
 use super::{
     app::{App, PaneFocus},
-    form::{AdvancedField, AdvancedForm, SortOrderUi},
+    form::{AdvancedField, AdvancedForm, SortOrderUi, StateScopeUi},
 };
-use qanvuli_db::{CveDetail, CveSummary};
+use qanvuli_db::{CveDetail, CveSummary, cve_state_label};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -78,7 +78,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, left[1], &mut app.list_state);
 
-    let footer = Paragraph::new(app.search_mode.footer_text()).style(
+    let footer = Paragraph::new(format!(
+        "{} | State: {}",
+        app.search_mode.footer_text(),
+        app.state_scope.label()
+    ))
+    .style(
         Style::default()
             .fg(app.search_mode.color())
             .add_modifier(Modifier::BOLD),
@@ -138,6 +143,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Enter  Search current input"),
         Line::from("Tab    Switch pane focus"),
         Line::from("F3     Open advanced search"),
+        Line::from("F4     Toggle PUBLISHED only / include REJECTED"),
         Line::from("Shift+Tab Switch search mode"),
         Line::from("Left/Right Switch pane focus"),
         Line::from("Up/Down Move focused pane"),
@@ -172,6 +178,12 @@ fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         advanced_line(form, AdvancedField::Cwe, "CWE", &form.cwe),
         advanced_line(form, AdvancedField::Product, "Product", &form.product),
         advanced_line(form, AdvancedField::Vendor, "Vendor", &form.vendor),
+        advanced_line(
+            form,
+            AdvancedField::StateScope,
+            "State",
+            form.state_scope.label(),
+        ),
         advanced_line(
             form,
             AdvancedField::SortOrder,
@@ -240,7 +252,7 @@ fn detail_lines(cve: &CveSummary) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
             Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(cve.state.clone()),
+            Span::raw(cve_state_label(cve.state)),
         ]),
         Line::from(vec![
             Span::styled("Published: ", Style::default().add_modifier(Modifier::BOLD)),

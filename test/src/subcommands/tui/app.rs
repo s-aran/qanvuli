@@ -4,7 +4,7 @@ use super::{
     mode::SearchMode,
     search::{SearchRequest, SearchResult, run_search_request},
 };
-use qanvuli_db::{CveDatabase, CveDetail, CveSummary};
+use qanvuli_db::{CveDatabase, CveDetail, CveStateScope, CveSummary};
 use ratatui::widgets::ListState;
 use std::time::Instant;
 use tokio::task::JoinHandle;
@@ -14,6 +14,7 @@ const MIN_PAGE_SIZE: usize = 1;
 pub(super) struct App {
     pub(super) query: String,
     pub(super) search_mode: SearchMode,
+    pub(super) state_scope: CveStateScope,
     pub(super) advanced: AdvancedForm,
     pub(super) limit: u64,
     pub(super) results: Vec<CveSummary>,
@@ -59,6 +60,7 @@ impl App {
         Self {
             query,
             search_mode,
+            state_scope: CveStateScope::PublishedOnly,
             advanced: AdvancedForm::default(),
             limit,
             results: Vec::new(),
@@ -73,6 +75,7 @@ impl App {
             searched_request: SearchRequest::Mode {
                 mode: search_mode,
                 query: String::new(),
+                state_scope: CveStateScope::PublishedOnly,
             },
             detail_cve_id: None,
             loading_detail_cve_id: None,
@@ -93,6 +96,7 @@ impl App {
         let request = SearchRequest::Mode {
             mode: self.search_mode,
             query: self.query.clone(),
+            state_scope: self.state_scope,
         };
         let limit = self.limit;
         self.searched_request = request.clone();
@@ -373,6 +377,13 @@ impl App {
 
     pub(super) fn next_search_mode(&mut self) {
         self.search_mode = self.search_mode.next();
+    }
+
+    pub(super) fn toggle_state_scope(&mut self) {
+        self.state_scope = match self.state_scope {
+            CveStateScope::PublishedOnly => CveStateScope::IncludeRejected,
+            CveStateScope::IncludeRejected => CveStateScope::PublishedOnly,
+        };
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {
