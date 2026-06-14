@@ -4,7 +4,7 @@ use super::{
     mode::SearchMode,
     search::{SearchRequest, SearchResult, run_search_request},
 };
-use qanvuli_db::{CveDatabase, CveDetail, CveStateScope, CveSummary};
+use qanvuli_db::{CveDatabase, CveStateScope, CveSummaryWithDetail};
 use ratatui::widgets::ListState;
 use std::time::Instant;
 use tokio::task::JoinHandle;
@@ -17,18 +17,14 @@ pub(super) struct App {
     pub(super) state_scope: CveStateScope,
     pub(super) advanced: AdvancedForm,
     pub(super) limit: u64,
-    pub(super) results: Vec<CveSummary>,
+    pub(super) results: Vec<CveSummaryWithDetail>,
     pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
-    pub(super) detail: Option<CveDetail>,
     pub(super) detail_scroll: u16,
     search: Option<PendingSearch>,
-    detail_search: Option<JoinHandle<Result<CveDetail, String>>>,
     search_started_at: Option<Instant>,
     searched_request: SearchRequest,
-    detail_cve_id: Option<String>,
-    loading_detail_cve_id: Option<String>,
     exhausted: bool,
     left_page_size: usize,
     right_page_size: usize,
@@ -67,18 +63,14 @@ impl App {
             total_results: None,
             list_state,
             focus: PaneFocus::Left,
-            detail: None,
             detail_scroll: 0,
             search: None,
-            detail_search: None,
             search_started_at: None,
             searched_request: SearchRequest::Mode {
                 mode: search_mode,
                 query: String::new(),
                 state_scope: CveStateScope::PublishedOnly,
             },
-            detail_cve_id: None,
-            loading_detail_cve_id: None,
             exhausted: false,
             left_page_size: 10,
             right_page_size: 10,
@@ -206,78 +198,21 @@ impl App {
         Ok(())
     }
 
-    pub(super) async fn poll_detail(&mut self) -> Result<(), String> {
-        let Some(search) = self.detail_search.as_ref() else {
-            return Ok(());
-        };
-        if !search.is_finished() {
-            return Ok(());
-        }
-
-        let search = self
-            .detail_search
-            .take()
-            .expect("detail handle disappeared");
-        self.detail = Some(
-            search
-                .await
-                .map_err(|err| format!("failed to join detail task: {err}"))??,
-        );
-        self.detail_cve_id = self.loading_detail_cve_id.take();
-        self.detail_scroll = 0;
-        Ok(())
-    }
-
-    pub(super) fn ensure_detail_for_selection(&mut self, db: CveDatabase) {
-        let Some(cve_id) = self.selected().map(|cve| cve.cve_id.clone()) else {
-            self.clear_detail();
-            return;
-        };
-        if self.detail_cve_id.as_deref() == Some(cve_id.as_str())
-            || self.loading_detail_cve_id.as_deref() == Some(cve_id.as_str())
-        {
-            return;
-        }
-        if let Some(search) = self.detail_search.take() {
-            search.abort();
-        }
-        self.detail = None;
-        self.detail_scroll = 0;
-        self.detail_cve_id = None;
-        self.loading_detail_cve_id = Some(cve_id.clone());
-        self.detail_search = Some(tokio::spawn(async move {
-            db.find_cve_detail(&cve_id)
-                .await
-                .map_err(|err| format!("failed to load CVE detail: {err}"))
-        }));
-    }
-
     pub(super) fn searching(&self) -> bool {
         self.search.is_some()
-    }
-
-    pub(super) fn loading_detail(&self) -> bool {
-        self.detail_search.is_some()
     }
 
     pub(super) fn detail_status(&self) -> &'static str {
         if self.selected().is_none() {
             "Detail: no selection"
-        } else if self.detail_search.is_some() {
-            "Detail: loading"
-        } else if self.detail.is_some() {
-            "Detail: loaded"
         } else {
-            "Detail: pending"
+            "Detail: loaded"
         }
     }
 
     pub(super) fn abort_search(&mut self) {
         if let Some(search) = self.search.take() {
             search.handle.abort();
-        }
-        if let Some(search) = self.detail_search.take() {
-            search.abort();
         }
         self.search_started_at = None;
     }
@@ -291,7 +226,7 @@ impl App {
         FRAMES[frame % FRAMES.len()]
     }
 
-    pub(super) fn selected(&self) -> Option<&CveSummary> {
+    pub(super) fn selected(&self) -> Option<&CveSummaryWithDetail> {
         self.list_state
             .selected()
             .and_then(|index| self.results.get(index))
@@ -484,13 +419,7 @@ impl App {
     }
 
     fn clear_detail(&mut self) {
-        if let Some(search) = self.detail_search.take() {
-            search.abort();
-        }
-        self.detail = None;
         self.detail_scroll = 0;
-        self.detail_cve_id = None;
-        self.loading_detail_cve_id = None;
     }
 }
 
@@ -506,8 +435,9 @@ enum PageAmount {
     Full,
 }
 
-fn detail_line_count(cve: &CveSummary) -> usize {
+fn detail_line_count(cve: &CveSummaryWithDetail) -> usize {
     let description_lines = cve
+        .summary
         .description_en
         .as_deref()
         .map(|description| description.lines().count().max(1))

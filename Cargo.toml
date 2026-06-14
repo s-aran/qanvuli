@@ -7,9 +7,9 @@ version = "0.1.0"
 default-members = ["app"]
 members = [
     "app",
-    "app-commands",
-    "app-mcp",
-    "app-tui",
+    "app/crates/commands",
+    "app/crates/mcp",
+    "app/crates/tui",
     "collector",
     "core",
     "db",

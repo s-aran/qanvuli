@@ -1,9 +1,9 @@
 use super::mode::SearchMode;
-use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary};
+use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveStateScope, CveSummaryWithDetail};
 
 #[derive(Debug)]
 pub(super) struct SearchResult {
-    pub(super) rows: Vec<CveSummary>,
+    pub(super) rows: Vec<CveSummaryWithDetail>,
     pub(super) total: u64,
 }
 
@@ -30,7 +30,12 @@ pub(super) async fn run_search_request(
             state_scope,
         } => {
             let (rows, total) = tokio::try_join!(
-                mode.search(&db, &query, state_scope, limit, offset),
+                async {
+                    let rows = mode.search(&db, &query, state_scope, limit, offset).await?;
+                    db.attach_cve_details(rows)
+                        .await
+                        .map_err(|err| err.to_string())
+                },
                 mode.count(&db, &query, state_scope)
             )?;
             Ok(SearchResult { rows, total })
@@ -38,7 +43,11 @@ pub(super) async fn run_search_request(
         SearchRequest::Advanced(options) => {
             let (rows, total) = tokio::try_join!(
                 async {
-                    db.search_cve_summaries_advanced(&options, limit, offset)
+                    let rows = db
+                        .search_cve_summaries_advanced(&options, limit, offset)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    db.attach_cve_details(rows)
                         .await
                         .map_err(|err| err.to_string())
                 },

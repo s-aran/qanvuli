@@ -2,7 +2,7 @@ use super::{
     app::{App, PaneFocus},
     form::{AdvancedField, AdvancedForm, SortOrderUi, StateScopeUi},
 };
-use qanvuli_db::{CveDetail, CveSummary, cve_state_label};
+use qanvuli_db::{CveDetail, CveSummaryWithDetail, cve_state_label};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -56,8 +56,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .iter()
         .map(|cve| {
             ListItem::new(vec![
-                Line::from(Span::raw(cve.cve_id.clone())),
-                Line::from(Span::raw(cve.title.clone())),
+                Line::from(Span::raw(cve.summary.cve_id.clone())),
+                Line::from(Span::raw(cve.summary.title.clone())),
             ])
         })
         .collect::<Vec<_>>();
@@ -97,7 +97,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.clamp_detail_scroll_to_lines(detail.len());
     let detail_title = app
         .selected()
-        .map(|cve| cve.cve_id.as_str())
+        .map(|cve| cve.summary.cve_id.as_str())
         .unwrap_or("CVE");
     let detail = Paragraph::new(detail)
         .block(
@@ -110,7 +110,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(detail, right[0]);
 
-    let metadata = Paragraph::new(metadata_lines(app.detail.as_ref()))
+    let metadata = Paragraph::new(metadata_lines(app.selected().map(|cve| &cve.detail)))
         .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(metadata, right[1]);
@@ -251,7 +251,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn detail_lines(cve: &CveSummary) -> Vec<Line<'static>> {
+fn detail_lines(cve: &CveSummaryWithDetail) -> Vec<Line<'static>> {
+    let cve = &cve.summary;
     vec![
         Line::from(vec![
             Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),

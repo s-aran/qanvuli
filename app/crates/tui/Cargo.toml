@@ -4,8 +4,8 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-qanvuli-app-commands = { version = "*", path = "../app-commands" }
-qanvuli-db = { version = "*", path = "../db" }
+qanvuli-app-commands = { version = "*", path = "../commands" }
+qanvuli-db = { version = "*", path = "../../../db" }
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 ratatui = "0.30"

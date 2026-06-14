@@ -65,9 +65,21 @@ pub struct CveSummary {
     pub description_en: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct CveSummaryWithDetail {
+    pub summary: CveSummary,
+    pub detail: CveDetail,
+}
+
 #[derive(Clone, Debug, FromQueryResult)]
 struct CveIdMapping {
     id: i32,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CveDbIdByCveId {
+    id: i32,
+    cve_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -99,6 +111,33 @@ pub struct CveAffectedDetail {
     pub package_name: Option<String>,
     pub collection_url: Option<String>,
     pub default_status: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CveCweDetailRow {
+    cve_db_id: i32,
+    id: i32,
+    description: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CveCvssDetailRow {
+    cve_db_id: i32,
+    version: String,
+    base_score: Option<f64>,
+    base_severity: Option<String>,
+    vector_string: Option<String>,
+    source: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CveAffectedDetailRow {
+    cve_db_id: i32,
+    vendor: Option<String>,
+    product: Option<String>,
+    package_name: Option<String>,
+    collection_url: Option<String>,
+    default_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -626,6 +665,130 @@ impl CveDatabase {
             cvss,
             affected,
         })
+    }
+
+    pub async fn attach_cve_details(
+        &self,
+        rows: Vec<CveSummary>,
+    ) -> Result<Vec<CveSummaryWithDetail>, DbErr> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cve_ids = rows
+            .iter()
+            .map(|row| row.cve_id.clone())
+            .collect::<Vec<_>>();
+        let id_rows = cve::Entity::find()
+            .select_only()
+            .columns([cve::Column::Id, cve::Column::CveId])
+            .filter(cve::Column::CveId.is_in(cve_ids))
+            .into_model::<CveDbIdByCveId>()
+            .all(&self.db)
+            .await?;
+        let cve_db_ids = id_rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let cve_id_by_db_id = id_rows
+            .iter()
+            .map(|row| (row.id, row.cve_id.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let mut detail_by_cve_id = id_rows
+            .into_iter()
+            .map(|row| (row.cve_id, CveDetail::default()))
+            .collect::<HashMap<_, _>>();
+
+        let cwes = cve_cwe::Entity::find()
+            .select_only()
+            .column(cve_cwe::Column::CveDbId)
+            .column_as(cve_cwe::Column::CweId, "id")
+            .column_as(cwe::Column::Description, "description")
+            .inner_join(cwe::Entity)
+            .filter(cve_cwe::Column::CveDbId.is_in(cve_db_ids.clone()))
+            .order_by_asc(cve_cwe::Column::CveDbId)
+            .order_by_asc(cve_cwe::Column::CweId)
+            .into_model::<CveCweDetailRow>()
+            .all(&self.db)
+            .await?;
+        for cwe in cwes {
+            if let Some(cve_id) = cve_id_by_db_id.get(&cwe.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.cwes.push(CveCweDetail {
+                    id: cwe.id,
+                    description: cwe.description,
+                });
+            }
+        }
+
+        let cvss = cve_cvss::Entity::find()
+            .select_only()
+            .column(cve_cvss::Column::CveDbId)
+            .columns([
+                cve_cvss::Column::Version,
+                cve_cvss::Column::BaseScore,
+                cve_cvss::Column::BaseSeverity,
+                cve_cvss::Column::VectorString,
+                cve_cvss::Column::Source,
+            ])
+            .filter(cve_cvss::Column::CveDbId.is_in(cve_db_ids.clone()))
+            .order_by_asc(cve_cvss::Column::CveDbId)
+            .order_by_desc(cve_cvss::Column::BaseScore)
+            .order_by_asc(cve_cvss::Column::Version)
+            .into_model::<CveCvssDetailRow>()
+            .all(&self.db)
+            .await?;
+        for cvss in cvss {
+            if let Some(cve_id) = cve_id_by_db_id.get(&cvss.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.cvss.push(CveCvssDetail {
+                    version: cvss.version,
+                    base_score: cvss.base_score,
+                    base_severity: cvss.base_severity,
+                    vector_string: cvss.vector_string,
+                    source: cvss.source,
+                });
+            }
+        }
+
+        let affected = cve_affected::Entity::find()
+            .select_only()
+            .column(cve_affected::Column::CveDbId)
+            .columns([
+                cve_affected::Column::Vendor,
+                cve_affected::Column::Product,
+                cve_affected::Column::PackageName,
+                cve_affected::Column::CollectionUrl,
+                cve_affected::Column::DefaultStatus,
+            ])
+            .filter(cve_affected::Column::CveDbId.is_in(cve_db_ids))
+            .order_by_asc(cve_affected::Column::CveDbId)
+            .order_by_asc(cve_affected::Column::Vendor)
+            .order_by_asc(cve_affected::Column::Product)
+            .into_model::<CveAffectedDetailRow>()
+            .all(&self.db)
+            .await?;
+        for affected in affected {
+            if let Some(cve_id) = cve_id_by_db_id.get(&affected.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.affected.push(CveAffectedDetail {
+                    vendor: affected.vendor,
+                    product: affected.product,
+                    package_name: affected.package_name,
+                    collection_url: affected.collection_url,
+                    default_status: affected.default_status,
+                });
+            }
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|summary| {
+                let detail = detail_by_cve_id.remove(&summary.cve_id).unwrap_or_default();
+                CveSummaryWithDetail { summary, detail }
+            })
+            .collect())
     }
 
     pub async fn search_cves_by_cwe(

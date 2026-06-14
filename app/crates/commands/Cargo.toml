@@ -4,10 +4,10 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-qanvuli-collector = { version = "*", path = "../collector" }
-qanvuli-db = { version = "*", path = "../db" }
-qanvuli-models = { version = "*", path = "../models" }
-qanvuli-utils = { version = "*", path = "../utils" }
+qanvuli-collector = { version = "*", path = "../../../collector" }
+qanvuli-db = { version = "*", path = "../../../db" }
+qanvuli-models = { version = "*", path = "../../../models" }
+qanvuli-utils = { version = "*", path = "../../../utils" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 rayon = "1.12"

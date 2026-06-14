@@ -36,9 +36,7 @@ async fn run_loop(
 ) -> Result<(), String> {
     loop {
         app.poll_search().await?;
-        app.poll_detail().await?;
-        app.ensure_detail_for_selection(db.clone());
-        if app.searching() || app.loading_detail() {
+        if app.searching() {
             tokio::task::yield_now().await;
         }
 
