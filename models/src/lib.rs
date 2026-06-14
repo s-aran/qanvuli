@@ -68,6 +68,10 @@ pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
 pub fn parse_json_with_raw(src: impl Into<String>) -> Result<RawCveStatusRecord, Error> {
     let buf = src.into();
     let raw_json: Value = serde_json::from_str(&buf)?;
+    parse_value_with_raw(raw_json)
+}
+
+pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error> {
     let cve: CveRoot = serde_json::from_value(raw_json.clone())?;
 
     match cve.cve_metadata.state {
