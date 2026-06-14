@@ -1,4 +1,7 @@
-use super::common::{IngestMode, ReleaseAssetKind, connect_db, download_latest_asset, ingest_zip};
+use super::common::{
+    IngestMode, ReleaseAssetKind, connect_db, download_latest_asset, ingest_zip,
+    reset_sqlite_database_files,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -14,9 +17,9 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    eprintln!("init: connecting database {db_url}");
-    let db = connect_db(db_url).await?;
     if args.schema_only {
+        eprintln!("init: connecting database {db_url}");
+        let db = connect_db(db_url).await?;
         if args.rebuild {
             eprintln!("init: rebuilding schema");
             db.rebuild_schema()
@@ -41,6 +44,10 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         download_latest_asset(ReleaseAssetKind::All).await?
     };
 
+    reset_sqlite_database_files(db_url)?;
+
+    eprintln!("init: connecting database {db_url}");
+    let db = connect_db(db_url).await?;
     eprintln!("init: importing all CVEs; schema will be rebuilt before insert");
     ingest_zip(
         &db,

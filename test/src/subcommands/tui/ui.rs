@@ -94,6 +94,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .selected()
         .map(detail_lines)
         .unwrap_or_else(|| vec![Line::from("No results")]);
+    app.clamp_detail_scroll_to_lines(detail.len());
     let detail_title = app
         .selected()
         .map(|cve| cve.cve_id.as_str())
@@ -110,11 +111,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(detail, right[0]);
 
     let metadata = Paragraph::new(metadata_lines(app.detail.as_ref()))
-        .block(
-            Block::default()
-                .title("CWE / CVSS / Supplemental")
-                .borders(Borders::ALL),
-        )
+        .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: true });
     frame.render_widget(metadata, right[1]);
 
@@ -165,6 +162,12 @@ fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
     let lines = vec![
         advanced_line(
             form,
+            AdvancedField::Query,
+            "Input AND",
+            &format!("{} {}", form.query_mode.footer_text(), form.query),
+        ),
+        advanced_line(
+            form,
             AdvancedField::PublishedFrom,
             "Published from",
             &form.published_from,
@@ -192,7 +195,7 @@ fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         ),
         Line::from(""),
         Line::from(
-            "Enter search  Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right sort",
+            "Enter search  Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right state/sort",
         ),
     ];
     let popup = Paragraph::new(lines)
@@ -277,10 +280,6 @@ fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {
         return vec![Line::from("Loading")];
     };
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "CWE",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
     if detail.cwes.is_empty() {
         lines.push(Line::from("No CWE"));
     } else {
@@ -290,10 +289,6 @@ fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {
         }));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "CVSS",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
     if detail.cvss.is_empty() {
         lines.push(Line::from("No CVSS"));
     } else {
@@ -311,10 +306,6 @@ fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {
         }));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Affected",
-        Style::default().add_modifier(Modifier::BOLD),
-    )));
     if detail.affected.is_empty() {
         lines.push(Line::from("No affected component"));
     } else {

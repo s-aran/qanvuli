@@ -97,8 +97,8 @@ fn print_help() {
 
 #[cfg(test)]
 mod tests {
-    use qanvuli_db::{CveActiveModels, CveDatabase, cve_state_label};
-    use qanvuli_models::parse_json_with_raw;
+    use qanvuli_db::CveDatabase;
+    use qanvuli_models::{CveStatusData, parse_json_with_raw};
 
     const CNA_CVE_JSON: &str = r#"{
         "dataType": "CVE_RECORD",
@@ -188,38 +188,38 @@ mod tests {
         runtime.block_on(async {
             let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
             db.initialize_schema().await.unwrap();
+            db.upsert_cwe(79, Some("Cross-site Scripting".to_owned()))
+                .await
+                .unwrap();
 
             let raw_record = parse_json_with_raw(CNA_CVE_JSON).unwrap();
             let expected_raw_json = raw_record.raw_json().clone();
-            let models = CveActiveModels::from(raw_record);
+            db.upsert_cve_records(vec![raw_record]).await.unwrap();
 
-            db.upsert_cve(models.cve).await.unwrap();
-            db.replace_cve_children(
-                "CVE-2024-1000",
-                models.cvss_rows,
-                models.affected_rows,
-                models.cwe_rows,
-            )
-            .await
-            .unwrap();
-
-            let found = db.find_cve_by_id("CVE-2024-1000").await.unwrap().unwrap();
-            assert_eq!(found.cve_id, "CVE-2024-1000");
-            assert_eq!(cve_state_label(found.state), "PUBLISHED");
-            assert_eq!(found.published_at, "2024-02-01T00:00:00+00:00");
-            assert_eq!(found.updated_at, "2024-02-02T00:00:00+00:00");
-            assert_eq!(found.serial, 7);
-            assert_eq!(found.title, "CNA sourced CVE");
+            let found = db
+                .find_cve_model_by_id("CVE-2024-1000")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.raw_json(), &expected_raw_json);
+            let CveStatusData::Published(found) = found.content() else {
+                panic!("expected published CVE");
+            };
+            assert_eq!(found.cve_metadata.cve_id, "CVE-2024-1000");
+            assert_eq!(found.cve_metadata.serial, Some(7));
             assert_eq!(
-                found.description_en.as_deref(),
-                Some("CNA description stored in DB.")
+                found.containers.cna.title.as_deref(),
+                Some("CNA sourced CVE")
             );
-            assert_eq!(found.raw_json, expected_raw_json);
             assert_eq!(
-                found.raw_json["containers"]["cna"]["providerMetadata"]["shortName"],
+                found.containers.cna.descriptions[0].value,
+                "CNA description stored in DB."
+            );
+            assert_eq!(
+                expected_raw_json["containers"]["cna"]["providerMetadata"]["shortName"],
                 "example-cna"
             );
-            assert_eq!(found.raw_json["x_testRawField"]["kept"], true);
+            assert_eq!(expected_raw_json["x_testRawField"]["kept"], true);
 
             let all = db.get_all().await.unwrap();
             assert_eq!(all.len(), 1);

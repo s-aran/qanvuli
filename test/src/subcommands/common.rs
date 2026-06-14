@@ -1,8 +1,8 @@
 use chrono::{DateTime, FixedOffset};
 use clap::ValueEnum;
-use qanvuli_collector::providers::cve::CveRelease;
-use qanvuli_db::{CveActiveModels, CveDatabase, ReadJsonFileRecord};
-use qanvuli_models::parse_json_with_raw;
+use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
+use qanvuli_db::{CveDatabase, ReadJsonFileRecord};
+use qanvuli_models::{CveStatusData, RawCveRecord, cwe::read_cwe_catalog_zip, parse_json_with_raw};
 use qanvuli_utils::loader::{self, FileStorageTrait};
 use rayon::prelude::*;
 use serde::Serialize;
@@ -13,6 +13,7 @@ pub const DEFAULT_DB_CONNECTION_STRING: &str = "sqlite://./db.sqlite?mode=rwc";
 pub const DEFAULT_LIMIT: u64 = 25;
 
 const INGEST_CHUNK_SIZE: usize = 10000;
+const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ReleaseAssetKind {
@@ -52,6 +53,34 @@ pub async fn connect_db(db_url: &str) -> Result<CveDatabase, String> {
         .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))
 }
 
+pub fn reset_sqlite_database_files(db_url: &str) -> Result<(), String> {
+    let Some(path) = sqlite_file_path(db_url) else {
+        return Ok(());
+    };
+
+    for path in [
+        path.clone(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => eprintln!("init: removed {}", path.display()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!("failed to remove {}: {err}", path.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
+    let value = db_url.strip_prefix("sqlite://")?;
+    let path = value.split_once('?').map_or(value, |(path, _)| path);
+    (!path.is_empty() && path != ":memory:").then(|| PathBuf::from(path))
+}
+
 pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
     println!(
         "{}",
@@ -71,6 +100,29 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     eprintln!("{kind}: ready {}", asset.name);
     Ok(PathBuf::from(asset.name))
+}
+
+pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
+    let catalog = CweCatalogFile::default();
+    eprintln!("cwe: downloading {}", catalog.url);
+    let path = catalog
+        .async_download_as_file()
+        .await
+        .map_err(|err| format!("failed to download {}: {err}", catalog.name))?;
+    eprintln!("cwe: ready {}", path.display());
+    Ok(path)
+}
+
+pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
+    let path = download_latest_cwe_catalog().await?;
+    let catalog = read_cwe_catalog_zip(&path)
+        .map_err(|err| format!("failed to read CWE catalog {}: {err}", path.display()))?;
+    let count = db
+        .upsert_cwe_catalog(&catalog)
+        .await
+        .map_err(|err| format!("failed to write CWE catalog: {err}"))?;
+    eprintln!("cwe: upserted {count} CWE master rows");
+    Ok(())
 }
 
 pub async fn latest_asset(
@@ -101,9 +153,11 @@ pub async fn ingest_zip(
 ) {
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
-    let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
-    eprintln!("{label}: enumerating CVE JSON entries");
-    let json_paths = storage.enum_json_list().collect::<Vec<String>>();
+    let json_paths = {
+        let storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
+        eprintln!("{label}: enumerating CVE JSON entries");
+        storage.enum_json_list().collect::<Vec<String>>()
+    };
     eprintln!(
         "{label}: asset={}, json_count={}",
         asset_path.display(),
@@ -115,13 +169,43 @@ pub async fn ingest_zip(
             panic!("{label}: failed to rebuild schema: {err}");
         }
         eprintln!("{label}: rebuilt schema in {:?}", rebuild_start.elapsed());
+
+        let compact_start = Instant::now();
+        if let Err(err) = db.compact_storage().await {
+            eprintln!("{label}: failed to compact empty database: {err}");
+        } else {
+            eprintln!(
+                "{label}: compacted empty database in {:?}",
+                compact_start.elapsed()
+            );
+        }
+    }
+
+    if let Err(err) = sync_cwe_catalog(db).await {
+        panic!("{label}: {err}");
+    }
+
+    if matches!(mode, IngestMode::ReplaceAll) {
+        let prepare_start = Instant::now();
+        if let Err(err) = db.prepare_bulk_replace_all().await {
+            panic!("{label}: failed to prepare bulk load: {err}");
+        }
+        eprintln!(
+            "{label}: prepared bulk load in {:?}",
+            prepare_start.elapsed()
+        );
     }
 
     let mut inserted = 0usize;
     let mut failed = 0usize;
     let mut timings = IngestTimings::default();
 
-    for (chunk_index, chunk) in json_paths.chunks(INGEST_CHUNK_SIZE).enumerate() {
+    let ingest_chunk_size = match mode {
+        IngestMode::ReplaceAll => REPLACE_ALL_INGEST_CHUNK_SIZE,
+        IngestMode::Upsert => INGEST_CHUNK_SIZE,
+    };
+
+    for (chunk_index, chunk) in json_paths.chunks(ingest_chunk_size).enumerate() {
         if max_chunks.is_some_and(|max_chunks| chunk_index >= max_chunks) {
             eprintln!("{label}: stopped after {chunk_index} chunks for profiling");
             break;
@@ -132,12 +216,15 @@ pub async fn ingest_zip(
         let mut read_failed = 0usize;
 
         let read_start = Instant::now();
-        for json_path in chunk {
-            match storage.get_json(json_path) {
-                Ok(json) => jsons.push((json_path.clone(), json)),
-                Err(err) => {
-                    read_failed += 1;
-                    eprintln!("{label}: failed to read {json_path}: {err}");
+        {
+            let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
+            for json_path in chunk {
+                match storage.get_json(json_path) {
+                    Ok(json) => jsons.push((json_path.clone(), json)),
+                    Err(err) => {
+                        read_failed += 1;
+                        eprintln!("{label}: failed to read {json_path}: {err}");
+                    }
                 }
             }
         }
@@ -162,13 +249,12 @@ pub async fn ingest_zip(
             .map(|(json_path, json, read_file)| {
                 let raw_record = parse_json_with_raw(json)
                     .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
-                let models = CveActiveModels::from(raw_record);
-                if models.cve_id.is_empty() {
+                if cve_id_from_record(&raw_record).is_none() {
                     return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
                 }
-                Ok((models, read_file))
+                Ok((raw_record, read_file))
             })
-            .collect::<Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>>();
+            .collect::<Vec<Result<(RawCveRecord<CveStatusData>, ReadJsonFileRecord), String>>>();
         let parse_elapsed = parse_start.elapsed();
         timings.parse += parse_elapsed;
 
@@ -192,8 +278,8 @@ pub async fn ingest_zip(
 
         let db_write_start = Instant::now();
         let result = match mode {
-            IngestMode::ReplaceAll => db.insert_cve_models(models).await,
-            IngestMode::Upsert => db.upsert_cve_models(models).await,
+            IngestMode::ReplaceAll => db.insert_cve_records_bulk(models).await,
+            IngestMode::Upsert => db.upsert_cve_records(models).await,
         };
 
         match result {
@@ -245,6 +331,17 @@ pub async fn ingest_zip(
         timings.db_write,
         timings.mark_read
     );
+
+    if matches!(mode, IngestMode::ReplaceAll) {
+        let finish_start = Instant::now();
+        if let Err(err) = db.finish_bulk_replace_all().await {
+            panic!("{label}: failed to finish bulk load: {err}");
+        }
+        eprintln!(
+            "{label}: rebuilt search indexes and FTS in {:?}",
+            finish_start.elapsed()
+        );
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -266,4 +363,12 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt: DateTime<FixedOffset>| dt.to_utc().to_rfc3339())
         .map_err(|err| format!("invalid RFC3339 timestamp `{value}`: {err}"))
+}
+
+fn cve_id_from_record(record: &RawCveRecord<CveStatusData>) -> Option<&str> {
+    record
+        .raw_json()
+        .pointer("/cveMetadata/cveId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|cve_id| !cve_id.is_empty())
 }

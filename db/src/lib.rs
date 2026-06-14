@@ -8,10 +8,11 @@ use migration::Migrator;
 use std::collections::{HashMap, HashSet};
 
 use qanvuli_models::{
-    CveStatusData, RawCveRecord, cna_affected_raw_values, cna_cvss_raw_values, cna_cwe_raw_values,
-    cve::base::cve_metadata::CveState, cve::published::cna_description::CnaDescription,
+    CveStatusData, RawCveRecord, RawCveStatusRecord, cna_affected_raw_values, cna_cvss_raw_values,
+    cna_cwe_raw_values, cve::base::cve_metadata::CveState,
+    cve::published::cna_description::CnaDescription, cwe::WeaknessCatalog, parse_value_with_raw,
 };
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction,
     DbBackend, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
@@ -67,7 +68,6 @@ pub struct CveSummary {
 #[derive(Clone, Debug, FromQueryResult)]
 struct CveIdMapping {
     id: i32,
-    cve_id: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -103,6 +103,8 @@ pub struct CveAffectedDetail {
 
 #[derive(Clone, Debug, Default)]
 pub struct CveAdvancedSearch {
+    pub query: Option<String>,
+    pub query_mode: Option<CveAdvancedQueryMode>,
     pub published_from: Option<String>,
     pub published_to: Option<String>,
     pub cwe: Option<String>,
@@ -110,6 +112,15 @@ pub struct CveAdvancedSearch {
     pub vendor: Option<String>,
     pub state_scope: CveStateScope,
     pub sort_order: CveSummarySortOrder,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CveAdvancedQueryMode {
+    FreeText,
+    Product,
+    Vendor,
+    Cwe,
+    Cve,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -152,7 +163,7 @@ impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
             cve: cve::ActiveModel::from(value),
             cvss_rows: cvss_active_models(&cve_id, &raw_json),
             affected_rows: affected_active_models(&cve_id, &raw_json),
-            cwe_master_rows: cwe_master_active_models(&raw_json),
+            cwe_master_rows: Vec::new(),
             cwe_rows: cwe_active_models(&cve_id, &raw_json),
         }
     }
@@ -256,25 +267,6 @@ fn cwe_active_models(_cve_id: &str, raw_json: &Value) -> Vec<cve_cwe::ActiveMode
             Some(cve_cwe::ActiveModel {
                 cve_db_id: Set(0),
                 cwe_id: Set(cwe_id),
-            })
-        })
-        .collect()
-}
-
-fn cwe_master_active_models(raw_json: &Value) -> Vec<cwe::ActiveModel> {
-    let mut seen = HashSet::new();
-
-    cna_cwe_raw_values(raw_json)
-        .into_iter()
-        .filter_map(|cwe| {
-            let cwe_id = cwe_number(json_string(&cwe, "cweId")?.as_str())?;
-            if !seen.insert(cwe_id) {
-                return None;
-            }
-
-            Some(cwe::ActiveModel {
-                id: Set(cwe_id),
-                description: Set(json_string(&cwe, "description")),
             })
         })
         .collect()
@@ -417,6 +409,14 @@ impl CveDatabase {
         Ok(inserted)
     }
 
+    pub async fn upsert_cve_records(
+        &self,
+        records: Vec<RawCveRecord<CveStatusData>>,
+    ) -> Result<usize, DbErr> {
+        self.upsert_cve_models(records.into_iter().map(CveActiveModels::from).collect())
+            .await
+    }
+
     pub async fn replace_all_cve_models(
         &self,
         models: Vec<CveActiveModels>,
@@ -424,15 +424,61 @@ impl CveDatabase {
         let txn = self.db.begin().await?;
 
         clear_cve_tables_on(&txn).await?;
-        let inserted = insert_cve_models_on(&txn, models).await?;
+        let inserted = insert_cve_models_on(&txn, models, true).await?;
 
         txn.commit().await?;
         Ok(inserted)
     }
 
+    pub async fn prepare_bulk_replace_all(&self) -> Result<(), DbErr> {
+        prepare_bulk_replace_all_on(&self.db).await
+    }
+
+    pub async fn insert_cve_models_bulk(
+        &self,
+        models: Vec<CveActiveModels>,
+    ) -> Result<usize, DbErr> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin().await?;
+        let inserted = insert_cve_models_on(&txn, models, false).await?;
+        txn.commit().await?;
+        Ok(inserted)
+    }
+
+    pub async fn finish_bulk_replace_all(&self) -> Result<(), DbErr> {
+        finish_bulk_replace_all_on(&self.db).await
+    }
+
+    pub async fn compact_storage(&self) -> Result<(), DbErr> {
+        compact_storage_on(&self.db).await
+    }
+
     pub async fn clear_cve_tables(&self) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
         clear_cve_tables_on(&txn).await?;
+        txn.commit().await
+    }
+
+    pub async fn upsert_cwe_catalog(&self, catalog: &WeaknessCatalog) -> Result<usize, DbErr> {
+        let txn = self.db.begin().await?;
+        let count = upsert_cwe_catalog_on(&txn, catalog).await?;
+        txn.commit().await?;
+        Ok(count)
+    }
+
+    pub async fn upsert_cwe(&self, id: i32, description: Option<String>) -> Result<(), DbErr> {
+        let txn = self.db.begin().await?;
+        upsert_cwe_rows(
+            &txn,
+            vec![cwe::ActiveModel {
+                id: Set(id),
+                description: Set(description),
+            }],
+        )
+        .await?;
         txn.commit().await
     }
 
@@ -442,9 +488,17 @@ impl CveDatabase {
         }
 
         let txn = self.db.begin().await?;
-        let inserted = insert_cve_models_on(&txn, models).await?;
+        let inserted = insert_cve_models_on(&txn, models, true).await?;
         txn.commit().await?;
         Ok(inserted)
+    }
+
+    pub async fn insert_cve_records_bulk(
+        &self,
+        records: Vec<RawCveRecord<CveStatusData>>,
+    ) -> Result<usize, DbErr> {
+        self.insert_cve_models_bulk(records.into_iter().map(CveActiveModels::from).collect())
+            .await
     }
 
     pub async fn replace_cve_children(
@@ -474,14 +528,6 @@ impl CveDatabase {
         set_affected_cve_db_id(&mut affected_rows, cve_db_id);
         set_cwe_cve_db_id(&mut cwe_rows, cve_db_id);
 
-        let cwe_master_rows = cwe_rows
-            .iter()
-            .map(|row| cwe::ActiveModel {
-                id: row.cwe_id.clone(),
-                description: Set(None),
-            })
-            .collect::<Vec<_>>();
-
         if !cvss_rows.is_empty() {
             cve_cvss::Entity::insert_many(cvss_rows).exec(&txn).await?;
         }
@@ -489,9 +535,6 @@ impl CveDatabase {
             cve_affected::Entity::insert_many(affected_rows)
                 .exec(&txn)
                 .await?;
-        }
-        if !cwe_master_rows.is_empty() {
-            upsert_cwe_rows(&txn, cwe_master_rows).await?;
         }
         if !cwe_rows.is_empty() {
             cve_cwe::Entity::insert_many(cwe_rows).exec(&txn).await?;
@@ -514,6 +557,19 @@ impl CveDatabase {
             .filter(cve::Column::CveId.eq(cve_id))
             .one(&self.db)
             .await
+    }
+
+    pub async fn find_cve_model_by_id(
+        &self,
+        cve_id: &str,
+    ) -> Result<Option<RawCveStatusRecord>, DbErr> {
+        self.find_cve_by_id(cve_id)
+            .await?
+            .map(|cve| {
+                parse_value_with_raw(cve.raw_json)
+                    .map_err(|err| DbErr::Custom(format!("failed to deserialize {cve_id}: {err}")))
+            })
+            .transpose()
     }
 
     pub async fn find_cve_detail(&self, cve_id: &str) -> Result<CveDetail, DbErr> {
@@ -1783,6 +1839,15 @@ impl CveDatabase {
         {
             return Ok(Vec::new());
         }
+        if matches!(options.query_mode, Some(CveAdvancedQueryMode::Cwe))
+            && let Some(query) = options
+                .query
+                .as_deref()
+                .filter(|query| !query.trim().is_empty())
+            && cwe_number(query).is_none()
+        {
+            return Ok(Vec::new());
+        }
 
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
             if options
@@ -1804,6 +1869,9 @@ impl CveDatabase {
 
         if !options.state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        if let Some(search_query) = option_text(options.query.as_deref()) {
+            query = apply_advanced_query_filter(query, options.query_mode, search_query);
         }
         if let Some(published_from) = option_text(options.published_from.as_deref()) {
             query = query.filter(cve::Column::PublishedAt.gte(published_from.to_owned()));
@@ -1860,6 +1928,15 @@ impl CveDatabase {
         {
             return Ok(0);
         }
+        if matches!(options.query_mode, Some(CveAdvancedQueryMode::Cwe))
+            && let Some(query) = options
+                .query
+                .as_deref()
+                .filter(|query| !query.trim().is_empty())
+            && cwe_number(query).is_none()
+        {
+            return Ok(0);
+        }
 
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
             if options
@@ -1876,6 +1953,9 @@ impl CveDatabase {
 
         if !options.state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        if let Some(search_query) = option_text(options.query.as_deref()) {
+            query = apply_advanced_query_filter(query, options.query_mode, search_query);
         }
         if let Some(published_from) = option_text(options.published_from.as_deref()) {
             query = query.filter(cve::Column::PublishedAt.gte(published_from.to_owned()));
@@ -1998,6 +2078,16 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
         "PRAGMA synchronous = NORMAL;".to_owned(),
     ))
     .await?;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA temp_store = MEMORY;".to_owned(),
+    ))
+    .await?;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA cache_size = -200000;".to_owned(),
+    ))
+    .await?;
     Ok(db)
 }
 
@@ -2027,14 +2117,7 @@ async fn upsert_cve_model_batch(
 
     let inserted = cve_rows.len();
 
-    for chunk in take_chunks(cve_rows, CVE_CHUNK_SIZE) {
-        cve::Entity::insert_many(chunk)
-            .on_conflict(cve_upsert_conflict())
-            .exec(txn)
-            .await?;
-    }
-
-    let cve_db_ids = cve_db_ids_by_cve_ids(txn, &cve_ids).await?;
+    let cve_db_ids = upsert_cve_rows_returning(txn, cve_rows).await?;
     let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
         child_rows_with_cve_db_ids(models, &cve_db_ids)?;
     let cve_db_id_values = cve_ids
@@ -2078,6 +2161,7 @@ async fn upsert_cve_model_batch(
 async fn insert_cve_models_on(
     txn: &DatabaseTransaction,
     models: Vec<CveActiveModels>,
+    update_search_index: bool,
 ) -> Result<usize, DbErr> {
     let mut inserted = 0usize;
     let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
@@ -2085,13 +2169,15 @@ async fn insert_cve_models_on(
     for models in models {
         batch.push(models);
         if batch.len() == CVE_CHUNK_SIZE {
-            inserted += insert_cve_model_batch(txn, std::mem::take(&mut batch)).await?;
+            inserted +=
+                insert_cve_model_batch(txn, std::mem::take(&mut batch), update_search_index)
+                    .await?;
             batch = Vec::with_capacity(CVE_CHUNK_SIZE);
         }
     }
 
     if !batch.is_empty() {
-        inserted += insert_cve_model_batch(txn, batch).await?;
+        inserted += insert_cve_model_batch(txn, batch, update_search_index).await?;
     }
 
     Ok(inserted)
@@ -2100,6 +2186,7 @@ async fn insert_cve_models_on(
 async fn insert_cve_model_batch(
     txn: &DatabaseTransaction,
     models: Vec<CveActiveModels>,
+    update_search_index: bool,
 ) -> Result<usize, DbErr> {
     let mut cve_rows = Vec::with_capacity(models.len());
     let mut cve_ids = Vec::with_capacity(models.len());
@@ -2111,8 +2198,7 @@ async fn insert_cve_model_batch(
 
     let inserted = cve_rows.len();
 
-    insert_cve_rows(txn, cve_rows).await?;
-    let cve_db_ids = cve_db_ids_by_cve_ids(txn, &cve_ids).await?;
+    let cve_db_ids = insert_cve_rows_returning(txn, cve_rows).await?;
     let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
         child_rows_with_cve_db_ids(models, &cve_db_ids)?;
 
@@ -2128,7 +2214,9 @@ async fn insert_cve_model_batch(
     for chunk in take_chunks(cwe_rows, CWE_CHUNK_SIZE) {
         insert_cwe_rows(txn, chunk).await?;
     }
-    upsert_cve_search_fts_rows(txn, &cve_ids).await?;
+    if update_search_index {
+        upsert_cve_search_fts_rows(txn, &cve_ids).await?;
+    }
 
     Ok(inserted)
 }
@@ -2215,37 +2303,12 @@ where
     cve::Entity::find()
         .select_only()
         .column(cve::Column::Id)
-        .column(cve::Column::CveId)
         .filter(cve::Column::CveId.eq(cve_id))
         .into_model::<CveIdMapping>()
         .one(db)
         .await?
         .map(|row| row.id)
         .ok_or_else(|| DbErr::Custom(format!("missing cve.id for {cve_id}")))
-}
-
-async fn cve_db_ids_by_cve_ids<C>(db: &C, cve_ids: &[String]) -> Result<HashMap<String, i32>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    if cve_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let rows = cve::Entity::find()
-        .select_only()
-        .column(cve::Column::Id)
-        .column(cve::Column::CveId)
-        .filter(cve::Column::CveId.is_in(cve_ids.iter().cloned()))
-        .into_model::<CveIdMapping>()
-        .all(db)
-        .await?;
-
-    let mut map = HashMap::with_capacity(rows.len());
-    for row in rows {
-        map.insert(row.cve_id, row.id);
-    }
-    Ok(map)
 }
 
 async fn clear_cve_tables_on(txn: &DatabaseTransaction) -> Result<(), DbErr> {
@@ -2258,12 +2321,37 @@ async fn clear_cve_tables_on(txn: &DatabaseTransaction) -> Result<(), DbErr> {
     Ok(())
 }
 
-async fn insert_cve_rows(
+async fn insert_cve_rows_returning(
     txn: &DatabaseTransaction,
     rows: Vec<cve::ActiveModel>,
-) -> Result<(), DbErr> {
-    cve::Entity::insert_many(rows).exec(txn).await?;
-    Ok(())
+) -> Result<HashMap<String, i32>, DbErr> {
+    let mut map = HashMap::with_capacity(rows.len());
+    for chunk in take_chunks(rows, CVE_CHUNK_SIZE) {
+        let inserted = cve::Entity::insert_many(chunk)
+            .exec_with_returning_many(txn)
+            .await?;
+        for row in inserted {
+            map.insert(row.cve_id, row.id);
+        }
+    }
+    Ok(map)
+}
+
+async fn upsert_cve_rows_returning(
+    txn: &DatabaseTransaction,
+    rows: Vec<cve::ActiveModel>,
+) -> Result<HashMap<String, i32>, DbErr> {
+    let mut map = HashMap::with_capacity(rows.len());
+    for chunk in take_chunks(rows, CVE_CHUNK_SIZE) {
+        let inserted = cve::Entity::insert_many(chunk)
+            .on_conflict(cve_upsert_conflict())
+            .exec_with_returning_many(txn)
+            .await?;
+        for row in inserted {
+            map.insert(row.cve_id, row.id);
+        }
+    }
+    Ok(map)
 }
 
 async fn insert_cvss_rows(
@@ -2326,6 +2414,47 @@ async fn upsert_cwe_rows(
     Ok(())
 }
 
+async fn upsert_cwe_catalog_on(
+    txn: &DatabaseTransaction,
+    catalog: &WeaknessCatalog,
+) -> Result<usize, DbErr> {
+    let mut rows = Vec::new();
+
+    if let Some(weaknesses) = &catalog.weaknesses {
+        for weakness in &weaknesses.weakness {
+            rows.push(cwe_catalog_row(weakness.id, weakness.description.clone())?);
+        }
+    }
+
+    if let Some(categories) = &catalog.categories {
+        for category in &categories.category {
+            rows.push(cwe_catalog_row(category.id, category.name.clone())?);
+        }
+    }
+
+    if let Some(views) = &catalog.views {
+        for view in &views.view {
+            rows.push(cwe_catalog_row(view.id, view.name.clone())?);
+        }
+    }
+
+    let count = rows.len();
+
+    for chunk in take_chunks(rows, CWE_MASTER_CHUNK_SIZE) {
+        upsert_cwe_rows(txn, chunk).await?;
+    }
+
+    Ok(count)
+}
+
+fn cwe_catalog_row(id: i64, description: String) -> Result<cwe::ActiveModel, DbErr> {
+    Ok(cwe::ActiveModel {
+        id: Set(i32::try_from(id)
+            .map_err(|err| DbErr::Custom(format!("CWE ID {id} does not fit in i32: {err}")))?),
+        description: Set(Some(description)),
+    })
+}
+
 async fn insert_cwe_rows(
     txn: &DatabaseTransaction,
     rows: Vec<cve_cwe::ActiveModel>,
@@ -2333,6 +2462,104 @@ async fn insert_cwe_rows(
     cve_cwe::Entity::insert_many(rows).exec(txn).await?;
     Ok(())
 }
+
+async fn prepare_bulk_replace_all_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    db.execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
+        .await?;
+    for index_name in BULK_LOAD_DROPPED_INDEXES {
+        db.execute_unprepared(&format!("DROP INDEX IF EXISTS {index_name}"))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn finish_bulk_replace_all_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    for sql in BULK_LOAD_FINAL_INDEXES {
+        db.execute_unprepared(sql).await?;
+    }
+    create_cve_search_fts(db).await?;
+    rebuild_cve_search_fts(db).await?;
+    db.execute_unprepared("ANALYZE").await?;
+    db.execute_unprepared("PRAGMA optimize").await?;
+    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
+        .await?;
+    Ok(())
+}
+
+async fn compact_storage_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
+        .await?;
+    db.execute_unprepared("VACUUM").await?;
+    Ok(())
+}
+
+const BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
+    "idx_read_json_file_filename",
+    "idx_cve_published_at",
+    "idx_cve_updated_at",
+    "idx_cve_cvss_cve_db_id",
+    "idx_cve_cvss_version",
+    "idx_cve_cvss_base_score",
+    "idx_cve_cvss_base_severity",
+    "idx_cve_cvss_severity_score",
+    "idx_cve_cvss_version_score",
+    "idx_cve_cvss_cve_db_id_score_version",
+    "idx_cve_affected_cve_db_id",
+    "idx_cve_affected_vendor",
+    "idx_cve_affected_product",
+    "idx_cve_affected_package",
+    "idx_cve_affected_cve_db_id_vendor_product",
+    "idx_cve_cwe_cve_id",
+    "idx_cve_cwe_cve_db_id",
+    "idx_cve_cwe_cwe_id",
+    "idx_cve_cwe_cwe_id_cve_id",
+    "idx_cve_cwe_cwe_id_cve_db_id",
+    "idx_cwe_id",
+    "idx_cve_published_at_cve_id",
+    "idx_cve_updated_at_cve_id",
+];
+
+const BULK_LOAD_FINAL_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file (filename)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve (published_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve (updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve (published_at, cve_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve (updated_at, cve_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version ON cve_cvss (version)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_score ON cve_cvss (base_score)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_severity ON cve_cvss (base_severity)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss (base_severity, base_score)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version_score ON cve_cvss (version, base_score)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id_score_version ON cve_cvss (cve_db_id, base_score, version)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor ON cve_affected (vendor)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_product ON cve_affected (product)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_package ON cve_affected (package_name)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
+];
 
 async fn create_cve_search_fts<C>(db: &C) -> Result<(), DbErr>
 where
@@ -2531,6 +2758,15 @@ pub async fn replace_all_cve_models(
 
 pub async fn clear_cve_tables(db: &DatabaseConnection) -> Result<(), DbErr> {
     CveDatabase { db: db.clone() }.clear_cve_tables().await
+}
+
+pub async fn upsert_cwe_catalog(
+    db: &DatabaseConnection,
+    catalog: &WeaknessCatalog,
+) -> Result<usize, DbErr> {
+    CveDatabase { db: db.clone() }
+        .upsert_cwe_catalog(catalog)
+        .await
 }
 
 pub async fn insert_cve_models(
@@ -2873,6 +3109,9 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     if !options.state_scope.includes_rejected() {
         conditions.push("cve.state = 0".to_owned());
     }
+    if let Some(query) = option_text(options.query.as_deref()) {
+        advanced_query_conditions(options.query_mode, query, &mut conditions);
+    }
     if let Some(published_from) = option_text(options.published_from.as_deref()) {
         conditions.push(format!(
             "cve.published_at >= {}",
@@ -2909,6 +3148,95 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
         String::new()
     } else {
         format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn advanced_query_conditions(
+    mode: Option<CveAdvancedQueryMode>,
+    query: &str,
+    conditions: &mut Vec<String>,
+) {
+    match mode.unwrap_or(CveAdvancedQueryMode::FreeText) {
+        CveAdvancedQueryMode::FreeText => {
+            let pattern = sql_string_literal(&like_pattern(query));
+            conditions.push(format!(
+                "(cve.cve_id LIKE {pattern} OR cve.title LIKE {pattern} OR cve.description_en LIKE {pattern})"
+            ));
+        }
+        CveAdvancedQueryMode::Product => {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
+                sql_string_literal(&like_pattern(query))
+            ));
+        }
+        CveAdvancedQueryMode::Vendor => {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
+                sql_string_literal(&like_pattern(query))
+            ));
+        }
+        CveAdvancedQueryMode::Cwe => {
+            if let Some(cwe_id) = cwe_number(query) {
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id WHERE cve_cwe.cwe_id = {cwe_id} AND cve_cwe.cve_db_id = cve.id)"
+                ));
+            }
+        }
+        CveAdvancedQueryMode::Cve => {
+            if let Some(upper_bound) = ascii_prefix_upper_bound(query) {
+                let lower_bound = sql_string_literal(query);
+                let upper_bound = sql_string_literal(&upper_bound);
+                conditions.push(format!(
+                    "(cve.cve_id >= {lower_bound} AND cve.cve_id < {upper_bound})"
+                ));
+            }
+        }
+    }
+}
+
+fn apply_advanced_query_filter(
+    query: sea_orm::Select<cve::Entity>,
+    mode: Option<CveAdvancedQueryMode>,
+    search_query: &str,
+) -> sea_orm::Select<cve::Entity> {
+    match mode.unwrap_or(CveAdvancedQueryMode::FreeText) {
+        CveAdvancedQueryMode::FreeText => {
+            let pattern = like_pattern(search_query);
+            query.filter(
+                cve::Column::CveId
+                    .like(pattern.clone())
+                    .or(cve::Column::Title.like(pattern.clone()))
+                    .or(cve::Column::DescriptionEn.like(pattern)),
+            )
+        }
+        CveAdvancedQueryMode::Product => query.filter(Expr::cust(format!(
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
+            sql_string_literal(&like_pattern(search_query))
+        ))),
+        CveAdvancedQueryMode::Vendor => query.filter(Expr::cust(format!(
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
+            sql_string_literal(&like_pattern(search_query))
+        ))),
+        CveAdvancedQueryMode::Cwe => {
+            if let Some(cwe_id) = cwe_number(search_query) {
+                query.filter(Expr::cust(format!(
+                    "EXISTS (SELECT 1 FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id WHERE cve_cwe.cwe_id = {cwe_id} AND cve_cwe.cve_db_id = cve.id)"
+                )))
+            } else {
+                query
+            }
+        }
+        CveAdvancedQueryMode::Cve => {
+            if let Some(upper_bound) = ascii_prefix_upper_bound(search_query) {
+                query.filter(
+                    cve::Column::CveId
+                        .gte(search_query.to_owned())
+                        .and(cve::Column::CveId.lt(upper_bound)),
+                )
+            } else {
+                query
+            }
+        }
     }
 }
 
@@ -3221,12 +3549,7 @@ mod tests {
         let cwe = models.cwe_rows.into_iter().next().unwrap();
         assert_eq!(cwe.cve_db_id.unwrap(), 0);
         assert_eq!(cwe.cwe_id.unwrap(), 79);
-        let cwe_master = models.cwe_master_rows.into_iter().next().unwrap();
-        assert_eq!(cwe_master.id.unwrap(), 79);
-        assert_eq!(
-            cwe_master.description.unwrap().as_deref(),
-            Some("Cross-site Scripting")
-        );
+        assert!(models.cwe_master_rows.is_empty());
     }
 
     #[test]
@@ -3291,6 +3614,7 @@ mod tests {
         runtime.block_on(async {
             let db = connect_database("sqlite::memory:").await.unwrap();
             initialize_schema(&db).await.unwrap();
+            insert_test_cwe(&db).await;
 
             upsert_cve(
                 &db,
@@ -3438,6 +3762,7 @@ mod tests {
         runtime.block_on(async {
             let db = connect_database("sqlite::memory:").await.unwrap();
             initialize_schema(&db).await.unwrap();
+            insert_test_cwe(&db).await;
 
             let models = CveActiveModels::from(parse_json_with_raw(CVE_JSON).unwrap());
             let inserted = upsert_cve_models(&db, vec![models]).await.unwrap();
@@ -3473,6 +3798,16 @@ mod tests {
             let cwe = cwe::Entity::find_by_id(79).one(&db).await.unwrap().unwrap();
             assert_eq!(cwe.description.as_deref(), Some("Cross-site Scripting"));
         });
+    }
+
+    async fn insert_test_cwe(db: &DatabaseConnection) {
+        cwe::Entity::insert(cwe::ActiveModel {
+            id: Set(79),
+            description: Set(Some("Cross-site Scripting".to_owned())),
+        })
+        .exec(db)
+        .await
+        .unwrap();
     }
 
     #[test]

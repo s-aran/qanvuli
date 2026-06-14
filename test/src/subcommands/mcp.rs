@@ -1,24 +1,237 @@
 use super::common::{IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip};
-use qanvuli_db::entity::cve;
 use qanvuli_db::{CveDatabase, CveStateScope, CveSummary, cve_state_label};
+use qanvuli_models::RawCveStatusRecord;
+use rmcp::{
+    ErrorData as McpError, ServerHandler, ServiceExt,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    schemars, tool, tool_handler, tool_router,
+    transport::stdio,
+};
 use serde::Deserialize;
-use simd_json::{Value, json};
-use std::io::{self, BufRead, Write};
+use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 
-const PROTOCOL_VERSION: &str = "2025-03-26";
-
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
+#[derive(Clone)]
+struct CveSearchServer {
+    db_url: String,
+    db: Arc<OnceCell<CveDatabase>>,
+    tool_router: ToolRouter<Self>,
 }
 
-#[derive(Debug, Deserialize)]
+impl CveSearchServer {
+    fn new(db_url: String) -> Self {
+        Self {
+            db_url,
+            db: Arc::new(OnceCell::new()),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    async fn db(&self) -> Result<&CveDatabase, McpError> {
+        self.db
+            .get_or_try_init(|| async {
+                CveDatabase::connect(&self.db_url).await.map_err(|err| {
+                    mcp_error(format!(
+                        "failed to connect database `{}`: {err}",
+                        self.db_url
+                    ))
+                })
+            })
+            .await
+    }
+
+    fn result(value: Value) -> Result<CallToolResult, McpError> {
+        let text = serde_json::to_string_pretty(&value)
+            .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
+    }
+}
+
+#[tool_router]
+impl CveSearchServer {
+    #[tool(
+        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79."
+    )]
+    async fn search_by_cwe(
+        &self,
+        Parameters(args): Parameters<CweArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let limit = limit(args.limit);
+        let offset = offset(args.offset);
+        let state_scope = state_scope(args.include_rejected);
+        let cwe_ids = args.search_values();
+        let cves = db
+            .search_cve_summaries_by_cwe_with_state_scope(&cwe_ids, state_scope, limit, offset)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(description = "Search CVEs by affected vendor and/or product name.")]
+    async fn search_by_product(
+        &self,
+        Parameters(args): Parameters<ProductArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cves = db
+            .search_cve_summaries_by_vendor_product_with_state_scope(
+                args.vendor.as_deref(),
+                args.product.as_deref(),
+                state_scope(args.include_rejected),
+                limit(args.limit),
+                offset(args.offset),
+            )
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(description = "Search CVEs by CVE ID, title, or English description text.")]
+    async fn search_text(
+        &self,
+        Parameters(args): Parameters<TextArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cves = db
+            .search_cve_summaries_by_text_with_state_scope(
+                &args.query,
+                state_scope(args.include_rejected),
+                limit(args.limit),
+                offset(args.offset),
+            )
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(description = "Search CVEs by CVSS score, severity, and/or CVSS version.")]
+    async fn search_by_cvss(
+        &self,
+        Parameters(args): Parameters<CvssArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cves = db
+            .search_cve_summaries_by_cvss_with_state_scope(
+                args.min_score,
+                args.max_score,
+                args.severity.as_deref(),
+                args.version.as_deref(),
+                state_scope(args.include_rejected),
+                limit(args.limit),
+                offset(args.offset),
+            )
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(description = "Search high-risk CVEs for a specific affected vendor/product.")]
+    async fn search_product_by_cvss(
+        &self,
+        Parameters(args): Parameters<ProductCvssArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cves = db
+            .search_cve_summaries_by_product_cvss_with_state_scope(
+                args.vendor.as_deref(),
+                args.product.as_deref(),
+                args.min_score,
+                args.severity.as_deref(),
+                state_scope(args.include_rejected),
+                limit(args.limit),
+                offset(args.offset),
+            )
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(
+        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps."
+    )]
+    async fn search_recent(
+        &self,
+        Parameters(args): Parameters<DateArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cves = db
+            .search_cve_summaries_by_date_with_state_scope(
+                args.published_since.as_deref(),
+                args.updated_since.as_deref(),
+                state_scope(args.include_rejected),
+                limit(args.limit),
+                offset(args.offset),
+            )
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries(cves)))
+    }
+
+    #[tool(description = "Fetch one CVE record by CVE ID, including raw JSON.")]
+    async fn get_cve(
+        &self,
+        Parameters(args): Parameters<GetCveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        let cve = db
+            .find_cve_model_by_id(&args.cve_id)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(cve.map(full_cve)))
+    }
+
+    #[tool(
+        description = "Update the CVE database by applying a delta CVE zip. If no zip is provided, the latest delta zip is downloaded from GitHub."
+    )]
+    async fn update_db(
+        &self,
+        Parameters(args): Parameters<UpdateDbArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db().await?;
+        db.initialize_schema()
+            .await
+            .map_err(|err| mcp_error(format!("failed to initialize schema: {err}")))?;
+
+        let asset_path = if let Some(zip) = args.zip {
+            PathBuf::from(zip)
+        } else {
+            download_latest_asset(ReleaseAssetKind::Delta)
+                .await
+                .map_err(mcp_error)?
+        };
+
+        ingest_zip(
+            db,
+            "delta",
+            &asset_path,
+            IngestMode::Upsert,
+            args.max_chunks,
+        )
+        .await;
+
+        Self::result(json!({
+            "updated": true,
+            "asset": asset_path.display().to_string(),
+        }))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for CveSearchServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            instructions: Some("Search and update the local qanvuli CVE database.".into()),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CweArgs {
     #[serde(default)]
     cwe_ids: Vec<CweArgValue>,
@@ -28,23 +241,14 @@ struct CweArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
 enum CweArgValue {
     Number(i32),
     String(String),
 }
 
-impl CweArgValue {
-    fn into_search_value(self) -> String {
-        match self {
-            Self::Number(value) => value.to_string(),
-            Self::String(value) => value,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ProductArgs {
     vendor: Option<String>,
     product: Option<String>,
@@ -53,7 +257,7 @@ struct ProductArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct TextArgs {
     query: String,
     limit: Option<u64>,
@@ -61,12 +265,12 @@ struct TextArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct GetCveArgs {
     cve_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CvssArgs {
     min_score: Option<f64>,
     max_score: Option<f64>,
@@ -77,7 +281,7 @@ struct CvssArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ProductCvssArgs {
     vendor: Option<String>,
     product: Option<String>,
@@ -88,7 +292,7 @@ struct ProductCvssArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct DateArgs {
     published_since: Option<String>,
     updated_since: Option<String>,
@@ -97,7 +301,7 @@ struct DateArgs {
     include_rejected: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct UpdateDbArgs {
     zip: Option<String>,
     max_chunks: Option<usize>,
@@ -108,236 +312,18 @@ pub fn run(db_url: String) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|err| format!("failed to build tokio runtime: {err}"))?;
-    let mut db = None;
 
-    let stdin = io::stdin();
-    let mut input = stdin.lock();
-    let stdout = io::stdout();
-    let mut output = stdout.lock();
-
-    loop {
-        let Some(message) =
-            read_message(&mut input).map_err(|err| format!("failed to read MCP message: {err}"))?
-        else {
-            break;
-        };
-
-        let request = match serde_json::from_slice::<JsonRpcRequest>(&message) {
-            Ok(request) => request,
-            Err(err) => {
-                let response = error_response(Value::Null, -32700, format!("parse error: {err}"));
-                write_message(&mut output, &response)
-                    .map_err(|err| format!("failed to write MCP response: {err}"))?;
-                continue;
-            }
-        };
-
-        if request.id.is_none() {
-            continue;
-        }
-
-        let id = request.id.clone().unwrap_or(Value::Null);
-        let response = runtime.block_on(handle_request(&mut db, &db_url, request));
-        let response = match response {
-            Ok(result) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": result,
-            }),
-            Err(err) => error_response(id, -32603, err),
-        };
-
-        write_message(&mut output, &response)
-            .map_err(|err| format!("failed to write MCP response: {err}"))?;
-    }
-
-    Ok(())
-}
-
-async fn handle_request(
-    db: &mut Option<CveDatabase>,
-    db_url: &str,
-    request: JsonRpcRequest,
-) -> Result<Value, String> {
-    match request.method.as_str() {
-        "initialize" => Ok(json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": "qanvuli-cve-search",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })),
-        "tools/list" => Ok(json!({
-            "tools": tools()
-        })),
-        "tools/call" => {
-            if db.is_none() {
-                *db = Some(
-                    CveDatabase::connect(db_url)
-                        .await
-                        .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))?,
-                );
-            }
-            call_tool(db.as_ref().expect("database is connected"), request.params).await
-        }
-        "ping" => Ok(json!({})),
-        method => Err(format!("unsupported method: {method}")),
-    }
-}
-
-async fn call_tool(db: &CveDatabase, params: Value) -> Result<Value, String> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "tools/call missing name".to_owned())?;
-    let args = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    let value = match name {
-        "search_by_cwe" => {
-            let args: CweArgs = parse_args(args)?;
-            let limit = limit(args.limit);
-            let offset = offset(args.offset);
-            let state_scope = state_scope(args.include_rejected);
-            let cwe_ids = args.search_values();
-            let cves = db
-                .search_cve_summaries_by_cwe_with_state_scope(&cwe_ids, state_scope, limit, offset)
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "search_by_product" => {
-            let args: ProductArgs = parse_args(args)?;
-            let cves = db
-                .search_cve_summaries_by_vendor_product_with_state_scope(
-                    args.vendor.as_deref(),
-                    args.product.as_deref(),
-                    state_scope(args.include_rejected),
-                    limit(args.limit),
-                    offset(args.offset),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "search_text" => {
-            let args: TextArgs = parse_args(args)?;
-            let cves = db
-                .search_cve_summaries_by_text_with_state_scope(
-                    &args.query,
-                    state_scope(args.include_rejected),
-                    limit(args.limit),
-                    offset(args.offset),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "search_by_cvss" => {
-            let args: CvssArgs = parse_args(args)?;
-            let cves = db
-                .search_cve_summaries_by_cvss_with_state_scope(
-                    args.min_score,
-                    args.max_score,
-                    args.severity.as_deref(),
-                    args.version.as_deref(),
-                    state_scope(args.include_rejected),
-                    limit(args.limit),
-                    offset(args.offset),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "search_product_by_cvss" => {
-            let args: ProductCvssArgs = parse_args(args)?;
-            let cves = db
-                .search_cve_summaries_by_product_cvss_with_state_scope(
-                    args.vendor.as_deref(),
-                    args.product.as_deref(),
-                    args.min_score,
-                    args.severity.as_deref(),
-                    state_scope(args.include_rejected),
-                    limit(args.limit),
-                    offset(args.offset),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "search_recent" => {
-            let args: DateArgs = parse_args(args)?;
-            let cves = db
-                .search_cve_summaries_by_date_with_state_scope(
-                    args.published_since.as_deref(),
-                    args.updated_since.as_deref(),
-                    state_scope(args.include_rejected),
-                    limit(args.limit),
-                    offset(args.offset),
-                )
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(summaries(cves))
-        }
-        "get_cve" => {
-            let args: GetCveArgs = parse_args(args)?;
-            let cve = db
-                .find_cve_by_id(&args.cve_id)
-                .await
-                .map_err(|err| err.to_string())?;
-            json!(cve.map(full_cve))
-        }
-        "update_db" => {
-            let args: UpdateDbArgs = parse_args(args)?;
-            db.initialize_schema()
-                .await
-                .map_err(|err| format!("failed to initialize schema: {err}"))?;
-
-            let asset_path = if let Some(zip) = args.zip {
-                PathBuf::from(zip)
-            } else {
-                download_latest_asset(ReleaseAssetKind::Delta).await?
-            };
-
-            ingest_zip(
-                db,
-                "delta",
-                &asset_path,
-                IngestMode::Upsert,
-                args.max_chunks,
-            )
-            .await;
-
-            json!({
-                "updated": true,
-                "asset": asset_path.display().to_string(),
-            })
-        }
-        _ => return Err(format!("unknown tool: {name}")),
-    };
-
-    let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
-    Ok(json!({
-        "content": [
-            {
-                "type": "text",
-                "text": text
-            }
-        ],
-        "isError": false
-    }))
-}
-
-fn parse_args<T>(value: Value) -> Result<T, String>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_value(value).map_err(|err| format!("invalid arguments: {err}"))
+    runtime.block_on(async move {
+        let service = CveSearchServer::new(db_url)
+            .serve(stdio())
+            .await
+            .map_err(|err| format!("failed to serve MCP over stdio: {err}"))?;
+        service
+            .waiting()
+            .await
+            .map_err(|err| format!("MCP server failed: {err}"))?;
+        Ok(())
+    })
 }
 
 impl CweArgs {
@@ -351,6 +337,15 @@ impl CweArgs {
             values.push(cwe_id.into_search_value());
         }
         values
+    }
+}
+
+impl CweArgValue {
+    fn into_search_value(self) -> String {
+        match self {
+            Self::Number(value) => value.to_string(),
+            Self::String(value) => value,
+        }
     }
 }
 
@@ -385,17 +380,8 @@ fn summary(cve: CveSummary) -> Value {
     })
 }
 
-fn full_cve(cve: cve::Model) -> Value {
-    json!({
-        "cve_id": cve.cve_id,
-        "state": cve_state_label(cve.state),
-        "published_at": cve.published_at,
-        "updated_at": cve.updated_at,
-        "serial": cve.serial,
-        "title": cve.title,
-        "description_en": cve.description_en,
-        "raw_json": cve.raw_json,
-    })
+fn full_cve(cve: RawCveStatusRecord) -> Value {
+    cve.into_parts().1
 }
 
 fn preview(value: &str) -> String {
@@ -411,194 +397,6 @@ fn preview(value: &str) -> String {
     }
 }
 
-fn tools() -> Value {
-    json!([
-        {
-            "name": "search_by_cwe",
-            "description": "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "cwe_ids": {
-                        "type": "array",
-                        "items": {
-                            "oneOf": [
-                                { "type": "string" },
-                                { "type": "integer" }
-                            ]
-                        },
-                        "description": "CWE IDs to match. Values may be strings such as CWE-79/CWE79 or integers such as 79."
-                    },
-                    "cwe_id": {
-                        "oneOf": [
-                            { "type": "string" },
-                            { "type": "integer" }
-                        ],
-                        "description": "Single CWE ID to match. Use cwe_ids for multiple values."
-                    },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                }
-            }
-        },
-        {
-            "name": "search_by_product",
-            "description": "Search CVEs by affected vendor and/or product name.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "vendor": { "type": "string", "description": "Affected vendor name or fragment." },
-                    "product": { "type": "string", "description": "Affected product name or fragment." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                }
-            }
-        },
-        {
-            "name": "search_text",
-            "description": "Search CVEs by CVE ID, title, or English description text.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Text to search for." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                },
-                "required": ["query"]
-            }
-        },
-        {
-            "name": "search_by_cvss",
-            "description": "Search CVEs by CVSS score, severity, and/or CVSS version.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "min_score": { "type": "number", "minimum": 0, "maximum": 10, "description": "Minimum CVSS base score." },
-                    "max_score": { "type": "number", "minimum": 0, "maximum": 10, "description": "Maximum CVSS base score." },
-                    "severity": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"], "description": "CVSS base severity." },
-                    "version": { "type": "string", "description": "CVSS version, for example 3.1 or 4.0." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                }
-            }
-        },
-        {
-            "name": "search_product_by_cvss",
-            "description": "Search high-risk CVEs for a specific affected vendor/product.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "vendor": { "type": "string", "description": "Affected vendor name or fragment." },
-                    "product": { "type": "string", "description": "Affected product name or fragment." },
-                    "min_score": { "type": "number", "minimum": 0, "maximum": 10, "description": "Minimum CVSS base score." },
-                    "severity": { "type": "string", "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"], "description": "CVSS base severity." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                }
-            }
-        },
-        {
-            "name": "search_recent",
-            "description": "Search recently published and/or recently updated CVEs using ISO-8601 timestamps.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "published_since": { "type": "string", "description": "Only CVEs published at or after this timestamp, for example 2026-06-01T00:00:00Z." },
-                    "updated_since": { "type": "string", "description": "Only CVEs updated at or after this timestamp, for example 2026-06-01T00:00:00Z." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "include_rejected": { "type": "boolean", "default": false, "description": "Include REJECTED CVEs. Defaults to false, returning PUBLISHED CVEs only." }
-                }
-            }
-        },
-        {
-            "name": "get_cve",
-            "description": "Fetch one CVE record by CVE ID, including raw JSON.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "cve_id": { "type": "string", "description": "CVE ID such as CVE-2024-1000." }
-                },
-                "required": ["cve_id"]
-            }
-        },
-        {
-            "name": "update_db",
-            "description": "Update the CVE database by applying a delta CVE zip. If no zip is provided, the latest delta zip is downloaded from GitHub.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "zip": { "type": "string", "description": "Optional local delta CVE zip path." },
-                    "max_chunks": { "type": "integer", "minimum": 1, "description": "Optional profiling/testing limit. Each chunk contains up to 10000 JSON files." }
-                }
-            }
-        }
-    ])
-}
-
-fn read_message<R>(input: &mut R) -> io::Result<Option<Vec<u8>>>
-where
-    R: BufRead,
-{
-    let mut line = String::new();
-    let read = input.read_line(&mut line)?;
-    if read == 0 {
-        return Ok(None);
-    }
-
-    let trimmed = line.trim_end_matches(['\r', '\n']);
-    if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-        let content_length = value.trim().parse::<usize>().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("bad content length: {err}"),
-            )
-        })?;
-
-        loop {
-            line.clear();
-            let read = input.read_line(&mut line)?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected eof while reading headers",
-                ));
-            }
-            if line.trim_end_matches(['\r', '\n']).is_empty() {
-                break;
-            }
-        }
-
-        let mut body = vec![0; content_length];
-        input.read_exact(&mut body)?;
-        Ok(Some(body))
-    } else {
-        Ok(Some(trimmed.as_bytes().to_vec()))
-    }
-}
-
-fn write_message<W>(output: &mut W, value: &Value) -> io::Result<()>
-where
-    W: Write,
-{
-    let body = serde_json::to_vec(value)?;
-    output.write_all(&body)?;
-    output.write_all(b"\n")?;
-    output.flush()
-}
-
-fn error_response(id: Value, code: i64, message: String) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message
-        }
-    })
+fn mcp_error(message: impl Into<String>) -> McpError {
+    McpError::internal_error(message.into(), None)
 }

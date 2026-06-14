@@ -1,7 +1,11 @@
-use qanvuli_db::{CveAdvancedSearch, CveStateScope, CveSummarySortOrder};
+use qanvuli_db::{CveAdvancedQueryMode, CveAdvancedSearch, CveStateScope, CveSummarySortOrder};
+
+use super::mode::SearchMode;
 
 #[derive(Clone, Debug)]
 pub(super) struct AdvancedForm {
+    pub(super) query: String,
+    pub(super) query_mode: SearchMode,
     pub(super) published_from: String,
     pub(super) published_to: String,
     pub(super) cwe: String,
@@ -14,6 +18,7 @@ pub(super) struct AdvancedForm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AdvancedField {
+    Query,
     PublishedFrom,
     PublishedTo,
     Cwe,
@@ -26,6 +31,8 @@ pub(super) enum AdvancedField {
 impl Default for AdvancedForm {
     fn default() -> Self {
         Self {
+            query: String::new(),
+            query_mode: SearchMode::FreeText,
             published_from: String::new(),
             published_to: String::new(),
             cwe: String::new(),
@@ -33,7 +40,7 @@ impl Default for AdvancedForm {
             vendor: String::new(),
             state_scope: CveStateScope::PublishedOnly,
             sort_order: CveSummarySortOrder::PublishedDesc,
-            active_field: AdvancedField::PublishedFrom,
+            active_field: AdvancedField::Query,
         }
     }
 }
@@ -53,6 +60,7 @@ impl AdvancedForm {
 
     fn active_text_mut(&mut self) -> Option<&mut String> {
         match self.active_field {
+            AdvancedField::Query => Some(&mut self.query),
             AdvancedField::PublishedFrom => Some(&mut self.published_from),
             AdvancedField::PublishedTo => Some(&mut self.published_to),
             AdvancedField::Cwe => Some(&mut self.cwe),
@@ -89,6 +97,8 @@ impl AdvancedForm {
 
     pub(super) fn to_search_options(&self) -> CveAdvancedSearch {
         CveAdvancedSearch {
+            query: option_string(&self.query),
+            query_mode: Some(self.query_mode.into()),
             published_from: option_string(&self.published_from),
             published_to: option_string(&self.published_to),
             cwe: option_string(&self.cwe),
@@ -103,25 +113,39 @@ impl AdvancedForm {
 impl AdvancedField {
     fn next(self) -> Self {
         match self {
+            Self::Query => Self::PublishedFrom,
             Self::PublishedFrom => Self::PublishedTo,
             Self::PublishedTo => Self::Cwe,
             Self::Cwe => Self::Product,
             Self::Product => Self::Vendor,
             Self::Vendor => Self::StateScope,
             Self::StateScope => Self::SortOrder,
-            Self::SortOrder => Self::PublishedFrom,
+            Self::SortOrder => Self::Query,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::PublishedFrom => Self::SortOrder,
+            Self::Query => Self::SortOrder,
+            Self::PublishedFrom => Self::Query,
             Self::PublishedTo => Self::PublishedFrom,
             Self::Cwe => Self::PublishedTo,
             Self::Product => Self::Cwe,
             Self::Vendor => Self::Product,
             Self::StateScope => Self::Vendor,
             Self::SortOrder => Self::StateScope,
+        }
+    }
+}
+
+impl From<SearchMode> for CveAdvancedQueryMode {
+    fn from(value: SearchMode) -> Self {
+        match value {
+            SearchMode::FreeText => Self::FreeText,
+            SearchMode::Product => Self::Product,
+            SearchMode::Vendor => Self::Vendor,
+            SearchMode::Cwe => Self::Cwe,
+            SearchMode::Cve => Self::Cve,
         }
     }
 }

@@ -118,6 +118,9 @@ impl App {
             search.handle.abort();
         }
 
+        self.query = self.advanced.query.clone();
+        self.search_mode = self.advanced.query_mode;
+        self.state_scope = self.advanced.state_scope;
         let request = SearchRequest::Advanced(self.advanced.to_search_options());
         self.searched_request = request.clone();
         self.exhausted = false;
@@ -132,6 +135,14 @@ impl App {
                     .map_err(|err| format!("failed to search: {err}"))
             }),
         });
+    }
+
+    pub(super) fn open_advanced_search(&mut self) {
+        self.apply_prefix_mode();
+        self.advanced.query = self.query.clone();
+        self.advanced.query_mode = self.search_mode;
+        self.advanced.state_scope = self.state_scope;
+        self.show_advanced = true;
     }
 
     pub(super) fn start_load_more(&mut self, db: CveDatabase) {
@@ -289,6 +300,12 @@ impl App {
     pub(super) fn set_page_sizes(&mut self, left: usize, right: usize) {
         self.left_page_size = left.max(MIN_PAGE_SIZE);
         self.right_page_size = right.max(MIN_PAGE_SIZE);
+        self.clamp_detail_scroll();
+    }
+
+    pub(super) fn clamp_detail_scroll_to_lines(&mut self, line_count: usize) {
+        let max_scroll = line_count.saturating_sub(self.right_page_size) as u16;
+        self.detail_scroll = self.detail_scroll.min(max_scroll);
     }
 
     pub(super) fn toggle_focus(&mut self) {
@@ -329,6 +346,7 @@ impl App {
             PaneFocus::Left => self.next_or_load_more(db),
             PaneFocus::Right => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
+                self.clamp_detail_scroll();
             }
         }
     }
@@ -338,6 +356,7 @@ impl App {
             PaneFocus::Left => self.previous(),
             PaneFocus::Right => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                self.clamp_detail_scroll();
             }
         }
     }
@@ -438,6 +457,16 @@ impl App {
             PageDirection::Up => self.detail_scroll.saturating_sub(step),
             PageDirection::Down => self.detail_scroll.saturating_add(step),
         };
+        self.clamp_detail_scroll();
+    }
+
+    fn clamp_detail_scroll(&mut self) {
+        self.detail_scroll = self.detail_scroll.min(self.max_detail_scroll());
+    }
+
+    fn max_detail_scroll(&self) -> u16 {
+        let line_count = self.selected().map(detail_line_count).unwrap_or(1);
+        line_count.saturating_sub(self.right_page_size) as u16
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {
@@ -475,4 +504,13 @@ enum PageDirection {
 enum PageAmount {
     Half,
     Full,
+}
+
+fn detail_line_count(cve: &CveSummary) -> usize {
+    let description_lines = cve
+        .description_en
+        .as_deref()
+        .map(|description| description.lines().count().max(1))
+        .unwrap_or(1);
+    6 + description_lines
 }

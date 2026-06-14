@@ -1,6 +1,5 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
-use qanvuli_db::{CveStateScope, cve_state_label};
-use serde_json::json;
+use qanvuli_db::CveStateScope;
 
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
@@ -65,21 +64,10 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
 
     if let Some(cve_id) = args.cve_id.as_deref() {
         let cve = db
-            .find_cve_by_id(cve_id)
+            .find_cve_model_by_id(cve_id)
             .await
             .map_err(|err| format!("failed to fetch {cve_id}: {err}"))?;
-        let cve = cve.map(|cve| {
-            json!({
-                "cve_id": cve.cve_id,
-                "state": cve_state_label(cve.state),
-                "published_at": cve.published_at,
-                "updated_at": cve.updated_at,
-                "serial": cve.serial,
-                "title": cve.title,
-                "description_en": cve.description_en,
-                "raw_json": cve.raw_json,
-            })
-        });
+        let cve = cve.map(|cve| cve.into_parts().1);
         print_json(&cve)?;
         db.close()
             .await
