@@ -1,15 +1,18 @@
+mod json_schemars;
+mod utils;
+
+use crate::subcommands::mcp::{json_schemars::*, utils::*};
+
 use super::common::{IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip};
-use qanvuli_db::{CveDatabase, CveStateScope, CveSummary, cve_state_label};
-use qanvuli_models::RawCveStatusRecord;
+use qanvuli_db::CveDatabase;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    tool, tool_handler, tool_router,
     transport::stdio,
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
+use simd_json::{OwnedValue as Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -18,7 +21,6 @@ use tokio::sync::OnceCell;
 struct CveSearchServer {
     db_url: String,
     db: Arc<OnceCell<CveDatabase>>,
-    tool_router: ToolRouter<Self>,
 }
 
 impl CveSearchServer {
@@ -26,7 +28,6 @@ impl CveSearchServer {
         Self {
             db_url,
             db: Arc::new(OnceCell::new()),
-            tool_router: Self::tool_router(),
         }
     }
 
@@ -44,7 +45,7 @@ impl CveSearchServer {
     }
 
     fn result(value: Value) -> Result<CallToolResult, McpError> {
-        let text = serde_json::to_string_pretty(&value)
+        let text = simd_json::to_string_pretty(&value)
             .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
@@ -223,88 +224,11 @@ impl CveSearchServer {
 #[tool_handler]
 impl ServerHandler for CveSearchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            instructions: Some("Search and update the local qanvuli CVE database.".into()),
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
-            ..Default::default()
-        }
+        let mut info = ServerInfo::default();
+        info.instructions = Some("Search and update the local qanvuli CVE database.".into());
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
     }
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CweArgs {
-    #[serde(default)]
-    cwe_ids: Vec<CweArgValue>,
-    cwe_id: Option<CweArgValue>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-enum CweArgValue {
-    Number(i32),
-    String(String),
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ProductArgs {
-    vendor: Option<String>,
-    product: Option<String>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct TextArgs {
-    query: String,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct GetCveArgs {
-    cve_id: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CvssArgs {
-    min_score: Option<f64>,
-    max_score: Option<f64>,
-    severity: Option<String>,
-    version: Option<String>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ProductCvssArgs {
-    vendor: Option<String>,
-    product: Option<String>,
-    min_score: Option<f64>,
-    severity: Option<String>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct DateArgs {
-    published_since: Option<String>,
-    updated_since: Option<String>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    include_rejected: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct UpdateDbArgs {
-    zip: Option<String>,
-    max_chunks: Option<usize>,
 }
 
 pub fn run(db_url: String) -> Result<(), String> {
@@ -324,77 +248,6 @@ pub fn run(db_url: String) -> Result<(), String> {
             .map_err(|err| format!("MCP server failed: {err}"))?;
         Ok(())
     })
-}
-
-impl CweArgs {
-    fn search_values(self) -> Vec<String> {
-        let mut values = self
-            .cwe_ids
-            .into_iter()
-            .map(CweArgValue::into_search_value)
-            .collect::<Vec<_>>();
-        if let Some(cwe_id) = self.cwe_id {
-            values.push(cwe_id.into_search_value());
-        }
-        values
-    }
-}
-
-impl CweArgValue {
-    fn into_search_value(self) -> String {
-        match self {
-            Self::Number(value) => value.to_string(),
-            Self::String(value) => value,
-        }
-    }
-}
-
-fn limit(value: Option<u64>) -> u64 {
-    value.unwrap_or(10).clamp(1, 25)
-}
-
-fn offset(value: Option<u64>) -> u64 {
-    value.unwrap_or(0)
-}
-
-fn state_scope(include_rejected: Option<bool>) -> CveStateScope {
-    if include_rejected.unwrap_or(false) {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    }
-}
-
-fn summaries(cves: Vec<CveSummary>) -> Vec<Value> {
-    cves.into_iter().map(summary).collect()
-}
-
-fn summary(cve: CveSummary) -> Value {
-    json!({
-        "cve_id": cve.cve_id,
-        "state": cve_state_label(cve.state),
-        "published_at": cve.published_at,
-        "updated_at": cve.updated_at,
-        "title": cve.title,
-        "description_preview": cve.description_en.as_deref().map(preview),
-    })
-}
-
-fn full_cve(cve: RawCveStatusRecord) -> Value {
-    cve.into_parts().1
-}
-
-fn preview(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let max_chars = 500;
-
-    if compact.chars().count() <= max_chars {
-        compact
-    } else {
-        let mut truncated = compact.chars().take(max_chars).collect::<String>();
-        truncated.push_str("...");
-        truncated
-    }
 }
 
 fn mcp_error(message: impl Into<String>) -> McpError {

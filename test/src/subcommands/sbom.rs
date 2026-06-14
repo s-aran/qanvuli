@@ -1,7 +1,7 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
 use qanvuli_db::{CveStateScope, CveSummary};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use simd_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -90,10 +90,10 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
 }
 
 fn load_sbom_packages(path: &Path) -> Result<Vec<SbomPackage>, String> {
-    let json = std::fs::read_to_string(path)
+    let mut json = std::fs::read(path)
         .map_err(|err| format!("failed to read SBOM {}: {err}", path.display()))?;
-    let sbom: GitHubSbom =
-        serde_json::from_str(&json).map_err(|err| format!("failed to parse SBOM JSON: {err}"))?;
+    let sbom: GitHubSbom = simd_json::from_slice(&mut json)
+        .map_err(|err| format!("failed to parse SBOM JSON: {err}"))?;
     let packages = sbom
         .sbom
         .map(|sbom| sbom.packages)

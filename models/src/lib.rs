@@ -41,24 +41,23 @@ impl<T> RawCveRecord<T> {
     }
 }
 
-pub fn parse_with_raw<T>(bytes: &[u8]) -> Result<RawCveRecord<T>, serde_json::Error>
+pub fn parse_with_raw<T>(bytes: &[u8]) -> Result<RawCveRecord<T>, simd_json::Error>
 where
     T: DeserializeOwned,
 {
-    let raw_json: Value = serde_json::from_slice(bytes)?;
-    let content: T = serde_json::from_value(raw_json.clone())?;
+    let mut content_bytes = bytes.to_vec();
+    let content: T = simd_json::from_slice(&mut content_bytes)?;
+    let mut bytes = bytes.to_vec();
+    let raw_json: Value = simd_json::from_slice(&mut bytes)?;
 
     Ok(RawCveRecord { content, raw_json })
 }
 
-pub fn parse_str_with_raw<T>(s: &str) -> Result<RawCveRecord<T>, serde_json::Error>
+pub fn parse_str_with_raw<T>(s: &str) -> Result<RawCveRecord<T>, simd_json::Error>
 where
     T: DeserializeOwned,
 {
-    let raw_json: Value = serde_json::from_str(s)?;
-    let content: T = serde_json::from_value(raw_json.clone())?;
-
-    Ok(RawCveRecord { content, raw_json })
+    parse_with_raw(s.as_bytes())
 }
 
 pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
@@ -66,8 +65,8 @@ pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
 }
 
 pub fn parse_json_with_raw(src: impl Into<String>) -> Result<RawCveStatusRecord, Error> {
-    let buf = src.into();
-    let raw_json: Value = serde_json::from_str(&buf)?;
+    let mut bytes = src.into().into_bytes();
+    let raw_json: Value = simd_json::from_slice(&mut bytes)?;
     parse_value_with_raw(raw_json)
 }
 

@@ -13,7 +13,7 @@ use ratatui::{
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(frame.area());
     let left = Layout::default()
         .direction(Direction::Vertical)
