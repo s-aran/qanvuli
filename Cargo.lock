@@ -2641,6 +2641,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "qanvuli-app"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "qanvuli-app-commands",
+ "qanvuli-app-mcp",
+ "qanvuli-app-tui",
+ "tokio",
+]
+
+[[package]]
+name = "qanvuli-app-commands"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "qanvuli-collector",
+ "qanvuli-db",
+ "qanvuli-models",
+ "qanvuli-utils",
+ "rayon",
+ "serde",
+ "serde_json",
+ "simd-json",
+]
+
+[[package]]
+name = "qanvuli-app-mcp"
+version = "0.1.0"
+dependencies = [
+ "qanvuli-app-commands",
+ "qanvuli-db",
+ "qanvuli-models",
+ "rmcp",
+ "serde",
+ "simd-json",
+ "tokio",
+]
+
+[[package]]
+name = "qanvuli-app-tui"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "qanvuli-app-commands",
+ "qanvuli-db",
+ "ratatui",
+ "tokio",
+]
+
+[[package]]
 name = "qanvuli-collector"
 version = "0.1.0"
 dependencies = [
@@ -2708,26 +2760,6 @@ dependencies = [
  "strum 0.28.0",
  "thiserror 2.0.18",
  "zip",
-]
-
-[[package]]
-name = "qanvuli-test"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "crossterm",
- "qanvuli-collector",
- "qanvuli-db",
- "qanvuli-models",
- "qanvuli-utils",
- "ratatui",
- "rayon",
- "rmcp",
- "serde",
- "serde_json",
- "simd-json",
- "tokio",
 ]
 
 [[package]]

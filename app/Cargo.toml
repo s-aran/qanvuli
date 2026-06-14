@@ -1,0 +1,11 @@
+[package]
+name = "qanvuli-app"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+qanvuli-app-commands = { version = "*", path = "../app-commands" }
+qanvuli-app-mcp = { version = "*", path = "../app-mcp" }
+qanvuli-app-tui = { version = "*", path = "../app-tui" }
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1.52", features = ["io-std", "macros", "rt", "sync"] }

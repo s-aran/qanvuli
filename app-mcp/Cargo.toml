@@ -1,0 +1,13 @@
+[package]
+name = "qanvuli-app-mcp"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+qanvuli-app-commands = { version = "*", path = "../app-commands" }
+qanvuli-db = { version = "*", path = "../db" }
+qanvuli-models = { version = "*", path = "../models" }
+rmcp = { version = "1.7", features = ["server", "transport-io"] }
+serde = { version = "1.0", features = ["derive"] }
+simd-json = { version = "0.17.0", features = ["ahash"] }
+tokio = { version = "1.52", features = ["io-std", "macros", "rt", "sync"] }

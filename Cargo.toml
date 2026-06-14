@@ -4,7 +4,18 @@ version = "0.1.0"
 
 
 [workspace]
-members = ["collector", "core", "db", "models", "test", "utils"]
+default-members = ["app"]
+members = [
+    "app",
+    "app-commands",
+    "app-mcp",
+    "app-tui",
+    "collector",
+    "core",
+    "db",
+    "models",
+    "utils",
+]
 resolver = "2"
 
 [profile.release]

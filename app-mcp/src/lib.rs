@@ -1,9 +1,10 @@
 mod json_schemars;
 mod utils;
 
-use crate::subcommands::mcp::{json_schemars::*, utils::*};
-
-use super::common::{IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip};
+use crate::{json_schemars::*, utils::*};
+use qanvuli_app_commands::common::{
+    IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip,
+};
 use qanvuli_db::CveDatabase;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,

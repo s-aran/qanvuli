@@ -1,6 +1,6 @@
 use super::{EVENT_POLL_MAX, TUI_LIMIT, app::App, terminal::TerminalGuard, ui::draw};
-use crate::subcommands::common::connect_db;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use qanvuli_app_commands::common::connect_db;
 use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
@@ -58,6 +58,15 @@ async fn run_loop(
             continue;
         };
         if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        if matches!(key.code, KeyCode::Char('l'))
+            && key.modifiers.contains(event::KeyModifiers::CONTROL)
+        {
+            terminal
+                .clear()
+                .map_err(|err| format!("failed to clear TUI: {err}"))?;
             continue;
         }
 
