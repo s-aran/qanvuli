@@ -45,9 +45,9 @@ impl FileStorageTrait for ActualStorage {
     }
 }
 
-trait ReadSeek: Read + Seek {}
+trait ReadSeek: Read + Seek + Send {}
 
-impl<T> ReadSeek for T where T: Read + Seek {}
+impl<T> ReadSeek for T where T: Read + Seek + Send {}
 
 pub struct ZipStorage {
     stream: zip::ZipArchive<Box<dyn ReadSeek>>,

@@ -153,11 +153,9 @@ pub async fn ingest_zip(
 ) {
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
-    let json_paths = {
-        let storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
-        eprintln!("{label}: enumerating CVE JSON entries");
-        storage.enum_json_list().collect::<Vec<String>>()
-    };
+    let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
+    eprintln!("{label}: enumerating CVE JSON entries");
+    let json_paths = storage.enum_json_list().collect::<Vec<String>>();
     eprintln!(
         "{label}: asset={}, json_count={}",
         asset_path.display(),
@@ -216,15 +214,12 @@ pub async fn ingest_zip(
         let mut read_failed = 0usize;
 
         let read_start = Instant::now();
-        {
-            let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
-            for json_path in chunk {
-                match storage.get_json(json_path) {
-                    Ok(json) => jsons.push((json_path.clone(), json)),
-                    Err(err) => {
-                        read_failed += 1;
-                        eprintln!("{label}: failed to read {json_path}: {err}");
-                    }
+        for json_path in chunk {
+            match storage.get_json(json_path) {
+                Ok(json) => jsons.push((json_path.clone(), json)),
+                Err(err) => {
+                    read_failed += 1;
+                    eprintln!("{label}: failed to read {json_path}: {err}");
                 }
             }
         }
