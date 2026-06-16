@@ -1,4 +1,6 @@
-use super::{EVENT_POLL_MAX, TUI_LIMIT, app::App, terminal::TerminalGuard, ui::draw};
+use super::{
+    EVENT_POLL_MAX, TUI_LIMIT, app::App, form::AdvancedField, terminal::TerminalGuard, ui::draw,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use qanvuli_app_commands::common::connect_db;
 use qanvuli_db::CveDatabase;
@@ -65,6 +67,7 @@ async fn run_loop(
             terminal
                 .clear()
                 .map_err(|err| format!("failed to clear TUI: {err}"))?;
+            app.reset_screen();
             continue;
         }
 
@@ -99,8 +102,33 @@ async fn run_loop(
                 KeyCode::BackTab => app.advanced.previous_field(),
                 KeyCode::Down => app.advanced.next_field(),
                 KeyCode::Up => app.advanced.previous_field(),
-                KeyCode::Right => app.advanced.next_sort_order(),
-                KeyCode::Left => app.advanced.previous_sort_order(),
+                KeyCode::Right if app.advanced.active_field == AdvancedField::Query => {
+                    app.advanced.query_mode = app.advanced.query_mode.next();
+                }
+                KeyCode::Left if app.advanced.active_field == AdvancedField::Query => {
+                    app.advanced.query_mode = app.advanced.query_mode.previous();
+                }
+                KeyCode::Right => app.advanced.next_value(),
+                KeyCode::Left => app.advanced.previous_value(),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.show_display {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => app.show_display = false,
+                KeyCode::Char('c') | KeyCode::Char('d')
+                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
+                {
+                    break;
+                }
+                KeyCode::Tab => app.display.next_field(),
+                KeyCode::BackTab => app.display.previous_field(),
+                KeyCode::Down => app.display.next_field(),
+                KeyCode::Up => app.display.previous_field(),
+                KeyCode::Right => app.display.next_value(),
+                KeyCode::Left => app.display.previous_value(),
                 _ => {}
             }
             continue;
@@ -123,7 +151,7 @@ async fn run_loop(
             }
             KeyCode::F(1) => app.show_help = true,
             KeyCode::F(3) => app.open_advanced_search(),
-            KeyCode::F(4) => app.toggle_state_scope(),
+            KeyCode::F(4) => app.open_display_settings(),
             KeyCode::Enter => app.start_search(db.clone()),
             KeyCode::Tab => app.toggle_focus(),
             KeyCode::Left => app.focus_left(),

@@ -2684,6 +2684,7 @@ dependencies = [
 name = "qanvuli-app-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "crossterm",
  "qanvuli-app-commands",

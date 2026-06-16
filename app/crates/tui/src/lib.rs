@@ -1,4 +1,5 @@
 mod app;
+mod display;
 mod form;
 mod mode;
 mod search;

@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "../commands" }
 qanvuli-db = { version = "*", path = "../../../db" }
+chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"
 ratatui = "0.30"

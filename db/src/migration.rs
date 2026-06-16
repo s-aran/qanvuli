@@ -1,4 +1,4 @@
-use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
+use crate::entity::{app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
 use sea_orm::{ConnectionTrait, EntityName, Schema};
 use sea_orm_migration::prelude::*;
 
@@ -17,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(M20260612OptimizeDetailLookup),
             Box::new(M20260613DropDuplicateReadJsonFileUniqueIndex),
             Box::new(M20260614RekeyCveTables),
+            Box::new(M20260615CreateAppMetadataTable),
         ]
     }
 }
@@ -843,6 +844,40 @@ impl MigrationTrait for M20260614RekeyCveTables {
 
     async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
         Ok(())
+    }
+}
+
+pub struct M20260615CreateAppMetadataTable;
+
+impl MigrationName for M20260615CreateAppMetadataTable {
+    fn name(&self) -> &str {
+        "m20260615_create_app_metadata_table"
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationTrait for M20260615CreateAppMetadataTable {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let schema = Schema::new(manager.get_database_backend());
+        manager
+            .create_table(
+                schema
+                    .create_table_from_entity(app_metadata::Entity)
+                    .if_not_exists()
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        manager
+            .drop_table(
+                Table::drop()
+                    .table(app_metadata::Entity)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
     }
 }
 

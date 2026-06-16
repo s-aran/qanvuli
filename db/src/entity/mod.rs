@@ -2,6 +2,7 @@
 
 pub mod prelude;
 
+pub mod app_metadata;
 pub mod cve;
 pub mod cve_affected;
 pub mod cve_cvss;

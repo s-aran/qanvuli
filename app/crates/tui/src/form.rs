@@ -12,7 +12,6 @@ pub(super) struct AdvancedForm {
     pub(super) product: String,
     pub(super) vendor: String,
     pub(super) state_scope: CveStateScope,
-    pub(super) sort_order: CveSummarySortOrder,
     pub(super) active_field: AdvancedField,
 }
 
@@ -25,7 +24,6 @@ pub(super) enum AdvancedField {
     Product,
     Vendor,
     StateScope,
-    SortOrder,
 }
 
 impl Default for AdvancedForm {
@@ -39,7 +37,6 @@ impl Default for AdvancedForm {
             product: String::new(),
             vendor: String::new(),
             state_scope: CveStateScope::PublishedOnly,
-            sort_order: CveSummarySortOrder::PublishedDesc,
             active_field: AdvancedField::Query,
         }
     }
@@ -50,12 +47,14 @@ impl AdvancedForm {
         if let Some(field) = self.active_text_mut() {
             field.push(ch);
         }
+        self.apply_query_prefix_mode();
     }
 
     pub(super) fn backspace(&mut self) {
         if let Some(field) = self.active_text_mut() {
             field.pop();
         }
+        self.apply_query_prefix_mode();
     }
 
     fn active_text_mut(&mut self) -> Option<&mut String> {
@@ -67,7 +66,6 @@ impl AdvancedForm {
             AdvancedField::Product => Some(&mut self.product),
             AdvancedField::Vendor => Some(&mut self.vendor),
             AdvancedField::StateScope => None,
-            AdvancedField::SortOrder => None,
         }
     }
 
@@ -79,23 +77,19 @@ impl AdvancedForm {
         self.active_field = self.active_field.previous();
     }
 
-    pub(super) fn next_sort_order(&mut self) {
-        match self.active_field {
-            AdvancedField::SortOrder => self.sort_order = self.sort_order.next(),
-            AdvancedField::StateScope => self.state_scope = self.state_scope.next(),
-            _ => {}
+    pub(super) fn next_value(&mut self) {
+        if matches!(self.active_field, AdvancedField::StateScope) {
+            self.state_scope = self.state_scope.next();
         }
     }
 
-    pub(super) fn previous_sort_order(&mut self) {
-        match self.active_field {
-            AdvancedField::SortOrder => self.sort_order = self.sort_order.previous(),
-            AdvancedField::StateScope => self.state_scope = self.state_scope.previous(),
-            _ => {}
+    pub(super) fn previous_value(&mut self) {
+        if matches!(self.active_field, AdvancedField::StateScope) {
+            self.state_scope = self.state_scope.previous();
         }
     }
 
-    pub(super) fn to_search_options(&self) -> CveAdvancedSearch {
+    pub(super) fn to_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
         CveAdvancedSearch {
             query: option_string(&self.query),
             query_mode: Some(self.query_mode.into()),
@@ -105,7 +99,15 @@ impl AdvancedForm {
             product: option_string(&self.product),
             vendor: option_string(&self.vendor),
             state_scope: self.state_scope,
-            sort_order: self.sort_order,
+            sort_order,
+        }
+    }
+
+    fn apply_query_prefix_mode(&mut self) {
+        if matches!(self.active_field, AdvancedField::Query)
+            && let Some(mode) = SearchMode::from_query_prefix(&self.query)
+        {
+            self.query_mode = mode;
         }
     }
 }
@@ -119,21 +121,19 @@ impl AdvancedField {
             Self::Cwe => Self::Product,
             Self::Product => Self::Vendor,
             Self::Vendor => Self::StateScope,
-            Self::StateScope => Self::SortOrder,
-            Self::SortOrder => Self::Query,
+            Self::StateScope => Self::Query,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Query => Self::SortOrder,
+            Self::Query => Self::StateScope,
             Self::PublishedFrom => Self::Query,
             Self::PublishedTo => Self::PublishedFrom,
             Self::Cwe => Self::PublishedTo,
             Self::Product => Self::Cwe,
             Self::Vendor => Self::Product,
             Self::StateScope => Self::Vendor,
-            Self::SortOrder => Self::StateScope,
         }
     }
 }
@@ -146,53 +146,6 @@ impl From<SearchMode> for CveAdvancedQueryMode {
             SearchMode::Vendor => Self::Vendor,
             SearchMode::Cwe => Self::Cwe,
             SearchMode::Cve => Self::Cve,
-        }
-    }
-}
-
-pub(super) trait SortOrderUi {
-    fn next(self) -> Self;
-    fn previous(self) -> Self;
-    fn label(self) -> &'static str;
-}
-
-impl SortOrderUi for CveSummarySortOrder {
-    fn next(self) -> Self {
-        match self {
-            Self::PublishedAsc => Self::PublishedDesc,
-            Self::PublishedDesc => Self::CveIdAsc,
-            Self::CveIdAsc => Self::CveIdDesc,
-            Self::CveIdDesc => Self::RelationRankAsc,
-            Self::RelationRankAsc => Self::RelationRankDesc,
-            Self::RelationRankDesc => Self::ScoreAsc,
-            Self::ScoreAsc => Self::ScoreDesc,
-            Self::ScoreDesc => Self::PublishedAsc,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::PublishedAsc => Self::ScoreDesc,
-            Self::PublishedDesc => Self::PublishedAsc,
-            Self::CveIdAsc => Self::PublishedDesc,
-            Self::CveIdDesc => Self::CveIdAsc,
-            Self::RelationRankAsc => Self::CveIdDesc,
-            Self::RelationRankDesc => Self::RelationRankAsc,
-            Self::ScoreAsc => Self::RelationRankDesc,
-            Self::ScoreDesc => Self::ScoreAsc,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::PublishedAsc => "published asc",
-            Self::PublishedDesc => "published desc",
-            Self::CveIdAsc => "a-z asc",
-            Self::CveIdDesc => "a-z desc",
-            Self::RelationRankAsc => "relation rank asc",
-            Self::RelationRankDesc => "relation rank desc",
-            Self::ScoreAsc => "score asc",
-            Self::ScoreDesc => "score desc",
         }
     }
 }

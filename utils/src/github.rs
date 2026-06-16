@@ -155,12 +155,12 @@ impl GitHub {
             .per_page(100)
             .send()
             .await?;
+        let release_items = octocrab.all_pages(page).await?;
 
         let releases: Vec<GitHubRelease> = {
-            let mut releases = page
-                .items
-                .iter()
-                .map(|release: &Release| release.clone().into())
+            let mut releases = release_items
+                .into_iter()
+                .map(GitHubRelease::from)
                 .collect::<Vec<GitHubRelease>>();
 
             releases.sort_by(|a, b| match (&a.published_at, &b.published_at) {

@@ -2,10 +2,8 @@ mod json_schemars;
 mod utils;
 
 use crate::{json_schemars::*, utils::*};
-use qanvuli_app_commands::common::{
-    IngestMode, ReleaseAssetKind, download_latest_asset, ingest_zip,
-};
-use qanvuli_db::CveDatabase;
+use qanvuli_app_commands::common::apply_delta_updates;
+use qanvuli_db::{CveDatabase, CveSummary};
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
@@ -50,12 +48,23 @@ impl CveSearchServer {
             .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
         Ok(CallToolResult::success(vec![Content::text(text)]))
     }
+
+    async fn search_result(
+        db: &CveDatabase,
+        cves: Vec<CveSummary>,
+    ) -> Result<CallToolResult, McpError> {
+        let cves = db
+            .attach_cve_details(cves)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        Self::result(json!(summaries_with_detail(cves)))
+    }
 }
 
 #[tool_router]
 impl CveSearchServer {
     #[tool(
-        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79."
+        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
     )]
     async fn search_by_cwe(
         &self,
@@ -70,10 +79,12 @@ impl CveSearchServer {
             .search_cve_summaries_by_cwe_with_state_scope(&cwe_ids, state_scope, limit, offset)
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
-    #[tool(description = "Search CVEs by affected vendor and/or product name.")]
+    #[tool(
+        description = "Search CVEs by affected vendor and/or product name. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+    )]
     async fn search_by_product(
         &self,
         Parameters(args): Parameters<ProductArgs>,
@@ -89,10 +100,12 @@ impl CveSearchServer {
             )
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
-    #[tool(description = "Search CVEs by CVE ID, title, or English description text.")]
+    #[tool(
+        description = "Search CVEs by CVE ID, title, or English description text. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+    )]
     async fn search_text(
         &self,
         Parameters(args): Parameters<TextArgs>,
@@ -107,10 +120,12 @@ impl CveSearchServer {
             )
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
-    #[tool(description = "Search CVEs by CVSS score, severity, and/or CVSS version.")]
+    #[tool(
+        description = "Search CVEs by CVSS score, severity, and/or CVSS version. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+    )]
     async fn search_by_cvss(
         &self,
         Parameters(args): Parameters<CvssArgs>,
@@ -128,10 +143,12 @@ impl CveSearchServer {
             )
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
-    #[tool(description = "Search high-risk CVEs for a specific affected vendor/product.")]
+    #[tool(
+        description = "Search high-risk CVEs for a specific affected vendor/product. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+    )]
     async fn search_product_by_cvss(
         &self,
         Parameters(args): Parameters<ProductCvssArgs>,
@@ -149,11 +166,11 @@ impl CveSearchServer {
             )
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
     #[tool(
-        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps."
+        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
     )]
     async fn search_recent(
         &self,
@@ -170,10 +187,12 @@ impl CveSearchServer {
             )
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
-        Self::result(json!(summaries(cves)))
+        Self::search_result(db, cves).await
     }
 
-    #[tool(description = "Fetch one CVE record by CVE ID, including raw JSON.")]
+    #[tool(
+        description = "Fetch one CVE record by CVE ID, including raw JSON. This is token-heavy; prefer search_* tools unless raw CVE JSON is explicitly required."
+    )]
     async fn get_cve(
         &self,
         Parameters(args): Parameters<GetCveArgs>,
@@ -198,26 +217,13 @@ impl CveSearchServer {
             .await
             .map_err(|err| mcp_error(format!("failed to initialize schema: {err}")))?;
 
-        let asset_path = if let Some(zip) = args.zip {
-            PathBuf::from(zip)
-        } else {
-            download_latest_asset(ReleaseAssetKind::Delta)
-                .await
-                .map_err(mcp_error)?
-        };
-
-        ingest_zip(
-            db,
-            "delta",
-            &asset_path,
-            IngestMode::Upsert,
-            args.max_chunks,
-        )
-        .await;
+        let applied = apply_delta_updates(db, args.zip.map(PathBuf::from), args.max_chunks)
+            .await
+            .map_err(mcp_error)?;
 
         Self::result(json!({
             "updated": true,
-            "asset": asset_path.display().to_string(),
+            "applied_assets": applied.into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         }))
     }
 }

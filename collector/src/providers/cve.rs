@@ -93,4 +93,14 @@ impl CveRelease {
         let releases = self.get_end_of_day_release();
         Self::get_latest_file(releases, |_| true)
     }
+
+    pub fn get_delta_files_oldest_first(&self) -> Vec<GitHubReleaseFile> {
+        let mut releases = self.get_hourly_release();
+        releases.reverse();
+        releases
+            .into_iter()
+            .flat_map(|release| release.files.iter().filter(|file| Self::is_delta_zip(file)))
+            .cloned()
+            .collect()
+    }
 }

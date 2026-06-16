@@ -2,7 +2,7 @@ pub mod entity;
 pub mod migration;
 
 use chrono::Utc;
-use entity::{cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
+use entity::{app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
 use md5::{Digest, Md5};
 use migration::Migrator;
 use std::collections::{HashMap, HashSet};
@@ -28,6 +28,7 @@ const AFFECTED_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const CWE_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 6;
 const CWE_MASTER_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const READ_JSON_FILE_CHUNK_SIZE: usize = 1000;
+const CVE_ASSET_METADATA_PREFIX: &str = "cve_asset:";
 const PUBLISHED_STATE: i32 = 0;
 const REJECTED_STATE: i32 = 1;
 
@@ -104,13 +105,23 @@ pub struct CveCvssDetail {
     pub source: Option<String>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CveAffectedDetail {
     pub vendor: Option<String>,
     pub product: Option<String>,
     pub package_name: Option<String>,
     pub collection_url: Option<String>,
     pub default_status: Option<String>,
+    pub versions: Vec<CveAffectedVersionDetail>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct CveAffectedVersionDetail {
+    pub version: Option<String>,
+    pub status: Option<String>,
+    pub version_type: Option<String>,
+    pub less_than: Option<String>,
+    pub less_than_or_equal: Option<String>,
 }
 
 #[derive(Clone, Debug, FromQueryResult)]
@@ -138,6 +149,7 @@ struct CveAffectedDetailRow {
     package_name: Option<String>,
     collection_url: Option<String>,
     default_status: Option<String>,
+    raw_json: Value,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -328,6 +340,10 @@ fn md5_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+fn cve_asset_metadata_key(asset_name: &str) -> String {
+    format!("{CVE_ASSET_METADATA_PREFIX}{asset_name}")
+}
+
 fn json_string_or_json(value: &Value, key: &str) -> Option<String> {
     value.get(key).map(|value| {
         value
@@ -335,6 +351,36 @@ fn json_string_or_json(value: &Value, key: &str) -> Option<String> {
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| value.to_string())
     })
+}
+
+fn cve_affected_detail_from_row(row: CveAffectedDetailRow) -> CveAffectedDetail {
+    CveAffectedDetail {
+        vendor: row.vendor,
+        product: row.product,
+        package_name: row.package_name,
+        collection_url: row.collection_url,
+        default_status: row.default_status,
+        versions: affected_versions(&row.raw_json),
+    }
+}
+
+fn affected_versions(raw_json: &Value) -> Vec<CveAffectedVersionDetail> {
+    raw_json
+        .get("versions")
+        .and_then(Value::as_array)
+        .map(|versions| {
+            versions
+                .iter()
+                .map(|version| CveAffectedVersionDetail {
+                    version: json_string(version, "version"),
+                    status: json_string(version, "status"),
+                    version_type: json_string(version, "versionType"),
+                    less_than: json_string(version, "lessThan"),
+                    less_than_or_equal: json_string(version, "lessThanOrEqual"),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cwe_numbers(cwe_ids: &[String]) -> Vec<i32> {
@@ -644,21 +690,27 @@ impl CveDatabase {
             .all(&self.db)
             .await?;
 
-        let affected = cve_affected::Entity::find()
+        let affected_rows = cve_affected::Entity::find()
             .select_only()
+            .column(cve_affected::Column::CveDbId)
             .columns([
                 cve_affected::Column::Vendor,
                 cve_affected::Column::Product,
                 cve_affected::Column::PackageName,
                 cve_affected::Column::CollectionUrl,
                 cve_affected::Column::DefaultStatus,
+                cve_affected::Column::RawJson,
             ])
             .filter(cve_affected::Column::CveDbId.eq(cve_db_id))
             .order_by_asc(cve_affected::Column::Vendor)
             .order_by_asc(cve_affected::Column::Product)
-            .into_model::<CveAffectedDetail>()
+            .into_model::<CveAffectedDetailRow>()
             .all(&self.db)
             .await?;
+        let affected = affected_rows
+            .into_iter()
+            .map(cve_affected_detail_from_row)
+            .collect();
 
         Ok(CveDetail {
             cwes,
@@ -760,6 +812,7 @@ impl CveDatabase {
                 cve_affected::Column::PackageName,
                 cve_affected::Column::CollectionUrl,
                 cve_affected::Column::DefaultStatus,
+                cve_affected::Column::RawJson,
             ])
             .filter(cve_affected::Column::CveDbId.is_in(cve_db_ids))
             .order_by_asc(cve_affected::Column::CveDbId)
@@ -772,13 +825,7 @@ impl CveDatabase {
             if let Some(cve_id) = cve_id_by_db_id.get(&affected.cve_db_id)
                 && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
             {
-                detail.affected.push(CveAffectedDetail {
-                    vendor: affected.vendor,
-                    product: affected.product,
-                    package_name: affected.package_name,
-                    collection_url: affected.collection_url,
-                    default_status: affected.default_status,
-                });
+                detail.affected.push(cve_affected_detail_from_row(affected));
             }
         }
 
@@ -2220,6 +2267,40 @@ impl CveDatabase {
             .filter(read_json_file::Column::Filename.eq(filename))
             .filter(read_json_file::Column::Md5hash.eq(md5hash))
             .one(&self.db)
+            .await
+    }
+
+    pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, DbErr> {
+        app_metadata::Entity::find_by_id(key.to_owned())
+            .one(&self.db)
+            .await
+            .map(|row| row.map(|row| row.value))
+    }
+
+    pub async fn set_metadata(&self, key: &str, value: &str) -> Result<(), DbErr> {
+        app_metadata::Entity::insert(app_metadata::ActiveModel {
+            key: Set(key.to_owned()),
+            value: Set(value.to_owned()),
+            updated_at: Set(Utc::now().to_rfc3339()),
+        })
+        .on_conflict(
+            OnConflict::column(app_metadata::Column::Key)
+                .update_columns([app_metadata::Column::Value, app_metadata::Column::UpdatedAt])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn is_cve_asset_applied(&self, asset_name: &str) -> Result<bool, DbErr> {
+        self.get_metadata(&cve_asset_metadata_key(asset_name))
+            .await
+            .map(|value| value.is_some())
+    }
+
+    pub async fn mark_cve_asset_applied(&self, asset_name: &str, value: &str) -> Result<(), DbErr> {
+        self.set_metadata(&cve_asset_metadata_key(asset_name), value)
             .await
     }
 }

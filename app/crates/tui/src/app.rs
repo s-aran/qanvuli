@@ -1,10 +1,13 @@
 use super::{
     TUI_LOAD_MORE_LIMIT,
+    display::DisplaySettings,
     form::AdvancedForm,
     mode::SearchMode,
     search::{SearchRequest, SearchResult, run_search_request},
 };
-use qanvuli_db::{CveDatabase, CveStateScope, CveSummaryWithDetail};
+use qanvuli_db::{
+    CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
+};
 use ratatui::widgets::ListState;
 use std::time::Instant;
 use tokio::task::JoinHandle;
@@ -16,6 +19,7 @@ pub(super) struct App {
     pub(super) search_mode: SearchMode,
     pub(super) state_scope: CveStateScope,
     pub(super) advanced: AdvancedForm,
+    pub(super) display: DisplaySettings,
     pub(super) limit: u64,
     pub(super) results: Vec<CveSummaryWithDetail>,
     pub(super) total_results: Option<u64>,
@@ -30,6 +34,7 @@ pub(super) struct App {
     right_page_size: usize,
     pub(super) show_help: bool,
     pub(super) show_advanced: bool,
+    pub(super) show_display: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +63,7 @@ impl App {
             search_mode,
             state_scope: CveStateScope::PublishedOnly,
             advanced: AdvancedForm::default(),
+            display: DisplaySettings::default(),
             limit,
             results: Vec::new(),
             total_results: None,
@@ -76,6 +82,7 @@ impl App {
             right_page_size: 10,
             show_help: false,
             show_advanced: false,
+            show_display: false,
         }
     }
 
@@ -85,10 +92,15 @@ impl App {
         }
 
         self.apply_prefix_mode();
-        let request = SearchRequest::Mode {
-            mode: self.search_mode,
-            query: self.query.clone(),
-            state_scope: self.state_scope,
+        let sort_order = self.display.sort_order();
+        let request = if sort_order == CveSummarySortOrder::PublishedDesc {
+            SearchRequest::Mode {
+                mode: self.search_mode,
+                query: self.query.clone(),
+                state_scope: self.state_scope,
+            }
+        } else {
+            SearchRequest::Advanced(self.main_search_options(sort_order))
         };
         let limit = self.limit;
         self.searched_request = request.clone();
@@ -113,7 +125,8 @@ impl App {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
         self.state_scope = self.advanced.state_scope;
-        let request = SearchRequest::Advanced(self.advanced.to_search_options());
+        let request =
+            SearchRequest::Advanced(self.advanced.to_search_options(self.display.sort_order()));
         self.searched_request = request.clone();
         self.exhausted = false;
         self.total_results = None;
@@ -135,6 +148,10 @@ impl App {
         self.advanced.query_mode = self.search_mode;
         self.advanced.state_scope = self.state_scope;
         self.show_advanced = true;
+    }
+
+    pub(super) fn open_display_settings(&mut self) {
+        self.show_display = true;
     }
 
     pub(super) fn start_load_more(&mut self, db: CveDatabase) {
@@ -333,16 +350,46 @@ impl App {
         self.search_mode = self.search_mode.next();
     }
 
-    pub(super) fn toggle_state_scope(&mut self) {
-        self.state_scope = match self.state_scope {
-            CveStateScope::PublishedOnly => CveStateScope::IncludeRejected,
-            CveStateScope::IncludeRejected => CveStateScope::PublishedOnly,
+    pub(super) fn reset_screen(&mut self) {
+        self.abort_search();
+        self.query.clear();
+        self.search_mode = SearchMode::FreeText;
+        self.state_scope = CveStateScope::PublishedOnly;
+        self.advanced = AdvancedForm::default();
+        self.display = DisplaySettings::default();
+        self.results.clear();
+        self.total_results = None;
+        self.list_state.select(Some(0));
+        self.focus = PaneFocus::Left;
+        self.detail_scroll = 0;
+        self.searched_request = SearchRequest::Mode {
+            mode: SearchMode::FreeText,
+            query: String::new(),
+            state_scope: CveStateScope::PublishedOnly,
         };
+        self.exhausted = false;
+        self.show_help = false;
+        self.show_advanced = false;
+        self.show_display = false;
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {
         if let Some(mode) = SearchMode::from_query_prefix(&self.query) {
             self.search_mode = mode;
+        }
+    }
+
+    fn main_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
+        CveAdvancedSearch {
+            query: option_string(&self.query),
+            query_mode: Some(self.search_mode.into()),
+            published_from: None,
+            published_to: None,
+            cwe: None,
+            product: None,
+            vendor: None,
+            state_scope: self.state_scope,
+            sort_order,
         }
     }
 
@@ -443,4 +490,13 @@ fn detail_line_count(cve: &CveSummaryWithDetail) -> usize {
         .map(|description| description.lines().count().max(1))
         .unwrap_or(1);
     6 + description_lines
+}
+
+fn option_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
 }

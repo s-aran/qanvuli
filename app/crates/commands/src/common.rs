@@ -14,6 +14,8 @@ pub const DEFAULT_LIMIT: u64 = 25;
 
 const INGEST_CHUNK_SIZE: usize = 10000;
 const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
+const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
+const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ReleaseAssetKind {
@@ -114,15 +116,82 @@ pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
 }
 
 pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
-    let path = download_latest_cwe_catalog().await?;
+    let catalog_file = CweCatalogFile::default();
+    let etag = db
+        .get_metadata(CWE_ETAG_METADATA_KEY)
+        .await
+        .map_err(|err| format!("failed to read CWE ETag metadata: {err}"))?;
+    let last_modified = db
+        .get_metadata(CWE_LAST_MODIFIED_METADATA_KEY)
+        .await
+        .map_err(|err| format!("failed to read CWE Last-Modified metadata: {err}"))?;
+
+    eprintln!("cwe: checking {}", catalog_file.url);
+    let download = catalog_file
+        .async_download_if_changed(etag.as_deref(), last_modified.as_deref())
+        .await
+        .map_err(|err| format!("failed to update {}: {err}", catalog_file.name))?;
+    let Some(path) = download.path else {
+        eprintln!("cwe: catalog unchanged");
+        return Ok(());
+    };
+
     let catalog = read_cwe_catalog_zip(&path)
         .map_err(|err| format!("failed to read CWE catalog {}: {err}", path.display()))?;
     let count = db
         .upsert_cwe_catalog(&catalog)
         .await
         .map_err(|err| format!("failed to write CWE catalog: {err}"))?;
+    if let Some(etag) = download.etag {
+        db.set_metadata(CWE_ETAG_METADATA_KEY, &etag)
+            .await
+            .map_err(|err| format!("failed to write CWE ETag metadata: {err}"))?;
+    }
+    if let Some(last_modified) = download.last_modified {
+        db.set_metadata(CWE_LAST_MODIFIED_METADATA_KEY, &last_modified)
+            .await
+            .map_err(|err| format!("failed to write CWE Last-Modified metadata: {err}"))?;
+    }
     eprintln!("cwe: upserted {count} CWE master rows");
     Ok(())
+}
+
+pub async fn apply_delta_updates(
+    db: &CveDatabase,
+    zip: Option<PathBuf>,
+    max_chunks: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    if let Some(zip) = zip {
+        ingest_zip(db, "delta", &zip, IngestMode::Upsert, max_chunks).await;
+        return Ok(vec![zip]);
+    }
+
+    let assets = delta_assets_oldest_first().await?;
+    let mut applied = Vec::new();
+    for asset in assets {
+        if db
+            .is_cve_asset_applied(&asset.name)
+            .await
+            .map_err(|err| format!("failed to read CVE asset metadata: {err}"))?
+        {
+            continue;
+        }
+
+        eprintln!("delta: downloading {} ({} bytes)", asset.name, asset.size);
+        asset
+            .async_download_as_file()
+            .await
+            .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
+        let asset_path = PathBuf::from(&asset.name);
+        ingest_zip(db, "delta", &asset_path, IngestMode::Upsert, max_chunks).await;
+        if max_chunks.is_none() {
+            db.mark_cve_asset_applied(&asset.name, &asset.url)
+                .await
+                .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
+        }
+        applied.push(asset_path);
+    }
+    Ok(applied)
 }
 
 pub async fn latest_asset(
@@ -142,6 +211,15 @@ pub async fn latest_asset(
     asset
         .cloned()
         .ok_or_else(|| format!("no {kind} CVE zip asset found"))
+}
+
+pub async fn delta_assets_oldest_first()
+-> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
+    let mut cve = CveRelease::new();
+    cve.async_get()
+        .await
+        .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
+    Ok(cve.get_delta_files_oldest_first())
 }
 
 pub async fn ingest_zip(

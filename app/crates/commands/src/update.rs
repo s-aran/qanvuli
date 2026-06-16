@@ -1,4 +1,4 @@
-use super::common::{IngestMode, ReleaseAssetKind, connect_db, download_latest_asset, ingest_zip};
+use super::common::{apply_delta_updates, connect_db};
 use std::path::PathBuf;
 
 #[derive(Debug, clap::Args)]
@@ -17,20 +17,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .await
         .map_err(|err| format!("failed to initialize schema: {err}"))?;
 
-    let asset_path = if let Some(zip) = args.zip {
-        zip
-    } else {
-        download_latest_asset(ReleaseAssetKind::Delta).await?
-    };
-
-    ingest_zip(
-        &db,
-        "delta",
-        &asset_path,
-        IngestMode::Upsert,
-        args.max_chunks,
-    )
-    .await;
+    let applied = apply_delta_updates(&db, args.zip, args.max_chunks).await?;
+    eprintln!("update: applied {} delta archive(s)", applied.len());
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;

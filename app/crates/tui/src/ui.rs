@@ -1,7 +1,9 @@
 use super::{
     app::{App, PaneFocus},
-    form::{AdvancedField, AdvancedForm, SortOrderUi, StateScopeUi},
+    display::{DisplayField, DisplaySettings, TimeZone},
+    form::{AdvancedField, AdvancedForm, StateScopeUi},
 };
+use chrono::{DateTime, FixedOffset};
 use qanvuli_db::{CveDetail, CveSummaryWithDetail, cve_state_label};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -79,9 +81,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_stateful_widget(list, left[1], &mut app.list_state);
 
     let footer = Paragraph::new(format!(
-        "{} | State: {}",
+        "{} | State: {} | Sort: {} {} | TZ: {}",
         app.search_mode.footer_text(),
-        app.state_scope.label()
+        app.state_scope.label(),
+        app.display.sort_field.label(),
+        app.display.sort_direction.label(),
+        app.display.timezone.label()
     ))
     .style(
         Style::default()
@@ -92,7 +97,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
 
     let detail = app
         .selected()
-        .map(detail_lines)
+        .map(|cve| detail_lines(cve, app.display.timezone))
         .unwrap_or_else(|| vec![Line::from("No results")]);
     app.clamp_detail_scroll_to_lines(detail.len());
     let detail_title = app
@@ -124,6 +129,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if app.show_advanced {
         draw_advanced(frame, app);
     }
+    if app.show_display {
+        draw_display(frame, app);
+    }
 }
 
 fn focus_style(active: bool) -> Style {
@@ -140,7 +148,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Enter  Search current input"),
         Line::from("Tab    Switch pane focus"),
         Line::from("F3     Open advanced search"),
-        Line::from("F4     Toggle PUBLISHED only / include REJECTED"),
+        Line::from("F4     Open display settings"),
         Line::from("Shift+Tab Switch search mode"),
         Line::from("Left/Right Switch pane focus"),
         Line::from("Up/Down Move focused pane"),
@@ -148,6 +156,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Ctrl-B/F Full-page up/down focused pane"),
         Line::from("F1     Show this help"),
         Line::from("Esc    Close this help"),
+        Line::from("Ctrl-L Reset screen and popup settings"),
         Line::from("Ctrl-C Quit"),
     ])
     .block(Block::default().title("Help").borders(Borders::ALL))
@@ -187,15 +196,9 @@ fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
             "State",
             form.state_scope.label(),
         ),
-        advanced_line(
-            form,
-            AdvancedField::SortOrder,
-            "Sort order",
-            form.sort_order.label(),
-        ),
         Line::from(""),
         Line::from(
-            "Enter search  Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right state/sort",
+            "Enter search  Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right mode/state",
         ),
     ];
     let popup = Paragraph::new(lines)
@@ -204,6 +207,43 @@ fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
                 .title("Advanced Search")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = centered_rect(56, 34, frame.area());
+    let display = &app.display;
+    let lines = vec![
+        display_line(
+            display,
+            DisplayField::SortField,
+            "Sort item",
+            display.sort_field.label(),
+        ),
+        display_line(
+            display,
+            DisplayField::SortDirection,
+            "Sort direction",
+            display.sort_direction.label(),
+        ),
+        display_line(
+            display,
+            DisplayField::TimeZone,
+            "Timezone",
+            display.timezone.label(),
+        ),
+        Line::from(""),
+        Line::from("Enter/Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right change"),
+    ];
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title("Display Settings")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
         )
         .wrap(Wrap { trim: true });
     frame.render_widget(Clear, area);
@@ -221,6 +261,28 @@ fn advanced_line(
     let style = if active {
         Style::default()
             .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(format!("{label}: "), style),
+        Span::raw(value.to_owned()),
+    ])
+}
+
+fn display_line(
+    display: &DisplaySettings,
+    field: DisplayField,
+    label: &'static str,
+    value: &str,
+) -> Line<'static> {
+    let active = display.active_field == field;
+    let marker = if active { "> " } else { "  " };
+    let style = if active {
+        Style::default()
+            .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -251,7 +313,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn detail_lines(cve: &CveSummaryWithDetail) -> Vec<Line<'static>> {
+fn detail_lines(cve: &CveSummaryWithDetail, timezone: TimeZone) -> Vec<Line<'static>> {
     let cve = &cve.summary;
     vec![
         Line::from(vec![
@@ -260,11 +322,11 @@ fn detail_lines(cve: &CveSummaryWithDetail) -> Vec<Line<'static>> {
         ]),
         Line::from(vec![
             Span::styled("Published: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(cve.published_at.clone()),
+            Span::raw(format_timestamp(&cve.published_at, timezone)),
         ]),
         Line::from(vec![
             Span::styled("Updated: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(cve.updated_at.clone()),
+            Span::raw(format_timestamp(&cve.updated_at, timezone)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -274,6 +336,27 @@ fn detail_lines(cve: &CveSummaryWithDetail) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(cve.description_en.clone().unwrap_or_default()),
     ]
+}
+
+fn format_timestamp(value: &str, timezone: TimeZone) -> String {
+    let Ok(datetime) = DateTime::parse_from_rfc3339(value) else {
+        return value.to_owned();
+    };
+    let Some(offset) = timezone_offset(timezone) else {
+        return value.to_owned();
+    };
+    datetime
+        .with_timezone(&offset)
+        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .to_string()
+}
+
+fn timezone_offset(timezone: TimeZone) -> Option<FixedOffset> {
+    match timezone {
+        TimeZone::Utc => FixedOffset::east_opt(0),
+        TimeZone::Jst => FixedOffset::east_opt(9 * 60 * 60),
+        TimeZone::Pst => FixedOffset::west_opt(8 * 60 * 60),
+    }
 }
 
 fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {

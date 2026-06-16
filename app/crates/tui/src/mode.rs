@@ -21,6 +21,16 @@ impl SearchMode {
         }
     }
 
+    pub(super) fn previous(self) -> Self {
+        match self {
+            Self::FreeText => Self::Cve,
+            Self::Product => Self::FreeText,
+            Self::Vendor => Self::Product,
+            Self::Cwe => Self::Vendor,
+            Self::Cve => Self::Cwe,
+        }
+    }
+
     pub(super) fn from_query_prefix(query: &str) -> Option<Self> {
         let query = query.trim_start();
         if query
