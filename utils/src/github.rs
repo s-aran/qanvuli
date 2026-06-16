@@ -155,25 +155,22 @@ impl GitHub {
             .per_page(100)
             .send()
             .await?;
+        release_items_to_sorted_releases(page.items)
+    }
+
+    pub async fn async_get_all_release_list(
+        &self,
+    ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
+        let octocrab = octocrab::instance();
+        let page = octocrab
+            .repos(&self.owner, &self.repo)
+            .releases()
+            .list()
+            .per_page(100)
+            .send()
+            .await?;
         let release_items = octocrab.all_pages(page).await?;
-
-        let releases: Vec<GitHubRelease> = {
-            let mut releases = release_items
-                .into_iter()
-                .map(GitHubRelease::from)
-                .collect::<Vec<GitHubRelease>>();
-
-            releases.sort_by(|a, b| match (&a.published_at, &b.published_at) {
-                (Some(a), Some(b)) => b.cmp(a), // Z -> A
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => std::cmp::Ordering::Equal,
-            });
-
-            releases
-        };
-
-        Ok(releases)
+        release_items_to_sorted_releases(release_items)
     }
 
     pub fn get_release_list(
@@ -184,4 +181,22 @@ impl GitHub {
             .build()?
             .block_on(self.async_get_release_list())
     }
+}
+
+fn release_items_to_sorted_releases(
+    release_items: Vec<Release>,
+) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut releases = release_items
+        .into_iter()
+        .map(GitHubRelease::from)
+        .collect::<Vec<GitHubRelease>>();
+
+    releases.sort_by(|a, b| match (&a.published_at, &b.published_at) {
+        (Some(a), Some(b)) => b.cmp(a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    Ok(releases)
 }

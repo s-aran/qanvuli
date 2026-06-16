@@ -28,6 +28,12 @@ impl CveRelease {
         Ok(())
     }
 
+    pub async fn async_get_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let gh = github::GitHub::new(github::GITHUB_OWNER, github::GITHUB_REPO);
+        self.releases = gh.async_get_all_release_list().await?;
+        Ok(())
+    }
+
     fn is_hourly_release(release: &GitHubRelease) -> bool {
         !Self::is_end_of_day_release(release)
     }

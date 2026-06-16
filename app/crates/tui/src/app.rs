@@ -93,15 +93,7 @@ impl App {
 
         self.apply_prefix_mode();
         let sort_order = self.display.sort_order();
-        let request = if sort_order == CveSummarySortOrder::PublishedDesc {
-            SearchRequest::Mode {
-                mode: self.search_mode,
-                query: self.query.clone(),
-                state_scope: self.state_scope,
-            }
-        } else {
-            SearchRequest::Advanced(self.main_search_options(sort_order))
-        };
+        let request = SearchRequest::Advanced(self.main_search_options(sort_order));
         let limit = self.limit;
         self.searched_request = request.clone();
         self.exhausted = false;

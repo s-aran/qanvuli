@@ -94,7 +94,19 @@ pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
 
 pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, String> {
     eprintln!("{kind}: fetching GitHub release metadata");
-    let asset = latest_asset(kind).await?;
+    let asset = match latest_asset(kind).await {
+        Ok(asset) => asset,
+        Err(err) => {
+            if let Some(path) = latest_local_asset(kind) {
+                eprintln!(
+                    "{kind}: failed to fetch GitHub release metadata ({err}); using local {}",
+                    path.display()
+                );
+                return Ok(path);
+            }
+            return Err(err);
+        }
+    };
     eprintln!("{kind}: downloading {} ({} bytes)", asset.name, asset.size);
     asset
         .async_download_as_file()
@@ -102,6 +114,29 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     eprintln!("{kind}: ready {}", asset.name);
     Ok(PathBuf::from(asset.name))
+}
+
+fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
+    let needle = match kind {
+        ReleaseAssetKind::All => "_all_",
+        ReleaseAssetKind::Delta => "_delta_",
+        ReleaseAssetKind::DeltaMidnight => "_at_end_of_day",
+    };
+    let mut candidates = std::fs::read_dir(".")
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            let Some(filename) = path.file_name().and_then(|value| value.to_str()) else {
+                return false;
+            };
+            filename.contains(needle)
+                && filename.ends_with(".zip")
+                && !filename.ends_with(".inner.zip")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.pop()
 }
 
 pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
@@ -216,7 +251,7 @@ pub async fn latest_asset(
 pub async fn delta_assets_oldest_first()
 -> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
     let mut cve = CveRelease::new();
-    cve.async_get()
+    cve.async_get_all()
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
     Ok(cve.get_delta_files_oldest_first())
