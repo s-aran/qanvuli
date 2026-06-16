@@ -169,7 +169,21 @@ impl GitHub {
             .per_page(100)
             .send()
             .await?;
-        let release_items = octocrab.all_pages(page).await?;
+        let mut release_items = Vec::new();
+        let mut page = page;
+        release_items.append(&mut page.items);
+        while page.next.is_some() {
+            let next = match octocrab.get_page(&page.next).await {
+                Ok(Some(next)) => next,
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("GitHub release pagination stopped early: {err}");
+                    break;
+                }
+            };
+            page = next;
+            release_items.append(&mut page.items);
+        }
         release_items_to_sorted_releases(release_items)
     }
 

@@ -117,13 +117,20 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
 }
 
 fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
+    let mut candidates = local_assets(kind);
+    candidates.pop()
+}
+
+fn local_assets(kind: ReleaseAssetKind) -> Vec<PathBuf> {
     let needle = match kind {
         ReleaseAssetKind::All => "_all_",
         ReleaseAssetKind::Delta => "_delta_",
         ReleaseAssetKind::DeltaMidnight => "_at_end_of_day",
     };
-    let mut candidates = std::fs::read_dir(".")
-        .ok()?
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return Vec::new();
+    };
+    let mut candidates = entries
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| {
@@ -136,7 +143,7 @@ fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
         })
         .collect::<Vec<_>>();
     candidates.sort();
-    candidates.pop()
+    candidates
 }
 
 pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
@@ -201,7 +208,30 @@ pub async fn apply_delta_updates(
         return Ok(vec![zip]);
     }
 
-    let assets = delta_assets_oldest_first().await?;
+    let assets = match delta_assets_oldest_first().await {
+        Ok(assets) => assets,
+        Err(err) => {
+            let local_assets = local_assets(ReleaseAssetKind::Delta);
+            if local_assets.is_empty() {
+                return Err(err);
+            }
+            eprintln!(
+                "delta: failed to fetch GitHub release metadata ({err}); using {} local delta archive(s)",
+                local_assets.len()
+            );
+            return apply_local_delta_updates(db, local_assets, max_chunks).await;
+        }
+    };
+    if assets.is_empty() {
+        let local_assets = local_assets(ReleaseAssetKind::Delta);
+        if !local_assets.is_empty() {
+            eprintln!(
+                "delta: no GitHub delta assets found; using {} local delta archive(s)",
+                local_assets.len()
+            );
+            return apply_local_delta_updates(db, local_assets, max_chunks).await;
+        }
+    }
     let mut applied = Vec::new();
     for asset in assets {
         if db
@@ -221,6 +251,38 @@ pub async fn apply_delta_updates(
         ingest_zip(db, "delta", &asset_path, IngestMode::Upsert, max_chunks).await;
         if max_chunks.is_none() {
             db.mark_cve_asset_applied(&asset.name, &asset.url)
+                .await
+                .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
+        }
+        applied.push(asset_path);
+    }
+    Ok(applied)
+}
+
+async fn apply_local_delta_updates(
+    db: &CveDatabase,
+    assets: Vec<PathBuf>,
+    max_chunks: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut applied = Vec::new();
+    for asset_path in assets {
+        let asset_name = asset_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if !asset_name.is_empty()
+            && db
+                .is_cve_asset_applied(&asset_name)
+                .await
+                .map_err(|err| format!("failed to read CVE asset metadata: {err}"))?
+        {
+            continue;
+        }
+
+        ingest_zip(db, "delta", &asset_path, IngestMode::Upsert, max_chunks).await;
+        if max_chunks.is_none() && !asset_name.is_empty() {
+            db.mark_cve_asset_applied(&asset_name, "local")
                 .await
                 .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
         }
