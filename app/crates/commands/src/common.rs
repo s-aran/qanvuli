@@ -256,8 +256,10 @@ pub async fn apply_delta_updates(
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
+    sync_cwe_catalog(db).await?;
+
     if let Some(zip) = zip {
-        ingest_zip(db, "delta", &zip, IngestMode::Upsert, max_chunks).await;
+        ingest_zip(db, "delta", &zip, IngestMode::Upsert, max_chunks, true).await;
         return Ok(vec![zip]);
     }
 
@@ -317,7 +319,15 @@ pub async fn apply_delta_updates(
             .await
             .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
         let asset_path = PathBuf::from(&asset.name);
-        ingest_zip(db, "delta", &asset_path, IngestMode::Upsert, max_chunks).await;
+        ingest_zip(
+            db,
+            "delta",
+            &asset_path,
+            IngestMode::Upsert,
+            max_chunks,
+            true,
+        )
+        .await;
         if max_chunks.is_none() {
             db.mark_cve_asset_applied(&asset.name, &asset.url)
                 .await
@@ -333,7 +343,7 @@ async fn apply_latest_all_midnight(
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
     let path = download_latest_asset(ReleaseAssetKind::All).await?;
-    ingest_zip(db, "all", &path, IngestMode::ReplaceAll, max_chunks).await;
+    ingest_zip(db, "all", &path, IngestMode::ReplaceAll, max_chunks, true).await;
     Ok(vec![path])
 }
 
@@ -364,7 +374,15 @@ async fn apply_local_delta_updates(
             continue;
         }
 
-        ingest_zip(db, "delta", &asset_path, IngestMode::Upsert, max_chunks).await;
+        ingest_zip(
+            db,
+            "delta",
+            &asset_path,
+            IngestMode::Upsert,
+            max_chunks,
+            true,
+        )
+        .await;
         if max_chunks.is_none() && !asset_name.is_empty() {
             db.mark_cve_asset_applied(&asset_name, "local")
                 .await
@@ -507,6 +525,7 @@ pub async fn ingest_zip(
     asset_path: &Path,
     mode: IngestMode,
     max_chunks: Option<usize>,
+    cwe_synced: bool,
 ) {
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
@@ -536,8 +555,10 @@ pub async fn ingest_zip(
         }
     }
 
-    if let Err(err) = sync_cwe_catalog(db).await {
-        panic!("{label}: {err}");
+    if !cwe_synced {
+        if let Err(err) = sync_cwe_catalog(db).await {
+            panic!("{label}: {err}");
+        }
     }
 
     let mut bulk_replace = None;

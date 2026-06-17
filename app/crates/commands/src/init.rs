@@ -55,6 +55,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         &asset_path,
         IngestMode::ReplaceAll,
         args.max_chunks,
+        false,
     )
     .await;
     db.close()
