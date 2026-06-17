@@ -1,5 +1,5 @@
 use super::{
-    app::{App, PaneFocus},
+    app::{App, PaneFocus, TimeoutChoice},
     display::{DisplayField, DisplaySettings, TimeZone},
     form::{AdvancedField, AdvancedForm, StateScopeUi},
 };
@@ -13,25 +13,21 @@ use ratatui::{
 };
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    let main = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(frame.area());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(frame.area());
+        .split(main[0]);
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(chunks[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(68),
-            Constraint::Min(4),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Percentage(68), Constraint::Min(4)])
         .split(chunks[1]);
     app.set_page_sizes(
         left[1].height.saturating_sub(2) as usize,
@@ -80,20 +76,12 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, left[1], &mut app.list_state);
 
-    let footer = Paragraph::new(format!(
-        "{} | State: {} | Sort: {} {} | TZ: {}",
-        app.search_mode.footer_text(),
-        app.state_scope.label(),
-        app.display.sort_field.label(),
-        app.display.sort_direction.label(),
-        app.display.timezone.label()
-    ))
-    .style(
+    let footer = Paragraph::new(main_footer(app)).style(
         Style::default()
             .fg(app.search_mode.color())
             .add_modifier(Modifier::BOLD),
     );
-    frame.render_widget(footer, left[2]);
+    frame.render_widget(footer, main[1]);
 
     let detail = app
         .selected()
@@ -120,9 +108,6 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(metadata, right[1]);
 
-    let status = Paragraph::new(app.detail_status()).style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(status, right[2]);
-
     if app.show_help {
         draw_help(frame);
     }
@@ -131,6 +116,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     }
     if app.show_display {
         draw_display(frame, app);
+    }
+    if app.show_timeout_prompt {
+        draw_timeout_prompt(frame, app);
     }
 }
 
@@ -250,6 +238,45 @@ fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(popup, area);
 }
 
+fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = centered_rect(56, 26, frame.area());
+    let continue_style = choice_style(app.timeout_choice == TimeoutChoice::Continue);
+    let cancel_style = choice_style(app.timeout_choice == TimeoutChoice::Cancel);
+    let lines = vec![
+        Line::from("Search is taking longer than expected."),
+        Line::from("Continue waiting or cancel the running search?"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[ Continue ]", continue_style),
+            Span::raw("  "),
+            Span::styled("[ Cancel ]", cancel_style),
+        ]),
+        Line::from(""),
+        Line::from("Enter confirm  Left/Right choose  Esc cancel"),
+    ];
+    let popup = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(format!("Search Timeout ({})", app.detail_status()))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: true });
+    frame.render_widget(Clear, area);
+    frame.render_widget(popup, area);
+}
+
+fn choice_style(active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
 fn advanced_line(
     form: &AdvancedForm,
     field: AdvancedField,
@@ -292,6 +319,22 @@ fn display_line(
         Span::styled(format!("{label}: "), style),
         Span::raw(value.to_owned()),
     ])
+}
+
+fn main_footer(app: &App) -> String {
+    let status = app
+        .status_message
+        .as_deref()
+        .unwrap_or_else(|| app.detail_status());
+    format!(
+        "{} | State: {} | Sort: {} {} | TZ: {} | {}",
+        app.search_mode.footer_text(),
+        app.state_scope.label(),
+        app.display.sort_field.label(),
+        app.display.sort_direction.label(),
+        app.display.timezone.label(),
+        status
+    )
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {

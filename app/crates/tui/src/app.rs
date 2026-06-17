@@ -1,5 +1,5 @@
 use super::{
-    TUI_LOAD_MORE_LIMIT,
+    SEARCH_TIMEOUT, TUI_LOAD_MORE_LIMIT,
     display::DisplaySettings,
     form::AdvancedForm,
     mode::SearchMode,
@@ -28,6 +28,7 @@ pub(super) struct App {
     pub(super) detail_scroll: u16,
     search: Option<PendingSearch>,
     search_started_at: Option<Instant>,
+    search_timeout_at: Option<Instant>,
     searched_request: SearchRequest,
     exhausted: bool,
     left_page_size: usize,
@@ -35,6 +36,9 @@ pub(super) struct App {
     pub(super) show_help: bool,
     pub(super) show_advanced: bool,
     pub(super) show_display: bool,
+    pub(super) show_timeout_prompt: bool,
+    pub(super) timeout_choice: TimeoutChoice,
+    pub(super) status_message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +50,18 @@ pub(super) enum PaneFocus {
 struct PendingSearch {
     kind: SearchKind,
     handle: JoinHandle<Result<SearchResult, String>>,
+    timed_out_once: bool,
 }
 
 enum SearchKind {
     Replace,
     Append { select_offset: usize },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TimeoutChoice {
+    Continue,
+    Cancel,
 }
 
 impl App {
@@ -72,6 +83,7 @@ impl App {
             detail_scroll: 0,
             search: None,
             search_started_at: None,
+            search_timeout_at: None,
             searched_request: SearchRequest::Mode {
                 mode: search_mode,
                 query: String::new(),
@@ -83,6 +95,9 @@ impl App {
             show_help: false,
             show_advanced: false,
             show_display: false,
+            show_timeout_prompt: false,
+            timeout_choice: TimeoutChoice::Continue,
+            status_message: None,
         };
         app.sync_advanced_from_main();
         app
@@ -109,9 +124,11 @@ impl App {
         self.searched_request = request.clone();
         self.exhausted = false;
         self.total_results = None;
-        self.search_started_at = Some(Instant::now());
+        self.status_message = None;
+        self.arm_search_timeout();
         self.search = Some(PendingSearch {
             kind: SearchKind::Replace,
+            timed_out_once: false,
             handle: tokio::spawn(async move {
                 run_search_request(db, request, limit, 0)
                     .await
@@ -133,10 +150,12 @@ impl App {
         self.searched_request = request.clone();
         self.exhausted = false;
         self.total_results = None;
-        self.search_started_at = Some(Instant::now());
+        self.status_message = None;
+        self.arm_search_timeout();
         let limit = self.limit;
         self.search = Some(PendingSearch {
             kind: SearchKind::Replace,
+            timed_out_once: false,
             handle: tokio::spawn(async move {
                 run_search_request(db, request, limit, 0)
                     .await
@@ -163,9 +182,11 @@ impl App {
         let request = self.searched_request.clone();
         let offset = self.results.len() as u64;
         let select_offset = self.results.len();
-        self.search_started_at = Some(Instant::now());
+        self.status_message = None;
+        self.arm_search_timeout();
         self.search = Some(PendingSearch {
             kind: SearchKind::Append { select_offset },
+            timed_out_once: false,
             handle: tokio::spawn(async move {
                 run_search_request(db, request, TUI_LOAD_MORE_LIMIT, offset)
                     .await
@@ -179,16 +200,26 @@ impl App {
             return Ok(());
         };
         if !search.handle.is_finished() {
+            self.check_search_timeout();
             return Ok(());
         }
 
         let search = self.search.take().expect("search handle disappeared");
         let kind = search.kind;
-        let result = search
-            .handle
-            .await
-            .map_err(|err| format!("failed to join search task: {err}"))??;
+        let result = match search.handle.await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) => {
+                self.finish_failed_search(err);
+                return Ok(());
+            }
+            Err(err) => {
+                self.finish_failed_search(format!("failed to join search task: {err}"));
+                return Ok(());
+            }
+        };
         self.search_started_at = None;
+        self.search_timeout_at = None;
+        self.show_timeout_prompt = false;
         match kind {
             SearchKind::Replace => {
                 self.exhausted = result.rows.len() < self.limit as usize;
@@ -221,10 +252,12 @@ impl App {
     }
 
     pub(super) fn detail_status(&self) -> &'static str {
-        if self.selected().is_none() {
-            "Detail: no selection"
+        if self.searching() {
+            "searching"
+        } else if self.selected().is_none() {
+            "no selection"
         } else {
-            "Detail: loaded"
+            "ready"
         }
     }
 
@@ -233,6 +266,45 @@ impl App {
             search.handle.abort();
         }
         self.search_started_at = None;
+        self.search_timeout_at = None;
+        self.show_timeout_prompt = false;
+    }
+
+    pub(super) fn cancel_timed_out_search(&mut self) {
+        self.abort_search();
+        self.status_message = Some("search canceled".to_owned());
+    }
+
+    pub(super) fn continue_timed_out_search(&mut self) {
+        if let Some(search) = self.search.as_mut() {
+            search.timed_out_once = true;
+            self.search_timeout_at = Some(Instant::now() + SEARCH_TIMEOUT);
+        }
+        self.show_timeout_prompt = false;
+        self.timeout_choice = TimeoutChoice::Continue;
+        self.status_message = Some("search continued".to_owned());
+    }
+
+    pub(super) fn toggle_timeout_choice(&mut self) {
+        self.timeout_choice = match self.timeout_choice {
+            TimeoutChoice::Continue => TimeoutChoice::Cancel,
+            TimeoutChoice::Cancel => TimeoutChoice::Continue,
+        };
+    }
+
+    pub(super) fn select_timeout_continue(&mut self) {
+        self.timeout_choice = TimeoutChoice::Continue;
+    }
+
+    pub(super) fn select_timeout_cancel(&mut self) {
+        self.timeout_choice = TimeoutChoice::Cancel;
+    }
+
+    pub(super) fn confirm_timeout_choice(&mut self) {
+        match self.timeout_choice {
+            TimeoutChoice::Continue => self.continue_timed_out_search(),
+            TimeoutChoice::Cancel => self.cancel_timed_out_search(),
+        }
     }
 
     pub(super) fn spinner(&self) -> &'static str {
@@ -400,6 +472,9 @@ impl App {
         self.show_help = false;
         self.show_advanced = false;
         self.show_display = false;
+        self.show_timeout_prompt = false;
+        self.timeout_choice = TimeoutChoice::Continue;
+        self.status_message = None;
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {
@@ -496,6 +571,47 @@ impl App {
 
     fn clear_detail(&mut self) {
         self.detail_scroll = 0;
+    }
+
+    fn finish_failed_search(&mut self, message: String) {
+        self.search_started_at = None;
+        self.search_timeout_at = None;
+        self.show_timeout_prompt = false;
+        self.status_message = Some(message);
+    }
+
+    fn arm_search_timeout(&mut self) {
+        let now = Instant::now();
+        self.search_started_at = Some(now);
+        self.search_timeout_at = Some(now + SEARCH_TIMEOUT);
+        self.show_timeout_prompt = false;
+        self.timeout_choice = TimeoutChoice::Continue;
+    }
+
+    fn check_search_timeout(&mut self) {
+        let Some(timeout_at) = self.search_timeout_at else {
+            return;
+        };
+        if Instant::now() < timeout_at {
+            return;
+        }
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        if search.timed_out_once {
+            search.handle.abort();
+            self.search = None;
+            self.search_started_at = None;
+            self.search_timeout_at = None;
+            self.show_timeout_prompt = false;
+            self.status_message = Some(format!(
+                "search timed out after {} seconds",
+                SEARCH_TIMEOUT.as_secs() * 2
+            ));
+        } else {
+            self.show_timeout_prompt = true;
+            self.timeout_choice = TimeoutChoice::Continue;
+        }
     }
 }
 

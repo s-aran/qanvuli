@@ -64,7 +64,7 @@ impl CveSearchServer {
 #[tool_router]
 impl CveSearchServer {
     #[tool(
-        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_by_cwe(
         &self,
@@ -83,7 +83,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by affected vendor and/or product name. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search CVEs by affected vendor and/or product name. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_by_product(
         &self,
@@ -104,7 +104,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by CVE ID, title, or English description text. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search CVEs by CVE ID, title, or English description text. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_text(
         &self,
@@ -124,7 +124,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by CVSS score, severity, and/or CVSS version. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search CVEs by CVSS score, severity, and/or CVSS version. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_by_cvss(
         &self,
@@ -147,7 +147,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search high-risk CVEs for a specific affected vendor/product. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search high-risk CVEs for a specific affected vendor/product. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_product_by_cvss(
         &self,
@@ -170,7 +170,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. Results include complete descriptions but not raw JSON; use get_cve only when raw CVE JSON is required."
+        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     async fn search_recent(
         &self,
@@ -191,7 +191,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Fetch one CVE record by CVE ID, including raw JSON. This is token-heavy; prefer search_* tools unless raw CVE JSON is explicitly required."
+        description = "Fetch one exact CVE record by CVE ID. Returns the raw CVE JSON stored in the local database, including cveMetadata and containers, so this is token-heavy. Prefer search_* tools for triage, affected version checks, CVSS, CWE, descriptions, published_at, and updated_at; use get_cve only when raw CVE JSON fields not exposed by search_* are explicitly required."
     )]
     async fn get_cve(
         &self,
@@ -206,7 +206,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Update the CVE database by applying a delta CVE zip. If no zip is provided, the latest delta zip is downloaded from GitHub."
+        description = "Update the local CVE database. With zip, applies that local CVE delta zip. Without zip, downloads and applies the applicable CVE delta archives according to local update history. Returns updated=true and applied_assets, the list of archive paths applied. This mutates the local database and may access GitHub."
     )]
     async fn update_db(
         &self,

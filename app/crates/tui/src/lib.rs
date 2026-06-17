@@ -12,3 +12,4 @@ pub use tui::{Args, run};
 const TUI_LIMIT: u64 = 30;
 const TUI_LOAD_MORE_LIMIT: u64 = 30;
 const EVENT_POLL_MAX: std::time::Duration = std::time::Duration::from_millis(50);
+const SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);

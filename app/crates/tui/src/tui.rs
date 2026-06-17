@@ -71,6 +71,23 @@ async fn run_loop(
             continue;
         }
 
+        if app.show_timeout_prompt {
+            match key.code {
+                KeyCode::Enter => app.confirm_timeout_choice(),
+                KeyCode::Esc => app.cancel_timed_out_search(),
+                KeyCode::Left => app.select_timeout_continue(),
+                KeyCode::Right => app.select_timeout_cancel(),
+                KeyCode::Tab | KeyCode::BackTab => app.toggle_timeout_choice(),
+                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    break;
+                }
+                KeyCode::Char('c') => app.select_timeout_continue(),
+                KeyCode::Char('x') => app.select_timeout_cancel(),
+                _ => {}
+            }
+            continue;
+        }
+
         if app.show_help {
             match key.code {
                 KeyCode::Esc => app.show_help = false,
