@@ -3,9 +3,7 @@ pub mod cwe;
 
 use anyhow::{Error, Result, anyhow};
 use cve::{
-    base::{cve_metadata::CveState, root::CveRoot},
-    published::root::CveRoot as PublishedCveRoot,
-    rejected::root::CveRoot as RejectedCveRoot,
+    published::root::CveRoot as PublishedCveRoot, rejected::root::CveRoot as RejectedCveRoot,
 };
 use qanvuli_utils::datetime_deserialize;
 use serde::de::DeserializeOwned;
@@ -65,16 +63,24 @@ pub fn parse_json(src: impl Into<String>) -> Result<CveStatusData, Error> {
 }
 
 pub fn parse_json_with_raw(src: impl Into<String>) -> Result<RawCveStatusRecord, Error> {
-    let mut bytes = src.into().into_bytes();
+    parse_json_bytes_with_raw(src.into().into_bytes())
+}
+
+pub fn parse_json_bytes_with_raw(mut bytes: Vec<u8>) -> Result<RawCveStatusRecord, Error> {
     let raw_json: Value = simd_json::from_slice(&mut bytes)?;
     parse_value_with_raw(raw_json)
 }
 
-pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error> {
-    let cve: CveRoot = serde_json::from_value(raw_json.clone())?;
+pub fn parse_json_value_bytes(mut bytes: Vec<u8>) -> Result<Value, Error> {
+    Ok(simd_json::from_slice(&mut bytes)?)
+}
 
-    match cve.cve_metadata.state {
-        CveState::Published => {
+pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error> {
+    match raw_json
+        .pointer("/cveMetadata/state")
+        .and_then(Value::as_str)
+    {
+        Some("PUBLISHED") => {
             let deserialized = match serde_json::from_value::<PublishedCveRoot>(raw_json.clone()) {
                 Ok(r) => r,
                 Err(e) => return Err(anyhow!(e)),
@@ -84,7 +90,7 @@ pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error
                 raw_json,
             })
         }
-        CveState::Rejected => {
+        Some("REJECTED") => {
             let deserialized = match serde_json::from_value::<RejectedCveRoot>(raw_json.clone()) {
                 Ok(r) => r,
                 Err(e) => return Err(anyhow!(e)),
@@ -94,7 +100,9 @@ pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error
                 raw_json,
             })
         }
-        CveState::Reserved => Err(anyhow!("unexpected reserved state.")),
+        Some("RESERVED") => Err(anyhow!("unexpected reserved state.")),
+        Some(state) => Err(anyhow!("unexpected CVE state: {state}")),
+        None => Err(anyhow!("missing cveMetadata.state")),
     }
 }
 

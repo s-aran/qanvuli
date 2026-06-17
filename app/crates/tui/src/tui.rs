@@ -91,25 +91,39 @@ async fn run_loop(
                     app.start_advanced_search(db.clone());
                     app.show_advanced = false;
                 }
-                KeyCode::Backspace => app.advanced.backspace(),
+                KeyCode::Backspace => {
+                    app.advanced.backspace();
+                    app.sync_main_from_advanced();
+                }
                 KeyCode::Char('c') | KeyCode::Char('d')
                     if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
                 {
                     break;
                 }
-                KeyCode::Char(ch) => app.advanced.push(ch),
+                KeyCode::Char(ch) => {
+                    app.advanced.push(ch);
+                    app.sync_main_from_advanced();
+                }
                 KeyCode::Tab => app.advanced.next_field(),
                 KeyCode::BackTab => app.advanced.previous_field(),
                 KeyCode::Down => app.advanced.next_field(),
                 KeyCode::Up => app.advanced.previous_field(),
                 KeyCode::Right if app.advanced.active_field == AdvancedField::Query => {
                     app.advanced.query_mode = app.advanced.query_mode.next();
+                    app.sync_main_from_advanced();
                 }
                 KeyCode::Left if app.advanced.active_field == AdvancedField::Query => {
                     app.advanced.query_mode = app.advanced.query_mode.previous();
+                    app.sync_main_from_advanced();
                 }
-                KeyCode::Right => app.advanced.next_value(),
-                KeyCode::Left => app.advanced.previous_value(),
+                KeyCode::Right => {
+                    app.advanced.next_value();
+                    app.sync_main_from_advanced();
+                }
+                KeyCode::Left => {
+                    app.advanced.previous_value();
+                    app.sync_main_from_advanced();
+                }
                 _ => {}
             }
             continue;
@@ -158,14 +172,10 @@ async fn run_loop(
             KeyCode::Right => app.focus_right(),
             KeyCode::BackTab => app.next_search_mode(),
             KeyCode::Backspace => {
-                app.query.pop();
-                app.scroll_detail_to_top();
-                app.apply_prefix_mode();
+                app.backspace_query();
             }
             KeyCode::Char(ch) => {
-                app.query.push(ch);
-                app.scroll_detail_to_top();
-                app.apply_prefix_mode();
+                app.push_query(ch);
             }
             KeyCode::Down => app.move_focused_down(db.clone()),
             KeyCode::Up => app.move_focused_up(),

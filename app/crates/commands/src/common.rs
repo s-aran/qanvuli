@@ -1,11 +1,12 @@
-use chrono::{DateTime, FixedOffset};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
 use clap::ValueEnum;
 use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
-use qanvuli_db::{CveDatabase, ReadJsonFileRecord};
-use qanvuli_models::{CveStatusData, RawCveRecord, cwe::read_cwe_catalog_zip, parse_json_with_raw};
+use qanvuli_db::{CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
+use qanvuli_models::{cwe::read_cwe_catalog_zip, parse_json_value_bytes};
 use qanvuli_utils::loader::{self, FileStorageTrait};
 use rayon::prelude::*;
 use serde::Serialize;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,6 +17,15 @@ const INGEST_CHUNK_SIZE: usize = 10000;
 const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
+const CVE_ZIP_TYPE_MIDNIGHT: i32 = 0;
+const CVE_ZIP_TYPE_DELTA: i32 = 1;
+
+#[derive(Clone, Debug)]
+struct CveZipAsset {
+    path_or_name: String,
+    zip_datetime: String,
+    zip_type: i32,
+}
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ReleaseAssetKind {
@@ -146,6 +156,39 @@ fn local_assets(kind: ReleaseAssetKind) -> Vec<PathBuf> {
     candidates
 }
 
+fn cve_zip_asset_from_path(path: &Path) -> Option<CveZipAsset> {
+    let filename = path.file_name()?.to_str()?;
+    cve_zip_asset_from_filename(filename)
+}
+
+fn cve_zip_asset_from_filename(filename: &str) -> Option<CveZipAsset> {
+    let date = filename.get(0..10)?;
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+
+    if filename.contains("_all_CVEs_at_midnight") {
+        let datetime = date.and_hms_opt(0, 0, 0)?;
+        return Some(CveZipAsset {
+            path_or_name: filename.to_owned(),
+            zip_datetime: Utc.from_utc_datetime(&datetime).to_rfc3339(),
+            zip_type: CVE_ZIP_TYPE_MIDNIGHT,
+        });
+    }
+
+    let (_, time) = filename.split_once("_delta_CVEs_at_")?;
+    let time = time.get(0..5)?;
+    let hour = time.get(0..2)?.parse::<u32>().ok()?;
+    let minute = time.get(2..4)?.parse::<u32>().ok()?;
+    if time.get(4..5)? != "Z" {
+        return None;
+    }
+    let datetime = date.and_hms_opt(hour, minute, 0)?;
+    Some(CveZipAsset {
+        path_or_name: filename.to_owned(),
+        zip_datetime: Utc.from_utc_datetime(&datetime).to_rfc3339(),
+        zip_type: CVE_ZIP_TYPE_DELTA,
+    })
+}
+
 pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
     let catalog = CweCatalogFile::default();
     eprintln!("cwe: downloading {}", catalog.url);
@@ -208,37 +251,57 @@ pub async fn apply_delta_updates(
         return Ok(vec![zip]);
     }
 
-    let assets = match delta_assets_oldest_first().await {
-        Ok(assets) => assets,
-        Err(err) => {
-            let local_assets = local_assets(ReleaseAssetKind::Delta);
-            if local_assets.is_empty() {
+    let anchor = latest_update_anchor(db).await?;
+    let assets = if let Some(anchor) = anchor {
+        match update_assets_since(Some(&anchor)).await {
+            Ok(assets) => assets,
+            Err(err) => {
+                if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
+                    eprintln!(
+                        "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
+                        path.display()
+                    );
+                    return apply_local_delta_updates(db, vec![path], max_chunks).await;
+                }
                 return Err(err);
             }
-            eprintln!(
-                "delta: failed to fetch GitHub release metadata ({err}); using {} local delta archive(s)",
-                local_assets.len()
-            );
-            return apply_local_delta_updates(db, local_assets, max_chunks).await;
+        }
+    } else {
+        match latest_asset(ReleaseAssetKind::Delta).await {
+            Ok(asset) => vec![asset],
+            Err(err) => {
+                if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
+                    eprintln!(
+                        "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
+                        path.display()
+                    );
+                    return apply_local_delta_updates(db, vec![path], max_chunks).await;
+                }
+                return Err(err);
+            }
         }
     };
-    if assets.is_empty() {
-        let local_assets = local_assets(ReleaseAssetKind::Delta);
-        if !local_assets.is_empty() {
+
+    let assets = if assets.is_empty() {
+        if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
             eprintln!(
-                "delta: no GitHub delta assets found; using {} local delta archive(s)",
-                local_assets.len()
+                "delta: no GitHub delta asset found; using latest local {}",
+                path.display()
             );
-            return apply_local_delta_updates(db, local_assets, max_chunks).await;
+            return apply_local_delta_updates(db, vec![path], max_chunks).await;
         }
-    }
+        assets
+    } else {
+        assets
+    };
+
     let mut applied = Vec::new();
     for asset in assets {
-        if db
-            .is_cve_asset_applied(&asset.name)
-            .await
-            .map_err(|err| format!("failed to read CVE asset metadata: {err}"))?
-        {
+        let Some(zip_asset) = cve_zip_asset_from_filename(&asset.name) else {
+            eprintln!("delta: skipping unsupported CVE zip asset {}", asset.name);
+            continue;
+        };
+        if cve_zip_asset_is_not_newer(db, &zip_asset).await? {
             continue;
         }
 
@@ -264,6 +327,7 @@ async fn apply_local_delta_updates(
     assets: Vec<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
+    let anchor = latest_update_anchor(db).await?;
     let mut applied = Vec::new();
     for asset_path in assets {
         let asset_name = asset_path
@@ -271,11 +335,16 @@ async fn apply_local_delta_updates(
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_owned();
-        if !asset_name.is_empty()
-            && db
-                .is_cve_asset_applied(&asset_name)
-                .await
-                .map_err(|err| format!("failed to read CVE asset metadata: {err}"))?
+        let Some(zip_asset) = cve_zip_asset_from_filename(&asset_name) else {
+            eprintln!(
+                "delta: skipping unsupported local CVE zip asset {}",
+                asset_path.display()
+            );
+            continue;
+        };
+        if anchor
+            .as_deref()
+            .is_some_and(|anchor| zip_asset.zip_datetime.as_str() <= anchor)
         {
             continue;
         }
@@ -289,6 +358,71 @@ async fn apply_local_delta_updates(
         applied.push(asset_path);
     }
     Ok(applied)
+}
+
+async fn latest_update_anchor(db: &CveDatabase) -> Result<Option<String>, String> {
+    if let Some(zip_datetime) = db
+        .latest_cve_zip_datetime()
+        .await
+        .map_err(|err| format!("failed to read CVE zip history: {err}"))?
+    {
+        return Ok(Some(zip_datetime));
+    }
+
+    db.latest_cve_updated_at()
+        .await
+        .map_err(|err| format!("failed to read latest CVE updated_at: {err}"))
+}
+
+async fn cve_zip_asset_is_not_newer(db: &CveDatabase, asset: &CveZipAsset) -> Result<bool, String> {
+    let Some(anchor) = latest_update_anchor(db).await? else {
+        return Ok(false);
+    };
+    Ok(asset.zip_datetime <= anchor)
+}
+
+async fn update_assets_since(
+    since: Option<&str>,
+) -> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
+    let mut cve = CveRelease::new();
+    cve.async_get_all()
+        .await
+        .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
+
+    let mut candidates = cve
+        .get_all_and_delta_files_oldest_first()
+        .into_iter()
+        .filter_map(|asset| cve_zip_asset_from_filename(&asset.name).map(|parsed| (asset, parsed)))
+        .filter(|(_, parsed)| since.is_none_or(|since| parsed.zip_datetime.as_str() > since))
+        .collect::<Vec<_>>();
+
+    candidates.sort_by(|(_, left), (_, right)| {
+        left.zip_datetime
+            .cmp(&right.zip_datetime)
+            .then(left.zip_type.cmp(&right.zip_type))
+            .then(left.path_or_name.cmp(&right.path_or_name))
+    });
+
+    let latest_midnight = candidates
+        .iter()
+        .rposition(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_MIDNIGHT);
+
+    let selected = if let Some(midnight_index) = latest_midnight {
+        let midnight_datetime = candidates[midnight_index].1.zip_datetime.clone();
+        candidates
+            .into_iter()
+            .skip(midnight_index)
+            .filter(|(_, parsed)| {
+                parsed.zip_type == CVE_ZIP_TYPE_MIDNIGHT
+                    || parsed.zip_datetime.as_str() > midnight_datetime.as_str()
+            })
+            .map(|(asset, _)| asset)
+            .collect()
+    } else {
+        candidates.into_iter().map(|(asset, _)| asset).collect()
+    };
+
+    Ok(selected)
 }
 
 pub async fn latest_asset(
@@ -358,15 +492,18 @@ pub async fn ingest_zip(
         panic!("{label}: {err}");
     }
 
+    let mut bulk_replace = None;
     if matches!(mode, IngestMode::ReplaceAll) {
         let prepare_start = Instant::now();
-        if let Err(err) = db.prepare_bulk_replace_all().await {
-            panic!("{label}: failed to prepare bulk load: {err}");
-        }
+        let session = db
+            .begin_bulk_replace_all()
+            .await
+            .unwrap_or_else(|err| panic!("{label}: failed to begin bulk load: {err}"));
         eprintln!(
             "{label}: prepared bulk load in {:?}",
             prepare_start.elapsed()
         );
+        bulk_replace = Some(session);
     }
 
     let mut inserted = 0usize;
@@ -390,7 +527,7 @@ pub async fn ingest_zip(
 
         let read_start = Instant::now();
         for json_path in chunk {
-            match storage.get_json(json_path) {
+            match storage.get_json_bytes(json_path) {
                 Ok(json) => jsons.push((json_path.clone(), json)),
                 Err(err) => {
                     read_failed += 1;
@@ -405,8 +542,7 @@ pub async fn ingest_zip(
         let jsons = jsons
             .into_par_iter()
             .map(|(json_path, json)| {
-                let read_file =
-                    ReadJsonFileRecord::from_content(json_path.clone(), json.as_bytes());
+                let read_file = ReadJsonFileRecord::from_content(json_path.clone(), &json);
                 (json_path, json, read_file)
             })
             .collect::<Vec<_>>();
@@ -417,14 +553,14 @@ pub async fn ingest_zip(
         let parsed = jsons
             .into_par_iter()
             .map(|(json_path, json, read_file)| {
-                let raw_record = parse_json_with_raw(json)
+                let raw_json = parse_json_value_bytes(json)
                     .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
-                if cve_id_from_record(&raw_record).is_none() {
+                if cve_id_from_value(&raw_json).is_none() {
                     return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
                 }
-                Ok((raw_record, read_file))
+                Ok((raw_json, read_file))
             })
-            .collect::<Vec<Result<(RawCveRecord<CveStatusData>, ReadJsonFileRecord), String>>>();
+            .collect::<Vec<Result<(Value, ReadJsonFileRecord), String>>>();
         let parse_elapsed = parse_start.elapsed();
         timings.parse += parse_elapsed;
 
@@ -448,8 +584,14 @@ pub async fn ingest_zip(
 
         let db_write_start = Instant::now();
         let result = match mode {
-            IngestMode::ReplaceAll => db.insert_cve_records_bulk(models).await,
-            IngestMode::Upsert => db.upsert_cve_records(models).await,
+            IngestMode::ReplaceAll => {
+                bulk_replace
+                    .as_ref()
+                    .expect("bulk replace session must exist in replace-all mode")
+                    .insert_cve_raw_values(models)
+                    .await
+            }
+            IngestMode::Upsert => db.upsert_cve_raw_values(models).await,
         };
 
         match result {
@@ -459,7 +601,17 @@ pub async fn ingest_zip(
                 timings.db_write += db_write_elapsed;
 
                 let mark_start = Instant::now();
-                if let Err(err) = db.mark_json_files_read(read_files).await {
+                let mark_result = match mode {
+                    IngestMode::ReplaceAll => {
+                        bulk_replace
+                            .as_ref()
+                            .expect("bulk replace session must exist in replace-all mode")
+                            .mark_json_files_read(read_files)
+                            .await
+                    }
+                    IngestMode::Upsert => db.mark_json_files_read(read_files).await,
+                };
+                if let Err(err) = mark_result {
                     eprintln!(
                         "{label}: failed to mark read json files in chunk {chunk_index}: {err}"
                     );
@@ -504,13 +656,39 @@ pub async fn ingest_zip(
 
     if matches!(mode, IngestMode::ReplaceAll) {
         let finish_start = Instant::now();
-        if let Err(err) = db.finish_bulk_replace_all().await {
+        let session = bulk_replace
+            .take()
+            .expect("bulk replace session must exist in replace-all mode");
+        if let Err(err) = session.finish(db).await {
             panic!("{label}: failed to finish bulk load: {err}");
         }
         eprintln!(
             "{label}: rebuilt search indexes and FTS in {:?}",
             finish_start.elapsed()
         );
+    }
+
+    if max_chunks.is_none() {
+        if let Some(zip_asset) = cve_zip_asset_from_path(asset_path) {
+            if let Err(err) = db
+                .mark_cve_zip_file_applied(CveZipFileRecord {
+                    zip_filename: zip_asset.path_or_name,
+                    zip_datetime: zip_asset.zip_datetime,
+                    zip_type: zip_asset.zip_type,
+                })
+                .await
+            {
+                eprintln!(
+                    "{label}: failed to mark CVE zip history for {}: {err}",
+                    asset_path.display()
+                );
+            }
+        } else {
+            eprintln!(
+                "{label}: skipped CVE zip history for unsupported filename {}",
+                asset_path.display()
+            );
+        }
     }
 }
 
@@ -535,10 +713,9 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
         .map_err(|err| format!("invalid RFC3339 timestamp `{value}`: {err}"))
 }
 
-fn cve_id_from_record(record: &RawCveRecord<CveStatusData>) -> Option<&str> {
-    record
-        .raw_json()
+fn cve_id_from_value(value: &Value) -> Option<&str> {
+    value
         .pointer("/cveMetadata/cveId")
-        .and_then(serde_json::Value::as_str)
+        .and_then(Value::as_str)
         .filter(|cve_id| !cve_id.is_empty())
 }

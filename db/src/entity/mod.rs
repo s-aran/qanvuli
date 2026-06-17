@@ -7,5 +7,6 @@ pub mod cve;
 pub mod cve_affected;
 pub mod cve_cvss;
 pub mod cve_cwe;
+pub mod cve_zip_file;
 pub mod cwe;
 pub mod read_json_file;

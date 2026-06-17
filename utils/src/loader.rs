@@ -9,7 +9,13 @@ use glob::{MatchOptions, glob_with};
 use regex::Regex;
 
 pub trait FileStorageTrait {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error>;
+    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error>;
+
+    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
+        let bytes = self.get_json_bytes(path)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
     fn enum_json_list(&self) -> impl Iterator<Item = String>;
 }
 
@@ -24,12 +30,12 @@ impl ActualStorage {
 }
 
 impl FileStorageTrait for ActualStorage {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
+    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
         // TODO: error handling
         let p = PathBuf::from(path.into());
         let mut file = File::open(p).expect("maybe not found");
-        let mut buf = String::new();
-        let _ = file.read_to_string(&mut buf);
+        let mut buf = Vec::new();
+        let _ = file.read_to_end(&mut buf);
 
         Ok(buf)
     }
@@ -83,11 +89,11 @@ impl ZipStorage {
 }
 
 impl FileStorageTrait for ZipStorage {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
+    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
         // TODO: error handling
         let mut f = self.stream.by_name(path.into().as_str()).unwrap();
-        let mut buf = String::new();
-        let _ = f.read_to_string(&mut buf);
+        let mut buf = Vec::new();
+        let _ = f.read_to_end(&mut buf);
 
         Ok(buf)
     }

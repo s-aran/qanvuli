@@ -2,7 +2,9 @@ pub mod entity;
 pub mod migration;
 
 use chrono::Utc;
-use entity::{app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cwe, read_json_file};
+use entity::{
+    app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cve_zip_file, cwe, read_json_file,
+};
 use md5::{Digest, Md5};
 use migration::Migrator;
 use std::collections::{HashMap, HashSet};
@@ -44,6 +46,13 @@ pub struct CveActiveModels {
 pub struct ReadJsonFileRecord {
     pub filename: String,
     pub md5hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CveZipFileRecord {
+    pub zip_filename: String,
+    pub zip_datetime: String,
+    pub zip_type: i32,
 }
 
 impl ReadJsonFileRecord {
@@ -220,6 +229,28 @@ impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
     }
 }
 
+impl CveActiveModels {
+    pub fn from_raw_json(raw_json: Value) -> Self {
+        let cve_id = raw_json
+            .pointer("/cveMetadata/cveId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let cvss_rows = cvss_active_models(&cve_id, &raw_json);
+        let affected_rows = affected_active_models(&cve_id, &raw_json);
+        let cwe_rows = cwe_active_models(&cve_id, &raw_json);
+
+        Self {
+            cve_id: cve_id.clone(),
+            cve: cve_active_model_from_raw_json(raw_json, &cve_id),
+            cvss_rows,
+            affected_rows,
+            cwe_master_rows: Vec::new(),
+            cwe_rows,
+        }
+    }
+}
+
 impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
     fn from(value: RawCveRecord<CveStatusData>) -> Self {
         let (content, raw_json) = value.into_parts();
@@ -269,6 +300,49 @@ impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
                 }
             }
         }
+    }
+}
+
+fn cve_active_model_from_raw_json(raw_json: Value, cve_id: &str) -> cve::ActiveModel {
+    let metadata = raw_json.pointer("/cveMetadata").and_then(Value::as_object);
+    let state = metadata
+        .and_then(|metadata| metadata.get("state"))
+        .and_then(Value::as_str)
+        .unwrap_or("PUBLISHED");
+    let cna = raw_json.pointer("/containers/cna");
+    let title = cna
+        .and_then(|cna| cna.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or(cve_id)
+        .to_owned();
+    let description_en = if state == "REJECTED" {
+        description_en_from_raw(cna.and_then(|cna| cna.get("rejectedReasons")))
+    } else {
+        description_en_from_raw(cna.and_then(|cna| cna.get("descriptions")))
+    };
+
+    cve::ActiveModel {
+        id: Default::default(),
+        cve_id: Set(cve_id.to_owned()),
+        state: Set(cve_state_str_to_int(state)),
+        published_at: Set(metadata
+            .and_then(|metadata| metadata.get("datePublished"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()),
+        updated_at: Set(metadata
+            .and_then(|metadata| metadata.get("dateUpdated"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()),
+        serial: Set(metadata
+            .and_then(|metadata| metadata.get("serial"))
+            .and_then(Value::as_i64)
+            .and_then(|serial| i32::try_from(serial).ok())
+            .unwrap_or_default()),
+        title: Set(title),
+        description_en: Set(description_en),
+        raw_json: Set(raw_json),
     }
 }
 
@@ -412,6 +486,13 @@ fn cve_state_to_int(state: &CveState) -> i32 {
     }
 }
 
+fn cve_state_str_to_int(state: &str) -> i32 {
+    match state {
+        "REJECTED" => REJECTED_STATE,
+        _ => PUBLISHED_STATE,
+    }
+}
+
 pub fn cve_state_label(state: i32) -> &'static str {
     match state {
         PUBLISHED_STATE => "PUBLISHED",
@@ -428,9 +509,30 @@ fn description_en(descriptions: &[CnaDescription]) -> Option<String> {
         .map(|description| description.value.clone())
 }
 
+fn description_en_from_raw(descriptions: Option<&Value>) -> Option<String> {
+    let descriptions = descriptions.and_then(Value::as_array)?;
+    descriptions
+        .iter()
+        .find(|description| {
+            description
+                .get("lang")
+                .and_then(Value::as_str)
+                .unwrap_or("en")
+                == "en"
+        })
+        .or_else(|| descriptions.first())
+        .and_then(|description| description.get("value"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
 #[derive(Clone)]
 pub struct CveDatabase {
     db: DatabaseConnection,
+}
+
+pub struct CveBulkReplaceSession {
+    txn: DatabaseTransaction,
 }
 
 impl CveDatabase {
@@ -457,7 +559,8 @@ impl CveDatabase {
     }
 
     pub async fn initialize_schema(&self) -> Result<(), DbErr> {
-        Migrator::up(&self.db, None).await
+        Migrator::up(&self.db, None).await?;
+        ensure_current_schema(&self.db).await
     }
 
     pub async fn rebuild_schema(&self) -> Result<(), DbErr> {
@@ -502,6 +605,16 @@ impl CveDatabase {
             .await
     }
 
+    pub async fn upsert_cve_raw_values(&self, values: Vec<Value>) -> Result<usize, DbErr> {
+        self.upsert_cve_models(
+            values
+                .into_iter()
+                .map(CveActiveModels::from_raw_json)
+                .collect(),
+        )
+        .await
+    }
+
     pub async fn replace_all_cve_models(
         &self,
         models: Vec<CveActiveModels>,
@@ -517,6 +630,12 @@ impl CveDatabase {
 
     pub async fn prepare_bulk_replace_all(&self) -> Result<(), DbErr> {
         prepare_bulk_replace_all_on(&self.db).await
+    }
+
+    pub async fn begin_bulk_replace_all(&self) -> Result<CveBulkReplaceSession, DbErr> {
+        prepare_bulk_replace_all_on(&self.db).await?;
+        let txn = self.db.begin().await?;
+        Ok(CveBulkReplaceSession { txn })
     }
 
     pub async fn insert_cve_models_bulk(
@@ -584,6 +703,16 @@ impl CveDatabase {
     ) -> Result<usize, DbErr> {
         self.insert_cve_models_bulk(records.into_iter().map(CveActiveModels::from).collect())
             .await
+    }
+
+    pub async fn insert_cve_raw_values_bulk(&self, values: Vec<Value>) -> Result<usize, DbErr> {
+        self.insert_cve_models_bulk(
+            values
+                .into_iter()
+                .map(CveActiveModels::from_raw_json)
+                .collect(),
+        )
+        .await
     }
 
     pub async fn replace_cve_children(
@@ -2229,33 +2358,7 @@ impl CveDatabase {
         &self,
         files: Vec<ReadJsonFileRecord>,
     ) -> Result<usize, DbErr> {
-        if files.is_empty() {
-            return Ok(0);
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let count = files.len();
-        let mut rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
-
-        for file in files {
-            rows.push(read_json_file::ActiveModel {
-                created_at: Set(now.clone()),
-                updated_at: Set(now.clone()),
-                filename: Set(file.filename),
-                md5hash: Set(file.md5hash),
-            });
-
-            if rows.len() == READ_JSON_FILE_CHUNK_SIZE {
-                insert_read_json_file_rows(std::mem::take(&mut rows), &self.db).await?;
-                rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
-            }
-        }
-
-        if !rows.is_empty() {
-            insert_read_json_file_rows(rows, &self.db).await?;
-        }
-
-        Ok(count)
+        mark_json_files_read_on(&self.db, files).await
     }
 
     pub async fn find_read_json_file(
@@ -2268,6 +2371,47 @@ impl CveDatabase {
             .filter(read_json_file::Column::Md5hash.eq(md5hash))
             .one(&self.db)
             .await
+    }
+
+    pub async fn mark_cve_zip_file_applied(&self, record: CveZipFileRecord) -> Result<(), DbErr> {
+        let now = Utc::now().to_rfc3339();
+        cve_zip_file::Entity::insert(cve_zip_file::ActiveModel {
+            id: Default::default(),
+            created_at: Set(now),
+            zip_filename: Set(record.zip_filename),
+            zip_datetime: Set(record.zip_datetime),
+            zip_type: Set(record.zip_type),
+        })
+        .on_conflict(
+            OnConflict::column(cve_zip_file::Column::ZipFilename)
+                .update_columns([
+                    cve_zip_file::Column::ZipDatetime,
+                    cve_zip_file::Column::ZipType,
+                ])
+                .to_owned(),
+        )
+        .exec(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn latest_cve_zip_datetime(&self) -> Result<Option<String>, DbErr> {
+        cve_zip_file::Entity::find()
+            .order_by_desc(cve_zip_file::Column::ZipDatetime)
+            .order_by_desc(cve_zip_file::Column::Id)
+            .one(&self.db)
+            .await
+            .map(|row| row.map(|row| row.zip_datetime))
+    }
+
+    pub async fn latest_cve_updated_at(&self) -> Result<Option<String>, DbErr> {
+        cve::Entity::find()
+            .select_only()
+            .column_as(cve::Column::UpdatedAt.max(), "updated_at")
+            .into_tuple::<Option<String>>()
+            .one(&self.db)
+            .await
+            .map(|value| value.flatten().filter(|value| !value.is_empty()))
     }
 
     pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, DbErr> {
@@ -2305,6 +2449,46 @@ impl CveDatabase {
     }
 }
 
+impl CveBulkReplaceSession {
+    pub async fn insert_cve_records(
+        &self,
+        records: Vec<RawCveRecord<CveStatusData>>,
+    ) -> Result<usize, DbErr> {
+        self.insert_cve_models(records.into_iter().map(CveActiveModels::from).collect())
+            .await
+    }
+
+    pub async fn insert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
+        if models.is_empty() {
+            return Ok(0);
+        }
+
+        insert_cve_models_on(&self.txn, models, false).await
+    }
+
+    pub async fn insert_cve_raw_values(&self, values: Vec<Value>) -> Result<usize, DbErr> {
+        self.insert_cve_models(
+            values
+                .into_iter()
+                .map(CveActiveModels::from_raw_json)
+                .collect(),
+        )
+        .await
+    }
+
+    pub async fn mark_json_files_read(
+        &self,
+        files: Vec<ReadJsonFileRecord>,
+    ) -> Result<usize, DbErr> {
+        mark_json_files_read_on(&self.txn, files).await
+    }
+
+    pub async fn finish(self, db: &CveDatabase) -> Result<(), DbErr> {
+        self.txn.commit().await?;
+        finish_bulk_replace_all_on(&db.db).await
+    }
+}
+
 pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, DbErr> {
     let db = Database::connect(database_url).await?;
     db.execute(Statement::from_string(
@@ -2333,6 +2517,41 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
     ))
     .await?;
     Ok(db)
+}
+
+async fn ensure_current_schema<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    db.execute_unprepared(
+        r#"
+        CREATE TABLE IF NOT EXISTS cve_zip_file (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            created_at TEXT NOT NULL,
+            zip_filename TEXT NOT NULL UNIQUE,
+            zip_datetime TEXT NOT NULL,
+            zip_type INTEGER NOT NULL
+        )
+        "#,
+    )
+    .await?;
+    db.execute_unprepared(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_cve_zip_file_filename ON cve_zip_file (zip_filename)",
+    )
+    .await?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_cve_zip_file_datetime ON cve_zip_file (zip_datetime)",
+    )
+    .await?;
+    db.execute_unprepared(
+        "CREATE INDEX IF NOT EXISTS idx_cve_zip_file_type_datetime ON cve_zip_file (zip_type, zip_datetime)",
+    )
+    .await?;
+    Ok(())
 }
 
 async fn upsert_cve_on<C>(db: &C, model: cve::ActiveModel) -> Result<(), DbErr>
@@ -2715,6 +2934,14 @@ where
         return Ok(());
     }
 
+    db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+    db.execute_unprepared("PRAGMA journal_mode = MEMORY")
+        .await?;
+    db.execute_unprepared("PRAGMA synchronous = OFF").await?;
+    db.execute_unprepared("PRAGMA temp_store = MEMORY").await?;
+    db.execute_unprepared("PRAGMA cache_size = -400000").await?;
+    db.execute_unprepared("PRAGMA locking_mode = EXCLUSIVE")
+        .await?;
     db.execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
         .await?;
     for index_name in BULK_LOAD_DROPPED_INDEXES {
@@ -2739,6 +2966,11 @@ where
     rebuild_cve_search_fts(db).await?;
     db.execute_unprepared("ANALYZE").await?;
     db.execute_unprepared("PRAGMA optimize").await?;
+    db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+    db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
+    db.execute_unprepared("PRAGMA synchronous = NORMAL").await?;
+    db.execute_unprepared("PRAGMA locking_mode = NORMAL")
+        .await?;
     db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
         .await?;
     Ok(())
@@ -2957,10 +3189,46 @@ fn read_json_file_upsert_conflict() -> OnConflict {
     .to_owned()
 }
 
-async fn insert_read_json_file_rows(
+async fn mark_json_files_read_on<C>(db: &C, files: Vec<ReadJsonFileRecord>) -> Result<usize, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if files.is_empty() {
+        return Ok(0);
+    }
+
+    let now = Utc::now().to_rfc3339();
+    let count = files.len();
+    let mut rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
+
+    for file in files {
+        rows.push(read_json_file::ActiveModel {
+            created_at: Set(now.clone()),
+            updated_at: Set(now.clone()),
+            filename: Set(file.filename),
+            md5hash: Set(file.md5hash),
+        });
+
+        if rows.len() == READ_JSON_FILE_CHUNK_SIZE {
+            insert_read_json_file_rows(std::mem::take(&mut rows), db).await?;
+            rows = Vec::with_capacity(READ_JSON_FILE_CHUNK_SIZE);
+        }
+    }
+
+    if !rows.is_empty() {
+        insert_read_json_file_rows(rows, db).await?;
+    }
+
+    Ok(count)
+}
+
+async fn insert_read_json_file_rows<C>(
     rows: Vec<read_json_file::ActiveModel>,
-    db: &DatabaseConnection,
-) -> Result<(), DbErr> {
+    db: &C,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
     read_json_file::Entity::insert_many(rows)
         .on_conflict(read_json_file_upsert_conflict())
         .exec(db)
@@ -2970,7 +3238,8 @@ async fn insert_read_json_file_rows(
 }
 
 pub async fn initialize_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
-    Migrator::up(db, None).await
+    Migrator::up(db, None).await?;
+    ensure_current_schema(db).await
 }
 
 pub async fn rebuild_schema(db: &DatabaseConnection) -> Result<(), DbErr> {
@@ -3268,7 +3537,7 @@ fn fts_summary_sql(state_scope: CveStateScope) -> &'static str {
     FROM cve_search_fts
     INNER JOIN cve ON cve.cve_id = cve_search_fts.cve_id
     WHERE cve_search_fts MATCH ?
-    ORDER BY bm25(cve_search_fts), cve.published_at DESC, cve.cve_id ASC
+    ORDER BY cve.published_at DESC, cve.cve_id ASC
     LIMIT ? OFFSET ?
     "#
     } else {
@@ -3283,7 +3552,7 @@ fn fts_summary_sql(state_scope: CveStateScope) -> &'static str {
     FROM cve_search_fts
     INNER JOIN cve ON cve.cve_id = cve_search_fts.cve_id
     WHERE cve_search_fts MATCH ? AND cve.state = 0
-    ORDER BY bm25(cve_search_fts), cve.published_at DESC, cve.cve_id ASC
+    ORDER BY cve.published_at DESC, cve.cve_id ASC
     LIMIT ? OFFSET ?
     "#
     }

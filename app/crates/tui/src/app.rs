@@ -58,7 +58,7 @@ impl App {
         let mut list_state = ListState::default();
         list_state.select(Some(0));
         let search_mode = SearchMode::from_query_prefix(&query).unwrap_or(SearchMode::FreeText);
-        Self {
+        let mut app = Self {
             query,
             search_mode,
             state_scope: CveStateScope::PublishedOnly,
@@ -83,7 +83,9 @@ impl App {
             show_help: false,
             show_advanced: false,
             show_display: false,
-        }
+        };
+        app.sync_advanced_from_main();
+        app
     }
 
     pub(super) fn start_search(&mut self, db: CveDatabase) {
@@ -92,8 +94,17 @@ impl App {
         }
 
         self.apply_prefix_mode();
+        self.sync_advanced_from_main();
         let sort_order = self.display.sort_order();
-        let request = SearchRequest::Advanced(self.main_search_options(sort_order));
+        let request = if sort_order == CveSummarySortOrder::PublishedDesc {
+            SearchRequest::Mode {
+                mode: self.search_mode,
+                query: self.query.clone(),
+                state_scope: self.state_scope,
+            }
+        } else {
+            SearchRequest::Advanced(self.main_search_options(sort_order))
+        };
         let limit = self.limit;
         self.searched_request = request.clone();
         self.exhausted = false;
@@ -136,9 +147,7 @@ impl App {
 
     pub(super) fn open_advanced_search(&mut self) {
         self.apply_prefix_mode();
-        self.advanced.query = self.query.clone();
-        self.advanced.query_mode = self.search_mode;
-        self.advanced.state_scope = self.state_scope;
+        self.sync_advanced_from_main();
         self.show_advanced = true;
     }
 
@@ -340,6 +349,34 @@ impl App {
 
     pub(super) fn next_search_mode(&mut self) {
         self.search_mode = self.search_mode.next();
+        self.sync_advanced_from_main();
+    }
+
+    pub(super) fn push_query(&mut self, ch: char) {
+        self.query.push(ch);
+        self.scroll_detail_to_top();
+        self.apply_prefix_mode();
+        self.sync_advanced_from_main();
+    }
+
+    pub(super) fn backspace_query(&mut self) {
+        self.query.pop();
+        self.scroll_detail_to_top();
+        self.apply_prefix_mode();
+        self.sync_advanced_from_main();
+    }
+
+    pub(super) fn sync_main_from_advanced(&mut self) {
+        self.query = self.advanced.query.clone();
+        self.search_mode = self.advanced.query_mode;
+        self.state_scope = self.advanced.state_scope;
+        self.scroll_detail_to_top();
+    }
+
+    pub(super) fn sync_advanced_from_main(&mut self) {
+        self.advanced.query = self.query.clone();
+        self.advanced.query_mode = self.search_mode;
+        self.advanced.state_scope = self.state_scope;
     }
 
     pub(super) fn reset_screen(&mut self) {
