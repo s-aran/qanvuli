@@ -9,6 +9,8 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    qanvuli_utils::init_tls_provider();
+
     let cli = Cli::parse();
     let db_url = cli.db_url();
     let command = cli.command.unwrap_or(Command::Help);

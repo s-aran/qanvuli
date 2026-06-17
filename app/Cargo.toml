@@ -7,5 +7,6 @@ version.workspace = true
 qanvuli-app-commands = { version = "*", path = "crates/commands" }
 qanvuli-app-mcp = { version = "*", path = "crates/mcp" }
 qanvuli-app-tui = { version = "*", path = "crates/tui" }
+qanvuli-utils = { version = "*", path = "../utils" }
 clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1.52", features = ["io-std", "macros", "rt", "sync"] }
