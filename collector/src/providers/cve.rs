@@ -61,6 +61,10 @@ impl CveRelease {
         asset.name.contains("_delta_") && asset.name.ends_with(".zip")
     }
 
+    fn is_end_of_day_zip(asset: &GitHubReleaseFile) -> bool {
+        asset.name.contains("_at_end_of_day") && asset.name.ends_with(".zip")
+    }
+
     fn is_all_zip(asset: &GitHubReleaseFile) -> bool {
         asset.name.contains("_all_") && asset.name.ends_with(".zip")
     }
@@ -111,15 +115,16 @@ impl CveRelease {
     }
 
     pub fn get_all_and_delta_files_oldest_first(&self) -> Vec<GitHubReleaseFile> {
-        let mut releases = self.get_hourly_release();
+        let mut releases = self.releases.iter().collect::<Vec<_>>();
         releases.reverse();
         releases
             .into_iter()
             .flat_map(|release| {
-                release
-                    .files
-                    .iter()
-                    .filter(|file| Self::is_all_zip(file) || Self::is_delta_zip(file))
+                release.files.iter().filter(|file| {
+                    Self::is_all_zip(file)
+                        || Self::is_delta_zip(file)
+                        || Self::is_end_of_day_zip(file)
+                })
             })
             .cloned()
             .collect()

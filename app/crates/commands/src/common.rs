@@ -1,4 +1,4 @@
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Utc};
 use clap::ValueEnum;
 use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
 use qanvuli_db::{CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
@@ -17,8 +17,9 @@ const INGEST_CHUNK_SIZE: usize = 10000;
 const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
-const CVE_ZIP_TYPE_MIDNIGHT: i32 = 0;
-const CVE_ZIP_TYPE_DELTA: i32 = 1;
+const CVE_ZIP_TYPE_ALL_MIDNIGHT: i32 = 0;
+const CVE_ZIP_TYPE_DELTA_HOURLY: i32 = 1;
+const CVE_ZIP_TYPE_DELTA_END_OF_DAY: i32 = 2;
 
 #[derive(Clone, Debug)]
 struct CveZipAsset {
@@ -170,7 +171,16 @@ fn cve_zip_asset_from_filename(filename: &str) -> Option<CveZipAsset> {
         return Some(CveZipAsset {
             path_or_name: filename.to_owned(),
             zip_datetime: Utc.from_utc_datetime(&datetime).to_rfc3339(),
-            zip_type: CVE_ZIP_TYPE_MIDNIGHT,
+            zip_type: CVE_ZIP_TYPE_ALL_MIDNIGHT,
+        });
+    }
+
+    if filename.contains("_at_end_of_day") {
+        let datetime = date.and_hms_opt(23, 59, 59)?;
+        return Some(CveZipAsset {
+            path_or_name: filename.to_owned(),
+            zip_datetime: Utc.from_utc_datetime(&datetime).to_rfc3339(),
+            zip_type: CVE_ZIP_TYPE_DELTA_END_OF_DAY,
         });
     }
 
@@ -185,7 +195,7 @@ fn cve_zip_asset_from_filename(filename: &str) -> Option<CveZipAsset> {
     Some(CveZipAsset {
         path_or_name: filename.to_owned(),
         zip_datetime: Utc.from_utc_datetime(&datetime).to_rfc3339(),
-        zip_type: CVE_ZIP_TYPE_DELTA,
+        zip_type: CVE_ZIP_TYPE_DELTA_HOURLY,
     })
 }
 
@@ -251,34 +261,30 @@ pub async fn apply_delta_updates(
         return Ok(vec![zip]);
     }
 
-    let anchor = latest_update_anchor(db).await?;
-    let assets = if let Some(anchor) = anchor {
-        match update_assets_since(Some(&anchor)).await {
-            Ok(assets) => assets,
-            Err(err) => {
-                if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
-                    eprintln!(
-                        "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
-                        path.display()
-                    );
-                    return apply_local_delta_updates(db, vec![path], max_chunks).await;
-                }
-                return Err(err);
+    let Some(anchor) = latest_update_anchor(db).await? else {
+        eprintln!("update: no previous CVE zip history; importing latest all midnight archive");
+        return apply_latest_all_midnight(db, max_chunks).await;
+    };
+    let anchor_datetime = parse_anchor_datetime(&anchor)?;
+    let elapsed = Utc::now().signed_duration_since(anchor_datetime);
+    if elapsed >= ChronoDuration::weeks(1) {
+        eprintln!(
+            "update: latest CVE zip is older than 1 week ({anchor}); importing latest all midnight archive"
+        );
+        return apply_latest_all_midnight(db, max_chunks).await;
+    }
+
+    let assets = match update_delta_assets_since(&anchor, elapsed).await {
+        Ok(assets) => assets,
+        Err(err) => {
+            if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
+                eprintln!(
+                    "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
+                    path.display()
+                );
+                return apply_local_delta_updates(db, vec![path], max_chunks).await;
             }
-        }
-    } else {
-        match latest_asset(ReleaseAssetKind::Delta).await {
-            Ok(asset) => vec![asset],
-            Err(err) => {
-                if let Some(path) = latest_local_asset(ReleaseAssetKind::Delta) {
-                    eprintln!(
-                        "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
-                        path.display()
-                    );
-                    return apply_local_delta_updates(db, vec![path], max_chunks).await;
-                }
-                return Err(err);
-            }
+            return Err(err);
         }
     };
 
@@ -320,6 +326,15 @@ pub async fn apply_delta_updates(
         applied.push(asset_path);
     }
     Ok(applied)
+}
+
+async fn apply_latest_all_midnight(
+    db: &CveDatabase,
+    max_chunks: Option<usize>,
+) -> Result<Vec<PathBuf>, String> {
+    let path = download_latest_asset(ReleaseAssetKind::All).await?;
+    ingest_zip(db, "all", &path, IngestMode::ReplaceAll, max_chunks).await;
+    Ok(vec![path])
 }
 
 async fn apply_local_delta_updates(
@@ -374,6 +389,12 @@ async fn latest_update_anchor(db: &CveDatabase) -> Result<Option<String>, String
         .map_err(|err| format!("failed to read latest CVE updated_at: {err}"))
 }
 
+fn parse_anchor_datetime(anchor: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(anchor)
+        .map(|datetime| datetime.with_timezone(&Utc))
+        .map_err(|err| format!("invalid CVE update anchor `{anchor}`: {err}"))
+}
+
 async fn cve_zip_asset_is_not_newer(db: &CveDatabase, asset: &CveZipAsset) -> Result<bool, String> {
     let Some(anchor) = latest_update_anchor(db).await? else {
         return Ok(false);
@@ -381,8 +402,9 @@ async fn cve_zip_asset_is_not_newer(db: &CveDatabase, asset: &CveZipAsset) -> Re
     Ok(asset.zip_datetime <= anchor)
 }
 
-async fn update_assets_since(
-    since: Option<&str>,
+async fn update_delta_assets_since(
+    since: &str,
+    elapsed: ChronoDuration,
 ) -> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
     let mut cve = CveRelease::new();
     cve.async_get_all()
@@ -393,7 +415,9 @@ async fn update_assets_since(
         .get_all_and_delta_files_oldest_first()
         .into_iter()
         .filter_map(|asset| cve_zip_asset_from_filename(&asset.name).map(|parsed| (asset, parsed)))
-        .filter(|(_, parsed)| since.is_none_or(|since| parsed.zip_datetime.as_str() > since))
+        .filter(|(_, parsed)| {
+            parsed.zip_datetime.as_str() > since && parsed.zip_type != CVE_ZIP_TYPE_ALL_MIDNIGHT
+        })
         .collect::<Vec<_>>();
 
     candidates.sort_by(|(_, left), (_, right)| {
@@ -403,23 +427,47 @@ async fn update_assets_since(
             .then(left.path_or_name.cmp(&right.path_or_name))
     });
 
-    let latest_midnight = candidates
+    let latest_end_of_day = candidates
         .iter()
-        .rposition(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_MIDNIGHT);
+        .rposition(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY);
 
-    let selected = if let Some(midnight_index) = latest_midnight {
-        let midnight_datetime = candidates[midnight_index].1.zip_datetime.clone();
+    let selected = if elapsed < ChronoDuration::hours(24) {
+        if let Some(end_of_day_index) = latest_end_of_day {
+            let end_of_day_datetime = candidates[end_of_day_index].1.zip_datetime.clone();
+            candidates
+                .into_iter()
+                .skip(end_of_day_index)
+                .filter(|(_, parsed)| {
+                    parsed.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY
+                        || (parsed.zip_type == CVE_ZIP_TYPE_DELTA_HOURLY
+                            && parsed.zip_datetime.as_str() > end_of_day_datetime.as_str())
+                })
+                .map(|(asset, _)| asset)
+                .collect()
+        } else {
+            candidates
+                .into_iter()
+                .filter(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_DELTA_HOURLY)
+                .map(|(asset, _)| asset)
+                .collect()
+        }
+    } else if let Some(end_of_day_index) = latest_end_of_day {
+        let latest_end_of_day_datetime = candidates[end_of_day_index].1.zip_datetime.clone();
         candidates
             .into_iter()
-            .skip(midnight_index)
             .filter(|(_, parsed)| {
-                parsed.zip_type == CVE_ZIP_TYPE_MIDNIGHT
-                    || parsed.zip_datetime.as_str() > midnight_datetime.as_str()
+                parsed.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY
+                    || (parsed.zip_type == CVE_ZIP_TYPE_DELTA_HOURLY
+                        && parsed.zip_datetime.as_str() > latest_end_of_day_datetime.as_str())
             })
             .map(|(asset, _)| asset)
             .collect()
     } else {
-        candidates.into_iter().map(|(asset, _)| asset).collect()
+        candidates
+            .into_iter()
+            .filter(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_DELTA_HOURLY)
+            .map(|(asset, _)| asset)
+            .collect()
     };
 
     Ok(selected)
