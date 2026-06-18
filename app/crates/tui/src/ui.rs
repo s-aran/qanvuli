@@ -4,7 +4,7 @@ use super::{
     form::{AdvancedField, AdvancedForm, StateScopeUi},
 };
 use chrono::{DateTime, FixedOffset};
-use qanvuli_db::{CveDetail, CveSummaryWithDetail, cve_state_label};
+use qanvuli_db::{CveAffectedDetail, CveDetail, CveSummaryWithDetail, cve_state_label};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -90,8 +90,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.clamp_detail_scroll_to_lines(detail.len());
     let detail_title = app
         .selected()
-        .map(|cve| cve.summary.cve_id.as_str())
-        .unwrap_or("CVE");
+        .map(|cve| {
+            format!(
+                "{} [{}]",
+                cve.summary.cve_id,
+                cve_state_label(cve.summary.state)
+            )
+        })
+        .unwrap_or_else(|| "CVE".to_owned());
     let detail = Paragraph::new(detail)
         .block(
             Block::default()
@@ -357,28 +363,53 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn detail_lines(cve: &CveSummaryWithDetail, timezone: TimeZone) -> Vec<Line<'static>> {
-    let cve = &cve.summary;
+    let summary = &cve.summary;
     vec![
-        Line::from(vec![
-            Span::styled("State: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(cve_state_label(cve.state)),
-        ]),
+        Line::from(Span::styled(
+            product_vendor_summary(&cve.detail.affected),
+            Style::default().fg(Color::Cyan),
+        )),
         Line::from(vec![
             Span::styled("Published: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format_timestamp(&cve.published_at, timezone)),
+            Span::raw(format_timestamp(&summary.published_at, timezone)),
         ]),
         Line::from(vec![
             Span::styled("Updated: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format_timestamp(&cve.updated_at, timezone)),
+            Span::raw(format_timestamp(&summary.updated_at, timezone)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
-            cve.title.clone(),
+            summary.title.clone(),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(cve.description_en.clone().unwrap_or_default()),
+        Line::from(summary.description_en.clone().unwrap_or_default()),
     ]
+}
+
+fn product_vendor_summary(affected: &[CveAffectedDetail]) -> String {
+    let mut values = Vec::new();
+    for affected in affected {
+        let vendor = affected.vendor.as_deref().unwrap_or("-");
+        let product = affected.product.as_deref().unwrap_or("-");
+        let value = format!("{product} / {vendor}");
+        if !values.contains(&value) {
+            values.push(value);
+        }
+        if values.len() >= 3 {
+            break;
+        }
+    }
+    if values.is_empty() {
+        "-".to_owned()
+    } else {
+        let suffix = if affected.len() > values.len() {
+            " ..."
+        } else {
+            ""
+        };
+        format!("{}{suffix}", values.join(", "))
+    }
 }
 
 fn format_timestamp(value: &str, timezone: TimeZone) -> String {
