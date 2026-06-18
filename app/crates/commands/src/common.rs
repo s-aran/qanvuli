@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_DB_CONNECTION_STRING: &str = "sqlite://./db.sqlite?mode=rwc";
@@ -20,6 +21,18 @@ const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CVE_ZIP_TYPE_ALL_MIDNIGHT: i32 = 0;
 const CVE_ZIP_TYPE_DELTA_HOURLY: i32 = 1;
 const CVE_ZIP_TYPE_DELTA_END_OF_DAY: i32 = 2;
+
+pub type IngestProgressCallback = Arc<dyn Fn(IngestProgress) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct IngestProgress {
+    pub label: String,
+    pub asset: String,
+    pub phase: String,
+    pub total_files: usize,
+    pub written_files: usize,
+    pub failed_files: usize,
+}
 
 #[derive(Clone, Debug)]
 struct CveZipAsset {
@@ -256,16 +269,36 @@ pub async fn apply_delta_updates(
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
+    apply_delta_updates_with_progress(db, zip, max_chunks, None).await
+}
+
+pub async fn apply_delta_updates_with_progress(
+    db: &CveDatabase,
+    zip: Option<PathBuf>,
+    max_chunks: Option<usize>,
+    progress: Option<IngestProgressCallback>,
+) -> Result<Vec<PathBuf>, String> {
+    emit_general_progress(&progress, "update", "syncing cwe");
     sync_cwe_catalog(db).await?;
+    emit_general_progress(&progress, "update", "checking updates");
 
     if let Some(zip) = zip {
-        ingest_zip(db, "delta", &zip, IngestMode::Upsert, max_chunks, true).await;
+        ingest_zip_with_progress(
+            db,
+            "delta",
+            &zip,
+            IngestMode::Upsert,
+            max_chunks,
+            true,
+            progress,
+        )
+        .await;
         return Ok(vec![zip]);
     }
 
     let Some(anchor) = latest_update_anchor(db).await? else {
         eprintln!("update: no previous CVE zip history; importing latest all midnight archive");
-        return apply_latest_all_midnight(db, max_chunks).await;
+        return apply_latest_all_midnight(db, max_chunks, progress).await;
     };
     let anchor_datetime = parse_anchor_datetime(&anchor)?;
     let elapsed = Utc::now().signed_duration_since(anchor_datetime);
@@ -273,7 +306,7 @@ pub async fn apply_delta_updates(
         eprintln!(
             "update: latest CVE zip is older than 1 week ({anchor}); importing latest all midnight archive"
         );
-        return apply_latest_all_midnight(db, max_chunks).await;
+        return apply_latest_all_midnight(db, max_chunks, progress).await;
     }
 
     let assets = match update_delta_assets_since(&anchor, elapsed).await {
@@ -284,7 +317,7 @@ pub async fn apply_delta_updates(
                     "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
                     path.display()
                 );
-                return apply_local_delta_updates(db, vec![path], max_chunks).await;
+                return apply_local_delta_updates(db, vec![path], max_chunks, progress).await;
             }
             return Err(err);
         }
@@ -296,7 +329,7 @@ pub async fn apply_delta_updates(
                 "delta: no GitHub delta asset found; using latest local {}",
                 path.display()
             );
-            return apply_local_delta_updates(db, vec![path], max_chunks).await;
+            return apply_local_delta_updates(db, vec![path], max_chunks, progress).await;
         }
         assets
     } else {
@@ -319,13 +352,14 @@ pub async fn apply_delta_updates(
             .await
             .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
         let asset_path = PathBuf::from(&asset.name);
-        ingest_zip(
+        ingest_zip_with_progress(
             db,
             "delta",
             &asset_path,
             IngestMode::Upsert,
             max_chunks,
             true,
+            progress.clone(),
         )
         .await;
         if max_chunks.is_none() {
@@ -338,12 +372,35 @@ pub async fn apply_delta_updates(
     Ok(applied)
 }
 
+fn emit_general_progress(progress: &Option<IngestProgressCallback>, label: &str, phase: &str) {
+    if let Some(progress) = progress {
+        progress(IngestProgress {
+            label: label.to_owned(),
+            asset: String::new(),
+            phase: phase.to_owned(),
+            total_files: 0,
+            written_files: 0,
+            failed_files: 0,
+        });
+    }
+}
+
 async fn apply_latest_all_midnight(
     db: &CveDatabase,
     max_chunks: Option<usize>,
+    progress: Option<IngestProgressCallback>,
 ) -> Result<Vec<PathBuf>, String> {
     let path = download_latest_asset(ReleaseAssetKind::All).await?;
-    ingest_zip(db, "all", &path, IngestMode::ReplaceAll, max_chunks, true).await;
+    ingest_zip_with_progress(
+        db,
+        "all",
+        &path,
+        IngestMode::ReplaceAll,
+        max_chunks,
+        true,
+        progress,
+    )
+    .await;
     Ok(vec![path])
 }
 
@@ -351,6 +408,7 @@ async fn apply_local_delta_updates(
     db: &CveDatabase,
     assets: Vec<PathBuf>,
     max_chunks: Option<usize>,
+    progress: Option<IngestProgressCallback>,
 ) -> Result<Vec<PathBuf>, String> {
     let anchor = latest_update_anchor(db).await?;
     let mut applied = Vec::new();
@@ -374,13 +432,14 @@ async fn apply_local_delta_updates(
             continue;
         }
 
-        ingest_zip(
+        ingest_zip_with_progress(
             db,
             "delta",
             &asset_path,
             IngestMode::Upsert,
             max_chunks,
             true,
+            progress.clone(),
         )
         .await;
         if max_chunks.is_none() && !asset_name.is_empty() {
@@ -527,6 +586,18 @@ pub async fn ingest_zip(
     max_chunks: Option<usize>,
     cwe_synced: bool,
 ) {
+    ingest_zip_with_progress(db, label, asset_path, mode, max_chunks, cwe_synced, None).await;
+}
+
+pub async fn ingest_zip_with_progress(
+    db: &CveDatabase,
+    label: &str,
+    asset_path: &Path,
+    mode: IngestMode,
+    max_chunks: Option<usize>,
+    cwe_synced: bool,
+    progress: Option<IngestProgressCallback>,
+) {
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
     let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
@@ -537,7 +608,25 @@ pub async fn ingest_zip(
         asset_path.display(),
         json_paths.len()
     );
+    emit_ingest_progress(
+        &progress,
+        label,
+        asset_path,
+        "enumerated",
+        json_paths.len(),
+        0,
+        0,
+    );
     if matches!(mode, IngestMode::ReplaceAll) {
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "rebuilding",
+            json_paths.len(),
+            0,
+            0,
+        );
         let rebuild_start = Instant::now();
         if let Err(err) = db.rebuild_schema().await {
             panic!("{label}: failed to rebuild schema: {err}");
@@ -556,6 +645,15 @@ pub async fn ingest_zip(
     }
 
     if !cwe_synced {
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "syncing cwe",
+            json_paths.len(),
+            0,
+            0,
+        );
         if let Err(err) = sync_cwe_catalog(db).await {
             panic!("{label}: {err}");
         }
@@ -563,6 +661,15 @@ pub async fn ingest_zip(
 
     let mut bulk_replace = None;
     if matches!(mode, IngestMode::ReplaceAll) {
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "preparing",
+            json_paths.len(),
+            0,
+            0,
+        );
         let prepare_start = Instant::now();
         let session = db
             .begin_bulk_replace_all()
@@ -590,6 +697,15 @@ pub async fn ingest_zip(
             break;
         }
 
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "reading",
+            json_paths.len(),
+            inserted,
+            failed,
+        );
         let chunk_start = Instant::now();
         let mut jsons = Vec::with_capacity(chunk.len());
         let mut read_failed = 0usize;
@@ -651,6 +767,15 @@ pub async fn ingest_zip(
 
         failed += read_failed + parse_failed;
 
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "writing",
+            json_paths.len(),
+            inserted,
+            failed,
+        );
         let db_write_start = Instant::now();
         let result = match mode {
             IngestMode::ReplaceAll => {
@@ -711,6 +836,15 @@ pub async fn ingest_zip(
             "{label}: progress chunk={}, inserted={}, failed={}",
             chunk_index, inserted, failed
         );
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "writing",
+            json_paths.len(),
+            inserted,
+            failed,
+        );
     }
 
     eprintln!(
@@ -724,6 +858,15 @@ pub async fn ingest_zip(
     );
 
     if matches!(mode, IngestMode::ReplaceAll) {
+        emit_ingest_progress(
+            &progress,
+            label,
+            asset_path,
+            "indexing",
+            json_paths.len(),
+            inserted,
+            failed,
+        );
         let finish_start = Instant::now();
         let session = bulk_replace
             .take()
@@ -758,6 +901,36 @@ pub async fn ingest_zip(
                 asset_path.display()
             );
         }
+    }
+    emit_ingest_progress(
+        &progress,
+        label,
+        asset_path,
+        "done",
+        json_paths.len(),
+        inserted,
+        failed,
+    );
+}
+
+fn emit_ingest_progress(
+    progress: &Option<IngestProgressCallback>,
+    label: &str,
+    asset_path: &Path,
+    phase: &str,
+    total_files: usize,
+    written_files: usize,
+    failed_files: usize,
+) {
+    if let Some(progress) = progress {
+        progress(IngestProgress {
+            label: label.to_owned(),
+            asset: asset_path.display().to_string(),
+            phase: phase.to_owned(),
+            total_files,
+            written_files,
+            failed_files,
+        });
     }
 }
 

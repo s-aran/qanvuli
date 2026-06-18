@@ -1,6 +1,6 @@
 use super::common::{
-    IngestMode, ReleaseAssetKind, connect_db, download_latest_asset, ingest_zip,
-    reset_sqlite_database_files,
+    IngestMode, IngestProgressCallback, ReleaseAssetKind, connect_db, download_latest_asset,
+    ingest_zip_with_progress, reset_sqlite_database_files,
 };
 use std::path::PathBuf;
 
@@ -17,6 +17,14 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
+    run_with_progress(db_url, args, None).await
+}
+
+async fn run_with_progress(
+    db_url: &str,
+    args: Args,
+    progress: Option<IngestProgressCallback>,
+) -> Result<(), String> {
     if args.schema_only {
         eprintln!("init: connecting database {db_url}");
         let db = connect_db(db_url).await?;
@@ -49,17 +57,48 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     eprintln!("init: connecting database {db_url}");
     let db = connect_db(db_url).await?;
     eprintln!("init: importing all CVEs; schema will be rebuilt before insert");
-    ingest_zip(
+    ingest_zip_with_progress(
         &db,
         "all",
         &asset_path,
         IngestMode::ReplaceAll,
         args.max_chunks,
         false,
+        progress,
     )
     .await;
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;
     Ok(())
+}
+
+pub async fn run_default(db_url: &str) -> Result<(), String> {
+    run(
+        db_url,
+        Args {
+            schema_only: false,
+            rebuild: false,
+            zip: None,
+            max_chunks: None,
+        },
+    )
+    .await
+}
+
+pub async fn run_default_with_progress(
+    db_url: &str,
+    progress: IngestProgressCallback,
+) -> Result<(), String> {
+    run_with_progress(
+        db_url,
+        Args {
+            schema_only: false,
+            rebuild: false,
+            zip: None,
+            max_chunks: None,
+        },
+        Some(progress),
+    )
+    .await
 }

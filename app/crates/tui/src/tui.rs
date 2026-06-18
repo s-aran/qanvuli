@@ -1,11 +1,16 @@
 use super::{
-    EVENT_POLL_MAX, TUI_LIMIT, app::App, form::AdvancedField, terminal::TerminalGuard, ui::draw,
+    EVENT_POLL_MAX, TUI_LIMIT,
+    app::{App, MaintenanceChoice, MaintenanceOperation},
+    form::AdvancedField,
+    terminal::TerminalGuard,
+    ui::draw,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use qanvuli_app_commands::common::connect_db;
+use qanvuli_app_commands::{common::connect_db, init, update};
 use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io;
+use std::{fs::File, future::Future, io, os::fd::AsRawFd, sync::Arc, thread};
+use tokio::sync::mpsc;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -16,28 +21,39 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_db(db_url).await?;
+    let mut db = Some(connect_db(db_url).await?);
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(args.query.unwrap_or_default(), args.limit);
-    if !app.query.is_empty() {
+    if let Some(db) = db.as_ref() {
+        update_db_as_of(&mut app, db).await;
+    }
+    if !app.query.is_empty()
+        && let Some(db) = db.as_ref()
+    {
         app.start_search(db.clone());
     }
 
-    let result = run_loop(&mut terminal.terminal, &db, &mut app).await;
+    let result = run_loop(&mut terminal.terminal, db_url, &mut db, &mut app).await;
     terminal.leave()?;
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    if let Some(db) = db.take() {
+        db.close()
+            .await
+            .map_err(|err| format!("failed to close database: {err}"))?;
+    }
     result
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    db: &CveDatabase,
+    db_url: &str,
+    db: &mut Option<CveDatabase>,
     app: &mut App,
 ) -> Result<(), String> {
     loop {
         app.poll_search().await?;
+        if app.poll_maintenance().await {
+            refresh_db_after_maintenance(db_url, db, app).await;
+        }
         if app.searching() {
             tokio::task::yield_now().await;
         }
@@ -58,6 +74,16 @@ async fn run_loop(
             continue;
         };
         if key.kind == KeyEventKind::Release {
+            continue;
+        }
+
+        if app.maintenance_running()
+            && matches!(key.code, KeyCode::Char('c'))
+            && key.modifiers.contains(event::KeyModifiers::CONTROL)
+        {
+            break;
+        }
+        if app.maintenance_running() {
             continue;
         }
 
@@ -105,7 +131,9 @@ async fn run_loop(
             match key.code {
                 KeyCode::Esc => app.show_advanced = false,
                 KeyCode::Enter => {
-                    app.start_advanced_search(db.clone());
+                    if let Some(db) = db.as_ref() {
+                        app.start_advanced_search(db.clone());
+                    }
                     app.show_advanced = false;
                 }
                 KeyCode::Backspace => {
@@ -165,6 +193,29 @@ async fn run_loop(
             continue;
         }
 
+        if app.show_maintenance {
+            match key.code {
+                KeyCode::Esc => app.close_maintenance(),
+                KeyCode::Enter => {
+                    start_selected_maintenance(db_url, db, app).await;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    break;
+                }
+                KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+                    app.next_maintenance_choice();
+                }
+                KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+                    app.previous_maintenance_choice();
+                }
+                KeyCode::Char('i') => app.maintenance_choice = MaintenanceChoice::Init,
+                KeyCode::Char('u') => app.maintenance_choice = MaintenanceChoice::Update,
+                KeyCode::Char('c') => app.maintenance_choice = MaintenanceChoice::Cancel,
+                _ => {}
+            }
+            continue;
+        }
+
         match key.code {
             KeyCode::Esc => {}
             KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
@@ -172,10 +223,14 @@ async fn run_loop(
                 app.move_half_page_up();
             }
             KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                app.move_half_page_down(db.clone());
+                if let Some(db) = db.as_ref() {
+                    app.move_half_page_down(db.clone());
+                }
             }
             KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                app.move_full_page_down(db.clone());
+                if let Some(db) = db.as_ref() {
+                    app.move_full_page_down(db.clone());
+                }
             }
             KeyCode::Char('b') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
                 app.move_full_page_up();
@@ -183,7 +238,12 @@ async fn run_loop(
             KeyCode::F(1) => app.show_help = true,
             KeyCode::F(3) => app.open_advanced_search(),
             KeyCode::F(4) => app.open_display_settings(),
-            KeyCode::Enter => app.start_search(db.clone()),
+            KeyCode::F(5) => app.open_maintenance(),
+            KeyCode::Enter => {
+                if let Some(db) = db.as_ref() {
+                    app.start_search(db.clone());
+                }
+            }
             KeyCode::Tab => app.toggle_focus(),
             KeyCode::Left => app.focus_left(),
             KeyCode::Right => app.focus_right(),
@@ -194,7 +254,11 @@ async fn run_loop(
             KeyCode::Char(ch) => {
                 app.push_query(ch);
             }
-            KeyCode::Down => app.move_focused_down(db.clone()),
+            KeyCode::Down => {
+                if let Some(db) = db.as_ref() {
+                    app.move_focused_down(db.clone());
+                }
+            }
             KeyCode::Up => app.move_focused_up(),
             _ => {}
         }
@@ -202,4 +266,143 @@ async fn run_loop(
 
     app.abort_search();
     Ok(())
+}
+
+async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
+    match app.maintenance_choice {
+        MaintenanceChoice::Cancel => app.close_maintenance(),
+        MaintenanceChoice::Update => {
+            let db_url = db_url.to_owned();
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+            let progress = Arc::new(move |progress| {
+                let _ = progress_tx.send(progress);
+            });
+            app.start_maintenance(
+                MaintenanceOperation::Update,
+                progress_rx,
+                spawn_maintenance_task(async move {
+                    update::run_default_with_progress(&db_url, progress).await
+                }),
+            );
+        }
+        MaintenanceChoice::Init => {
+            app.abort_search();
+            if let Some(current_db) = db.take()
+                && let Err(err) = current_db.close().await
+            {
+                app.status_message = Some(format!("failed to close database before init: {err}"));
+                app.close_maintenance();
+                return;
+            }
+            app.results.clear();
+            app.total_results = None;
+            let db_url = db_url.to_owned();
+            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+            let progress = Arc::new(move |progress| {
+                let _ = progress_tx.send(progress);
+            });
+            app.start_maintenance(
+                MaintenanceOperation::Init,
+                progress_rx,
+                spawn_maintenance_task(async move {
+                    init::run_default_with_progress(&db_url, progress).await
+                }),
+            );
+        }
+    }
+}
+
+fn spawn_maintenance_task<F>(future: F) -> mpsc::UnboundedReceiver<Result<(), String>>
+where
+    F: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let (result_tx, result_rx) = mpsc::unbounded_channel();
+    thread::spawn(move || {
+        let _stderr = StderrSilencer::new();
+        let result = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(future),
+            Err(err) => Err(format!("failed to build maintenance runtime: {err}")),
+        };
+        let _ = result_tx.send(result);
+    });
+    result_rx
+}
+
+struct StderrSilencer {
+    saved: Option<i32>,
+}
+
+impl StderrSilencer {
+    fn new() -> Self {
+        let Ok(dev_null) = File::options().write(true).open("/dev/null") else {
+            return Self { saved: None };
+        };
+        let saved = unsafe { dup(STDERR_FD) };
+        if saved < 0 {
+            return Self { saved: None };
+        }
+        if unsafe { dup2(dev_null.as_raw_fd(), STDERR_FD) } < 0 {
+            unsafe {
+                close(saved);
+            }
+            return Self { saved: None };
+        }
+        Self { saved: Some(saved) }
+    }
+}
+
+impl Drop for StderrSilencer {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            unsafe {
+                let _ = dup2(saved, STDERR_FD);
+                close(saved);
+            }
+        }
+    }
+}
+
+const STDERR_FD: i32 = 2;
+
+unsafe extern "C" {
+    fn dup(fd: i32) -> i32;
+    fn dup2(oldfd: i32, newfd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+}
+
+async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
+    if db.is_some() {
+        return;
+    }
+    match connect_db(db_url).await {
+        Ok(reconnected) => {
+            update_db_as_of(app, &reconnected).await;
+            *db = Some(reconnected);
+        }
+        Err(err) => {
+            app.status_message = Some(format!("{err}; database is unavailable"));
+        }
+    }
+}
+
+async fn update_db_as_of(app: &mut App, db: &CveDatabase) {
+    match db.latest_cve_zip_datetime().await {
+        Ok(Some(value)) => {
+            app.db_as_of = Some(value);
+        }
+        Ok(None) => match db.latest_cve_updated_at().await {
+            Ok(value) => {
+                app.db_as_of = value;
+            }
+            Err(err) => {
+                app.status_message = Some(format!("failed to read DB timestamp: {err}"));
+            }
+        },
+        Err(err) => {
+            app.status_message = Some(format!("failed to read CVE release timestamp: {err}"));
+        }
+    }
 }

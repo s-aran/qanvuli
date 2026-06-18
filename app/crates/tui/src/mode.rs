@@ -149,11 +149,11 @@ impl SearchMode {
 
     pub(super) fn footer_text(self) -> &'static str {
         match self {
-            Self::FreeText => "Mode: free text",
-            Self::Product => "Mode: product",
-            Self::Vendor => "Mode: vendor",
-            Self::Cwe => "Mode: CWE",
-            Self::Cve => "Mode: CVE prefix",
+            Self::FreeText => "free text",
+            Self::Product => "product",
+            Self::Vendor => "vendor",
+            Self::Cwe => "CWE",
+            Self::Cve => "CVE prefix",
         }
     }
 

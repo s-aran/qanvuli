@@ -5,12 +5,13 @@ use super::{
     mode::SearchMode,
     search::{SearchRequest, SearchResult, run_search_request},
 };
+use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_db::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
 };
 use ratatui::widgets::ListState;
 use std::time::Instant;
-use tokio::task::JoinHandle;
+use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 const MIN_PAGE_SIZE: usize = 1;
 
@@ -37,8 +38,13 @@ pub(super) struct App {
     pub(super) show_advanced: bool,
     pub(super) show_display: bool,
     pub(super) show_timeout_prompt: bool,
+    pub(super) show_maintenance: bool,
     pub(super) timeout_choice: TimeoutChoice,
+    pub(super) maintenance_choice: MaintenanceChoice,
     pub(super) status_message: Option<String>,
+    pub(super) db_as_of: Option<String>,
+    pub(super) maintenance_progress: Option<MaintenanceProgress>,
+    maintenance: Option<PendingMaintenance>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +59,12 @@ struct PendingSearch {
     timed_out_once: bool,
 }
 
+struct PendingMaintenance {
+    operation: MaintenanceOperation,
+    progress: UnboundedReceiver<IngestProgress>,
+    result: UnboundedReceiver<Result<(), String>>,
+}
+
 enum SearchKind {
     Replace,
     Append { select_offset: usize },
@@ -62,6 +74,42 @@ enum SearchKind {
 pub(super) enum TimeoutChoice {
     Continue,
     Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MaintenanceChoice {
+    Init,
+    Update,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum MaintenanceOperation {
+    Init,
+    Update,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct MaintenanceProgress {
+    pub(super) label: String,
+    pub(super) asset: String,
+    pub(super) phase: String,
+    pub(super) total_files: usize,
+    pub(super) written_files: usize,
+    pub(super) failed_files: usize,
+}
+
+impl From<IngestProgress> for MaintenanceProgress {
+    fn from(value: IngestProgress) -> Self {
+        Self {
+            label: value.label,
+            asset: value.asset,
+            phase: value.phase,
+            total_files: value.total_files,
+            written_files: value.written_files,
+            failed_files: value.failed_files,
+        }
+    }
 }
 
 impl App {
@@ -96,8 +144,13 @@ impl App {
             show_advanced: false,
             show_display: false,
             show_timeout_prompt: false,
+            show_maintenance: false,
             timeout_choice: TimeoutChoice::Continue,
+            maintenance_choice: MaintenanceChoice::Update,
             status_message: None,
+            db_as_of: None,
+            maintenance_progress: None,
+            maintenance: None,
         };
         app.sync_advanced_from_main();
         app
@@ -247,8 +300,62 @@ impl App {
         Ok(())
     }
 
+    pub(super) async fn poll_maintenance(&mut self) -> bool {
+        let Some(maintenance) = self.maintenance.as_mut() else {
+            return false;
+        };
+        while let Ok(progress) = maintenance.progress.try_recv() {
+            self.maintenance_progress = Some(progress.into());
+        }
+        match maintenance.result.try_recv() {
+            Ok(result) => {
+                let operation = maintenance.operation;
+                self.maintenance = None;
+                let message = match result {
+                    Ok(()) => match operation {
+                        MaintenanceOperation::Init => "init completed".to_owned(),
+                        MaintenanceOperation::Update => "update completed".to_owned(),
+                    },
+                    Err(err) => match operation {
+                        MaintenanceOperation::Init => format!("init failed: {err}"),
+                        MaintenanceOperation::Update => format!("update failed: {err}"),
+                    },
+                };
+                self.status_message = Some(message);
+                self.maintenance_progress = None;
+                self.show_maintenance = false;
+                true
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                let operation = maintenance.operation;
+                self.maintenance = None;
+                self.status_message = Some(match operation {
+                    MaintenanceOperation::Init => "init task disconnected".to_owned(),
+                    MaintenanceOperation::Update => "update task disconnected".to_owned(),
+                });
+                self.maintenance_progress = None;
+                self.show_maintenance = false;
+                true
+            }
+        }
+    }
+
     pub(super) fn searching(&self) -> bool {
         self.search.is_some()
+    }
+
+    pub(super) fn maintenance_running(&self) -> bool {
+        self.maintenance.is_some()
+    }
+
+    pub(super) fn maintenance_status(&self) -> Option<&'static str> {
+        self.maintenance
+            .as_ref()
+            .map(|maintenance| match maintenance.operation {
+                MaintenanceOperation::Init => "init running",
+                MaintenanceOperation::Update => "update running",
+            })
     }
 
     pub(super) fn detail_status(&self) -> &'static str {
@@ -268,6 +375,62 @@ impl App {
         self.search_started_at = None;
         self.search_timeout_at = None;
         self.show_timeout_prompt = false;
+    }
+
+    pub(super) fn open_maintenance(&mut self) {
+        if self.maintenance_running() {
+            self.status_message = Some("database maintenance is already running".to_owned());
+            return;
+        }
+        self.show_maintenance = true;
+        self.maintenance_choice = MaintenanceChoice::Update;
+    }
+
+    pub(super) fn close_maintenance(&mut self) {
+        self.show_maintenance = false;
+    }
+
+    pub(super) fn next_maintenance_choice(&mut self) {
+        self.maintenance_choice = match self.maintenance_choice {
+            MaintenanceChoice::Init => MaintenanceChoice::Update,
+            MaintenanceChoice::Update => MaintenanceChoice::Cancel,
+            MaintenanceChoice::Cancel => MaintenanceChoice::Init,
+        };
+    }
+
+    pub(super) fn previous_maintenance_choice(&mut self) {
+        self.maintenance_choice = match self.maintenance_choice {
+            MaintenanceChoice::Init => MaintenanceChoice::Cancel,
+            MaintenanceChoice::Update => MaintenanceChoice::Init,
+            MaintenanceChoice::Cancel => MaintenanceChoice::Update,
+        };
+    }
+
+    pub(super) fn start_maintenance(
+        &mut self,
+        operation: MaintenanceOperation,
+        progress: UnboundedReceiver<IngestProgress>,
+        result: UnboundedReceiver<Result<(), String>>,
+    ) {
+        self.abort_search();
+        self.show_maintenance = true;
+        self.status_message = Some(match operation {
+            MaintenanceOperation::Init => "init started".to_owned(),
+            MaintenanceOperation::Update => "update started".to_owned(),
+        });
+        self.maintenance_progress = Some(MaintenanceProgress {
+            label: match operation {
+                MaintenanceOperation::Init => "init".to_owned(),
+                MaintenanceOperation::Update => "update".to_owned(),
+            },
+            phase: "starting".to_owned(),
+            ..MaintenanceProgress::default()
+        });
+        self.maintenance = Some(PendingMaintenance {
+            operation,
+            progress,
+            result,
+        });
     }
 
     pub(super) fn cancel_timed_out_search(&mut self) {
@@ -473,8 +636,11 @@ impl App {
         self.show_advanced = false;
         self.show_display = false;
         self.show_timeout_prompt = false;
+        self.show_maintenance = false;
         self.timeout_choice = TimeoutChoice::Continue;
+        self.maintenance_choice = MaintenanceChoice::Update;
         self.status_message = None;
+        self.maintenance_progress = None;
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {

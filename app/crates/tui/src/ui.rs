@@ -1,5 +1,5 @@
 use super::{
-    app::{App, PaneFocus, TimeoutChoice},
+    app::{App, MaintenanceChoice, PaneFocus, TimeoutChoice},
     display::{DisplayField, DisplaySettings, TimeZone},
     form::{AdvancedField, AdvancedForm, StateScopeUi},
 };
@@ -9,7 +9,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
 };
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
@@ -35,9 +35,17 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     );
 
     let input_title = if app.searching() {
-        format!("Search - searching {}", app.spinner())
+        format!(
+            "Search [{}] - searching {}",
+            app.search_mode.footer_text(),
+            app.spinner()
+        )
     } else {
-        format!("Search - limit {}", app.limit)
+        format!(
+            "Search [{}] - limit {}",
+            app.search_mode.footer_text(),
+            app.limit
+        )
     };
     let input = Paragraph::new(app.query.as_str())
         .block(
@@ -126,6 +134,9 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     if app.show_timeout_prompt {
         draw_timeout_prompt(frame, app);
     }
+    if app.show_maintenance {
+        draw_maintenance(frame, app);
+    }
 }
 
 fn focus_style(active: bool) -> Style {
@@ -143,6 +154,7 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Tab    Switch pane focus"),
         Line::from("F3     Open advanced search"),
         Line::from("F4     Open display settings"),
+        Line::from("F5     Open database maintenance"),
         Line::from("Shift+Tab Switch search mode"),
         Line::from("Left/Right Switch pane focus"),
         Line::from("Up/Down Move focused pane"),
@@ -272,6 +284,67 @@ fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
     frame.render_widget(popup, area);
 }
 
+fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = centered_rect(56, 28, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title("Database Maintenance")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    if app.maintenance_running() {
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(4),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let progress = app.maintenance_progress.as_ref();
+        let total = progress.map(|progress| progress.total_files).unwrap_or(0);
+        let written = progress.map(|progress| progress.written_files).unwrap_or(0);
+        let failed = progress.map(|progress| progress.failed_files).unwrap_or(0);
+        let phase = progress
+            .map(|progress| progress.phase.as_str())
+            .unwrap_or("starting");
+        let label = progress
+            .map(|progress| progress.label.as_str())
+            .unwrap_or("maintenance");
+        let asset = progress
+            .map(|progress| progress.asset.as_str())
+            .filter(|asset| !asset.is_empty())
+            .unwrap_or("-");
+        let lines = vec![
+            Line::from(format!("{label}: {phase}")),
+            Line::from(format!("asset: {asset}")),
+            Line::from(format!("written: {written}/{total}  failed: {failed}")),
+        ];
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), chunks[0]);
+        let ratio = progress_ratio(written, total);
+        let gauge = Gauge::default()
+            .gauge_style(Style::default().fg(Color::Magenta))
+            .ratio(ratio)
+            .label(format!("{:.0}%", ratio * 100.0));
+        frame.render_widget(gauge, chunks[1]);
+        return;
+    }
+
+    let lines = vec![
+        Line::from("Select a database maintenance operation."),
+        Line::from(""),
+        maintenance_line(app, MaintenanceChoice::Init, "Initialize"),
+        maintenance_line(app, MaintenanceChoice::Update, "Update"),
+        maintenance_line(app, MaintenanceChoice::Cancel, "Cancel"),
+        Line::from(""),
+        Line::from("Enter run  Esc close  Up/Down choose  I/U/C choose"),
+    ];
+    let popup = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+    frame.render_widget(popup, area);
+}
+
 fn choice_style(active: bool) -> Style {
     if active {
         Style::default()
@@ -327,18 +400,43 @@ fn display_line(
     ])
 }
 
+fn maintenance_line(app: &App, choice: MaintenanceChoice, label: &'static str) -> Line<'static> {
+    let active = app.maintenance_choice == choice;
+    let marker = if active { "(*) " } else { "( ) " };
+    let style = if active {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(marker, style),
+        Span::styled(label.to_owned(), style),
+    ])
+}
+
+fn progress_ratio(written: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (written as f64 / total as f64).clamp(0.0, 1.0)
+    }
+}
+
 fn main_footer(app: &App) -> String {
     let status = app
-        .status_message
-        .as_deref()
+        .maintenance_status()
+        .or(app.status_message.as_deref())
         .unwrap_or_else(|| app.detail_status());
+    let db_as_of = app.db_as_of.as_deref().unwrap_or("-");
     format!(
-        "{} | State: {} | Sort: {} {} | TZ: {} | {}",
-        app.search_mode.footer_text(),
+        "{} | {} {} | {} | DB: {} | {}",
         app.state_scope.label(),
         app.display.sort_field.label(),
         app.display.sort_direction.label(),
         app.display.timezone.label(),
+        db_as_of,
         status
     )
 }
