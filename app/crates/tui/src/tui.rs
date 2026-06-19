@@ -12,7 +12,9 @@ use qanvuli_app_commands::{
 };
 use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{fs::File, future::Future, io, os::fd::AsRawFd, sync::Arc, thread};
+#[cfg(unix)]
+use std::{fs::File, os::fd::AsRawFd};
+use std::{future::Future, io, sync::Arc, thread};
 use tokio::sync::mpsc;
 
 #[derive(Debug, clap::Args)]
@@ -329,10 +331,12 @@ where
 }
 
 struct StderrSilencer {
+    #[cfg(unix)]
     saved: Option<i32>,
 }
 
 impl StderrSilencer {
+    #[cfg(unix)]
     fn new() -> Self {
         let Ok(dev_null) = File::options().write(true).open("/dev/null") else {
             return Self { saved: None };
@@ -349,8 +353,14 @@ impl StderrSilencer {
         }
         Self { saved: Some(saved) }
     }
+
+    #[cfg(not(unix))]
+    fn new() -> Self {
+        Self {}
+    }
 }
 
+#[cfg(unix)]
 impl Drop for StderrSilencer {
     fn drop(&mut self) {
         if let Some(saved) = self.saved.take() {
@@ -362,8 +372,10 @@ impl Drop for StderrSilencer {
     }
 }
 
+#[cfg(unix)]
 const STDERR_FD: i32 = 2;
 
+#[cfg(unix)]
 unsafe extern "C" {
     fn dup(fd: i32) -> i32;
     fn dup2(oldfd: i32, newfd: i32) -> i32;
