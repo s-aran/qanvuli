@@ -33,6 +33,8 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         left[1].height.saturating_sub(2) as usize,
         right[0].height.saturating_sub(2) as usize,
         right[1].height.saturating_sub(2) as usize,
+        right[0].width.saturating_sub(2) as usize,
+        right[1].width.saturating_sub(2) as usize,
     );
 
     let input_title = format!(
@@ -88,7 +90,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .selected()
         .map(|cve| detail_lines(cve, app.display.timezone))
         .unwrap_or_else(|| vec![Line::from("No results")]);
-    app.clamp_detail_scroll_to_lines(detail.len());
+    app.clamp_detail_scroll();
     let detail_title = app
         .selected()
         .map(|cve| {
@@ -111,7 +113,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     frame.render_widget(detail, right[0]);
 
     let metadata_lines = metadata_lines(app.selected().map(|cve| &cve.detail));
-    app.clamp_metadata_scroll_to_lines(metadata_lines.len());
+    app.clamp_metadata_scroll();
     let metadata = Paragraph::new(metadata_lines)
         .block(
             Block::default()

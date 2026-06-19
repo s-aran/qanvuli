@@ -465,16 +465,6 @@ impl App {
         self.clamp_metadata_scroll();
     }
 
-    pub(super) fn clamp_detail_scroll_to_lines(&mut self, line_count: usize) {
-        let max_scroll = line_count.saturating_sub(self.right_page_size) as u16;
-        self.detail_scroll = self.detail_scroll.min(max_scroll);
-    }
-
-    pub(super) fn clamp_metadata_scroll_to_lines(&mut self, line_count: usize) {
-        let max_scroll = line_count.saturating_sub(self.metadata_page_size) as u16;
-        self.metadata_scroll = self.metadata_scroll.min(max_scroll);
-    }
-
     pub(super) fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             PaneFocus::Left => PaneFocus::Right,
@@ -759,21 +749,27 @@ impl App {
         self.clamp_metadata_scroll();
     }
 
-    fn clamp_detail_scroll(&mut self) {
+    pub(super) fn clamp_detail_scroll(&mut self) {
         self.detail_scroll = self.detail_scroll.min(self.max_detail_scroll());
     }
 
-    fn clamp_metadata_scroll(&mut self) {
+    pub(super) fn clamp_metadata_scroll(&mut self) {
         self.metadata_scroll = self.metadata_scroll.min(self.max_metadata_scroll());
     }
 
     fn max_detail_scroll(&self) -> u16 {
-        let line_count = self.selected().map(detail_line_count).unwrap_or(1);
+        let line_count = self
+            .selected()
+            .map(|cve| detail_line_count(cve, self.detail_content_width))
+            .unwrap_or(1);
         line_count.saturating_sub(self.right_page_size) as u16
     }
 
     fn max_metadata_scroll(&self) -> u16 {
-        let line_count = self.selected().map(metadata_line_count).unwrap_or(1);
+        let line_count = self
+            .selected()
+            .map(|cve| metadata_line_count(cve, self.metadata_content_width))
+            .unwrap_or(1);
         line_count.saturating_sub(self.metadata_page_size) as u16
     }
 
@@ -866,22 +862,75 @@ enum PageAmount {
     Full,
 }
 
-fn detail_line_count(cve: &CveSummaryWithDetail) -> usize {
+fn detail_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
     let description_lines = cve
         .summary
         .description_en
         .as_deref()
-        .map(|description| description.lines().count().max(1))
+        .map(|description| wrapped_line_count(description, width))
         .unwrap_or(1);
     6 + description_lines
 }
 
-fn metadata_line_count(cve: &CveSummaryWithDetail) -> usize {
+fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
     let detail = &cve.detail;
-    let cwe_lines = detail.cwes.len().max(1);
-    let cvss_lines = detail.cvss.len().max(1);
-    let affected_lines = detail.affected.len().max(1);
+    let cwe_lines = detail
+        .cwes
+        .iter()
+        .map(|cwe| {
+            let description = cwe.description.as_deref().unwrap_or_default();
+            wrapped_line_count(&format!("CWE-{} {}", cwe.id, description), width)
+        })
+        .sum::<usize>()
+        .max(1);
+    let cvss_lines = detail
+        .cvss
+        .iter()
+        .map(|cvss| {
+            let score = cvss
+                .base_score
+                .map(|score| format!("{score:.1}"))
+                .unwrap_or_else(|| "-".to_owned());
+            let severity = cvss.base_severity.as_deref().unwrap_or("-");
+            let vector = cvss.vector_string.as_deref().unwrap_or("");
+            wrapped_line_count(
+                &format!("{} {} {} {}", cvss.version, score, severity, vector),
+                width,
+            )
+        })
+        .sum::<usize>()
+        .max(1);
+    let affected_lines = detail
+        .affected
+        .iter()
+        .map(|affected| {
+            let vendor = affected.vendor.as_deref().unwrap_or("-");
+            let product = affected.product.as_deref().unwrap_or("-");
+            let package = affected.package_name.as_deref().unwrap_or("-");
+            let status = affected.default_status.as_deref().unwrap_or("-");
+            let collection = affected.collection_url.as_deref().unwrap_or("");
+            let suffix = if collection.is_empty() {
+                String::new()
+            } else {
+                format!(" {collection}")
+            };
+            wrapped_line_count(
+                &format!("{vendor}/{product} pkg:{package} status:{status}{suffix}"),
+                width,
+            )
+        })
+        .sum::<usize>()
+        .max(1);
     cwe_lines + cvss_lines + affected_lines + 2
+}
+
+fn wrapped_line_count(value: &str, width: usize) -> usize {
+    let width = width.max(MIN_PAGE_SIZE);
+    value
+        .lines()
+        .map(|line| (line.chars().count().max(1) + width - 1) / width)
+        .sum::<usize>()
+        .max(1)
 }
 
 fn option_string(value: &str) -> Option<String> {
