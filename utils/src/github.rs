@@ -1,6 +1,9 @@
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::{Asset, Release};
-use std::io::Write;
+use std::{
+    io::{self, Write},
+    path::{Component, Path},
+};
 
 pub const GITHUB_OWNER: &str = "CVEProject";
 pub const GITHUB_REPO: &str = "cvelistV5";
@@ -13,6 +16,10 @@ pub struct GitHubReleaseFile {
 }
 
 impl GitHubReleaseFile {
+    pub fn safe_file_name(&self) -> Result<&str, io::Error> {
+        safe_file_name(&self.name)
+    }
+
     pub async fn async_download(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let content = reqwest::Client::new()
             .get(&self.url)
@@ -69,9 +76,9 @@ impl GitHubReleaseFile {
     }
 
     pub async fn async_download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let filename = self.name.clone();
+        let filename = self.safe_file_name()?;
         if self.size > 0 {
-            if let Ok(metadata) = std::fs::metadata(&filename) {
+            if let Ok(metadata) = std::fs::metadata(filename) {
                 if metadata.len() == self.size {
                     return Ok(());
                 }
@@ -81,15 +88,26 @@ impl GitHubReleaseFile {
     }
 
     pub fn download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let filename = self.name.clone();
+        let filename = self.safe_file_name()?;
         if self.size > 0 {
-            if let Ok(metadata) = std::fs::metadata(&filename) {
+            if let Ok(metadata) = std::fs::metadata(filename) {
                 if metadata.len() == self.size {
                     return Ok(());
                 }
             }
         }
         self.download_as(filename)
+    }
+}
+
+fn safe_file_name(value: &str) -> Result<&str, io::Error> {
+    let mut components = Path::new(value).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(value),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe release asset filename: {value}"),
+        )),
     }
 }
 

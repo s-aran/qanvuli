@@ -32,21 +32,14 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
     app.set_page_sizes(
         left[1].height.saturating_sub(2) as usize,
         right[0].height.saturating_sub(2) as usize,
+        right[1].height.saturating_sub(2) as usize,
     );
 
-    let input_title = if app.searching() {
-        format!(
-            "Search [{}] - searching {}",
-            app.search_mode.footer_text(),
-            app.spinner()
-        )
-    } else {
-        format!(
-            "Search [{}] - limit {}",
-            app.search_mode.footer_text(),
-            app.limit
-        )
-    };
+    let input_title = format!(
+        "Search [{}] - limit {}",
+        app.search_mode.footer_text(),
+        app.limit
+    );
     let input = Paragraph::new(app.query.as_str())
         .block(
             Block::default()
@@ -117,8 +110,15 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .wrap(Wrap { trim: false });
     frame.render_widget(detail, right[0]);
 
-    let metadata = Paragraph::new(metadata_lines(app.selected().map(|cve| &cve.detail)))
-        .block(Block::default().borders(Borders::ALL))
+    let metadata_lines = metadata_lines(app.selected().map(|cve| &cve.detail));
+    app.clamp_metadata_scroll_to_lines(metadata_lines.len());
+    let metadata = Paragraph::new(metadata_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_style(app.focus == PaneFocus::Metadata)),
+        )
+        .scroll((app.metadata_scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(metadata, right[1]);
 
@@ -151,12 +151,13 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
     let area = centered_rect(60, 42, frame.area());
     let help = Paragraph::new(vec![
         Line::from("Enter  Search current input"),
-        Line::from("Tab    Switch pane focus"),
+        Line::from("Tab    Next pane focus"),
+        Line::from("Shift+Tab Previous pane focus"),
+        Line::from("F2     Switch search mode"),
+        Line::from("Left/Right Switch search mode"),
         Line::from("F3     Open advanced search"),
         Line::from("F4     Open display settings"),
         Line::from("F5     Open database maintenance"),
-        Line::from("Shift+Tab Switch search mode"),
-        Line::from("Left/Right Switch pane focus"),
         Line::from("Up/Down Move focused pane"),
         Line::from("Ctrl-U/D Half-page up/down focused pane"),
         Line::from("Ctrl-B/F Full-page up/down focused pane"),
@@ -362,20 +363,7 @@ fn advanced_line(
     label: &'static str,
     value: &str,
 ) -> Line<'static> {
-    let active = form.active_field == field;
-    let marker = if active { "> " } else { "  " };
-    let style = if active {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::styled(marker, style),
-        Span::styled(format!("{label}: "), style),
-        Span::raw(value.to_owned()),
-    ])
+    selectable_line(form.active_field == field, Color::Yellow, label, value)
 }
 
 fn display_line(
@@ -384,11 +372,19 @@ fn display_line(
     label: &'static str,
     value: &str,
 ) -> Line<'static> {
-    let active = display.active_field == field;
+    selectable_line(display.active_field == field, Color::Cyan, label, value)
+}
+
+fn selectable_line(
+    active: bool,
+    active_color: Color,
+    label: &'static str,
+    value: &str,
+) -> Line<'static> {
     let marker = if active { "> " } else { "  " };
     let style = if active {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(active_color)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
@@ -429,15 +425,24 @@ fn main_footer(app: &App) -> String {
         .maintenance_status()
         .or(app.status_message.as_deref())
         .unwrap_or_else(|| app.detail_status());
-    let db_as_of = app.db_as_of.as_deref().unwrap_or("-");
+    let db_as_of = app
+        .db_as_of
+        .as_deref()
+        .map(|value| format_timestamp(value, app.display.timezone))
+        .unwrap_or_else(|| "-".to_owned());
+    let activity = if app.searching() {
+        app.search_spinner().to_owned()
+    } else {
+        status.to_owned()
+    };
     format!(
         "{} | {} {} | {} | DB: {} | {}",
-        app.state_scope.label(),
+        activity,
         app.display.sort_field.label(),
         app.display.sort_direction.label(),
+        app.state_scope.label(),
         app.display.timezone.label(),
-        db_as_of,
-        status
+        db_as_of
     )
 }
 
@@ -519,7 +524,7 @@ fn format_timestamp(value: &str, timezone: TimeZone) -> String {
     };
     datetime
         .with_timezone(&offset)
-        .format("%Y-%m-%dT%H:%M:%S%:z")
+        .format("%Y-%m-%d %H:%M:%S")
         .to_string()
 }
 

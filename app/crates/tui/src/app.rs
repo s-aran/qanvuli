@@ -27,6 +27,7 @@ pub(super) struct App {
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
     pub(super) detail_scroll: u16,
+    pub(super) metadata_scroll: u16,
     search: Option<PendingSearch>,
     search_started_at: Option<Instant>,
     search_timeout_at: Option<Instant>,
@@ -34,6 +35,9 @@ pub(super) struct App {
     exhausted: bool,
     left_page_size: usize,
     right_page_size: usize,
+    metadata_page_size: usize,
+    detail_content_width: usize,
+    metadata_content_width: usize,
     pub(super) show_help: bool,
     pub(super) show_advanced: bool,
     pub(super) show_display: bool,
@@ -51,6 +55,7 @@ pub(super) struct App {
 pub(super) enum PaneFocus {
     Left,
     Right,
+    Metadata,
 }
 
 struct PendingSearch {
@@ -129,6 +134,7 @@ impl App {
             list_state,
             focus: PaneFocus::Left,
             detail_scroll: 0,
+            metadata_scroll: 0,
             search: None,
             search_started_at: None,
             search_timeout_at: None,
@@ -140,6 +146,9 @@ impl App {
             exhausted: false,
             left_page_size: 10,
             right_page_size: 10,
+            metadata_page_size: 10,
+            detail_content_width: 80,
+            metadata_content_width: 80,
             show_help: false,
             show_advanced: false,
             show_display: false,
@@ -157,10 +166,6 @@ impl App {
     }
 
     pub(super) fn start_search(&mut self, db: CveDatabase) {
-        if let Some(search) = self.search.take() {
-            search.handle.abort();
-        }
-
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
         let sort_order = self.display.sort_order();
@@ -173,48 +178,18 @@ impl App {
         } else {
             SearchRequest::Advanced(self.main_search_options(sort_order))
         };
-        let limit = self.limit;
         self.searched_request = request.clone();
-        self.exhausted = false;
-        self.total_results = None;
-        self.status_message = None;
-        self.arm_search_timeout();
-        self.search = Some(PendingSearch {
-            kind: SearchKind::Replace,
-            timed_out_once: false,
-            handle: tokio::spawn(async move {
-                run_search_request(db, request, limit, 0)
-                    .await
-                    .map_err(|err| format!("failed to search: {err}"))
-            }),
-        });
+        self.start_replace_search(db, request, "failed to search");
     }
 
     pub(super) fn start_advanced_search(&mut self, db: CveDatabase) {
-        if let Some(search) = self.search.take() {
-            search.handle.abort();
-        }
-
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
         self.state_scope = self.advanced.state_scope;
         let request =
             SearchRequest::Advanced(self.advanced.to_search_options(self.display.sort_order()));
         self.searched_request = request.clone();
-        self.exhausted = false;
-        self.total_results = None;
-        self.status_message = None;
-        self.arm_search_timeout();
-        let limit = self.limit;
-        self.search = Some(PendingSearch {
-            kind: SearchKind::Replace,
-            timed_out_once: false,
-            handle: tokio::spawn(async move {
-                run_search_request(db, request, limit, 0)
-                    .await
-                    .map_err(|err| format!("failed to search: {err}"))
-            }),
-        });
+        self.start_replace_search(db, request, "failed to search");
     }
 
     pub(super) fn open_advanced_search(&mut self) {
@@ -235,17 +210,14 @@ impl App {
         let request = self.searched_request.clone();
         let offset = self.results.len() as u64;
         let select_offset = self.results.len();
-        self.status_message = None;
-        self.arm_search_timeout();
-        self.search = Some(PendingSearch {
-            kind: SearchKind::Append { select_offset },
-            timed_out_once: false,
-            handle: tokio::spawn(async move {
-                run_search_request(db, request, TUI_LOAD_MORE_LIMIT, offset)
-                    .await
-                    .map_err(|err| format!("failed to load more search results: {err}"))
-            }),
-        });
+        self.start_pending_search(
+            db,
+            request,
+            TUI_LOAD_MORE_LIMIT,
+            offset,
+            SearchKind::Append { select_offset },
+            "failed to load more search results",
+        );
     }
 
     pub(super) async fn poll_search(&mut self) -> Result<(), String> {
@@ -279,22 +251,13 @@ impl App {
                 self.total_results = Some(result.total);
                 self.results = result.rows;
                 self.clear_detail();
-                if self.results.is_empty() {
-                    self.list_state.select(None);
-                } else {
-                    self.list_state.select(Some(0));
-                }
+                self.select_candidate(0);
             }
             SearchKind::Append { select_offset } => {
                 self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize;
                 self.total_results = Some(result.total);
                 self.results.extend(result.rows);
-                if self.results.is_empty() {
-                    self.list_state.select(None);
-                } else {
-                    let next = select_offset.min(self.results.len() - 1);
-                    self.list_state.select(Some(next));
-                }
+                self.select_candidate(select_offset);
             }
         }
         Ok(())
@@ -470,11 +433,11 @@ impl App {
         }
     }
 
-    pub(super) fn spinner(&self) -> &'static str {
-        const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    pub(super) fn search_spinner(&self) -> &'static str {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = self
             .search_started_at
-            .map(|started_at| (started_at.elapsed().as_millis() / 150) as usize)
+            .map(|started_at| (started_at.elapsed().as_millis() / 80) as usize)
             .unwrap_or(0);
         FRAMES[frame % FRAMES.len()]
     }
@@ -485,10 +448,21 @@ impl App {
             .and_then(|index| self.results.get(index))
     }
 
-    pub(super) fn set_page_sizes(&mut self, left: usize, right: usize) {
+    pub(super) fn set_page_sizes(
+        &mut self,
+        left: usize,
+        right: usize,
+        metadata: usize,
+        detail_width: usize,
+        metadata_width: usize,
+    ) {
         self.left_page_size = left.max(MIN_PAGE_SIZE);
         self.right_page_size = right.max(MIN_PAGE_SIZE);
+        self.metadata_page_size = metadata.max(MIN_PAGE_SIZE);
+        self.detail_content_width = detail_width.max(MIN_PAGE_SIZE);
+        self.metadata_content_width = metadata_width.max(MIN_PAGE_SIZE);
         self.clamp_detail_scroll();
+        self.clamp_metadata_scroll();
     }
 
     pub(super) fn clamp_detail_scroll_to_lines(&mut self, line_count: usize) {
@@ -496,19 +470,25 @@ impl App {
         self.detail_scroll = self.detail_scroll.min(max_scroll);
     }
 
+    pub(super) fn clamp_metadata_scroll_to_lines(&mut self, line_count: usize) {
+        let max_scroll = line_count.saturating_sub(self.metadata_page_size) as u16;
+        self.metadata_scroll = self.metadata_scroll.min(max_scroll);
+    }
+
     pub(super) fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             PaneFocus::Left => PaneFocus::Right,
-            PaneFocus::Right => PaneFocus::Left,
+            PaneFocus::Right => PaneFocus::Metadata,
+            PaneFocus::Metadata => PaneFocus::Left,
         };
     }
 
-    pub(super) fn focus_left(&mut self) {
-        self.focus = PaneFocus::Left;
-    }
-
-    pub(super) fn focus_right(&mut self) {
-        self.focus = PaneFocus::Right;
+    pub(super) fn previous_focus(&mut self) {
+        self.focus = match self.focus {
+            PaneFocus::Left => PaneFocus::Metadata,
+            PaneFocus::Right => PaneFocus::Left,
+            PaneFocus::Metadata => PaneFocus::Right,
+        };
     }
 
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
@@ -536,6 +516,10 @@ impl App {
                 self.detail_scroll = self.detail_scroll.saturating_add(1);
                 self.clamp_detail_scroll();
             }
+            PaneFocus::Metadata => {
+                self.metadata_scroll = self.metadata_scroll.saturating_add(1);
+                self.clamp_metadata_scroll();
+            }
         }
     }
 
@@ -545,6 +529,10 @@ impl App {
             PaneFocus::Right => {
                 self.detail_scroll = self.detail_scroll.saturating_sub(1);
                 self.clamp_detail_scroll();
+            }
+            PaneFocus::Metadata => {
+                self.metadata_scroll = self.metadata_scroll.saturating_sub(1);
+                self.clamp_metadata_scroll();
             }
         }
     }
@@ -587,6 +575,11 @@ impl App {
         self.sync_advanced_from_main();
     }
 
+    pub(super) fn previous_search_mode(&mut self) {
+        self.search_mode = self.search_mode.previous();
+        self.sync_advanced_from_main();
+    }
+
     pub(super) fn push_query(&mut self, ch: char) {
         self.query.push(ch);
         self.scroll_detail_to_top();
@@ -626,6 +619,7 @@ impl App {
         self.list_state.select(Some(0));
         self.focus = PaneFocus::Left;
         self.detail_scroll = 0;
+        self.metadata_scroll = 0;
         self.searched_request = SearchRequest::Mode {
             mode: SearchMode::FreeText,
             query: String::new(),
@@ -663,10 +657,53 @@ impl App {
         }
     }
 
+    fn start_replace_search(
+        &mut self,
+        db: CveDatabase,
+        request: SearchRequest,
+        error_prefix: &str,
+    ) {
+        self.exhausted = false;
+        self.total_results = None;
+        self.start_pending_search(
+            db,
+            request,
+            self.limit,
+            0,
+            SearchKind::Replace,
+            error_prefix,
+        );
+    }
+
+    fn start_pending_search(
+        &mut self,
+        db: CveDatabase,
+        request: SearchRequest,
+        limit: u64,
+        offset: u64,
+        kind: SearchKind,
+        error_prefix: &str,
+    ) {
+        self.abort_search();
+        self.status_message = None;
+        self.arm_search_timeout();
+        let error_prefix = error_prefix.to_owned();
+        self.search = Some(PendingSearch {
+            kind,
+            timed_out_once: false,
+            handle: tokio::spawn(async move {
+                run_search_request(db, request, limit, offset)
+                    .await
+                    .map_err(|err| format!("{error_prefix}: {err}"))
+            }),
+        });
+    }
+
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
         match self.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, Some(db)),
             PaneFocus::Right => self.move_detail_page(direction, amount),
+            PaneFocus::Metadata => self.move_metadata_page(direction, amount),
         }
     }
 
@@ -674,6 +711,7 @@ impl App {
         match self.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, None),
             PaneFocus::Right => self.move_detail_page(direction, amount),
+            PaneFocus::Metadata => self.move_metadata_page(direction, amount),
         }
     }
 
@@ -712,13 +750,31 @@ impl App {
         self.clamp_detail_scroll();
     }
 
+    fn move_metadata_page(&mut self, direction: PageDirection, amount: PageAmount) {
+        let step = self.metadata_step(amount) as u16;
+        self.metadata_scroll = match direction {
+            PageDirection::Up => self.metadata_scroll.saturating_sub(step),
+            PageDirection::Down => self.metadata_scroll.saturating_add(step),
+        };
+        self.clamp_metadata_scroll();
+    }
+
     fn clamp_detail_scroll(&mut self) {
         self.detail_scroll = self.detail_scroll.min(self.max_detail_scroll());
+    }
+
+    fn clamp_metadata_scroll(&mut self) {
+        self.metadata_scroll = self.metadata_scroll.min(self.max_metadata_scroll());
     }
 
     fn max_detail_scroll(&self) -> u16 {
         let line_count = self.selected().map(detail_line_count).unwrap_or(1);
         line_count.saturating_sub(self.right_page_size) as u16
+    }
+
+    fn max_metadata_scroll(&self) -> u16 {
+        let line_count = self.selected().map(metadata_line_count).unwrap_or(1);
+        line_count.saturating_sub(self.metadata_page_size) as u16
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {
@@ -735,8 +791,25 @@ impl App {
         }
     }
 
+    fn metadata_step(&self, amount: PageAmount) -> usize {
+        match amount {
+            PageAmount::Half => (self.metadata_page_size / 2).max(MIN_PAGE_SIZE),
+            PageAmount::Full => self.metadata_page_size.max(MIN_PAGE_SIZE),
+        }
+    }
+
     fn clear_detail(&mut self) {
         self.detail_scroll = 0;
+        self.metadata_scroll = 0;
+    }
+
+    fn select_candidate(&mut self, index: usize) {
+        if self.results.is_empty() {
+            self.list_state.select(None);
+        } else {
+            self.list_state
+                .select(Some(index.min(self.results.len() - 1)));
+        }
     }
 
     fn finish_failed_search(&mut self, message: String) {
@@ -801,6 +874,14 @@ fn detail_line_count(cve: &CveSummaryWithDetail) -> usize {
         .map(|description| description.lines().count().max(1))
         .unwrap_or(1);
     6 + description_lines
+}
+
+fn metadata_line_count(cve: &CveSummaryWithDetail) -> usize {
+    let detail = &cve.detail;
+    let cwe_lines = detail.cwes.len().max(1);
+    let cvss_lines = detail.cvss.len().max(1);
+    let affected_lines = detail.affected.len().max(1);
+    cwe_lines + cvss_lines + affected_lines + 2
 }
 
 fn option_string(value: &str) -> Option<String> {

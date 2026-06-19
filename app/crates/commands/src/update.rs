@@ -9,6 +9,15 @@ pub struct Args {
     max_chunks: Option<usize>,
 }
 
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            zip: None,
+            max_chunks: None,
+        }
+    }
+}
+
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
@@ -35,27 +44,12 @@ async fn run_with_progress(
 }
 
 pub async fn run_default(db_url: &str) -> Result<(), String> {
-    run(
-        db_url,
-        Args {
-            zip: None,
-            max_chunks: None,
-        },
-    )
-    .await
+    run(db_url, Args::default()).await
 }
 
 pub async fn run_default_with_progress(
     db_url: &str,
     progress: IngestProgressCallback,
 ) -> Result<(), String> {
-    run_with_progress(
-        db_url,
-        Args {
-            zip: None,
-            max_chunks: None,
-        },
-        Some(progress),
-    )
-    .await
+    run_with_progress(db_url, Args::default(), Some(progress)).await
 }

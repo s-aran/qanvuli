@@ -13,7 +13,10 @@ pub async fn run(args: Args) -> Result<(), String> {
     let asset = latest_asset(args.kind).await?;
     std::fs::create_dir_all(&args.output_dir)
         .map_err(|err| format!("failed to create {}: {err}", args.output_dir.display()))?;
-    let output_path = args.output_dir.join(&asset.name);
+    let filename = asset
+        .safe_file_name()
+        .map_err(|err| format!("unsafe asset name {}: {err}", asset.name))?;
+    let output_path = args.output_dir.join(filename);
 
     asset
         .async_download_as(&output_path)

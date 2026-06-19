@@ -132,12 +132,16 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
         }
     };
     eprintln!("{kind}: downloading {} ({} bytes)", asset.name, asset.size);
+    let filename = asset
+        .safe_file_name()
+        .map_err(|err| format!("unsafe asset name {}: {err}", asset.name))?
+        .to_owned();
     asset
         .async_download_as_file()
         .await
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     eprintln!("{kind}: ready {}", asset.name);
-    Ok(PathBuf::from(asset.name))
+    Ok(PathBuf::from(filename))
 }
 
 fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
@@ -347,11 +351,15 @@ pub async fn apply_delta_updates_with_progress(
         }
 
         eprintln!("delta: downloading {} ({} bytes)", asset.name, asset.size);
+        let filename = asset
+            .safe_file_name()
+            .map_err(|err| format!("unsafe asset name {}: {err}", asset.name))?
+            .to_owned();
         asset
             .async_download_as_file()
             .await
             .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
-        let asset_path = PathBuf::from(&asset.name);
+        let asset_path = PathBuf::from(filename);
         ingest_zip_with_progress(
             db,
             "delta",

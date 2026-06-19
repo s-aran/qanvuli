@@ -5,8 +5,11 @@ use super::{
     terminal::TerminalGuard,
     ui::draw,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use qanvuli_app_commands::{common::connect_db, init, update};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use qanvuli_app_commands::{
+    common::{IngestProgress, IngestProgressCallback, connect_db},
+    init, update,
+};
 use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::{fs::File, future::Future, io, os::fd::AsRawFd, sync::Arc, thread};
@@ -77,19 +80,14 @@ async fn run_loop(
             continue;
         }
 
-        if app.maintenance_running()
-            && matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(event::KeyModifiers::CONTROL)
-        {
+        if app.maintenance_running() && is_ctrl(&key, 'c') {
             break;
         }
         if app.maintenance_running() {
             continue;
         }
 
-        if matches!(key.code, KeyCode::Char('l'))
-            && key.modifiers.contains(event::KeyModifiers::CONTROL)
-        {
+        if is_ctrl(&key, 'l') {
             terminal
                 .clear()
                 .map_err(|err| format!("failed to clear TUI: {err}"))?;
@@ -104,9 +102,7 @@ async fn run_loop(
                 KeyCode::Left => app.select_timeout_continue(),
                 KeyCode::Right => app.select_timeout_cancel(),
                 KeyCode::Tab | KeyCode::BackTab => app.toggle_timeout_choice(),
-                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                    break;
-                }
+                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
                 KeyCode::Char('c') => app.select_timeout_continue(),
                 KeyCode::Char('x') => app.select_timeout_cancel(),
                 _ => {}
@@ -117,11 +113,7 @@ async fn run_loop(
         if app.show_help {
             match key.code {
                 KeyCode::Esc => app.show_help = false,
-                KeyCode::Char('c') | KeyCode::Char('d')
-                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                {
-                    break;
-                }
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 _ => {}
             }
             continue;
@@ -140,11 +132,7 @@ async fn run_loop(
                     app.advanced.backspace();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Char('c') | KeyCode::Char('d')
-                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                {
-                    break;
-                }
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Char(ch) => {
                     app.advanced.push(ch);
                     app.sync_main_from_advanced();
@@ -177,11 +165,7 @@ async fn run_loop(
         if app.show_display {
             match key.code {
                 KeyCode::Esc | KeyCode::Enter => app.show_display = false,
-                KeyCode::Char('c') | KeyCode::Char('d')
-                    if key.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                {
-                    break;
-                }
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Tab => app.display.next_field(),
                 KeyCode::BackTab => app.display.previous_field(),
                 KeyCode::Down => app.display.next_field(),
@@ -199,9 +183,7 @@ async fn run_loop(
                 KeyCode::Enter => {
                     start_selected_maintenance(db_url, db, app).await;
                 }
-                KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                    break;
-                }
+                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
                 KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
                     app.next_maintenance_choice();
                 }
@@ -218,24 +200,25 @@ async fn run_loop(
 
         match key.code {
             KeyCode::Esc => {}
-            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => break,
-            KeyCode::Char('u') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
+            KeyCode::Char('u') if is_ctrl(&key, 'u') => {
                 app.move_half_page_up();
             }
-            KeyCode::Char('d') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('d') if is_ctrl(&key, 'd') => {
                 if let Some(db) = db.as_ref() {
                     app.move_half_page_down(db.clone());
                 }
             }
-            KeyCode::Char('f') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('f') if is_ctrl(&key, 'f') => {
                 if let Some(db) = db.as_ref() {
                     app.move_full_page_down(db.clone());
                 }
             }
-            KeyCode::Char('b') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('b') if is_ctrl(&key, 'b') => {
                 app.move_full_page_up();
             }
             KeyCode::F(1) => app.show_help = true,
+            KeyCode::F(2) => app.next_search_mode(),
             KeyCode::F(3) => app.open_advanced_search(),
             KeyCode::F(4) => app.open_display_settings(),
             KeyCode::F(5) => app.open_maintenance(),
@@ -245,9 +228,9 @@ async fn run_loop(
                 }
             }
             KeyCode::Tab => app.toggle_focus(),
-            KeyCode::Left => app.focus_left(),
-            KeyCode::Right => app.focus_right(),
-            KeyCode::BackTab => app.next_search_mode(),
+            KeyCode::BackTab => app.previous_focus(),
+            KeyCode::Left => app.previous_search_mode(),
+            KeyCode::Right => app.next_search_mode(),
             KeyCode::Backspace => {
                 app.backspace_query();
             }
@@ -268,15 +251,21 @@ async fn run_loop(
     Ok(())
 }
 
+fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
+    matches!(key.code, KeyCode::Char(value) if value == ch)
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn is_ctrl_quit(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('c' | 'd')) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
     match app.maintenance_choice {
         MaintenanceChoice::Cancel => app.close_maintenance(),
         MaintenanceChoice::Update => {
             let db_url = db_url.to_owned();
-            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-            let progress = Arc::new(move |progress| {
-                let _ = progress_tx.send(progress);
-            });
+            let (progress, progress_rx) = maintenance_progress_channel();
             app.start_maintenance(
                 MaintenanceOperation::Update,
                 progress_rx,
@@ -297,10 +286,7 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
             app.results.clear();
             app.total_results = None;
             let db_url = db_url.to_owned();
-            let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-            let progress = Arc::new(move |progress| {
-                let _ = progress_tx.send(progress);
-            });
+            let (progress, progress_rx) = maintenance_progress_channel();
             app.start_maintenance(
                 MaintenanceOperation::Init,
                 progress_rx,
@@ -310,6 +296,17 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
             );
         }
     }
+}
+
+fn maintenance_progress_channel() -> (
+    IngestProgressCallback,
+    mpsc::UnboundedReceiver<IngestProgress>,
+) {
+    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
+    let progress = Arc::new(move |progress| {
+        let _ = progress_tx.send(progress);
+    });
+    (progress, progress_rx)
 }
 
 fn spawn_maintenance_task<F>(future: F) -> mpsc::UnboundedReceiver<Result<(), String>>
