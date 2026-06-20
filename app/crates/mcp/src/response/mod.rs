@@ -1,24 +1,16 @@
+use crate::common::error::mcp_error;
 use qanvuli_db::{
-    CveAffectedDetail, CveCvssDetail, CveCweDetail, CveStateScope, CveSummary,
-    CveSummaryWithDetail, cve_state_label,
+    CveAffectedDetail, CveCvssDetail, CveCweDetail, CveSummary, CveSummaryWithDetail,
+    cve_state_label,
 };
 use qanvuli_models::RawCveStatusRecord;
+use rmcp::model::{CallToolResult, Content};
 use simd_json::{OwnedValue as Value, json};
 
-pub(crate) fn limit(value: Option<u64>) -> u64 {
-    value.unwrap_or(10).clamp(1, 30)
-}
-
-pub(crate) fn offset(value: Option<u64>) -> u64 {
-    value.unwrap_or(0)
-}
-
-pub(crate) fn state_scope(include_rejected: Option<bool>) -> CveStateScope {
-    if include_rejected.unwrap_or(false) {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    }
+pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
+    let text = simd_json::to_string_pretty(&value)
+        .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
+    Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
 pub(crate) fn summaries_with_detail(cves: Vec<CveSummaryWithDetail>) -> Vec<Value> {

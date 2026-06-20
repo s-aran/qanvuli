@@ -109,6 +109,7 @@ pub struct CveCweDetail {
 pub struct CweEntry {
     pub id: i32,
     pub description: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
@@ -543,9 +544,9 @@ pub struct CveBulkReplaceSession {
 
 impl CveDatabase {
     pub async fn connect(database_url: &str) -> Result<Self, DbErr> {
-        Ok(Self {
-            db: connect_database(database_url).await?,
-        })
+        let db = connect_database(database_url).await?;
+        ensure_current_schema(&db).await?;
+        Ok(Self { db })
     }
 
     pub async fn new_async(database_url: &str) -> Result<Self, DbErr> {
@@ -686,6 +687,7 @@ impl CveDatabase {
             vec![cwe::ActiveModel {
                 id: Set(id),
                 description: Set(description),
+                status: Set(None),
             }],
         )
         .await?;
@@ -2481,14 +2483,24 @@ impl CveDatabase {
         &self,
         query: &str,
         limit: u64,
+        statuses: &[String],
     ) -> Result<Vec<CweEntry>, DbErr> {
         let query = query.trim();
         let limit = limit.max(1);
         let mut search = cwe::Entity::find()
             .select_only()
-            .columns([cwe::Column::Id, cwe::Column::Description])
+            .columns([
+                cwe::Column::Id,
+                cwe::Column::Description,
+                cwe::Column::Status,
+            ])
             .limit(limit)
             .order_by_asc(cwe::Column::Id);
+
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        search = search.filter(cwe::Column::Status.is_in(statuses.iter().cloned()));
 
         if !query.is_empty() {
             let id = cwe_number(query);
@@ -2640,6 +2652,28 @@ where
         "CREATE INDEX IF NOT EXISTS idx_cve_zip_file_type_datetime ON cve_zip_file (zip_type, zip_datetime)",
     )
     .await?;
+    let has_cwe_table = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cwe'".to_owned(),
+        ))
+        .await?
+        .is_some();
+    if has_cwe_table {
+        let has_status = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 FROM pragma_table_info('cwe') WHERE name = 'status'".to_owned(),
+            ))
+            .await?
+            .is_some();
+        if !has_status {
+            db.execute_unprepared("ALTER TABLE cwe ADD COLUMN status TEXT")
+                .await?;
+        }
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cwe_status ON cwe (status)")
+            .await?;
+    }
     Ok(())
 }
 
@@ -2976,19 +3010,31 @@ async fn upsert_cwe_catalog_on(
 
     if let Some(weaknesses) = &catalog.weaknesses {
         for weakness in &weaknesses.weakness {
-            rows.push(cwe_catalog_row(weakness.id, weakness.description.clone())?);
+            rows.push(cwe_catalog_row(
+                weakness.id,
+                weakness.description.clone(),
+                Some(&weakness.status),
+            )?);
         }
     }
 
     if let Some(categories) = &catalog.categories {
         for category in &categories.category {
-            rows.push(cwe_catalog_row(category.id, category.name.clone())?);
+            rows.push(cwe_catalog_row(
+                category.id,
+                category.name.clone(),
+                Some(&category.status),
+            )?);
         }
     }
 
     if let Some(views) = &catalog.views {
         for view in &views.view {
-            rows.push(cwe_catalog_row(view.id, view.name.clone())?);
+            rows.push(cwe_catalog_row(
+                view.id,
+                view.name.clone(),
+                Some(&view.status),
+            )?);
         }
     }
 
@@ -3001,11 +3047,16 @@ async fn upsert_cwe_catalog_on(
     Ok(count)
 }
 
-fn cwe_catalog_row(id: i64, description: String) -> Result<cwe::ActiveModel, DbErr> {
+fn cwe_catalog_row(
+    id: i64,
+    description: String,
+    status: Option<&qanvuli_models::cwe::enumeration::Status>,
+) -> Result<cwe::ActiveModel, DbErr> {
     Ok(cwe::ActiveModel {
         id: Set(i32::try_from(id)
             .map_err(|err| DbErr::Custom(format!("CWE ID {id} does not fit in i32: {err}")))?),
         description: Set(Some(description)),
+        status: Set(status.map(|status| status.as_ref().to_owned())),
     })
 }
 
@@ -3349,6 +3400,7 @@ fn cve_upsert_conflict() -> OnConflict {
 fn cwe_upsert_conflict() -> OnConflict {
     OnConflict::column(cwe::Column::Id)
         .update_column(cwe::Column::Description)
+        .update_column(cwe::Column::Status)
         .to_owned()
 }
 
@@ -4572,6 +4624,7 @@ mod tests {
         cwe::Entity::insert(cwe::ActiveModel {
             id: Set(79),
             description: Set(Some("Cross-site Scripting".to_owned())),
+            status: Set(Some("Stable".to_owned())),
         })
         .exec(db)
         .await

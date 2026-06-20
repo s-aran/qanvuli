@@ -1,9 +1,14 @@
 use super::{
     SEARCH_TIMEOUT, TUI_LOAD_MORE_LIMIT,
+    db::{
+        cwe::search_cwe_entries,
+        raw_json::load_cve_raw_json,
+        search::{SearchRequest, SearchResult, run_search_request},
+    },
     display::DisplaySettings,
     form::AdvancedForm,
     mode::SearchMode,
-    search::{SearchRequest, SearchResult, run_search_request},
+    utils::text::{normalize_spaces, wrapped_line_count},
 };
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_db::{
@@ -15,6 +20,15 @@ use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 const MIN_PAGE_SIZE: usize = 1;
+pub(super) const CWE_STATUS_COUNT: usize = 6;
+pub(super) const CWE_STATUSES: [CweStatus; CWE_STATUS_COUNT] = [
+    CweStatus::Stable,
+    CweStatus::Usable,
+    CweStatus::Draft,
+    CweStatus::Incomplete,
+    CweStatus::Obsolete,
+    CweStatus::Deprecated,
+];
 
 pub(super) struct App {
     pub(super) query: String,
@@ -35,6 +49,14 @@ pub(super) struct App {
     pub(super) cwe_query: String,
     pub(super) cwe_results: Vec<CweEntry>,
     pub(super) cwe_scroll: u16,
+    pub(super) cwe_selected: usize,
+    pub(super) cwe_detail_scroll: u16,
+    pub(super) cwe_status_filter: [bool; CWE_STATUS_COUNT],
+    pub(super) cwe_status_cursor: usize,
+    pub(super) show_cwe_status: bool,
+    pub(super) detail_search_query: String,
+    pub(super) detail_search_input: bool,
+    pub(super) detail_search_error: Option<String>,
     search: Option<PendingSearch>,
     raw_json_task: Option<JoinHandle<Result<String, String>>>,
     cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
@@ -72,6 +94,29 @@ pub(super) enum ViewMode {
     Normal,
     RawJson,
     CweList,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CweStatus {
+    Stable,
+    Usable,
+    Draft,
+    Incomplete,
+    Obsolete,
+    Deprecated,
+}
+
+impl CweStatus {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Stable => "Stable",
+            Self::Usable => "Usable",
+            Self::Draft => "Draft",
+            Self::Incomplete => "Incomplete",
+            Self::Obsolete => "Obsolete",
+            Self::Deprecated => "Deprecated",
+        }
+    }
 }
 
 struct PendingSearch {
@@ -157,6 +202,14 @@ impl App {
             cwe_query: String::new(),
             cwe_results: Vec::new(),
             cwe_scroll: 0,
+            cwe_selected: 0,
+            cwe_detail_scroll: 0,
+            cwe_status_filter: default_cwe_status_filter(),
+            cwe_status_cursor: 0,
+            show_cwe_status: false,
+            detail_search_query: String::new(),
+            detail_search_input: false,
+            detail_search_error: None,
             search: None,
             raw_json_task: None,
             cwe_task: None,
@@ -367,16 +420,23 @@ impl App {
             Ok(Ok(rows)) => {
                 self.cwe_results = rows;
                 self.cwe_scroll = 0;
+                self.cwe_selected = 0;
+                self.cwe_detail_scroll = 0;
+                self.clamp_cwe_scroll(self.left_page_size);
             }
             Ok(Err(err)) => {
                 self.status_message = Some(err);
                 self.cwe_results.clear();
                 self.cwe_scroll = 0;
+                self.cwe_selected = 0;
+                self.cwe_detail_scroll = 0;
             }
             Err(err) => {
                 self.status_message = Some(format!("failed to join CWE task: {err}"));
                 self.cwe_results.clear();
                 self.cwe_scroll = 0;
+                self.cwe_selected = 0;
+                self.cwe_detail_scroll = 0;
             }
         }
     }
@@ -558,15 +618,7 @@ impl App {
             task.abort();
         }
         self.raw_json = Some("Loading".to_owned());
-        self.raw_json_task = Some(tokio::spawn(async move {
-            let raw_json = db
-                .find_cve_raw_json_by_id(&cve_id)
-                .await
-                .map_err(|err| format!("failed to load raw JSON: {err}"))?
-                .ok_or_else(|| format!("{cve_id} not found"))?;
-            serde_json::to_string_pretty(&raw_json)
-                .map_err(|err| format!("failed to encode raw JSON: {err}"))
-        }));
+        self.raw_json_task = Some(tokio::spawn(load_cve_raw_json(db, cve_id)));
     }
 
     pub(super) fn toggle_cwe_list_mode(&mut self, db: Option<CveDatabase>) {
@@ -586,6 +638,73 @@ impl App {
     pub(super) fn backspace_cwe_query(&mut self, db: Option<CveDatabase>) {
         self.cwe_query.pop();
         self.start_cwe_search(db);
+    }
+
+    pub(super) fn selected_cwe_status_labels(&self) -> Vec<&'static str> {
+        CWE_STATUSES
+            .iter()
+            .enumerate()
+            .filter_map(|(index, status)| self.cwe_status_filter[index].then_some(status.label()))
+            .collect()
+    }
+
+    pub(super) fn cwe_status_summary(&self) -> String {
+        let labels = self.selected_cwe_status_labels();
+        if labels.is_empty() {
+            "none".to_owned()
+        } else {
+            labels.join("|")
+        }
+    }
+
+    pub(super) fn open_cwe_status_popup(&mut self) {
+        self.show_cwe_status = true;
+    }
+
+    pub(super) fn close_cwe_status_popup(&mut self) {
+        self.show_cwe_status = false;
+    }
+
+    pub(super) fn next_cwe_status(&mut self) {
+        self.cwe_status_cursor = (self.cwe_status_cursor + 1) % CWE_STATUS_COUNT;
+    }
+
+    pub(super) fn previous_cwe_status(&mut self) {
+        self.cwe_status_cursor = if self.cwe_status_cursor == 0 {
+            CWE_STATUS_COUNT - 1
+        } else {
+            self.cwe_status_cursor - 1
+        };
+    }
+
+    pub(super) fn toggle_current_cwe_status(&mut self, db: Option<CveDatabase>) {
+        self.cwe_status_filter[self.cwe_status_cursor] =
+            !self.cwe_status_filter[self.cwe_status_cursor];
+        self.start_cwe_search(db);
+    }
+
+    pub(super) fn selected_cwe(&self) -> Option<&CweEntry> {
+        self.cwe_results.get(self.cwe_selected)
+    }
+
+    pub(super) fn start_detail_search(&mut self) {
+        self.detail_search_input = true;
+        self.detail_search_error = None;
+    }
+
+    pub(super) fn close_detail_search(&mut self) {
+        self.detail_search_input = false;
+        self.detail_search_error = None;
+    }
+
+    pub(super) fn push_detail_search(&mut self, ch: char) {
+        self.detail_search_query.push(ch);
+        self.detail_search_error = None;
+    }
+
+    pub(super) fn backspace_detail_search(&mut self) {
+        self.detail_search_query.pop();
+        self.detail_search_error = None;
     }
 
     pub(super) fn set_page_sizes(
@@ -610,6 +729,13 @@ impl App {
             PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Metadata,
             PaneFocus::Metadata => PaneFocus::Left,
+        };
+    }
+
+    pub(super) fn toggle_cwe_focus(&mut self) {
+        self.focus = match self.focus {
+            PaneFocus::Left => PaneFocus::Right,
+            PaneFocus::Right | PaneFocus::Metadata => PaneFocus::Left,
         };
     }
 
@@ -750,15 +876,99 @@ impl App {
     }
 
     pub(super) fn move_cwe_down(&mut self, page_size: usize) {
-        let max_scroll = self
-            .cwe_results
-            .len()
-            .saturating_sub(page_size.max(MIN_PAGE_SIZE)) as u16;
-        self.cwe_scroll = self.cwe_scroll.saturating_add(1).min(max_scroll);
+        self.move_cwe_page(PageDirection::Down, 1, page_size);
     }
 
-    pub(super) fn move_cwe_up(&mut self) {
-        self.cwe_scroll = self.cwe_scroll.saturating_sub(1);
+    pub(super) fn move_cwe_up(&mut self, page_size: usize) {
+        self.move_cwe_page(PageDirection::Up, 1, page_size);
+    }
+
+    pub(super) fn move_cwe_half_page_down(&mut self, page_size: usize) {
+        self.move_cwe_page(
+            PageDirection::Down,
+            (page_size / 2).max(MIN_PAGE_SIZE),
+            page_size,
+        );
+    }
+
+    pub(super) fn move_cwe_half_page_up(&mut self, page_size: usize) {
+        self.move_cwe_page(
+            PageDirection::Up,
+            (page_size / 2).max(MIN_PAGE_SIZE),
+            page_size,
+        );
+    }
+
+    pub(super) fn move_cwe_full_page_down(&mut self, page_size: usize) {
+        self.move_cwe_page(PageDirection::Down, page_size.max(MIN_PAGE_SIZE), page_size);
+    }
+
+    pub(super) fn move_cwe_full_page_up(&mut self, page_size: usize) {
+        self.move_cwe_page(PageDirection::Up, page_size.max(MIN_PAGE_SIZE), page_size);
+    }
+
+    fn move_cwe_page(&mut self, direction: PageDirection, step: usize, page_size: usize) {
+        if self.cwe_results.is_empty() {
+            self.cwe_selected = 0;
+            self.cwe_scroll = 0;
+            self.cwe_detail_scroll = 0;
+            return;
+        }
+
+        self.cwe_selected = match direction {
+            PageDirection::Up => self.cwe_selected.saturating_sub(step),
+            PageDirection::Down => self
+                .cwe_selected
+                .saturating_add(step)
+                .min(self.cwe_results.len() - 1),
+        };
+        self.scroll_cwe_selection_into_view(page_size);
+        self.cwe_detail_scroll = 0;
+    }
+
+    fn scroll_cwe_selection_into_view(&mut self, page_size: usize) {
+        let page_size = page_size.max(MIN_PAGE_SIZE);
+        if self.cwe_selected < self.cwe_scroll as usize {
+            self.cwe_scroll = self.cwe_selected as u16;
+        } else if self.cwe_selected >= self.cwe_scroll as usize + page_size {
+            self.cwe_scroll =
+                self.cwe_selected
+                    .saturating_sub(page_size - 1)
+                    .min(self.cwe_results.len().saturating_sub(page_size)) as u16;
+        }
+        self.clamp_cwe_scroll(page_size);
+    }
+
+    fn clamp_cwe_scroll(&mut self, page_size: usize) {
+        let page_size = page_size.max(MIN_PAGE_SIZE);
+        let max_scroll = self.cwe_results.len().saturating_sub(page_size) as u16;
+        self.cwe_scroll = self.cwe_scroll.min(max_scroll);
+    }
+
+    pub(super) fn move_cwe_detail_down(&mut self, line_count: usize, page_size: usize) {
+        let page_size = page_size.max(MIN_PAGE_SIZE);
+        self.cwe_detail_scroll = self
+            .cwe_detail_scroll
+            .saturating_add(1)
+            .min(line_count.saturating_sub(page_size) as u16);
+    }
+
+    pub(super) fn move_cwe_detail_up(&mut self) {
+        self.cwe_detail_scroll = self.cwe_detail_scroll.saturating_sub(1);
+    }
+
+    pub(super) fn move_cwe_detail_page_down(&mut self, line_count: usize, page_size: usize) {
+        let page_size = page_size.max(MIN_PAGE_SIZE);
+        self.cwe_detail_scroll = self
+            .cwe_detail_scroll
+            .saturating_add(page_size as u16)
+            .min(line_count.saturating_sub(page_size) as u16);
+    }
+
+    pub(super) fn move_cwe_detail_page_up(&mut self, page_size: usize) {
+        self.cwe_detail_scroll = self
+            .cwe_detail_scroll
+            .saturating_sub(page_size.max(MIN_PAGE_SIZE) as u16);
     }
 
     pub(super) fn sync_main_from_advanced(&mut self) {
@@ -793,6 +1003,14 @@ impl App {
         self.cwe_query.clear();
         self.cwe_results.clear();
         self.cwe_scroll = 0;
+        self.cwe_selected = 0;
+        self.cwe_detail_scroll = 0;
+        self.cwe_status_filter = default_cwe_status_filter();
+        self.cwe_status_cursor = 0;
+        self.show_cwe_status = false;
+        self.detail_search_query.clear();
+        self.detail_search_input = false;
+        self.detail_search_error = None;
         self.searched_request = SearchRequest::Mode {
             mode: SearchMode::FreeText,
             query: String::new(),
@@ -883,11 +1101,12 @@ impl App {
             return;
         };
         let query = self.cwe_query.clone();
-        self.cwe_task = Some(tokio::spawn(async move {
-            db.search_cwe_entries(&query, 200)
-                .await
-                .map_err(|err| format!("failed to search CWE: {err}"))
-        }));
+        let statuses = self
+            .selected_cwe_status_labels()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        self.cwe_task = Some(tokio::spawn(search_cwe_entries(db, query, statuses)));
     }
 
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
@@ -1129,19 +1348,6 @@ fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
     cwe_lines + cvss_lines + affected_lines + 2
 }
 
-fn wrapped_line_count(value: &str, width: usize) -> usize {
-    let width = width.max(MIN_PAGE_SIZE);
-    value
-        .lines()
-        .map(|line| (line.chars().count().max(1) + width - 1) / width)
-        .sum::<usize>()
-        .max(1)
-}
-
-fn normalize_spaces(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn option_string(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1149,4 +1355,10 @@ fn option_string(value: &str) -> Option<String> {
     } else {
         Some(value.to_owned())
     }
+}
+
+fn default_cwe_status_filter() -> [bool; CWE_STATUS_COUNT] {
+    let mut filter = [false; CWE_STATUS_COUNT];
+    filter[0] = true;
+    filter
 }

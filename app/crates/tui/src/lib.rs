@@ -1,11 +1,15 @@
 mod app;
+mod common;
+mod db;
 mod display;
 mod form;
 mod mode;
-mod search;
+mod modes;
 mod terminal;
+mod traits;
 mod tui;
 mod ui;
+mod utils;
 
 pub use tui::{Args, run};
 

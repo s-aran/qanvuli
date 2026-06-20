@@ -64,6 +64,7 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
             manager.create_table(statement).await?;
         }
 
+        ensure_cwe_status_column(manager).await?;
         create_current_indexes(manager.get_connection()).await?;
         create_cve_search_fts(manager.get_connection()).await?;
         rebuild_cve_search_fts(manager.get_connection()).await?;
@@ -110,6 +111,20 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
     }
 }
 
+async fn ensure_cwe_status_column(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    if manager.has_table("cwe").await? && !manager.has_column("cwe", "status").await? {
+        manager
+            .alter_table(
+                Table::alter()
+                    .table(cwe::Entity)
+                    .add_column(ColumnDef::new(cwe::Column::Status).text().null())
+                    .to_owned(),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 async fn reject_legacy_pre_rekey_schema(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     if manager.has_table("cve").await? && !manager.has_column("cve", "id").await? {
         return Err(DbErr::Custom(
@@ -146,6 +161,7 @@ where
         "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id ON cve_cwe (cwe_id)",
         "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
         "CREATE INDEX IF NOT EXISTS idx_cwe_id ON cwe (id)",
+        "CREATE INDEX IF NOT EXISTS idx_cwe_status ON cwe (status)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_cve_zip_file_filename ON cve_zip_file (zip_filename)",
         "CREATE INDEX IF NOT EXISTS idx_cve_zip_file_datetime ON cve_zip_file (zip_datetime)",
         "CREATE INDEX IF NOT EXISTS idx_cve_zip_file_type_datetime ON cve_zip_file (zip_type, zip_datetime)",

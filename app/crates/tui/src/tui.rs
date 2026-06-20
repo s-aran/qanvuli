@@ -1,21 +1,19 @@
 use super::{
     EVENT_POLL_MAX, TUI_LIMIT,
     app::{App, MaintenanceChoice, MaintenanceOperation, ViewMode},
+    common::input::{is_ctrl, is_ctrl_quit},
+    db::connection,
     form::AdvancedField,
+    modes,
     terminal::TerminalGuard,
     ui::draw,
+    utils::task::{maintenance_progress_channel, spawn_maintenance_task},
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use qanvuli_app_commands::{
-    common::{IngestProgress, IngestProgressCallback, connect_db},
-    init, update,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use qanvuli_app_commands::{init, update};
 use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
-#[cfg(unix)]
-use std::{fs::File, os::fd::AsRawFd};
-use std::{future::Future, io, sync::Arc, thread};
-use tokio::sync::mpsc;
+use std::io;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -26,7 +24,7 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let mut db = Some(connect_db(db_url).await?);
+    let mut db = Some(connection::connect(db_url).await?);
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(args.query.unwrap_or_default(), args.limit);
     if let Some(db) = db.as_ref() {
@@ -41,9 +39,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let result = run_loop(&mut terminal.terminal, db_url, &mut db, &mut app).await;
     terminal.leave()?;
     if let Some(db) = db.take() {
-        db.close()
-            .await
-            .map_err(|err| format!("failed to close database: {err}"))?;
+        connection::close(db).await?;
     }
     result
 }
@@ -202,129 +198,61 @@ async fn run_loop(
             continue;
         }
 
-        if app.view_mode == ViewMode::RawJson {
-            let area = terminal.size().ok();
-            let page_size = area
-                .map(|area| area.height.saturating_sub(2) as usize)
-                .unwrap_or(1);
-            let width = area
-                .map(|area| area.width.saturating_sub(2) as usize)
-                .unwrap_or(1);
-            let line_count = app
-                .raw_json
-                .as_deref()
-                .map(|value| wrapped_line_count(value, width))
-                .unwrap_or(1);
+        if app.detail_search_input {
             match key.code {
-                KeyCode::F(8) => app.toggle_raw_json_mode(None),
-                KeyCode::F(9) => app.toggle_cwe_list_mode(db.as_ref().cloned()),
-                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
-                KeyCode::Char('d') if is_ctrl(&key, 'd') => {
-                    app.move_raw_page_down(line_count, page_size)
-                }
-                KeyCode::Char('u') if is_ctrl(&key, 'u') => app.move_raw_page_up(page_size),
-                KeyCode::Char('f') if is_ctrl(&key, 'f') => {
-                    app.move_raw_page_down(line_count, page_size.saturating_mul(2))
-                }
-                KeyCode::Char('b') if is_ctrl(&key, 'b') => {
-                    app.move_raw_page_up(page_size.saturating_mul(2))
-                }
-                KeyCode::Down => app.move_raw_down(line_count, page_size),
-                KeyCode::Up => app.move_raw_up(),
+                KeyCode::Esc => app.close_detail_search(),
+                KeyCode::Enter => app.close_detail_search(),
+                KeyCode::Backspace => app.backspace_detail_search(),
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
+                KeyCode::Char(ch) => app.push_detail_search(ch),
                 _ => {}
+            }
+            continue;
+        }
+
+        if app.show_cwe_status {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => app.close_cwe_status_popup(),
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
+                KeyCode::Down | KeyCode::Tab => app.next_cwe_status(),
+                KeyCode::Up | KeyCode::BackTab => app.previous_cwe_status(),
+                KeyCode::Char(' ') => app.toggle_current_cwe_status(db.as_ref().cloned()),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.view_mode == ViewMode::RawJson {
+            if modes::raw_json::handler::handle_key(
+                app,
+                db.as_ref().cloned(),
+                &key,
+                terminal.size().ok(),
+            ) {
+                break;
             }
             continue;
         }
 
         if app.view_mode == ViewMode::CweList {
-            let page_size = terminal
-                .size()
-                .map(|area| area.height.saturating_sub(4) as usize)
-                .unwrap_or(1);
-            match key.code {
-                KeyCode::F(9) => app.toggle_cwe_list_mode(None),
-                KeyCode::F(8) => app.toggle_raw_json_mode(db.as_ref().cloned()),
-                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
-                KeyCode::Backspace => app.backspace_cwe_query(db.as_ref().cloned()),
-                KeyCode::Char(ch) => app.push_cwe_query(ch, db.as_ref().cloned()),
-                KeyCode::Down => app.move_cwe_down(page_size),
-                KeyCode::Up => app.move_cwe_up(),
-                _ => {}
+            if modes::cwe::handler::handle_key(
+                app,
+                db.as_ref().cloned(),
+                &key,
+                terminal.size().ok(),
+            ) {
+                break;
             }
             continue;
         }
 
-        match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
-            KeyCode::Char('u') if is_ctrl(&key, 'u') => {
-                app.move_half_page_up();
-            }
-            KeyCode::Char('d') if is_ctrl(&key, 'd') => {
-                if let Some(db) = db.as_ref() {
-                    app.move_half_page_down(db.clone());
-                }
-            }
-            KeyCode::Char('f') if is_ctrl(&key, 'f') => {
-                if let Some(db) = db.as_ref() {
-                    app.move_full_page_down(db.clone());
-                }
-            }
-            KeyCode::Char('b') if is_ctrl(&key, 'b') => {
-                app.move_full_page_up();
-            }
-            KeyCode::F(1) => app.show_help = true,
-            KeyCode::F(2) => app.next_search_mode(),
-            KeyCode::F(3) => app.open_advanced_search(),
-            KeyCode::F(4) => app.open_display_settings(),
-            KeyCode::F(5) => app.open_maintenance(),
-            KeyCode::F(8) => app.toggle_raw_json_mode(db.as_ref().cloned()),
-            KeyCode::F(9) => app.toggle_cwe_list_mode(db.as_ref().cloned()),
-            KeyCode::Enter => {
-                if let Some(db) = db.as_ref() {
-                    app.start_search(db.clone());
-                }
-            }
-            KeyCode::Tab => app.toggle_focus(),
-            KeyCode::BackTab => app.previous_focus(),
-            KeyCode::Left => app.previous_search_mode(),
-            KeyCode::Right => app.next_search_mode(),
-            KeyCode::Backspace => {
-                app.backspace_query();
-            }
-            KeyCode::Char(ch) => {
-                app.push_query(ch);
-            }
-            KeyCode::Down => {
-                if let Some(db) = db.as_ref() {
-                    app.move_focused_down(db.clone());
-                }
-            }
-            KeyCode::Up => app.move_focused_up(),
-            _ => {}
+        if modes::main::handler::handle_key(app, db.as_ref().cloned(), &key) {
+            break;
         }
     }
 
     app.abort_search();
     Ok(())
-}
-
-fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
-    matches!(key.code, KeyCode::Char(value) if value == ch)
-        && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn is_ctrl_quit(key: &KeyEvent) -> bool {
-    matches!(key.code, KeyCode::Char('c' | 'd')) && key.modifiers.contains(KeyModifiers::CONTROL)
-}
-
-fn wrapped_line_count(value: &str, width: usize) -> usize {
-    let width = width.max(1);
-    value
-        .lines()
-        .map(|line| (line.chars().count().max(1) + width - 1) / width)
-        .sum::<usize>()
-        .max(1)
 }
 
 async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
@@ -344,7 +272,7 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
         MaintenanceChoice::Init => {
             app.abort_search();
             if let Some(current_db) = db.take()
-                && let Err(err) = current_db.close().await
+                && let Err(err) = connection::close(current_db).await
             {
                 app.status_message = Some(format!("failed to close database before init: {err}"));
                 app.close_maintenance();
@@ -365,93 +293,11 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
     }
 }
 
-fn maintenance_progress_channel() -> (
-    IngestProgressCallback,
-    mpsc::UnboundedReceiver<IngestProgress>,
-) {
-    let (progress_tx, progress_rx) = mpsc::unbounded_channel();
-    let progress = Arc::new(move |progress| {
-        let _ = progress_tx.send(progress);
-    });
-    (progress, progress_rx)
-}
-
-fn spawn_maintenance_task<F>(future: F) -> mpsc::UnboundedReceiver<Result<(), String>>
-where
-    F: Future<Output = Result<(), String>> + Send + 'static,
-{
-    let (result_tx, result_rx) = mpsc::unbounded_channel();
-    thread::spawn(move || {
-        let _stderr = StderrSilencer::new();
-        let result = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(future),
-            Err(err) => Err(format!("failed to build maintenance runtime: {err}")),
-        };
-        let _ = result_tx.send(result);
-    });
-    result_rx
-}
-
-struct StderrSilencer {
-    #[cfg(unix)]
-    saved: Option<i32>,
-}
-
-impl StderrSilencer {
-    #[cfg(unix)]
-    fn new() -> Self {
-        let Ok(dev_null) = File::options().write(true).open("/dev/null") else {
-            return Self { saved: None };
-        };
-        let saved = unsafe { dup(STDERR_FD) };
-        if saved < 0 {
-            return Self { saved: None };
-        }
-        if unsafe { dup2(dev_null.as_raw_fd(), STDERR_FD) } < 0 {
-            unsafe {
-                close(saved);
-            }
-            return Self { saved: None };
-        }
-        Self { saved: Some(saved) }
-    }
-
-    #[cfg(not(unix))]
-    fn new() -> Self {
-        Self {}
-    }
-}
-
-#[cfg(unix)]
-impl Drop for StderrSilencer {
-    fn drop(&mut self) {
-        if let Some(saved) = self.saved.take() {
-            unsafe {
-                let _ = dup2(saved, STDERR_FD);
-                close(saved);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-const STDERR_FD: i32 = 2;
-
-#[cfg(unix)]
-unsafe extern "C" {
-    fn dup(fd: i32) -> i32;
-    fn dup2(oldfd: i32, newfd: i32) -> i32;
-    fn close(fd: i32) -> i32;
-}
-
 async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
     if db.is_some() {
         return;
     }
-    match connect_db(db_url).await {
+    match connection::connect(db_url).await {
         Ok(reconnected) => {
             update_db_as_of(app, &reconnected).await;
             *db = Some(reconnected);
@@ -463,20 +309,10 @@ async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>
 }
 
 async fn update_db_as_of(app: &mut App, db: &CveDatabase) {
-    match db.latest_cve_zip_datetime().await {
-        Ok(Some(value)) => {
-            app.db_as_of = Some(value);
-        }
-        Ok(None) => match db.latest_cve_updated_at().await {
-            Ok(value) => {
-                app.db_as_of = value;
-            }
-            Err(err) => {
-                app.status_message = Some(format!("failed to read DB timestamp: {err}"));
-            }
-        },
+    match connection::latest_data_timestamp(db).await {
+        Ok(value) => app.db_as_of = value,
         Err(err) => {
-            app.status_message = Some(format!("failed to read CVE release timestamp: {err}"));
+            app.status_message = Some(err);
         }
     }
 }
