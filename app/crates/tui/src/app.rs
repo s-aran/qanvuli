@@ -8,6 +8,7 @@ use super::{
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_db::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
+    CweEntry,
 };
 use ratatui::widgets::ListState;
 use std::time::Instant;
@@ -28,7 +29,15 @@ pub(super) struct App {
     pub(super) focus: PaneFocus,
     pub(super) detail_scroll: u16,
     pub(super) metadata_scroll: u16,
+    pub(super) view_mode: ViewMode,
+    pub(super) raw_json: Option<String>,
+    pub(super) raw_scroll: u16,
+    pub(super) cwe_query: String,
+    pub(super) cwe_results: Vec<CweEntry>,
+    pub(super) cwe_scroll: u16,
     search: Option<PendingSearch>,
+    raw_json_task: Option<JoinHandle<Result<String, String>>>,
+    cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
     search_started_at: Option<Instant>,
     search_timeout_at: Option<Instant>,
     searched_request: SearchRequest,
@@ -56,6 +65,13 @@ pub(super) enum PaneFocus {
     Left,
     Right,
     Metadata,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ViewMode {
+    Normal,
+    RawJson,
+    CweList,
 }
 
 struct PendingSearch {
@@ -135,7 +151,15 @@ impl App {
             focus: PaneFocus::Left,
             detail_scroll: 0,
             metadata_scroll: 0,
+            view_mode: ViewMode::Normal,
+            raw_json: None,
+            raw_scroll: 0,
+            cwe_query: String::new(),
+            cwe_results: Vec::new(),
+            cwe_scroll: 0,
             search: None,
+            raw_json_task: None,
+            cwe_task: None,
             search_started_at: None,
             search_timeout_at: None,
             searched_request: SearchRequest::Mode {
@@ -304,8 +328,69 @@ impl App {
         }
     }
 
+    pub(super) async fn poll_raw_json(&mut self) {
+        let Some(task) = self.raw_json_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let task = self
+            .raw_json_task
+            .take()
+            .expect("raw JSON task disappeared");
+        match task.await {
+            Ok(Ok(raw_json)) => {
+                self.raw_json = Some(raw_json);
+                self.raw_scroll = 0;
+            }
+            Ok(Err(err)) => {
+                self.raw_json = Some(err);
+                self.raw_scroll = 0;
+            }
+            Err(err) => {
+                self.raw_json = Some(format!("failed to join raw JSON task: {err}"));
+                self.raw_scroll = 0;
+            }
+        }
+    }
+
+    pub(super) async fn poll_cwe_search(&mut self) {
+        let Some(task) = self.cwe_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let task = self.cwe_task.take().expect("CWE task disappeared");
+        match task.await {
+            Ok(Ok(rows)) => {
+                self.cwe_results = rows;
+                self.cwe_scroll = 0;
+            }
+            Ok(Err(err)) => {
+                self.status_message = Some(err);
+                self.cwe_results.clear();
+                self.cwe_scroll = 0;
+            }
+            Err(err) => {
+                self.status_message = Some(format!("failed to join CWE task: {err}"));
+                self.cwe_results.clear();
+                self.cwe_scroll = 0;
+            }
+        }
+    }
+
     pub(super) fn searching(&self) -> bool {
         self.search.is_some()
+    }
+
+    pub(super) fn has_background_task(&self) -> bool {
+        self.search.is_some() || self.raw_json_task.is_some() || self.cwe_task.is_some()
+    }
+
+    pub(super) fn cwe_searching(&self) -> bool {
+        self.cwe_task.is_some()
     }
 
     pub(super) fn maintenance_running(&self) -> bool {
@@ -334,6 +419,12 @@ impl App {
     pub(super) fn abort_search(&mut self) {
         if let Some(search) = self.search.take() {
             search.handle.abort();
+        }
+        if let Some(task) = self.raw_json_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.cwe_task.take() {
+            task.abort();
         }
         self.search_started_at = None;
         self.search_timeout_at = None;
@@ -446,6 +537,55 @@ impl App {
         self.list_state
             .selected()
             .and_then(|index| self.results.get(index))
+    }
+
+    pub(super) fn toggle_raw_json_mode(&mut self, db: Option<CveDatabase>) {
+        if self.view_mode == ViewMode::RawJson {
+            self.view_mode = ViewMode::Normal;
+            return;
+        }
+        self.view_mode = ViewMode::RawJson;
+        self.raw_scroll = 0;
+        let Some(cve_id) = self.selected().map(|cve| cve.summary.cve_id.clone()) else {
+            self.raw_json = Some("No CVE selected".to_owned());
+            return;
+        };
+        let Some(db) = db else {
+            self.raw_json = Some("Database is unavailable".to_owned());
+            return;
+        };
+        if let Some(task) = self.raw_json_task.take() {
+            task.abort();
+        }
+        self.raw_json = Some("Loading".to_owned());
+        self.raw_json_task = Some(tokio::spawn(async move {
+            let raw_json = db
+                .find_cve_raw_json_by_id(&cve_id)
+                .await
+                .map_err(|err| format!("failed to load raw JSON: {err}"))?
+                .ok_or_else(|| format!("{cve_id} not found"))?;
+            serde_json::to_string_pretty(&raw_json)
+                .map_err(|err| format!("failed to encode raw JSON: {err}"))
+        }));
+    }
+
+    pub(super) fn toggle_cwe_list_mode(&mut self, db: Option<CveDatabase>) {
+        if self.view_mode == ViewMode::CweList {
+            self.view_mode = ViewMode::Normal;
+            return;
+        }
+        self.view_mode = ViewMode::CweList;
+        self.start_cwe_search(db);
+    }
+
+    pub(super) fn push_cwe_query(&mut self, ch: char, db: Option<CveDatabase>) {
+        self.cwe_query.push(ch);
+        self.start_cwe_search(db);
+    }
+
+    pub(super) fn backspace_cwe_query(&mut self, db: Option<CveDatabase>) {
+        self.cwe_query.pop();
+        self.start_cwe_search(db);
     }
 
     pub(super) fn set_page_sizes(
@@ -584,6 +724,43 @@ impl App {
         self.sync_advanced_from_main();
     }
 
+    pub(super) fn move_raw_down(&mut self, line_count: usize, page_size: usize) {
+        self.raw_scroll = self.raw_scroll.saturating_add(1);
+        self.raw_scroll = self
+            .raw_scroll
+            .min(line_count.saturating_sub(page_size.max(MIN_PAGE_SIZE)) as u16);
+    }
+
+    pub(super) fn move_raw_up(&mut self) {
+        self.raw_scroll = self.raw_scroll.saturating_sub(1);
+    }
+
+    pub(super) fn move_raw_page_down(&mut self, line_count: usize, page_size: usize) {
+        let page_size = page_size.max(MIN_PAGE_SIZE);
+        self.raw_scroll = self
+            .raw_scroll
+            .saturating_add(page_size as u16)
+            .min(line_count.saturating_sub(page_size) as u16);
+    }
+
+    pub(super) fn move_raw_page_up(&mut self, page_size: usize) {
+        self.raw_scroll = self
+            .raw_scroll
+            .saturating_sub(page_size.max(MIN_PAGE_SIZE) as u16);
+    }
+
+    pub(super) fn move_cwe_down(&mut self, page_size: usize) {
+        let max_scroll = self
+            .cwe_results
+            .len()
+            .saturating_sub(page_size.max(MIN_PAGE_SIZE)) as u16;
+        self.cwe_scroll = self.cwe_scroll.saturating_add(1).min(max_scroll);
+    }
+
+    pub(super) fn move_cwe_up(&mut self) {
+        self.cwe_scroll = self.cwe_scroll.saturating_sub(1);
+    }
+
     pub(super) fn sync_main_from_advanced(&mut self) {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
@@ -608,8 +785,14 @@ impl App {
         self.total_results = None;
         self.list_state.select(Some(0));
         self.focus = PaneFocus::Left;
+        self.view_mode = ViewMode::Normal;
         self.detail_scroll = 0;
         self.metadata_scroll = 0;
+        self.raw_json = None;
+        self.raw_scroll = 0;
+        self.cwe_query.clear();
+        self.cwe_results.clear();
+        self.cwe_scroll = 0;
         self.searched_request = SearchRequest::Mode {
             mode: SearchMode::FreeText,
             query: String::new(),
@@ -687,6 +870,24 @@ impl App {
                     .map_err(|err| format!("{error_prefix}: {err}"))
             }),
         });
+    }
+
+    fn start_cwe_search(&mut self, db: Option<CveDatabase>) {
+        if let Some(task) = self.cwe_task.take() {
+            task.abort();
+        }
+        self.cwe_scroll = 0;
+        let Some(db) = db else {
+            self.status_message = Some("database is unavailable".to_owned());
+            self.cwe_results.clear();
+            return;
+        };
+        let query = self.cwe_query.clone();
+        self.cwe_task = Some(tokio::spawn(async move {
+            db.search_cwe_entries(&query, 200)
+                .await
+                .map_err(|err| format!("failed to search CWE: {err}"))
+        }));
     }
 
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
@@ -878,7 +1079,11 @@ fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
         .cwes
         .iter()
         .map(|cwe| {
-            let description = cwe.description.as_deref().unwrap_or_default();
+            let description = cwe
+                .description
+                .as_deref()
+                .map(normalize_spaces)
+                .unwrap_or_default();
             wrapped_line_count(&format!("CWE-{} {}", cwe.id, description), width)
         })
         .sum::<usize>()
@@ -931,6 +1136,10 @@ fn wrapped_line_count(value: &str, width: usize) -> usize {
         .map(|line| (line.chars().count().max(1) + width - 1) / width)
         .sum::<usize>()
         .max(1)
+}
+
+fn normalize_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn option_string(value: &str) -> Option<String> {

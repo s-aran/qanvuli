@@ -1,5 +1,5 @@
 use super::{
-    app::{App, MaintenanceChoice, PaneFocus, TimeoutChoice},
+    app::{App, MaintenanceChoice, PaneFocus, TimeoutChoice, ViewMode},
     display::{DisplayField, DisplaySettings, TimeZone},
     form::{AdvancedField, AdvancedForm, StateScopeUi},
 };
@@ -13,6 +13,15 @@ use ratatui::{
 };
 
 pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
+    if app.view_mode == ViewMode::RawJson {
+        draw_raw_json(frame, app);
+        return;
+    }
+    if app.view_mode == ViewMode::CweList {
+        draw_cwe_list(frame, app);
+        return;
+    }
+
     let main = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -149,6 +158,159 @@ fn focus_style(active: bool) -> Style {
     }
 }
 
+fn draw_raw_json(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = frame.area();
+    let cve_id = app
+        .selected()
+        .map(|cve| cve.summary.cve_id.as_str())
+        .unwrap_or("CVE");
+    let text = app.raw_json.as_deref().unwrap_or("Loading");
+    let paragraph = Paragraph::new(json_lines(text))
+        .block(
+            Block::default()
+                .title(format!("{cve_id} raw JSON"))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .scroll((app.raw_scroll, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn draw_cwe_list(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let main = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .split(frame.area());
+    let input = Paragraph::new(app.cwe_query.as_str()).block(
+        Block::default()
+            .title("CWE Search")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(input, main[0]);
+
+    let lines = if app.cwe_searching() {
+        vec![Line::from("Loading")]
+    } else if app.cwe_results.is_empty() {
+        vec![Line::from("No CWE")]
+    } else {
+        app.cwe_results
+            .iter()
+            .map(|cwe| {
+                let description = cwe
+                    .description
+                    .as_deref()
+                    .map(normalize_spaces)
+                    .unwrap_or_default();
+                Line::from(format!("CWE-{} {}", cwe.id, description))
+            })
+            .collect::<Vec<_>>()
+    };
+    let list = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(format!("CWE ({})", app.cwe_results.len()))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .scroll((app.cwe_scroll, 0))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(list, main[1]);
+}
+
+fn json_lines(text: &str) -> Vec<Line<'static>> {
+    if serde_json::from_str::<serde_json::Value>(text).is_err() {
+        return text
+            .lines()
+            .map(|line| Line::from(line.to_owned()))
+            .collect();
+    }
+    text.lines().map(highlight_json_line).collect()
+}
+
+fn highlight_json_line(line: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    while let Some((start, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                let end = json_string_end(line, &mut chars);
+                let token = &line[start..end];
+                let style = if is_json_key(line, end) {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Green)
+                };
+                spans.push(Span::styled(token.to_owned(), style));
+            }
+            '-' | '0'..='9' => {
+                let end = json_number_end(line, start);
+                spans.push(Span::styled(
+                    line[start..end].to_owned(),
+                    Style::default().fg(Color::Magenta),
+                ));
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
+                }
+            }
+            't' | 'f' | 'n' => {
+                let end = json_literal_end(line, start);
+                spans.push(Span::styled(
+                    line[start..end].to_owned(),
+                    Style::default().fg(Color::Yellow),
+                ));
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
+                }
+            }
+            '{' | '}' | '[' | ']' | ':' | ',' => {
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            _ => spans.push(Span::raw(ch.to_string())),
+        }
+    }
+    Line::from(spans)
+}
+
+fn json_string_end(
+    line: &str,
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+) -> usize {
+    let mut escaped = false;
+    for (index, ch) in chars.by_ref() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            return index + ch.len_utf8();
+        }
+    }
+    line.len()
+}
+
+fn is_json_key(line: &str, end: usize) -> bool {
+    line[end..].trim_start().starts_with(':')
+}
+
+fn json_number_end(line: &str, start: usize) -> usize {
+    line[start..]
+        .find(|ch: char| !matches!(ch, '-' | '+' | '.' | '0'..='9' | 'e' | 'E'))
+        .map(|offset| start + offset)
+        .unwrap_or(line.len())
+}
+
+fn json_literal_end(line: &str, start: usize) -> usize {
+    line[start..]
+        .find(|ch: char| !ch.is_ascii_alphabetic())
+        .map(|offset| start + offset)
+        .unwrap_or(line.len())
+}
+
 fn draw_help(frame: &mut ratatui::Frame<'_>) {
     let area = centered_rect(60, 42, frame.area());
     let help = Paragraph::new(vec![
@@ -160,6 +322,8 @@ fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("F3     Open advanced search"),
         Line::from("F4     Open display settings"),
         Line::from("F5     Open database maintenance"),
+        Line::from("F8     Toggle raw CVE JSON"),
+        Line::from("F9     Toggle CWE list"),
         Line::from("Up/Down Move focused pane"),
         Line::from("Ctrl-U/D Half-page up/down focused pane"),
         Line::from("Ctrl-B/F Full-page up/down focused pane"),
@@ -547,7 +711,11 @@ fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {
         lines.push(Line::from("No CWE"));
     } else {
         lines.extend(detail.cwes.iter().map(|cwe| {
-            let description = cwe.description.as_deref().unwrap_or_default();
+            let description = cwe
+                .description
+                .as_deref()
+                .map(normalize_spaces)
+                .unwrap_or_default();
             Line::from(format!("CWE-{} {}", cwe.id, description))
         }));
     }
@@ -589,4 +757,8 @@ fn metadata_lines(detail: Option<&CveDetail>) -> Vec<Line<'static>> {
         }));
     }
     lines
+}
+
+fn normalize_spaces(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }

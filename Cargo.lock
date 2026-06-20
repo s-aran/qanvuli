@@ -2584,6 +2584,7 @@ dependencies = [
  "qanvuli-app-commands",
  "qanvuli-db",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

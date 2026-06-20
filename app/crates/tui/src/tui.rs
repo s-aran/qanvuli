@@ -1,6 +1,6 @@
 use super::{
     EVENT_POLL_MAX, TUI_LIMIT,
-    app::{App, MaintenanceChoice, MaintenanceOperation},
+    app::{App, MaintenanceChoice, MaintenanceOperation, ViewMode},
     form::AdvancedField,
     terminal::TerminalGuard,
     ui::draw,
@@ -56,10 +56,12 @@ async fn run_loop(
 ) -> Result<(), String> {
     loop {
         app.poll_search().await?;
+        app.poll_raw_json().await;
+        app.poll_cwe_search().await;
         if app.poll_maintenance().await {
             refresh_db_after_maintenance(db_url, db, app).await;
         }
-        if app.searching() {
+        if app.has_background_task() {
             tokio::task::yield_now().await;
         }
 
@@ -200,6 +202,58 @@ async fn run_loop(
             continue;
         }
 
+        if app.view_mode == ViewMode::RawJson {
+            let area = terminal.size().ok();
+            let page_size = area
+                .map(|area| area.height.saturating_sub(2) as usize)
+                .unwrap_or(1);
+            let width = area
+                .map(|area| area.width.saturating_sub(2) as usize)
+                .unwrap_or(1);
+            let line_count = app
+                .raw_json
+                .as_deref()
+                .map(|value| wrapped_line_count(value, width))
+                .unwrap_or(1);
+            match key.code {
+                KeyCode::F(8) => app.toggle_raw_json_mode(None),
+                KeyCode::F(9) => app.toggle_cwe_list_mode(db.as_ref().cloned()),
+                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
+                KeyCode::Char('d') if is_ctrl(&key, 'd') => {
+                    app.move_raw_page_down(line_count, page_size)
+                }
+                KeyCode::Char('u') if is_ctrl(&key, 'u') => app.move_raw_page_up(page_size),
+                KeyCode::Char('f') if is_ctrl(&key, 'f') => {
+                    app.move_raw_page_down(line_count, page_size.saturating_mul(2))
+                }
+                KeyCode::Char('b') if is_ctrl(&key, 'b') => {
+                    app.move_raw_page_up(page_size.saturating_mul(2))
+                }
+                KeyCode::Down => app.move_raw_down(line_count, page_size),
+                KeyCode::Up => app.move_raw_up(),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.view_mode == ViewMode::CweList {
+            let page_size = terminal
+                .size()
+                .map(|area| area.height.saturating_sub(4) as usize)
+                .unwrap_or(1);
+            match key.code {
+                KeyCode::F(9) => app.toggle_cwe_list_mode(None),
+                KeyCode::F(8) => app.toggle_raw_json_mode(db.as_ref().cloned()),
+                KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
+                KeyCode::Backspace => app.backspace_cwe_query(db.as_ref().cloned()),
+                KeyCode::Char(ch) => app.push_cwe_query(ch, db.as_ref().cloned()),
+                KeyCode::Down => app.move_cwe_down(page_size),
+                KeyCode::Up => app.move_cwe_up(),
+                _ => {}
+            }
+            continue;
+        }
+
         match key.code {
             KeyCode::Esc => {}
             KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
@@ -224,6 +278,8 @@ async fn run_loop(
             KeyCode::F(3) => app.open_advanced_search(),
             KeyCode::F(4) => app.open_display_settings(),
             KeyCode::F(5) => app.open_maintenance(),
+            KeyCode::F(8) => app.toggle_raw_json_mode(db.as_ref().cloned()),
+            KeyCode::F(9) => app.toggle_cwe_list_mode(db.as_ref().cloned()),
             KeyCode::Enter => {
                 if let Some(db) = db.as_ref() {
                     app.start_search(db.clone());
@@ -260,6 +316,15 @@ fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
 
 fn is_ctrl_quit(key: &KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char('c' | 'd')) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+fn wrapped_line_count(value: &str, width: usize) -> usize {
+    let width = width.max(1);
+    value
+        .lines()
+        .map(|line| (line.chars().count().max(1) + width - 1) / width)
+        .sum::<usize>()
+        .max(1)
 }
 
 async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {

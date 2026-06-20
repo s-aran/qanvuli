@@ -67,6 +67,8 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
         create_current_indexes(manager.get_connection()).await?;
         create_cve_search_fts(manager.get_connection()).await?;
         rebuild_cve_search_fts(manager.get_connection()).await?;
+        create_cve_affected_fts(manager.get_connection()).await?;
+        rebuild_cve_affected_fts(manager.get_connection()).await?;
         Ok(())
     }
 
@@ -74,6 +76,10 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
         manager
             .get_connection()
             .execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
+            .await?;
+        manager
+            .get_connection()
+            .execute_unprepared("DROP TABLE IF EXISTS cve_affected_fts")
             .await?;
 
         for statement in [
@@ -192,6 +198,47 @@ where
         FROM cve
         LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
         GROUP BY cve.cve_id
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn create_cve_affected_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS cve_affected_fts USING fts5(
+            cve_id UNINDEXED,
+            vendor,
+            product,
+            package_name,
+            tokenize = 'unicode61'
+        )
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_cve_affected_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute_unprepared("DELETE FROM cve_affected_fts")
+        .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_affected_fts (cve_id, vendor, product, package_name)
+        SELECT
+            cve.cve_id,
+            COALESCE(cve_affected.vendor, ''),
+            COALESCE(cve_affected.product, ''),
+            COALESCE(cve_affected.package_name, '')
+        FROM cve_affected
+        INNER JOIN cve ON cve.id = cve_affected.cve_db_id
         "#,
     )
     .await?;

@@ -106,6 +106,12 @@ pub struct CveCweDetail {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+pub struct CweEntry {
+    pub id: i32,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct CveCvssDetail {
     pub version: String,
     pub base_score: Option<f64>,
@@ -754,6 +760,7 @@ impl CveDatabase {
             cve_cwe::Entity::insert_many(cwe_rows).exec(&txn).await?;
         }
         upsert_cve_search_fts_rows(&txn, &[cve_id.to_owned()]).await?;
+        upsert_cve_affected_fts_rows(&txn, &[cve_id.to_owned()]).await?;
 
         txn.commit().await
     }
@@ -771,6 +778,12 @@ impl CveDatabase {
             .filter(cve::Column::CveId.eq(cve_id))
             .one(&self.db)
             .await
+    }
+
+    pub async fn find_cve_raw_json_by_id(&self, cve_id: &str) -> Result<Option<Value>, DbErr> {
+        self.find_cve_by_id(cve_id)
+            .await
+            .map(|row| row.map(|row| row.raw_json))
     }
 
     pub async fn find_cve_model_by_id(
@@ -1140,6 +1153,27 @@ impl CveDatabase {
         Ok(())
     }
 
+    async fn ensure_cve_affected_fts(&self) -> Result<(), DbErr> {
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            return Ok(());
+        }
+
+        create_cve_affected_fts(&self.db).await?;
+        let has_rows = self
+            .db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 FROM cve_affected_fts LIMIT 1".to_owned(),
+            ))
+            .await?
+            .is_some();
+        if !has_rows {
+            rebuild_cve_affected_fts(&self.db).await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn search_cves_by_vendor_product(
         &self,
         vendor: Option<&str>,
@@ -1212,6 +1246,23 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && let Some(query) = affected_fts_query(vendor, product)
+        {
+            self.ensure_cve_affected_fts().await?;
+            return CveSummary::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                affected_fts_summary_sql(state_scope),
+                vec![
+                    SeaValue::from(query),
+                    SeaValue::from(limit as i64),
+                    SeaValue::from(offset as i64),
+                ],
+            ))
+            .all(&self.db)
+            .await;
+        }
+
         let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
@@ -1257,6 +1308,18 @@ impl CveDatabase {
         product: Option<&str>,
         state_scope: CveStateScope,
     ) -> Result<u64, DbErr> {
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && let Some(query) = affected_fts_query(vendor, product)
+        {
+            self.ensure_cve_affected_fts().await?;
+            return self
+                .count_by_statement(
+                    affected_fts_count_sql(state_scope),
+                    vec![SeaValue::from(query)],
+                )
+                .await;
+        }
+
         let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
 
         if !state_scope.includes_rejected() {
@@ -2414,6 +2477,32 @@ impl CveDatabase {
             .map(|value| value.flatten().filter(|value| !value.is_empty()))
     }
 
+    pub async fn search_cwe_entries(
+        &self,
+        query: &str,
+        limit: u64,
+    ) -> Result<Vec<CweEntry>, DbErr> {
+        let query = query.trim();
+        let limit = limit.max(1);
+        let mut search = cwe::Entity::find()
+            .select_only()
+            .columns([cwe::Column::Id, cwe::Column::Description])
+            .limit(limit)
+            .order_by_asc(cwe::Column::Id);
+
+        if !query.is_empty() {
+            let id = cwe_number(query);
+            let mut condition =
+                Condition::any().add(cwe::Column::Description.like(like_pattern(query)));
+            if let Some(id) = id {
+                condition = condition.add(cwe::Column::Id.eq(id));
+            }
+            search = search.filter(condition);
+        }
+
+        search.into_model::<CweEntry>().all(&self.db).await
+    }
+
     pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, DbErr> {
         app_metadata::Entity::find_by_id(key.to_owned())
             .one(&self.db)
@@ -2617,6 +2706,7 @@ async fn upsert_cve_model_batch(
         cve_cwe::Entity::insert_many(chunk).exec(txn).await?;
     }
     upsert_cve_search_fts_rows(txn, &cve_ids).await?;
+    upsert_cve_affected_fts_rows(txn, &cve_ids).await?;
 
     Ok(inserted)
 }
@@ -2679,6 +2769,7 @@ async fn insert_cve_model_batch(
     }
     if update_search_index {
         upsert_cve_search_fts_rows(txn, &cve_ids).await?;
+        upsert_cve_affected_fts_rows(txn, &cve_ids).await?;
     }
 
     Ok(inserted)
@@ -2944,6 +3035,8 @@ where
         .await?;
     db.execute_unprepared("DROP TABLE IF EXISTS cve_search_fts")
         .await?;
+    db.execute_unprepared("DROP TABLE IF EXISTS cve_affected_fts")
+        .await?;
     for index_name in BULK_LOAD_DROPPED_INDEXES {
         db.execute_unprepared(&format!("DROP INDEX IF EXISTS {index_name}"))
             .await?;
@@ -2964,6 +3057,8 @@ where
     }
     create_cve_search_fts(db).await?;
     rebuild_cve_search_fts(db).await?;
+    create_cve_affected_fts(db).await?;
+    rebuild_cve_affected_fts(db).await?;
     db.execute_unprepared("ANALYZE").await?;
     db.execute_unprepared("PRAGMA optimize").await?;
     db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
@@ -3146,6 +3241,91 @@ where
         LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
         WHERE cve.cve_id IN ({cve_ids})
         GROUP BY cve.cve_id
+        "#
+    ))
+    .await?;
+    Ok(())
+}
+
+async fn create_cve_affected_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    db.execute_unprepared(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS cve_affected_fts USING fts5(
+            cve_id UNINDEXED,
+            vendor,
+            product,
+            package_name,
+            tokenize = 'unicode61'
+        )
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_cve_affected_fts<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    create_cve_affected_fts(db).await?;
+    db.execute_unprepared("DELETE FROM cve_affected_fts")
+        .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_affected_fts (cve_id, vendor, product, package_name)
+        SELECT
+            cve.cve_id,
+            COALESCE(cve_affected.vendor, ''),
+            COALESCE(cve_affected.product, ''),
+            COALESCE(cve_affected.package_name, '')
+        FROM cve_affected
+        INNER JOIN cve ON cve.id = cve_affected.cve_db_id
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn upsert_cve_affected_fts_rows<C>(db: &C, cve_ids: &[String]) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if cve_ids.is_empty() || !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    create_cve_affected_fts(db).await?;
+    let cve_ids = cve_ids
+        .iter()
+        .map(|cve_id| sql_string_literal(cve_id))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute_unprepared(&format!(
+        "DELETE FROM cve_affected_fts WHERE cve_id IN ({cve_ids})"
+    ))
+    .await?;
+    db.execute_unprepared(&format!(
+        r#"
+        INSERT INTO cve_affected_fts (cve_id, vendor, product, package_name)
+        SELECT
+            cve.cve_id,
+            COALESCE(cve_affected.vendor, ''),
+            COALESCE(cve_affected.product, ''),
+            COALESCE(cve_affected.package_name, '')
+        FROM cve_affected
+        INNER JOIN cve ON cve.id = cve_affected.cve_db_id
+        WHERE cve.cve_id IN ({cve_ids})
         "#
     ))
     .await?;
@@ -3571,6 +3751,53 @@ fn fts_count_sql(state_scope: CveStateScope) -> &'static str {
     }
 }
 
+fn affected_fts_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        SELECT DISTINCT
+            cve.cve_id,
+            cve.state,
+            cve.published_at,
+            cve.updated_at,
+            cve.title,
+            cve.description_en
+        FROM cve_affected_fts
+        INNER JOIN cve ON cve.cve_id = cve_affected_fts.cve_id
+        WHERE cve_affected_fts MATCH ?
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    } else {
+        r#"
+        SELECT DISTINCT
+            cve.cve_id,
+            cve.state,
+            cve.published_at,
+            cve.updated_at,
+            cve.title,
+            cve.description_en
+        FROM cve_affected_fts
+        INNER JOIN cve ON cve.cve_id = cve_affected_fts.cve_id
+        WHERE cve_affected_fts MATCH ? AND cve.state = 0
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    }
+}
+
+fn affected_fts_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        "SELECT COUNT(DISTINCT cve_id) AS count FROM cve_affected_fts WHERE cve_affected_fts MATCH ?"
+    } else {
+        r#"
+        SELECT COUNT(DISTINCT cve_affected_fts.cve_id) AS count
+        FROM cve_affected_fts
+        INNER JOIN cve ON cve.cve_id = cve_affected_fts.cve_id
+        WHERE cve_affected_fts MATCH ? AND cve.state = 0
+        "#
+    }
+}
+
 fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) -> String {
     let where_clause = advanced_where_clause(options);
     let order_by = match options.sort_order {
@@ -3861,6 +4088,34 @@ fn fts_query(query: &str) -> Option<String> {
         .split(|ch: char| !ch.is_alphanumeric())
         .filter(|token| token.len() >= 2)
         .map(|token| format!("{}*", fts_token(token)))
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        None
+    } else {
+        Some(tokens.join(" AND "))
+    }
+}
+
+fn affected_fts_query(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
+    let mut clauses = Vec::new();
+    if let Some(vendor) = vendor.and_then(|value| fts_column_query("vendor", value)) {
+        clauses.push(vendor);
+    }
+    if let Some(product) = product.and_then(|value| fts_column_query("product", value)) {
+        clauses.push(product);
+    }
+    if clauses.is_empty() {
+        None
+    } else {
+        Some(clauses.join(" AND "))
+    }
+}
+
+fn fts_column_query(column: &str, value: &str) -> Option<String> {
+    let tokens = value
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() >= 2)
+        .map(|token| format!("{column}:{}*", fts_token(token)))
         .collect::<Vec<_>>();
     if tokens.is_empty() {
         None
