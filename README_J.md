@@ -2,11 +2,13 @@
     <img src="./design/logo.svg" width="12%" height="12%">
 </div>
 
-# qanvuli
+# qanvuli (寒鰤)
 
-qanvuli is a local CVE database maintenance and search tool.
+qanvuli はローカルに構築した CVE データベースを検索するライブラリーおよびツールソフトウェアです。
 
 It imports CVE JSON archives into a local SQLite database, applies delta updates, searches CVE records from the command line, opens an interactive TUI, and can run as an MCP server over stdio.
+
+
 
 ## Features
 
