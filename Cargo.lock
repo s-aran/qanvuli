@@ -2510,7 +2510,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qanvuli-app"
+name = "qanvuli"
 version = "0.1.0"
 dependencies = [
  "clap",

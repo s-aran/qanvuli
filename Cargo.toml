@@ -2,11 +2,27 @@
 edition = "2024"
 version = "0.1.0"
 
+[package]
+name = "qanvuli"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "qanvuli"
+path = "app/src/main.rs"
+
+[dependencies]
+qanvuli-app-commands = { version = "*", path = "app/crates/commands" }
+qanvuli-app-mcp = { version = "*", path = "app/crates/mcp" }
+qanvuli-app-tui = { version = "*", path = "app/crates/tui" }
+qanvuli-utils = { version = "*", path = "utils" }
+clap = { version = "4.6", features = ["derive"] }
+tokio = { version = "1.52", features = ["io-std", "macros", "rt", "sync"] }
+
 
 [workspace]
-default-members = ["app"]
+default-members = ["."]
 members = [
-    "app",
     "app/crates/commands",
     "app/crates/mcp",
     "app/crates/tui",
