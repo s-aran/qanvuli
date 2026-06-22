@@ -44,7 +44,7 @@ fn run() -> Result<(), String> {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "qanvuli-app",
+    name = "qanvuli",
     version,
     about = "CVE DB maintenance and search tool",
     disable_help_subcommand = true

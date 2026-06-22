@@ -1,9 +1,5 @@
 use super::CveSearchServer;
-use crate::{
-    args::*,
-    common::params::*,
-    db, response,
-};
+use crate::{args::*, common::params::*, db, response};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,

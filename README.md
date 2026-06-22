@@ -35,19 +35,28 @@ You can override it with `--db-url` or `QANVULI_DB_URL`.
 ## Build
 
 ```bash
-cargo build --manifest-path app/Cargo.toml --release
+cargo build --release
 ```
 
 The CLI binary is:
 
 ```bash
-./target/release/qanvuli-app
+./target/release/qanvuli
+```
+
+## Install
+
+From the repository root:
+
+```bash
+cargo install --path . --locked
+qanvuli --help
 ```
 
 For development, commands can be run directly through Cargo:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- --help
+cargo run -- --help
 ```
 
 ## Quick Start
@@ -55,34 +64,34 @@ cargo run --manifest-path app/Cargo.toml -- --help
 Initialize the database:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- init
+cargo run -- init
 ```
 
 Apply later delta updates:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- update
+cargo run -- update
 ```
 
 Open the TUI:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- tui
+cargo run -- tui
 ```
 
 Search from the CLI:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- search --text openssl --limit 20
-cargo run --manifest-path app/Cargo.toml -- search --cwe CWE-79
-cargo run --manifest-path app/Cargo.toml -- search --vendor microsoft --product windows
-cargo run --manifest-path app/Cargo.toml -- search --min-score 9.0 --severity CRITICAL
+cargo run -- search --text openssl --limit 20
+cargo run -- search --cwe CWE-79
+cargo run -- search --vendor microsoft --product windows
+cargo run -- search --min-score 9.0 --severity CRITICAL
 ```
 
 Fetch one raw CVE JSON record:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- search --cve CVE-2024-12345
+cargo run -- search --cve CVE-2024-12345
 ```
 
 ## Database Commands
@@ -90,24 +99,24 @@ cargo run --manifest-path app/Cargo.toml -- search --cve CVE-2024-12345
 Create or rebuild the database schema and import CVE data:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- init
-cargo run --manifest-path app/Cargo.toml -- init --schema-only
-cargo run --manifest-path app/Cargo.toml -- init --rebuild
-cargo run --manifest-path app/Cargo.toml -- init --zip ./path/to/cve.zip
+cargo run -- init
+cargo run -- init --schema-only
+cargo run -- init --rebuild
+cargo run -- init --zip ./path/to/cve.zip
 ```
 
 Apply updates:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- update
-cargo run --manifest-path app/Cargo.toml -- update --zip ./path/to/delta.zip
+cargo run -- update
+cargo run -- update --zip ./path/to/delta.zip
 ```
 
 Download a CVE archive without modifying the database:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- download-cve --kind delta --output-dir ./data
-cargo run --manifest-path app/Cargo.toml -- download-cve --kind all --output-dir ./data
+cargo run -- download-cve --kind delta --output-dir ./data
+cargo run -- download-cve --kind all --output-dir ./data
 ```
 
 ## TUI
@@ -115,7 +124,7 @@ cargo run --manifest-path app/Cargo.toml -- download-cve --kind all --output-dir
 Start the terminal UI with an optional initial query:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- tui openssl
+cargo run -- tui openssl
 ```
 
 Common keys:
@@ -137,7 +146,7 @@ Common keys:
 Run the MCP server over stdio:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- mcp
+cargo run -- mcp
 ```
 
 The MCP server exposes tools for:
@@ -157,8 +166,8 @@ Use `--db-url` or `QANVULI_DB_URL` to point the MCP server at the same database 
 Search CVEs for packages in a GitHub SBOM JSON file:
 
 ```bash
-cargo run --manifest-path app/Cargo.toml -- sbom ./sbom.json
-cargo run --manifest-path app/Cargo.toml -- sbom --file ./sbom.json --per-package-limit 5
+cargo run -- sbom ./sbom.json
+cargo run -- sbom --file ./sbom.json --per-package-limit 5
 ```
 
 ## Workspace Layout
@@ -177,24 +186,24 @@ cargo run --manifest-path app/Cargo.toml -- sbom --file ./sbom.json --per-packag
 Format the workspace:
 
 ```bash
-cargo fmt --manifest-path app/Cargo.toml
+cargo fmt
 ```
 
 Check the main app:
 
 ```bash
-cargo check --manifest-path app/Cargo.toml
+cargo check
 ```
 
 Run focused crate checks:
 
 ```bash
-cargo check --manifest-path app/Cargo.toml -p qanvuli-app-tui
-cargo check --manifest-path app/Cargo.toml -p qanvuli-app-mcp
+cargo check -p qanvuli-app-tui
+cargo check -p qanvuli-app-mcp
 ```
 
 Run tests:
 
 ```bash
-cargo test --manifest-path app/Cargo.toml
+cargo test
 ```
