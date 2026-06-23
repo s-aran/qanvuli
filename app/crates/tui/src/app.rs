@@ -21,6 +21,9 @@ use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 const MIN_PAGE_SIZE: usize = 1;
 pub(super) const CWE_STATUS_COUNT: usize = 6;
+const CWE_STATUS_CONTROL_COUNT: usize = CWE_STATUS_COUNT + 2;
+const CWE_STATUS_SELECT_ALL_CURSOR: usize = CWE_STATUS_COUNT;
+const CWE_STATUS_CLEAR_ALL_CURSOR: usize = CWE_STATUS_COUNT + 1;
 pub(super) const CWE_STATUSES: [CweStatus; CWE_STATUS_COUNT] = [
     CweStatus::Stable,
     CweStatus::Usable,
@@ -666,20 +669,27 @@ impl App {
     }
 
     pub(super) fn next_cwe_status(&mut self) {
-        self.cwe_status_cursor = (self.cwe_status_cursor + 1) % CWE_STATUS_COUNT;
+        self.cwe_status_cursor = (self.cwe_status_cursor + 1) % CWE_STATUS_CONTROL_COUNT;
     }
 
     pub(super) fn previous_cwe_status(&mut self) {
         self.cwe_status_cursor = if self.cwe_status_cursor == 0 {
-            CWE_STATUS_COUNT - 1
+            CWE_STATUS_CONTROL_COUNT - 1
         } else {
             self.cwe_status_cursor - 1
         };
     }
 
     pub(super) fn toggle_current_cwe_status(&mut self, db: Option<CveDatabase>) {
-        self.cwe_status_filter[self.cwe_status_cursor] =
-            !self.cwe_status_filter[self.cwe_status_cursor];
+        match self.cwe_status_cursor {
+            0..CWE_STATUS_COUNT => {
+                self.cwe_status_filter[self.cwe_status_cursor] =
+                    !self.cwe_status_filter[self.cwe_status_cursor];
+            }
+            CWE_STATUS_SELECT_ALL_CURSOR => self.cwe_status_filter = [true; CWE_STATUS_COUNT],
+            CWE_STATUS_CLEAR_ALL_CURSOR => self.cwe_status_filter = [false; CWE_STATUS_COUNT],
+            _ => {}
+        }
         self.start_cwe_search(db);
     }
 

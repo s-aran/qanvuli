@@ -10,8 +10,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use url::Url;
 
-pub const DEFAULT_DB_CONNECTION_STRING: &str = "sqlite://./db.sqlite?mode=rwc";
 pub const DEFAULT_LIMIT: u64 = 25;
 
 const INGEST_CHUNK_SIZE: usize = 10000;
@@ -79,6 +79,21 @@ pub async fn connect_db(db_url: &str) -> Result<CveDatabase, String> {
         .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))
 }
 
+pub fn default_db_connection_string() -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|err| format!("failed to locate qanvuli executable: {err}"))?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| format!("qanvuli executable has no parent: {}", executable.display()))?;
+    let file_url = Url::from_file_path(directory.join("db.sqlite"))
+        .map_err(|_| "failed to create DB URL beside qanvuli executable".to_owned())?;
+    let path = file_url
+        .as_str()
+        .strip_prefix("file:")
+        .ok_or_else(|| "failed to convert DB file URL to SQLite URL".to_owned())?;
+    Ok(format!("sqlite:{path}?mode=rwc"))
+}
+
 pub fn reset_sqlite_database_files(db_url: &str) -> Result<(), String> {
     let Some(path) = sqlite_file_path(db_url) else {
         return Ok(());
@@ -102,6 +117,12 @@ pub fn reset_sqlite_database_files(db_url: &str) -> Result<(), String> {
 }
 
 fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
+    if let Some(value) = db_url.strip_prefix("sqlite:") {
+        let file_url = Url::parse(&format!("file:{value}")).ok()?;
+        if let Ok(path) = file_url.to_file_path() {
+            return Some(path);
+        }
+    }
     let value = db_url.strip_prefix("sqlite://")?;
     let path = value.split_once('?').map_or(value, |(path, _)| path);
     (!path.is_empty() && path != ":memory:").then(|| PathBuf::from(path))
@@ -968,4 +989,18 @@ fn cve_id_from_value(value: &Value) -> Option<&str> {
         .pointer("/cveMetadata/cveId")
         .and_then(Value::as_str)
         .filter(|cve_id| !cve_id.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_database_is_beside_executable() {
+        let db_url = default_db_connection_string().unwrap();
+        let db_path = sqlite_file_path(&db_url).unwrap();
+        let executable = std::env::current_exe().unwrap();
+
+        assert_eq!(db_path, executable.parent().unwrap().join("db.sqlite"));
+    }
 }

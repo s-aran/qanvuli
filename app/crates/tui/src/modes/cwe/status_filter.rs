@@ -1,6 +1,9 @@
 use crate::{
     app::{App, CWE_STATUSES},
-    common::{centered_rect, components::Checkbox},
+    common::{
+        centered_rect,
+        components::{ActionButton, ButtonRow, Checkbox},
+    },
     traits::component::LineComponent,
 };
 use ratatui::{
@@ -25,7 +28,23 @@ pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         );
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Space toggle  Enter/Esc close"));
+    lines.push(
+        ButtonRow {
+            buttons: vec![
+                ActionButton {
+                    label: "Select All",
+                    active: app.cwe_status_cursor == CWE_STATUSES.len(),
+                },
+                ActionButton {
+                    label: "Clear All",
+                    active: app.cwe_status_cursor == CWE_STATUSES.len() + 1,
+                },
+            ],
+        }
+        .line(),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from("Space toggle/apply  Enter/Esc close"));
     let popup = Paragraph::new(lines)
         .block(
             Block::default()

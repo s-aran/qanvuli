@@ -1,5 +1,5 @@
 use clap::{CommandFactory, Parser, Subcommand};
-use qanvuli_app_commands::common::DEFAULT_DB_CONNECTION_STRING;
+use qanvuli_app_commands::common::default_db_connection_string;
 
 fn main() {
     if let Err(err) = run() {
@@ -12,7 +12,7 @@ fn run() -> Result<(), String> {
     qanvuli_utils::init_tls_provider();
 
     let cli = Cli::parse();
-    let db_url = cli.db_url();
+    let db_url = cli.db_url()?;
     let command = cli.command.unwrap_or(Command::Help);
 
     if matches!(command, Command::Help) {
@@ -57,11 +57,12 @@ struct Cli {
 }
 
 impl Cli {
-    fn db_url(&self) -> String {
+    fn db_url(&self) -> Result<String, String> {
         self.db_url
             .clone()
             .or_else(|| std::env::var("QANVULI_DB_URL").ok())
-            .unwrap_or_else(|| DEFAULT_DB_CONNECTION_STRING.to_owned())
+            .map(Ok)
+            .unwrap_or_else(default_db_connection_string)
     }
 }
 
