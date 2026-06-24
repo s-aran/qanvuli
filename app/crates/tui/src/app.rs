@@ -54,6 +54,7 @@ pub(super) struct App {
     pub(super) cwe_scroll: u16,
     pub(super) cwe_selected: usize,
     pub(super) cwe_detail_scroll: u16,
+    pub(super) cwe_relation_return_id: Option<i32>,
     pub(super) cwe_status_filter: [bool; CWE_STATUS_COUNT],
     pub(super) cwe_status_cursor: usize,
     pub(super) show_cwe_status: bool,
@@ -207,6 +208,7 @@ impl App {
             cwe_scroll: 0,
             cwe_selected: 0,
             cwe_detail_scroll: 0,
+            cwe_relation_return_id: None,
             cwe_status_filter: default_cwe_status_filter(),
             cwe_status_cursor: 0,
             show_cwe_status: false,
@@ -425,6 +427,7 @@ impl App {
                 self.cwe_scroll = 0;
                 self.cwe_selected = 0;
                 self.cwe_detail_scroll = 0;
+                self.cwe_relation_return_id = None;
                 self.clamp_cwe_scroll(self.left_page_size);
             }
             Ok(Err(err)) => {
@@ -433,6 +436,7 @@ impl App {
                 self.cwe_scroll = 0;
                 self.cwe_selected = 0;
                 self.cwe_detail_scroll = 0;
+                self.cwe_relation_return_id = None;
             }
             Err(err) => {
                 self.status_message = Some(format!("failed to join CWE task: {err}"));
@@ -440,6 +444,7 @@ impl App {
                 self.cwe_scroll = 0;
                 self.cwe_selected = 0;
                 self.cwe_detail_scroll = 0;
+                self.cwe_relation_return_id = None;
             }
         }
     }
@@ -941,6 +946,84 @@ impl App {
         self.move_cwe_page(PageDirection::Up, page_size.max(MIN_PAGE_SIZE), page_size);
     }
 
+    pub(super) fn move_cwe_to_parent(&mut self, page_size: usize) {
+        self.cwe_relation_return_id = None;
+        let Some(selected) = self.selected_cwe() else {
+            return;
+        };
+        let Some(parent_id) = selected.parent_id else {
+            self.status_message = Some("selected CWE has no parent".to_owned());
+            return;
+        };
+        let return_id = selected.id;
+        if !self.select_cwe_by_id(parent_id, page_size) {
+            self.status_message = Some(format!("parent CWE-{parent_id} is not in current results"));
+            return;
+        }
+        self.cwe_relation_return_id = Some(return_id);
+    }
+
+    pub(super) fn move_cwe_to_relation_return(&mut self, page_size: usize) {
+        let Some(return_id) = self.cwe_relation_return_id.take() else {
+            self.status_message = Some("no CWE relation return target".to_owned());
+            return;
+        };
+        if !self.select_cwe_by_id(return_id, page_size) {
+            self.status_message = Some(format!(
+                "return target CWE-{return_id} is not in current results"
+            ));
+        }
+    }
+
+    pub(super) fn move_cwe_to_previous_sibling(&mut self, page_size: usize) {
+        let Some(selected) = self.selected_cwe() else {
+            return;
+        };
+        let sibling_id = self
+            .cwe_results
+            .iter()
+            .filter(|cwe| cwe.parent_id == selected.parent_id && cwe.id < selected.id)
+            .map(|cwe| cwe.id)
+            .max();
+        let Some(sibling_id) = sibling_id else {
+            self.status_message =
+                Some("selected CWE has no previous sibling in current results".to_owned());
+            return;
+        };
+        self.cwe_relation_return_id = None;
+        self.select_cwe_by_id(sibling_id, page_size);
+    }
+
+    pub(super) fn move_cwe_to_next_sibling(&mut self, page_size: usize) {
+        let Some(selected) = self.selected_cwe() else {
+            return;
+        };
+        let sibling_id = self
+            .cwe_results
+            .iter()
+            .filter(|cwe| cwe.parent_id == selected.parent_id && cwe.id > selected.id)
+            .map(|cwe| cwe.id)
+            .min();
+        let Some(sibling_id) = sibling_id else {
+            self.status_message =
+                Some("selected CWE has no next sibling in current results".to_owned());
+            return;
+        };
+        self.cwe_relation_return_id = None;
+        self.select_cwe_by_id(sibling_id, page_size);
+    }
+
+    fn select_cwe_by_id(&mut self, id: i32, page_size: usize) -> bool {
+        let Some(index) = self.cwe_results.iter().position(|cwe| cwe.id == id) else {
+            return false;
+        };
+        self.cwe_selected = index;
+        self.scroll_cwe_selection_into_view(page_size);
+        self.cwe_detail_scroll = 0;
+        self.status_message = None;
+        true
+    }
+
     fn move_cwe_page(&mut self, direction: PageDirection, step: usize, page_size: usize) {
         if self.cwe_results.is_empty() {
             self.cwe_selected = 0;
@@ -958,6 +1041,7 @@ impl App {
         };
         self.scroll_cwe_selection_into_view(page_size);
         self.cwe_detail_scroll = 0;
+        self.cwe_relation_return_id = None;
     }
 
     fn scroll_cwe_selection_into_view(&mut self, page_size: usize) {
@@ -1039,6 +1123,7 @@ impl App {
         self.cwe_scroll = 0;
         self.cwe_selected = 0;
         self.cwe_detail_scroll = 0;
+        self.cwe_relation_return_id = None;
         self.cwe_status_filter = default_cwe_status_filter();
         self.cwe_status_cursor = 0;
         self.show_cwe_status = false;
@@ -1131,6 +1216,7 @@ impl App {
             task.abort();
         }
         self.cwe_scroll = 0;
+        self.cwe_relation_return_id = None;
         let Some(db) = db else {
             self.status_message = Some("database is unavailable".to_owned());
             self.cwe_results.clear();

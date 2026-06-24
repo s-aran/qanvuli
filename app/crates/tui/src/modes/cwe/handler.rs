@@ -56,6 +56,10 @@ pub(crate) fn handle_key(
         KeyCode::F(4) => app.open_cwe_status_popup(),
         KeyCode::Backspace => app.backspace_cwe_query(db),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_cwe_focus(),
+        KeyCode::Left => app.move_cwe_to_parent(page_size),
+        KeyCode::Right => app.move_cwe_to_relation_return(page_size),
+        KeyCode::Char('[') => app.move_cwe_to_previous_sibling(page_size),
+        KeyCode::Char(']') => app.move_cwe_to_next_sibling(page_size),
         KeyCode::Char(ch) => app.push_cwe_query(ch, db),
         KeyCode::Down if app.focus == PaneFocus::Right => {
             app.move_cwe_detail_down(detail_line_count, detail_page_size)

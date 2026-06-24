@@ -108,12 +108,23 @@ pub struct CveCweDetail {
     pub description: Option<String>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CweEntry {
     pub id: i32,
     pub description: Option<String>,
     pub status: Option<String>,
     pub parent_id: Option<i32>,
+    pub parent_count: usize,
+    pub sibling_count: usize,
+    pub child_count: usize,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct CweEntryRow {
+    id: i32,
+    description: Option<String>,
+    status: Option<String>,
+    parent_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
@@ -2668,10 +2679,12 @@ impl CveDatabase {
         }
 
         search
-            .into_model::<CweEntry>()
+            .into_model::<CweEntryRow>()
             .all(&self.db)
             .await
-            .map(|entries| cwe_entries_tree_order(entries, limit as usize))
+            .map(|entries| {
+                cwe_entries_tree_order(cwe_entries_with_relation_counts(entries), limit as usize)
+            })
     }
 
     pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, DbErr> {
@@ -3609,6 +3622,33 @@ fn cwe_active_model_id(row: &cwe::ActiveModel) -> Option<i32> {
         sea_orm::ActiveValue::Unchanged(id) => Some(*id),
         sea_orm::ActiveValue::NotSet => None,
     }
+}
+
+fn cwe_entries_with_relation_counts(rows: Vec<CweEntryRow>) -> Vec<CweEntry> {
+    let mut sibling_groups = HashMap::<Option<i32>, usize>::new();
+    let mut child_counts = HashMap::<i32, usize>::new();
+    for row in &rows {
+        *sibling_groups.entry(row.parent_id).or_default() += 1;
+        if let Some(parent_id) = row.parent_id {
+            *child_counts.entry(parent_id).or_default() += 1;
+        }
+    }
+
+    rows.into_iter()
+        .map(|row| CweEntry {
+            id: row.id,
+            description: row.description,
+            status: row.status,
+            parent_id: row.parent_id,
+            parent_count: usize::from(row.parent_id.is_some()),
+            sibling_count: sibling_groups
+                .get(&row.parent_id)
+                .copied()
+                .unwrap_or_default()
+                .saturating_sub(1),
+            child_count: child_counts.get(&row.id).copied().unwrap_or_default(),
+        })
+        .collect()
 }
 
 fn cwe_entries_tree_order(entries: Vec<CweEntry>, limit: usize) -> Vec<CweEntry> {

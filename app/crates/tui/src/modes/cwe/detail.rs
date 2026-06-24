@@ -22,7 +22,7 @@ impl DetailPanel for CweDetailPanel {
     ) {
         let detail = app
             .selected_cwe()
-            .map(|cwe| cwe_detail_lines(cwe, &app.cwe_results, detail_search))
+            .map(|cwe| cwe_detail_lines(cwe, detail_search))
             .unwrap_or_else(|| vec![Line::from("No CWE selected")]);
         let title = app
             .selected_cwe()
@@ -41,26 +41,16 @@ impl DetailPanel for CweDetailPanel {
     }
 }
 
-fn cwe_detail_lines(
-    cwe: &CweEntry,
-    cwes: &[CweEntry],
-    detail_search: &DetailSearch,
-) -> Vec<Line<'static>> {
+fn cwe_detail_lines(cwe: &CweEntry, detail_search: &DetailSearch) -> Vec<Line<'static>> {
     let mut lines = vec![
         highlighted_line(&format!("CWE-{}", cwe.id), detail_search),
         highlighted_line(
             &format!("Status: {}", cwe.status.as_deref().unwrap_or("-")),
             detail_search,
         ),
-        highlighted_line(&format!("Parent: {}", parent_count(cwe)), detail_search),
-        highlighted_line(
-            &format!("Siblings: {}", sibling_count(cwe, cwes)),
-            detail_search,
-        ),
-        highlighted_line(
-            &format!("Children: {}", child_count(cwe, cwes)),
-            detail_search,
-        ),
+        highlighted_line(&format!("Parent: {}", cwe.parent_count), detail_search),
+        highlighted_line(&format!("Siblings: {}", cwe.sibling_count), detail_search),
+        highlighted_line(&format!("Children: {}", cwe.child_count), detail_search),
         Line::from(""),
     ];
     lines.extend(
@@ -71,20 +61,4 @@ fn cwe_detail_lines(
             .map(|line| highlighted_line(line, detail_search)),
     );
     lines
-}
-
-fn parent_count(cwe: &CweEntry) -> usize {
-    usize::from(cwe.parent_id.is_some())
-}
-
-fn sibling_count(cwe: &CweEntry, cwes: &[CweEntry]) -> usize {
-    cwes.iter()
-        .filter(|candidate| candidate.id != cwe.id && candidate.parent_id == cwe.parent_id)
-        .count()
-}
-
-fn child_count(cwe: &CweEntry, cwes: &[CweEntry]) -> usize {
-    cwes.iter()
-        .filter(|candidate| candidate.parent_id == Some(cwe.id))
-        .count()
 }
