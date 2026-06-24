@@ -10,7 +10,9 @@ pub(super) struct AdvancedForm {
     pub(super) published_to: String,
     pub(super) cwe: String,
     pub(super) product: String,
+    pub(super) product_exact: String,
     pub(super) vendor: String,
+    pub(super) vendor_exact: String,
     pub(super) state_scope: CveStateScope,
     pub(super) active_field: AdvancedField,
 }
@@ -22,7 +24,9 @@ pub(super) enum AdvancedField {
     PublishedTo,
     Cwe,
     Product,
+    ProductExact,
     Vendor,
+    VendorExact,
     StateScope,
 }
 
@@ -35,7 +39,9 @@ impl Default for AdvancedForm {
             published_to: String::new(),
             cwe: String::new(),
             product: String::new(),
+            product_exact: String::new(),
             vendor: String::new(),
+            vendor_exact: String::new(),
             state_scope: CveStateScope::PublishedOnly,
             active_field: AdvancedField::Query,
         }
@@ -64,7 +70,9 @@ impl AdvancedForm {
             AdvancedField::PublishedTo => Some(&mut self.published_to),
             AdvancedField::Cwe => Some(&mut self.cwe),
             AdvancedField::Product => Some(&mut self.product),
+            AdvancedField::ProductExact => Some(&mut self.product_exact),
             AdvancedField::Vendor => Some(&mut self.vendor),
+            AdvancedField::VendorExact => Some(&mut self.vendor_exact),
             AdvancedField::StateScope => None,
         }
     }
@@ -97,7 +105,9 @@ impl AdvancedForm {
             published_to: option_string(&self.published_to),
             cwe: option_string(&self.cwe),
             product: option_string(&self.product),
+            product_exact: option_string(&self.product_exact),
             vendor: option_string(&self.vendor),
+            vendor_exact: option_string(&self.vendor_exact),
             state_scope: self.state_scope,
             sort_order,
         }
@@ -119,8 +129,10 @@ impl AdvancedField {
             Self::PublishedFrom => Self::PublishedTo,
             Self::PublishedTo => Self::Cwe,
             Self::Cwe => Self::Product,
-            Self::Product => Self::Vendor,
-            Self::Vendor => Self::StateScope,
+            Self::Product => Self::ProductExact,
+            Self::ProductExact => Self::Vendor,
+            Self::Vendor => Self::VendorExact,
+            Self::VendorExact => Self::StateScope,
             Self::StateScope => Self::Query,
         }
     }
@@ -132,8 +144,10 @@ impl AdvancedField {
             Self::PublishedTo => Self::PublishedFrom,
             Self::Cwe => Self::PublishedTo,
             Self::Product => Self::Cwe,
-            Self::Vendor => Self::Product,
-            Self::StateScope => Self::Vendor,
+            Self::ProductExact => Self::Product,
+            Self::Vendor => Self::ProductExact,
+            Self::VendorExact => Self::Vendor,
+            Self::StateScope => Self::VendorExact,
         }
     }
 }

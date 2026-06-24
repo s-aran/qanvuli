@@ -2,7 +2,11 @@ use qanvuli_app_commands::common::connect_db;
 use qanvuli_db::CveDatabase;
 
 pub(crate) async fn connect(db_url: &str) -> Result<CveDatabase, String> {
-    connect_db(db_url).await
+    let db = connect_db(db_url).await?;
+    db.initialize_schema()
+        .await
+        .map_err(|err| format!("failed to initialize database schema: {err}"))?;
+    Ok(db)
 }
 
 pub(crate) async fn close(db: CveDatabase) -> Result<(), String> {

@@ -27,8 +27,12 @@ pub(crate) enum CweArgValue {
 pub(crate) struct ProductArgs {
     /// Affected vendor substring to search for. Can be combined with product.
     pub(crate) vendor: Option<String>,
+    /// Affected vendor exact value to match. Can be combined with vendor/product filters.
+    pub(crate) vendor_exact: Option<String>,
     /// Affected product substring to search for. Can be combined with vendor.
     pub(crate) product: Option<String>,
+    /// Affected product exact value to match. Can be combined with vendor/product filters.
+    pub(crate) product_exact: Option<String>,
     /// Maximum number of results to return. Clamped to 1..=30; default is 10.
     pub(crate) limit: Option<u64>,
     /// Number of matching results to skip for pagination. Default is 0.
@@ -77,8 +81,12 @@ pub(crate) struct CvssArgs {
 pub(crate) struct ProductCvssArgs {
     /// Affected vendor substring to search for. Can be combined with product.
     pub(crate) vendor: Option<String>,
+    /// Affected vendor exact value to match. Can be combined with vendor/product filters.
+    pub(crate) vendor_exact: Option<String>,
     /// Affected product substring to search for. Can be combined with vendor.
     pub(crate) product: Option<String>,
+    /// Affected product exact value to match. Can be combined with vendor/product filters.
+    pub(crate) product_exact: Option<String>,
     /// Minimum CVSS base score, inclusive.
     pub(crate) min_score: Option<f64>,
     /// CVSS base severity string, such as LOW, MEDIUM, HIGH, or CRITICAL.

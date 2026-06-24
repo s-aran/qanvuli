@@ -212,11 +212,18 @@ async fn run_loop(
 
         if app.show_cwe_status {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.close_cwe_status_popup(),
+                KeyCode::Esc => app.close_cwe_status_popup(),
+                KeyCode::Enter => {
+                    if !app.activate_cwe_status_control(db.as_ref().cloned()) {
+                        app.close_cwe_status_popup();
+                    }
+                }
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Down | KeyCode::Tab => app.next_cwe_status(),
                 KeyCode::Up | KeyCode::BackTab => app.previous_cwe_status(),
                 KeyCode::Char(' ') => app.toggle_current_cwe_status(db.as_ref().cloned()),
+                KeyCode::Char('a') => app.select_all_cwe_statuses(db.as_ref().cloned()),
+                KeyCode::Char('x') => app.clear_all_cwe_statuses(db.as_ref().cloned()),
                 _ => {}
             }
             continue;

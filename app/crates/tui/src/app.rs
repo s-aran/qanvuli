@@ -693,6 +693,30 @@ impl App {
         self.start_cwe_search(db);
     }
 
+    pub(super) fn select_all_cwe_statuses(&mut self, db: Option<CveDatabase>) {
+        self.cwe_status_filter = [true; CWE_STATUS_COUNT];
+        self.start_cwe_search(db);
+    }
+
+    pub(super) fn clear_all_cwe_statuses(&mut self, db: Option<CveDatabase>) {
+        self.cwe_status_filter = [false; CWE_STATUS_COUNT];
+        self.start_cwe_search(db);
+    }
+
+    pub(super) fn activate_cwe_status_control(&mut self, db: Option<CveDatabase>) -> bool {
+        match self.cwe_status_cursor {
+            CWE_STATUS_SELECT_ALL_CURSOR => {
+                self.select_all_cwe_statuses(db);
+                true
+            }
+            CWE_STATUS_CLEAR_ALL_CURSOR => {
+                self.clear_all_cwe_statuses(db);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(super) fn selected_cwe(&self) -> Option<&CweEntry> {
         self.cwe_results.get(self.cwe_selected)
     }
@@ -1052,7 +1076,9 @@ impl App {
             published_to: None,
             cwe: None,
             product: None,
+            product_exact: None,
             vendor: None,
+            vendor_exact: None,
             state_scope: self.state_scope,
             sort_order,
         }

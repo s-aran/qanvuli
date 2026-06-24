@@ -69,7 +69,19 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         ),
         advanced_line(form, AdvancedField::Cwe, "CWE", &form.cwe),
         advanced_line(form, AdvancedField::Product, "Product", &form.product),
+        advanced_line(
+            form,
+            AdvancedField::ProductExact,
+            "Product exact",
+            &form.product_exact,
+        ),
         advanced_line(form, AdvancedField::Vendor, "Vendor", &form.vendor),
+        advanced_line(
+            form,
+            AdvancedField::VendorExact,
+            "Vendor exact",
+            &form.vendor_exact,
+        ),
         advanced_line(
             form,
             AdvancedField::StateScope,

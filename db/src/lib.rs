@@ -11,8 +11,11 @@ use std::collections::{HashMap, HashSet};
 
 use qanvuli_models::{
     CveStatusData, RawCveRecord, RawCveStatusRecord, cna_affected_raw_values, cna_cvss_raw_values,
-    cna_cwe_raw_values, cve::base::cve_metadata::CveState,
-    cve::published::cna_description::CnaDescription, cwe::WeaknessCatalog, parse_value_with_raw,
+    cna_cwe_raw_values,
+    cve::base::cve_metadata::CveState,
+    cve::published::cna_description::CnaDescription,
+    cwe::{WeaknessCatalog, enumeration::RelatedNature},
+    parse_value_with_raw,
 };
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
@@ -110,6 +113,7 @@ pub struct CweEntry {
     pub id: i32,
     pub description: Option<String>,
     pub status: Option<String>,
+    pub parent_id: Option<i32>,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
@@ -176,7 +180,9 @@ pub struct CveAdvancedSearch {
     pub published_to: Option<String>,
     pub cwe: Option<String>,
     pub product: Option<String>,
+    pub product_exact: Option<String>,
     pub vendor: Option<String>,
+    pub vendor_exact: Option<String>,
     pub state_scope: CveStateScope,
     pub sort_order: CveSummarySortOrder,
 }
@@ -688,6 +694,7 @@ impl CveDatabase {
                 id: Set(id),
                 description: Set(description),
                 status: Set(None),
+                parent_id: Set(None),
             }],
         )
         .await?;
@@ -1201,17 +1208,34 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<cve::Model>, DbErr> {
+        self.search_cves_by_vendor_product_exact_with_state_scope(
+            vendor,
+            product,
+            None,
+            None,
+            state_scope,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cves_by_vendor_product_exact_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<cve::Model>, DbErr> {
         let mut query = cve::Entity::find().inner_join(cve_affected::Entity);
 
         if !state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
         }
-        if let Some(vendor) = vendor {
-            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-        }
-        if let Some(product) = product {
-            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-        }
+        query = apply_affected_filters(query, vendor, product, vendor_exact, product_exact);
 
         query
             .distinct()
@@ -1248,7 +1272,59 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_vendor_product_exact_with_state_scope(
+            vendor,
+            product,
+            None,
+            None,
+            state_scope,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_vendor_product_exact_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_vendor_product_exact_date_with_state_scope(
+            vendor,
+            product,
+            vendor_exact,
+            product_exact,
+            None,
+            None,
+            state_scope,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_vendor_product_exact_date_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && vendor_exact.is_none()
+            && product_exact.is_none()
+            && published_since.is_none()
+            && updated_since.is_none()
             && let Some(query) = affected_fts_query(vendor, product)
         {
             self.ensure_cve_affected_fts().await?;
@@ -1273,11 +1349,12 @@ impl CveDatabase {
         if !state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
         }
-        if let Some(vendor) = vendor {
-            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+        query = apply_affected_filters(query, vendor, product, vendor_exact, product_exact);
+        if let Some(published_since) = published_since {
+            query = query.filter(cve::Column::PublishedAt.gte(published_since));
         }
-        if let Some(product) = product {
-            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+        if let Some(updated_since) = updated_since {
+            query = query.filter(cve::Column::UpdatedAt.gte(updated_since));
         }
 
         query
@@ -1310,7 +1387,27 @@ impl CveDatabase {
         product: Option<&str>,
         state_scope: CveStateScope,
     ) -> Result<u64, DbErr> {
+        self.count_cve_summaries_by_vendor_product_exact_with_state_scope(
+            vendor,
+            product,
+            None,
+            None,
+            state_scope,
+        )
+        .await
+    }
+
+    pub async fn count_cve_summaries_by_vendor_product_exact_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && vendor_exact.is_none()
+            && product_exact.is_none()
             && let Some(query) = affected_fts_query(vendor, product)
         {
             self.ensure_cve_affected_fts().await?;
@@ -1327,12 +1424,7 @@ impl CveDatabase {
         if !state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
         }
-        if let Some(vendor) = vendor {
-            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-        }
-        if let Some(product) = product {
-            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-        }
+        query = apply_affected_filters(query, vendor, product, vendor_exact, product_exact);
 
         query.distinct().count(&self.db).await
     }
@@ -1368,6 +1460,32 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_affected_component_exact_with_state_scope(
+            vendor,
+            component,
+            None,
+            None,
+            published_since,
+            updated_since,
+            state_scope,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_affected_component_exact_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        component: &str,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        published_since: Option<&str>,
+        updated_since: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let pattern = like_pattern(component);
         let mut query = cve::Entity::find()
             .select_only()
@@ -1382,9 +1500,7 @@ impl CveDatabase {
         if !state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
         }
-        if let Some(vendor) = vendor {
-            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-        }
+        query = apply_affected_filters(query, vendor, None, vendor_exact, product_exact);
         if let Some(published_since) = published_since {
             query = query.filter(cve::Column::PublishedAt.gte(published_since));
         }
@@ -2152,6 +2268,36 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        self.search_cve_summaries_by_product_cvss_exact_with_state_scope(
+            vendor,
+            product,
+            None,
+            None,
+            min_score,
+            None,
+            severity,
+            None,
+            state_scope,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_cve_summaries_by_product_cvss_exact_with_state_scope(
+        &self,
+        vendor: Option<&str>,
+        product: Option<&str>,
+        vendor_exact: Option<&str>,
+        product_exact: Option<&str>,
+        min_score: Option<f64>,
+        max_score: Option<f64>,
+        severity: Option<&str>,
+        version: Option<&str>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
         let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
@@ -2161,17 +2307,18 @@ impl CveDatabase {
         if !state_scope.includes_rejected() {
             query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
         }
-        if let Some(vendor) = vendor {
-            query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-        }
-        if let Some(product) = product {
-            query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-        }
+        query = apply_affected_filters(query, vendor, product, vendor_exact, product_exact);
         if let Some(min_score) = min_score {
             query = query.filter(cve_cvss::Column::BaseScore.gte(min_score));
         }
+        if let Some(max_score) = max_score {
+            query = query.filter(cve_cvss::Column::BaseScore.lte(max_score));
+        }
         if let Some(severity) = severity {
             query = query.filter(cve_cvss::Column::BaseSeverity.eq(severity.to_ascii_uppercase()));
+        }
+        if let Some(version) = version {
+            query = query.filter(cve_cvss::Column::Version.eq(version));
         }
 
         query
@@ -2292,14 +2439,17 @@ impl CveDatabase {
         }
         if option_text(options.vendor.as_deref()).is_some()
             || option_text(options.product.as_deref()).is_some()
+            || option_text(options.vendor_exact.as_deref()).is_some()
+            || option_text(options.product_exact.as_deref()).is_some()
         {
             query = query.inner_join(cve_affected::Entity);
-            if let Some(vendor) = option_text(options.vendor.as_deref()) {
-                query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-            }
-            if let Some(product) = option_text(options.product.as_deref()) {
-                query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-            }
+            query = apply_affected_filters(
+                query,
+                option_text(options.vendor.as_deref()),
+                option_text(options.product.as_deref()),
+                option_text(options.vendor_exact.as_deref()),
+                option_text(options.product_exact.as_deref()),
+            );
         }
 
         let query = match options.sort_order {
@@ -2376,14 +2526,17 @@ impl CveDatabase {
         }
         if option_text(options.vendor.as_deref()).is_some()
             || option_text(options.product.as_deref()).is_some()
+            || option_text(options.vendor_exact.as_deref()).is_some()
+            || option_text(options.product_exact.as_deref()).is_some()
         {
             query = query.inner_join(cve_affected::Entity);
-            if let Some(vendor) = option_text(options.vendor.as_deref()) {
-                query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
-            }
-            if let Some(product) = option_text(options.product.as_deref()) {
-                query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
-            }
+            query = apply_affected_filters(
+                query,
+                option_text(options.vendor.as_deref()),
+                option_text(options.product.as_deref()),
+                option_text(options.vendor_exact.as_deref()),
+                option_text(options.product_exact.as_deref()),
+            );
         }
 
         query.distinct().count(&self.db).await
@@ -2493,14 +2646,16 @@ impl CveDatabase {
                 cwe::Column::Id,
                 cwe::Column::Description,
                 cwe::Column::Status,
+                cwe::Column::ParentId,
             ])
-            .limit(limit)
             .order_by_asc(cwe::Column::Id);
 
         if statuses.is_empty() {
             return Ok(Vec::new());
         }
-        search = search.filter(cwe::Column::Status.is_in(statuses.iter().cloned()));
+        if statuses.len() < 6 {
+            search = search.filter(cwe::Column::Status.is_in(statuses.iter().cloned()));
+        }
 
         if !query.is_empty() {
             let id = cwe_number(query);
@@ -2512,7 +2667,11 @@ impl CveDatabase {
             search = search.filter(condition);
         }
 
-        search.into_model::<CweEntry>().all(&self.db).await
+        search
+            .into_model::<CweEntry>()
+            .all(&self.db)
+            .await
+            .map(|entries| cwe_entries_tree_order(entries, limit as usize))
     }
 
     pub async fn get_metadata(&self, key: &str) -> Result<Option<String>, DbErr> {
@@ -2671,7 +2830,20 @@ where
             db.execute_unprepared("ALTER TABLE cwe ADD COLUMN status TEXT")
                 .await?;
         }
+        let has_parent_id = db
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT 1 FROM pragma_table_info('cwe') WHERE name = 'parent_id'".to_owned(),
+            ))
+            .await?
+            .is_some();
+        if !has_parent_id {
+            db.execute_unprepared("ALTER TABLE cwe ADD COLUMN parent_id INTEGER")
+                .await?;
+        }
         db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cwe_status ON cwe (status)")
+            .await?;
+        db.execute_unprepared("CREATE INDEX IF NOT EXISTS idx_cwe_parent_id ON cwe (parent_id)")
             .await?;
     }
     Ok(())
@@ -3014,6 +3186,7 @@ async fn upsert_cwe_catalog_on(
                 weakness.id,
                 weakness.description.clone(),
                 Some(&weakness.status),
+                cwe_parent_id(&weakness.related_weaknesses)?,
             )?);
         }
     }
@@ -3024,6 +3197,7 @@ async fn upsert_cwe_catalog_on(
                 category.id,
                 category.name.clone(),
                 Some(&category.status),
+                None,
             )?);
         }
     }
@@ -3034,6 +3208,7 @@ async fn upsert_cwe_catalog_on(
                 view.id,
                 view.name.clone(),
                 Some(&view.status),
+                None,
             )?);
         }
     }
@@ -3051,13 +3226,36 @@ fn cwe_catalog_row(
     id: i64,
     description: String,
     status: Option<&qanvuli_models::cwe::enumeration::Status>,
+    parent_id: Option<i32>,
 ) -> Result<cwe::ActiveModel, DbErr> {
     Ok(cwe::ActiveModel {
         id: Set(i32::try_from(id)
             .map_err(|err| DbErr::Custom(format!("CWE ID {id} does not fit in i32: {err}")))?),
         description: Set(Some(description)),
         status: Set(status.map(|status| status.as_ref().to_owned())),
+        parent_id: Set(parent_id),
     })
+}
+
+fn cwe_parent_id(
+    related_weaknesses: &Option<qanvuli_models::cwe::common::RelatedWeaknesses>,
+) -> Result<Option<i32>, DbErr> {
+    let Some(related_weaknesses) = related_weaknesses else {
+        return Ok(None);
+    };
+    related_weaknesses
+        .related_weakness
+        .iter()
+        .find(|related| matches!(related.nature, RelatedNature::ChildOf))
+        .map(|related| {
+            i32::try_from(related.cwe_id).map_err(|err| {
+                DbErr::Custom(format!(
+                    "parent CWE ID {} does not fit in i32: {err}",
+                    related.cwe_id
+                ))
+            })
+        })
+        .transpose()
 }
 
 async fn insert_cwe_rows(
@@ -3401,6 +3599,7 @@ fn cwe_upsert_conflict() -> OnConflict {
     OnConflict::column(cwe::Column::Id)
         .update_column(cwe::Column::Description)
         .update_column(cwe::Column::Status)
+        .update_column(cwe::Column::ParentId)
         .to_owned()
 }
 
@@ -3409,6 +3608,70 @@ fn cwe_active_model_id(row: &cwe::ActiveModel) -> Option<i32> {
         sea_orm::ActiveValue::Set(id) => Some(*id),
         sea_orm::ActiveValue::Unchanged(id) => Some(*id),
         sea_orm::ActiveValue::NotSet => None,
+    }
+}
+
+fn cwe_entries_tree_order(entries: Vec<CweEntry>, limit: usize) -> Vec<CweEntry> {
+    let ids = entries.iter().map(|entry| entry.id).collect::<HashSet<_>>();
+    let mut children = HashMap::<i32, Vec<i32>>::new();
+    for entry in &entries {
+        if let Some(parent_id) = entry.parent_id
+            && ids.contains(&parent_id)
+        {
+            children.entry(parent_id).or_default().push(entry.id);
+        }
+    }
+    for child_ids in children.values_mut() {
+        child_ids.sort_unstable();
+    }
+
+    let by_id = entries
+        .into_iter()
+        .map(|entry| (entry.id, entry))
+        .collect::<HashMap<_, _>>();
+    let mut roots = by_id
+        .values()
+        .filter(|entry| {
+            entry
+                .parent_id
+                .is_none_or(|parent_id| !by_id.contains_key(&parent_id))
+        })
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    roots.sort_unstable();
+
+    let mut ordered_ids = Vec::with_capacity(by_id.len());
+    let mut seen = HashSet::new();
+    for root_id in roots {
+        push_cwe_entry_tree_id(root_id, &children, &mut seen, &mut ordered_ids);
+    }
+    let mut remaining = by_id.keys().copied().collect::<Vec<_>>();
+    remaining.sort_unstable();
+    for id in remaining {
+        push_cwe_entry_tree_id(id, &children, &mut seen, &mut ordered_ids);
+    }
+
+    ordered_ids
+        .into_iter()
+        .take(limit)
+        .filter_map(|id| by_id.get(&id).cloned())
+        .collect()
+}
+
+fn push_cwe_entry_tree_id(
+    id: i32,
+    children: &HashMap<i32, Vec<i32>>,
+    seen: &mut HashSet<i32>,
+    ordered_ids: &mut Vec<i32>,
+) {
+    if !seen.insert(id) {
+        return;
+    }
+    ordered_ids.push(id);
+    if let Some(child_ids) = children.get(&id) {
+        for child_id in child_ids {
+            push_cwe_entry_tree_id(*child_id, children, seen, ordered_ids);
+        }
     }
 }
 
@@ -3895,6 +4158,28 @@ fn advanced_count_sql(options: &CveAdvancedSearch) -> String {
     )
 }
 
+fn apply_affected_filters(
+    mut query: sea_orm::Select<cve::Entity>,
+    vendor: Option<&str>,
+    product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
+) -> sea_orm::Select<cve::Entity> {
+    if let Some(vendor) = option_text(vendor) {
+        query = query.filter(cve_affected::Column::Vendor.like(like_pattern(vendor)));
+    }
+    if let Some(product) = option_text(product) {
+        query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
+    }
+    if let Some(vendor_exact) = option_text(vendor_exact) {
+        query = query.filter(cve_affected::Column::Vendor.eq(vendor_exact.to_owned()));
+    }
+    if let Some(product_exact) = option_text(product_exact) {
+        query = query.filter(cve_affected::Column::Product.eq(product_exact.to_owned()));
+    }
+    query
+}
+
 fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     let mut conditions = Vec::new();
 
@@ -3933,6 +4218,18 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
         conditions.push(format!(
             "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
             sql_string_literal(&like_pattern(product))
+        ));
+    }
+    if let Some(vendor_exact) = option_text(options.vendor_exact.as_deref()) {
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor = {})",
+            sql_string_literal(vendor_exact)
+        ));
+    }
+    if let Some(product_exact) = option_text(options.product_exact.as_deref()) {
+        conditions.push(format!(
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product = {})",
+            sql_string_literal(product_exact)
         ));
     }
 
@@ -4602,6 +4899,35 @@ mod tests {
                     .unwrap();
             assert_eq!(by_product.len(), 1);
 
+            let cve_db = CveDatabase { db: db.clone() };
+            let by_exact_product = cve_db
+                .search_cve_summaries_by_vendor_product_exact_with_state_scope(
+                    None,
+                    None,
+                    None,
+                    Some("Example Product"),
+                    CveStateScope::PublishedOnly,
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert_eq!(by_exact_product.len(), 1);
+
+            let by_partial_as_exact = cve_db
+                .search_cve_summaries_by_vendor_product_exact_with_state_scope(
+                    None,
+                    None,
+                    None,
+                    Some("Product"),
+                    CveStateScope::PublishedOnly,
+                    10,
+                    0,
+                )
+                .await
+                .unwrap();
+            assert!(by_partial_as_exact.is_empty());
+
             replace_cve_children(
                 &db,
                 "CVE-2024-0001",
@@ -4625,6 +4951,7 @@ mod tests {
             id: Set(79),
             description: Set(Some("Cross-site Scripting".to_owned())),
             status: Set(Some("Stable".to_owned())),
+            parent_id: Set(None),
         })
         .exec(db)
         .await

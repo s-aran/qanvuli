@@ -33,7 +33,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by affected vendor and/or product name. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by affected vendor and/or product name. vendor/product are substring filters; vendor_exact/product_exact require exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     pub(crate) async fn search_by_product(
         &self,
@@ -44,6 +44,8 @@ impl CveSearchServer {
             db,
             args.vendor.as_deref(),
             args.product.as_deref(),
+            args.vendor_exact.as_deref(),
+            args.product_exact.as_deref(),
             state_scope(args.include_rejected),
             limit(args.limit),
             offset(args.offset),
@@ -94,7 +96,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search high-risk CVEs for a specific affected vendor/product. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search high-risk CVEs for a specific affected vendor/product. vendor/product are substring filters; vendor_exact/product_exact require exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     pub(crate) async fn search_product_by_cvss(
         &self,
@@ -105,6 +107,8 @@ impl CveSearchServer {
             db,
             args.vendor.as_deref(),
             args.product.as_deref(),
+            args.vendor_exact.as_deref(),
+            args.product_exact.as_deref(),
             args.min_score,
             args.severity.as_deref(),
             state_scope(args.include_rejected),

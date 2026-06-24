@@ -63,13 +63,17 @@ pub(crate) async fn search_by_product(
     db: &CveDatabase,
     vendor: Option<&str>,
     product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
     state_scope: CveStateScope,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<CveSummary>, McpError> {
-    db.search_cve_summaries_by_vendor_product_with_state_scope(
+    db.search_cve_summaries_by_vendor_product_exact_with_state_scope(
         vendor,
         product,
+        vendor_exact,
+        product_exact,
         state_scope,
         limit,
         offset,
@@ -117,17 +121,23 @@ pub(crate) async fn search_product_by_cvss(
     db: &CveDatabase,
     vendor: Option<&str>,
     product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
     min_score: Option<f64>,
     severity: Option<&str>,
     state_scope: CveStateScope,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<CveSummary>, McpError> {
-    db.search_cve_summaries_by_product_cvss_with_state_scope(
+    db.search_cve_summaries_by_product_cvss_exact_with_state_scope(
         vendor,
         product,
+        vendor_exact,
+        product_exact,
         min_score,
+        None,
         severity,
+        None,
         state_scope,
         limit,
         offset,

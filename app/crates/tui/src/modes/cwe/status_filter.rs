@@ -44,7 +44,9 @@ pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
         .line(),
     );
     lines.push(Line::from(""));
-    lines.push(Line::from("Space toggle/apply  Enter/Esc close"));
+    lines.push(Line::from(
+        "Space toggle/apply  Enter apply/close  A all  X clear",
+    ));
     let popup = Paragraph::new(lines)
         .block(
             Block::default()

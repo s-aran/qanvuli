@@ -75,9 +75,12 @@ fn cwe_detail_line_count(cwe: &CweEntry, width: usize) -> usize {
 
 fn cwe_detail_text(cwe: &CweEntry) -> String {
     format!(
-        "CWE-{}\nStatus: {}\n\n{}",
+        "CWE-{}\nStatus: {}\nParent: {}\n\n{}",
         cwe.id,
         cwe.status.as_deref().unwrap_or("-"),
+        cwe.parent_id
+            .map(|parent_id| format!("CWE-{parent_id}"))
+            .unwrap_or_else(|| "-".to_owned()),
         cwe.description.as_deref().unwrap_or("")
     )
 }
