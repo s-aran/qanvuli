@@ -33,9 +33,7 @@ impl CweCatalogFile {
         last_modified: Option<&str>,
     ) -> Result<CweCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
-        let mut request = client
-            .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli");
+        let mut request = client.get(&self.url);
         if let Some(etag) = etag {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -75,7 +73,6 @@ impl CweCatalogFile {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut response = reqwest::Client::new()
             .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli")
             .send()
             .await?
             .error_for_status()?;
