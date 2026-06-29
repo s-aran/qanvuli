@@ -1,6 +1,6 @@
 use crate::common::error::mcp_error;
 use qanvuli_db::{
-    CveAffectedDetail, CveCvssDetail, CveCweDetail, CveSummary, CveSummaryWithDetail,
+    CveAffectedDetail, CveCvssDetail, CveCweDetail, CveReference, CveSummary, CveSummaryWithDetail,
     cve_state_label,
 };
 use qanvuli_models::RawCveStatusRecord;
@@ -96,4 +96,102 @@ pub(crate) fn full_cve(cve: RawCveStatusRecord) -> Value {
         .1
         .try_into()
         .unwrap_or_else(|_| Value::Static(simd_json::StaticNode::Null))
+}
+
+pub(crate) fn explain_match(
+    query: Option<&str>,
+    cve: Option<CveSummaryWithDetail>,
+    references: Vec<CveReference>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    let Some(cve) = cve else {
+        return tool_result(json!(null));
+    };
+    let query = query.unwrap_or_default().trim().to_ascii_lowercase();
+    let evidence = if query.is_empty() {
+        Vec::new()
+    } else {
+        match_evidence(&query, &cve, &references)
+    };
+    tool_result(json!({
+        "cve": summary_with_detail(cve),
+        "query": if query.is_empty() { None } else { Some(query) },
+        "matched_fields": evidence,
+        "references": references,
+    }))
+}
+
+pub(crate) fn known_exploited_unavailable(
+    cve_id: Option<&str>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    tool_result(json!({
+        "available": false,
+        "cve_id": cve_id,
+        "reason": "known exploited vulnerability data is not configured; qanvuli does not import CISA KEV yet",
+        "next_step": "import a KEV provider before using this as an exploit-prioritization signal",
+    }))
+}
+
+fn match_evidence(
+    query: &str,
+    cve: &CveSummaryWithDetail,
+    references: &[CveReference],
+) -> Vec<Value> {
+    let mut evidence = Vec::new();
+    push_text_match(&mut evidence, "cve_id", &cve.summary.cve_id, query);
+    push_text_match(&mut evidence, "title", &cve.summary.title, query);
+    if let Some(description) = &cve.summary.description_en {
+        push_text_match(&mut evidence, "description", description, query);
+    }
+    for cwe in &cve.detail.cwes {
+        push_text_match(&mut evidence, "cwe_id", &format!("CWE-{}", cwe.id), query);
+        if let Some(description) = &cwe.description {
+            push_text_match(&mut evidence, "cwe_description", description, query);
+        }
+    }
+    for cvss in &cve.detail.cvss {
+        push_text_match(&mut evidence, "cvss_version", &cvss.version, query);
+        if let Some(severity) = &cvss.base_severity {
+            push_text_match(&mut evidence, "cvss_severity", severity, query);
+        }
+        if let Some(vector) = &cvss.vector_string {
+            push_text_match(&mut evidence, "cvss_vector", vector, query);
+        }
+    }
+    for affected in &cve.detail.affected {
+        if let Some(vendor) = &affected.vendor {
+            push_text_match(&mut evidence, "affected_vendor", vendor, query);
+        }
+        if let Some(product) = &affected.product {
+            push_text_match(&mut evidence, "affected_product", product, query);
+        }
+        if let Some(package_name) = &affected.package_name {
+            push_text_match(&mut evidence, "affected_package", package_name, query);
+        }
+        for version in &affected.versions {
+            if let Some(value) = &version.version {
+                push_text_match(&mut evidence, "affected_version", value, query);
+            }
+        }
+    }
+    for reference in references {
+        if let Some(url) = &reference.url {
+            push_text_match(&mut evidence, "reference_url", url, query);
+        }
+        if let Some(name) = &reference.name {
+            push_text_match(&mut evidence, "reference_name", name, query);
+        }
+        for tag in &reference.tags {
+            push_text_match(&mut evidence, "reference_tag", tag, query);
+        }
+    }
+    evidence
+}
+
+fn push_text_match(evidence: &mut Vec<Value>, field: &str, value: &str, query: &str) {
+    if value.to_ascii_lowercase().contains(query) {
+        evidence.push(json!({
+            "field": field,
+            "value": value,
+        }));
+    }
 }

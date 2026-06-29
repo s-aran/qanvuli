@@ -36,15 +36,21 @@ impl DbProvider {
     }
 }
 
-pub(crate) async fn search_result(
+pub(crate) async fn paged_search_result(
     db: &CveDatabase,
-    cves: Vec<CveSummary>,
+    mut cves: Vec<CveSummary>,
+    requested_limit: u64,
 ) -> Result<CallToolResult, McpError> {
+    let has_more = cves.len() > requested_limit as usize;
+    cves.truncate(requested_limit as usize);
     let cves = db
         .attach_cve_details(cves)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
-    response::tool_result(json!(response::summaries_with_detail(cves)))
+    response::tool_result(json!({
+        "has_more": has_more,
+        "results": response::summaries_with_detail(cves),
+    }))
 }
 
 pub(crate) async fn search_by_cwe(
@@ -170,6 +176,149 @@ pub(crate) async fn find_cve(
     cve_id: &str,
 ) -> Result<Option<RawCveStatusRecord>, McpError> {
     db.find_cve_model_by_id(cve_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))
+}
+
+pub(crate) async fn find_cve_summary(
+    db: &CveDatabase,
+    cve_id: &str,
+) -> Result<CallToolResult, McpError> {
+    let cve = db
+        .find_cve_summary_with_detail(cve_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(cve.map(response::summary_with_detail)))
+}
+
+pub(crate) async fn find_cve_references(
+    db: &CveDatabase,
+    cve_id: &str,
+) -> Result<CallToolResult, McpError> {
+    let references = db
+        .find_cve_references(cve_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(references))
+}
+
+pub(crate) async fn database_status(db: &CveDatabase) -> Result<CallToolResult, McpError> {
+    let status = db
+        .database_status()
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(status))
+}
+
+pub(crate) async fn search_references(
+    db: &CveDatabase,
+    query: &str,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, McpError> {
+    db.search_cve_summaries_by_reference_text(query, state_scope, limit, offset)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))
+}
+
+pub(crate) async fn search_date_range(
+    db: &CveDatabase,
+    published_from: Option<&str>,
+    published_to: Option<&str>,
+    updated_from: Option<&str>,
+    updated_to: Option<&str>,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, McpError> {
+    db.search_cve_summaries_by_date_range(
+        published_from,
+        published_to,
+        updated_from,
+        updated_to,
+        state_scope,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|err| mcp_error(err.to_string()))
+}
+
+pub(crate) async fn search_id_prefix(
+    db: &CveDatabase,
+    prefix: &str,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, McpError> {
+    db.search_cve_summaries_by_cve_id_prefix_with_state_scope(prefix, state_scope, limit, offset)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))
+}
+
+pub(crate) async fn search_product_version(
+    db: &CveDatabase,
+    vendor: Option<&str>,
+    product: Option<&str>,
+    version: Option<&str>,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, McpError> {
+    db.search_cve_summaries_by_vendor_product_version(
+        vendor,
+        product,
+        version,
+        state_scope,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(|err| mcp_error(err.to_string()))
+}
+
+pub(crate) async fn search_cwe_catalog(
+    db: &CveDatabase,
+    query: Option<&str>,
+    limit: u64,
+    statuses: &[String],
+) -> Result<CallToolResult, McpError> {
+    let statuses = if statuses.is_empty() {
+        vec![
+            "Draft".to_owned(),
+            "Incomplete".to_owned(),
+            "Usable".to_owned(),
+            "Stable".to_owned(),
+            "Deprecated".to_owned(),
+            "Obsolete".to_owned(),
+        ]
+    } else {
+        statuses.to_owned()
+    };
+    let entries = db
+        .search_cwe_entries(query.unwrap_or_default(), limit, &statuses)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(entries))
+}
+
+pub(crate) async fn get_cwe(db: &CveDatabase, cwe_id: i32) -> Result<CallToolResult, McpError> {
+    let entry = db
+        .get_cwe_entry(cwe_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(entry))
+}
+
+pub(crate) async fn list_recent_updates(
+    db: &CveDatabase,
+    since: Option<&str>,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, McpError> {
+    db.list_recent_updates(since, state_scope, limit, offset)
         .await
         .map_err(|err| mcp_error(err.to_string()))
 }

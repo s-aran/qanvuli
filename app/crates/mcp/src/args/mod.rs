@@ -60,6 +60,18 @@ pub(crate) struct GetCveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReferenceSearchArgs {
+    /// Text to match against CVE reference URLs, names, and tags.
+    pub(crate) query: String,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CvssArgs {
     /// Minimum CVSS base score, inclusive.
     pub(crate) min_score: Option<f64>,
@@ -114,6 +126,95 @@ pub(crate) struct DateArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DateRangeArgs {
+    /// Return CVEs whose CVE datePublished is greater than or equal to this ISO-8601 timestamp.
+    pub(crate) published_from: Option<String>,
+    /// Return CVEs whose CVE datePublished is less than or equal to this ISO-8601 timestamp.
+    pub(crate) published_to: Option<String>,
+    /// Return CVEs whose CVE dateUpdated is greater than or equal to this ISO-8601 timestamp.
+    pub(crate) updated_from: Option<String>,
+    /// Return CVEs whose CVE dateUpdated is less than or equal to this ISO-8601 timestamp.
+    pub(crate) updated_to: Option<String>,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct IdPrefixArgs {
+    /// CVE ID prefix such as CVE-2026- or CVE-2026-12.
+    pub(crate) prefix: String,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ProductVersionArgs {
+    /// Affected vendor substring to search for. Can be combined with product.
+    pub(crate) vendor: Option<String>,
+    /// Affected product substring to search for. Can be combined with vendor.
+    pub(crate) product: Option<String>,
+    /// Version string to look for in affected version entries. This returns candidate CVEs, not a definitive vulnerable/not-vulnerable verdict.
+    pub(crate) version: Option<String>,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CweCatalogArgs {
+    /// CWE ID or text query. Empty query returns the first entries in tree order.
+    pub(crate) query: Option<String>,
+    /// Optional CWE statuses to include, such as Draft, Stable, Deprecated, or Obsolete.
+    #[serde(default)]
+    pub(crate) statuses: Vec<String>,
+    /// Maximum number of CWE entries to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetCweArgs {
+    /// CWE ID. Accepts a number or a string such as CWE-79.
+    pub(crate) cwe_id: CweArgValue,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ExplainMatchArgs {
+    /// Exact CVE ID to explain.
+    pub(crate) cve_id: String,
+    /// Optional query that led to this match.
+    pub(crate) query: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RecentUpdatesArgs {
+    /// Return CVEs updated on or after this ISO-8601 timestamp.
+    pub(crate) since: Option<String>,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct KnownExploitedArgs {
+    /// Optional CVE ID. qanvuli currently needs a KEV provider before it can answer this.
+    pub(crate) cve_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct UpdateDbArgs {
     /// Optional local CVE delta zip path to apply. When omitted, the updater downloads applicable CVE delta archives.
     pub(crate) zip: Option<String>,
@@ -136,7 +237,7 @@ impl CweArgs {
 }
 
 impl CweArgValue {
-    fn into_search_value(self) -> String {
+    pub(crate) fn into_search_value(self) -> String {
         match self {
             Self::Number(value) => value.to_string(),
             Self::String(value) => value,
