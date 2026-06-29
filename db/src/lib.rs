@@ -1410,6 +1410,30 @@ impl CveDatabase {
             .all(&self.db)
             .await;
         }
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && self.has_cve_summary_index_rows().await?
+            && (vendor_exact.is_some() || product_exact.is_some())
+        {
+            self.ensure_cve_summary_index().await?;
+            return CveSummary::find_by_statement(Statement::from_string(
+                DbBackend::Sqlite,
+                affected_exact_summary_sql(
+                    vendor,
+                    product,
+                    vendor_exact,
+                    product_exact,
+                    published_since,
+                    None,
+                    updated_since,
+                    state_scope,
+                    CveSummarySortOrder::PublishedDesc,
+                    limit,
+                    offset,
+                ),
+            ))
+            .all(&self.db)
+            .await;
+        }
 
         let mut query = cve::Entity::find()
             .select_only()
@@ -1495,6 +1519,21 @@ impl CveDatabase {
                     },
                     vec![SeaValue::from(query)],
                 )
+                .await;
+        }
+        if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && self.has_cve_summary_index_rows().await?
+            && (vendor_exact.is_some() || product_exact.is_some())
+        {
+            self.ensure_cve_summary_index().await?;
+            return self
+                .count_by_sql(affected_exact_count_sql(
+                    vendor,
+                    product,
+                    vendor_exact,
+                    product_exact,
+                    state_scope,
+                ))
                 .await;
         }
 
@@ -2603,6 +2642,30 @@ impl CveDatabase {
             {
                 self.ensure_cwe_search_index().await?;
             }
+            if (option_text(options.vendor_exact.as_deref()).is_some()
+                || option_text(options.product_exact.as_deref()).is_some())
+                && option_text(options.query.as_deref()).is_none()
+                && option_text(options.cwe.as_deref()).is_none()
+            {
+                return CveSummary::find_by_statement(Statement::from_string(
+                    DbBackend::Sqlite,
+                    affected_exact_summary_sql(
+                        option_text(options.vendor.as_deref()),
+                        option_text(options.product.as_deref()),
+                        option_text(options.vendor_exact.as_deref()),
+                        option_text(options.product_exact.as_deref()),
+                        option_text(options.published_from.as_deref()),
+                        option_text(options.published_to.as_deref()),
+                        None,
+                        options.state_scope,
+                        options.sort_order,
+                        limit,
+                        offset,
+                    ),
+                ))
+                .all(&self.db)
+                .await;
+            }
             return CveSummary::find_by_statement(Statement::from_string(
                 DbBackend::Sqlite,
                 advanced_summary_sql(options, limit, offset),
@@ -2696,6 +2759,21 @@ impl CveDatabase {
                 .is_some_and(|cwe| !cwe.trim().is_empty())
             {
                 self.ensure_cwe_search_index().await?;
+            }
+            if (option_text(options.vendor_exact.as_deref()).is_some()
+                || option_text(options.product_exact.as_deref()).is_some())
+                && option_text(options.query.as_deref()).is_none()
+                && option_text(options.cwe.as_deref()).is_none()
+            {
+                return self
+                    .count_by_sql(affected_exact_count_sql(
+                        option_text(options.vendor.as_deref()),
+                        option_text(options.product.as_deref()),
+                        option_text(options.vendor_exact.as_deref()),
+                        option_text(options.product_exact.as_deref()),
+                        options.state_scope,
+                    ))
+                    .await;
             }
             return self.count_by_sql(advanced_count_sql(options)).await;
         }
@@ -3233,7 +3311,65 @@ where
             .await?;
     }
     create_cve_summary_indexes(db).await?;
+    if has_cve_rows_without_summary_index(db).await? {
+        rebuild_cve_summary_indexes(db).await?;
+    }
+    let has_cve_affected_table = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cve_affected'".to_owned(),
+        ))
+        .await?
+        .is_some();
+    if has_cve_affected_table {
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_cve_db_id ON cve_affected (vendor, cve_db_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
+        )
+        .await?;
+        db.execute_unprepared(
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected (vendor, product, cve_db_id)",
+        )
+        .await?;
+    }
     Ok(())
+}
+
+async fn has_cve_rows_without_summary_index<C>(db: &C) -> Result<bool, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let has_cve_table = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cve'".to_owned(),
+        ))
+        .await?
+        .is_some();
+    if !has_cve_table {
+        return Ok(false);
+    }
+
+    let has_cve_rows = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1 FROM cve LIMIT 1".to_owned(),
+        ))
+        .await?
+        .is_some();
+    if !has_cve_rows {
+        return Ok(false);
+    }
+
+    db.query_one(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT 1 FROM cve_summary_index LIMIT 1".to_owned(),
+    ))
+    .await
+    .map(|row| row.is_none())
 }
 
 async fn upsert_cve_on<C>(db: &C, model: cve::ActiveModel) -> Result<(), DbErr>
@@ -3741,6 +3877,9 @@ const BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
     "idx_cve_affected_product",
     "idx_cve_affected_package",
     "idx_cve_affected_cve_db_id_vendor_product",
+    "idx_cve_affected_vendor_cve_db_id",
+    "idx_cve_affected_product_cve_db_id",
+    "idx_cve_affected_vendor_product_cve_db_id",
     "idx_cve_cwe_cve_id",
     "idx_cve_cwe_cve_db_id",
     "idx_cve_cwe_cwe_id",
@@ -3769,6 +3908,9 @@ const BULK_LOAD_FINAL_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_cve_affected_product ON cve_affected (product)",
     "CREATE INDEX IF NOT EXISTS idx_cve_affected_package ON cve_affected (package_name)",
     "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_cve_db_id ON cve_affected (vendor, cve_db_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
+    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected (vendor, product, cve_db_id)",
     "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
 ];
 
@@ -5497,6 +5639,157 @@ fn affected_fts_count_sql(state_scope: CveStateScope) -> &'static str {
         INNER JOIN cve_summary_index ON cve_summary_index.cve_id = cve_affected_summary_fts.cve_id
         WHERE cve_affected_summary_fts MATCH ? AND cve_summary_index.state = 0
         "#
+    }
+}
+
+fn affected_exact_summary_sql(
+    vendor: Option<&str>,
+    product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
+    published_since: Option<&str>,
+    published_to: Option<&str>,
+    updated_since: Option<&str>,
+    state_scope: CveStateScope,
+    sort_order: CveSummarySortOrder,
+    limit: u64,
+    offset: u64,
+) -> String {
+    let where_clause = affected_exact_where_clause(
+        vendor,
+        product,
+        vendor_exact,
+        product_exact,
+        published_since,
+        published_to,
+        updated_since,
+        state_scope,
+    );
+    let order_by = affected_exact_order_by(sort_order);
+    format!(
+        r#"
+        SELECT DISTINCT
+            cve_summary_index.cve_id,
+            cve_summary_index.state,
+            cve_summary_index.published_at,
+            cve_summary_index.updated_at,
+            cve_summary_index.title,
+            cve_summary_index.description_en
+        FROM cve_affected
+        INNER JOIN cve_summary_index ON cve_summary_index.cve_db_id = cve_affected.cve_db_id
+        {where_clause}
+        ORDER BY {order_by}
+        LIMIT {limit} OFFSET {offset}
+        "#
+    )
+}
+
+fn affected_exact_count_sql(
+    vendor: Option<&str>,
+    product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
+    state_scope: CveStateScope,
+) -> String {
+    let where_clause = affected_exact_where_clause(
+        vendor,
+        product,
+        vendor_exact,
+        product_exact,
+        None,
+        None,
+        None,
+        state_scope,
+    );
+    format!(
+        r#"
+        SELECT COUNT(DISTINCT cve_affected.cve_db_id) AS count
+        FROM cve_affected
+        INNER JOIN cve_summary_index ON cve_summary_index.cve_db_id = cve_affected.cve_db_id
+        {where_clause}
+        "#
+    )
+}
+
+fn affected_exact_where_clause(
+    vendor: Option<&str>,
+    product: Option<&str>,
+    vendor_exact: Option<&str>,
+    product_exact: Option<&str>,
+    published_since: Option<&str>,
+    published_to: Option<&str>,
+    updated_since: Option<&str>,
+    state_scope: CveStateScope,
+) -> String {
+    let mut conditions = Vec::new();
+    if !state_scope.includes_rejected() {
+        conditions.push("cve_summary_index.state = 0".to_owned());
+    }
+    if let Some(vendor) = option_text(vendor) {
+        conditions.push(format!(
+            "cve_affected.vendor LIKE {}",
+            sql_string_literal(&like_pattern(vendor))
+        ));
+    }
+    if let Some(product) = option_text(product) {
+        conditions.push(format!(
+            "cve_affected.product LIKE {}",
+            sql_string_literal(&like_pattern(product))
+        ));
+    }
+    if let Some(vendor_exact) = option_text(vendor_exact) {
+        conditions.push(format!(
+            "cve_affected.vendor = {}",
+            sql_string_literal(vendor_exact)
+        ));
+    }
+    if let Some(product_exact) = option_text(product_exact) {
+        conditions.push(format!(
+            "cve_affected.product = {}",
+            sql_string_literal(product_exact)
+        ));
+    }
+    if let Some(published_since) = option_text(published_since) {
+        conditions.push(format!(
+            "cve_summary_index.published_at >= {}",
+            sql_string_literal(published_since)
+        ));
+    }
+    if let Some(published_to) = option_text(published_to) {
+        conditions.push(format!(
+            "cve_summary_index.published_at <= {}",
+            sql_string_literal(published_to)
+        ));
+    }
+    if let Some(updated_since) = option_text(updated_since) {
+        conditions.push(format!(
+            "cve_summary_index.updated_at >= {}",
+            sql_string_literal(updated_since)
+        ));
+    }
+
+    if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    }
+}
+
+fn affected_exact_order_by(sort_order: CveSummarySortOrder) -> &'static str {
+    match sort_order {
+        CveSummarySortOrder::PublishedAsc | CveSummarySortOrder::RelationRankAsc => {
+            "cve_summary_index.published_at ASC, cve_summary_index.cve_id ASC"
+        }
+        CveSummarySortOrder::CveIdAsc => "cve_summary_index.cve_id ASC",
+        CveSummarySortOrder::CveIdDesc => "cve_summary_index.cve_id DESC",
+        CveSummarySortOrder::ScoreAsc => {
+            "cve_summary_index.max_cvss_score ASC, cve_summary_index.published_at DESC, cve_summary_index.cve_id ASC"
+        }
+        CveSummarySortOrder::PublishedDesc
+        | CveSummarySortOrder::RelationRankDesc
+        | CveSummarySortOrder::ScoreDesc => {
+            "cve_summary_index.published_at DESC, cve_summary_index.cve_id ASC"
+        }
     }
 }
 
