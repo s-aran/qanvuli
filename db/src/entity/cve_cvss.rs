@@ -18,7 +18,7 @@ pub struct Model {
     #[sea_orm(column_type = "Text", nullable)]
     pub source: Option<String>,
     #[sea_orm(column_type = "Text")]
-    pub raw_json: Json,
+    pub raw_json: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

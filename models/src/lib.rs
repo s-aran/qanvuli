@@ -77,7 +77,9 @@ pub fn parse_json_value_bytes(mut bytes: Vec<u8>) -> Result<Value, Error> {
 
 pub fn parse_value_with_raw(raw_json: Value) -> Result<RawCveStatusRecord, Error> {
     match raw_json
-        .pointer("/cveMetadata/state")
+        .get("cveMetadata")
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("state"))
         .and_then(Value::as_str)
     {
         Some("PUBLISHED") => {
@@ -114,16 +116,16 @@ pub struct RawCvssValue {
 }
 
 pub fn cna_affected_raw_values(raw_json: &Value) -> Vec<Value> {
-    raw_json
-        .pointer("/containers/cna/affected")
+    cna_value(raw_json)
+        .and_then(|cna| cna.get("affected"))
         .and_then(Value::as_array)
         .map(|affected| affected.to_vec())
         .unwrap_or_default()
 }
 
 pub fn cna_cvss_raw_values(raw_json: &Value) -> Vec<RawCvssValue> {
-    let Some(metrics) = raw_json
-        .pointer("/containers/cna/metrics")
+    let Some(metrics) = cna_value(raw_json)
+        .and_then(|cna| cna.get("metrics"))
         .and_then(Value::as_array)
     else {
         return Vec::new();
@@ -147,8 +149,8 @@ pub fn cna_cvss_raw_values(raw_json: &Value) -> Vec<RawCvssValue> {
 }
 
 pub fn cna_cwe_raw_values(raw_json: &Value) -> Vec<Value> {
-    raw_json
-        .pointer("/containers/cna/problemTypes")
+    cna_value(raw_json)
+        .and_then(|cna| cna.get("problemTypes"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -162,6 +164,13 @@ pub fn cna_cwe_raw_values(raw_json: &Value) -> Vec<Value> {
         .filter(|description| description.get("cweId").is_some())
         .cloned()
         .collect()
+}
+
+fn cna_value(raw_json: &Value) -> Option<&Value> {
+    raw_json
+        .get("containers")
+        .and_then(Value::as_object)
+        .and_then(|containers| containers.get("cna"))
 }
 
 #[cfg(test)]

@@ -11,12 +11,28 @@ use regex::Regex;
 pub trait FileStorageTrait {
     fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error>;
 
+    fn get_json_entry_bytes(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        self.get_json_bytes(entry.path.clone())
+    }
+
     fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
         let bytes = self.get_json_bytes(path)?;
         Ok(String::from_utf8(bytes)?)
     }
 
     fn enum_json_list(&self) -> impl Iterator<Item = String>;
+
+    fn enum_json_entries(&self) -> Vec<JsonEntry> {
+        self.enum_json_list()
+            .map(|path| JsonEntry { path, index: None })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct JsonEntry {
+    pub path: String,
+    pub index: Option<usize>,
 }
 
 pub struct ActualStorage {
@@ -110,6 +126,35 @@ impl FileStorageTrait for ZipStorage {
                 }
             })
             .map(|e| e.to_owned())
+    }
+
+    fn enum_json_entries(&self) -> Vec<JsonEntry> {
+        let re = cve_json_regex();
+        (0..self.stream.len())
+            .filter_map(|index| {
+                let path = self.stream.name_for_index(index)?;
+                if re.is_match(path) {
+                    Some(JsonEntry {
+                        path: path.to_owned(),
+                        index: Some(index),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn get_json_entry_bytes(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        let mut f = if let Some(index) = entry.index {
+            self.stream.by_index(index).unwrap()
+        } else {
+            self.stream.by_name(entry.path.as_str()).unwrap()
+        };
+        let mut buf = Vec::with_capacity(f.size() as usize);
+        let _ = f.read_to_end(&mut buf);
+
+        Ok(buf)
     }
 }
 

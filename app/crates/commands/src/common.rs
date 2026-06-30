@@ -1,12 +1,11 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Utc};
 use clap::ValueEnum;
 use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
-use qanvuli_db::{CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
-use qanvuli_models::{cwe::read_cwe_catalog_zip, parse_json_value_bytes};
+use qanvuli_db::{CveActiveModels, CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
+use qanvuli_models::cwe::read_cwe_catalog_zip;
 use qanvuli_utils::loader::{self, FileStorageTrait};
 use rayon::prelude::*;
 use serde::Serialize;
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -533,9 +532,12 @@ async fn update_delta_assets_since(
             .then(left.path_or_name.cmp(&right.path_or_name))
     });
 
-    let latest_end_of_day = candidates
-        .iter()
-        .rposition(|(_, parsed)| parsed.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY);
+    let mut latest_end_of_day = None;
+    for index in 0..candidates.len() {
+        if candidates[index].1.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY {
+            latest_end_of_day = Some(index);
+        }
+    }
 
     let selected = if elapsed < ChronoDuration::hours(24) {
         if let Some(end_of_day_index) = latest_end_of_day {
@@ -631,18 +633,18 @@ pub async fn ingest_zip_with_progress(
     eprintln!("{label}: opening zip {}", asset_path.display());
     let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
     eprintln!("{label}: enumerating CVE JSON entries");
-    let json_paths = storage.enum_json_list().collect::<Vec<String>>();
+    let json_entries = storage.enum_json_entries();
     eprintln!(
         "{label}: asset={}, json_count={}",
         asset_path.display(),
-        json_paths.len()
+        json_entries.len()
     );
     emit_ingest_progress(
         &progress,
         label,
         asset_path,
         "enumerated",
-        json_paths.len(),
+        json_entries.len(),
         0,
         0,
     );
@@ -652,7 +654,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "rebuilding",
-            json_paths.len(),
+            json_entries.len(),
             0,
             0,
         );
@@ -679,7 +681,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "syncing cwe",
-            json_paths.len(),
+            json_entries.len(),
             0,
             0,
         );
@@ -695,7 +697,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "preparing",
-            json_paths.len(),
+            json_entries.len(),
             0,
             0,
         );
@@ -720,7 +722,7 @@ pub async fn ingest_zip_with_progress(
         IngestMode::Upsert => INGEST_CHUNK_SIZE,
     };
 
-    for (chunk_index, chunk) in json_paths.chunks(ingest_chunk_size).enumerate() {
+    for (chunk_index, chunk) in json_entries.chunks(ingest_chunk_size).enumerate() {
         if max_chunks.is_some_and(|max_chunks| chunk_index >= max_chunks) {
             eprintln!("{label}: stopped after {chunk_index} chunks for profiling");
             break;
@@ -731,7 +733,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "reading",
-            json_paths.len(),
+            json_entries.len(),
             inserted,
             failed,
         );
@@ -740,12 +742,12 @@ pub async fn ingest_zip_with_progress(
         let mut read_failed = 0usize;
 
         let read_start = Instant::now();
-        for json_path in chunk {
-            match storage.get_json_bytes(json_path) {
-                Ok(json) => jsons.push((json_path.clone(), json)),
+        for entry in chunk {
+            match storage.get_json_entry_bytes(entry) {
+                Ok(json) => jsons.push((entry.path.clone(), json)),
                 Err(err) => {
                     read_failed += 1;
-                    eprintln!("{label}: failed to read {json_path}: {err}");
+                    eprintln!("{label}: failed to read {}: {err}", entry.path);
                 }
             }
         }
@@ -767,14 +769,16 @@ pub async fn ingest_zip_with_progress(
         let parsed = jsons
             .into_par_iter()
             .map(|(json_path, json, read_file)| {
-                let raw_json = parse_json_value_bytes(json)
+                let raw_json = String::from_utf8(json)
+                    .map_err(|err| format!("{label}: invalid UTF-8 in {json_path}: {err}"))?;
+                let model = CveActiveModels::from_raw_json_string(raw_json)
                     .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
-                if cve_id_from_value(&raw_json).is_none() {
+                if model.cve_id.is_empty() {
                     return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
                 }
-                Ok((raw_json, read_file))
+                Ok((model, read_file))
             })
-            .collect::<Vec<Result<(Value, ReadJsonFileRecord), String>>>();
+            .collect::<Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>>();
         let parse_elapsed = parse_start.elapsed();
         timings.parse += parse_elapsed;
 
@@ -801,7 +805,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "writing",
-            json_paths.len(),
+            json_entries.len(),
             inserted,
             failed,
         );
@@ -811,10 +815,10 @@ pub async fn ingest_zip_with_progress(
                 bulk_replace
                     .as_ref()
                     .expect("bulk replace session must exist in replace-all mode")
-                    .insert_cve_raw_values(models)
+                    .insert_cve_models(models)
                     .await
             }
-            IngestMode::Upsert => db.upsert_cve_raw_values(models).await,
+            IngestMode::Upsert => db.upsert_cve_models(models).await,
         };
 
         match result {
@@ -870,7 +874,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "writing",
-            json_paths.len(),
+            json_entries.len(),
             inserted,
             failed,
         );
@@ -892,7 +896,7 @@ pub async fn ingest_zip_with_progress(
             label,
             asset_path,
             "indexing",
-            json_paths.len(),
+            json_entries.len(),
             inserted,
             failed,
         );
@@ -936,7 +940,7 @@ pub async fn ingest_zip_with_progress(
         label,
         asset_path,
         "done",
-        json_paths.len(),
+        json_entries.len(),
         inserted,
         failed,
     );
@@ -982,13 +986,6 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
     DateTime::parse_from_rfc3339(value)
         .map(|dt: DateTime<FixedOffset>| dt.to_utc().to_rfc3339())
         .map_err(|err| format!("invalid RFC3339 timestamp `{value}`: {err}"))
-}
-
-fn cve_id_from_value(value: &Value) -> Option<&str> {
-    value
-        .pointer("/cveMetadata/cveId")
-        .and_then(Value::as_str)
-        .filter(|cve_id| !cve_id.is_empty())
 }
 
 #[cfg(test)]

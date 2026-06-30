@@ -4,7 +4,6 @@ use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary, CveS
 #[derive(Debug)]
 pub(crate) struct SearchResult {
     pub(crate) rows: Vec<CveSummaryWithDetail>,
-    pub(crate) total: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -29,37 +28,41 @@ pub(crate) async fn run_search_request(
             query,
             state_scope,
         } => {
-            let (rows, total) = tokio::try_join!(
-                async {
-                    let rows =
-                        search_by_mode(&db, mode, &query, state_scope, limit, offset).await?;
-                    db.attach_cve_details(rows)
-                        .await
-                        .map_err(|err| err.to_string())
-                },
-                count_by_mode(&db, mode, &query, state_scope)
-            )?;
-            Ok(SearchResult { rows, total })
+            let rows = search_by_mode(&db, mode, &query, state_scope, limit, offset).await?;
+            let rows = db
+                .attach_cve_details(rows)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(SearchResult { rows })
         }
         SearchRequest::Advanced(options) => {
-            let (rows, total) = tokio::try_join!(
-                async {
-                    let rows = db
-                        .search_cve_summaries_advanced(&options, limit, offset)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                    db.attach_cve_details(rows)
-                        .await
-                        .map_err(|err| err.to_string())
-                },
-                async {
-                    db.count_cve_summaries_advanced(&options)
-                        .await
-                        .map_err(|err| err.to_string())
-                }
-            )?;
-            Ok(SearchResult { rows, total })
+            let rows = db
+                .search_cve_summaries_advanced(&options, limit, offset)
+                .await
+                .map_err(|err| err.to_string())?;
+            let rows = db
+                .attach_cve_details(rows)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(SearchResult { rows })
         }
+    }
+}
+
+pub(crate) async fn run_count_request(
+    db: CveDatabase,
+    request: SearchRequest,
+) -> Result<u64, String> {
+    match request {
+        SearchRequest::Mode {
+            mode,
+            query,
+            state_scope,
+        } => count_by_mode(&db, mode, &query, state_scope).await,
+        SearchRequest::Advanced(options) => db
+            .count_cve_summaries_advanced(&options)
+            .await
+            .map_err(|err| err.to_string()),
     }
 }
 

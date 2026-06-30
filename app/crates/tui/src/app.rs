@@ -3,7 +3,7 @@ use super::{
     db::{
         cwe::search_cwe_entries,
         raw_json::load_cve_raw_json,
-        search::{SearchRequest, SearchResult, run_search_request},
+        search::{SearchRequest, SearchResult, run_count_request, run_search_request},
     },
     display::DisplaySettings,
     form::AdvancedForm,
@@ -62,6 +62,7 @@ pub(super) struct App {
     pub(super) detail_search_input: bool,
     pub(super) detail_search_error: Option<String>,
     search: Option<PendingSearch>,
+    count_task: Option<JoinHandle<Result<u64, String>>>,
     raw_json_task: Option<JoinHandle<Result<String, String>>>,
     cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
     search_started_at: Option<Instant>,
@@ -126,7 +127,13 @@ impl CweStatus {
 struct PendingSearch {
     kind: SearchKind,
     handle: JoinHandle<Result<SearchResult, String>>,
+    count: Option<PendingCount>,
     timed_out_once: bool,
+}
+
+struct PendingCount {
+    db: CveDatabase,
+    request: SearchRequest,
 }
 
 struct PendingMaintenance {
@@ -216,6 +223,7 @@ impl App {
             detail_search_input: false,
             detail_search_error: None,
             search: None,
+            count_task: None,
             raw_json_task: None,
             cwe_task: None,
             search_started_at: None,
@@ -327,22 +335,46 @@ impl App {
         self.search_started_at = None;
         self.search_timeout_at = None;
         self.show_timeout_prompt = false;
+        let count = search.count;
         match kind {
             SearchKind::Replace => {
                 self.exhausted = result.rows.len() < self.limit as usize;
-                self.total_results = Some(result.total);
                 self.results = result.rows;
                 self.clear_detail();
                 self.select_candidate(0);
+                if let Some(count) = count {
+                    self.count_task =
+                        Some(tokio::spawn(run_count_request(count.db, count.request)));
+                }
             }
             SearchKind::Append { select_offset } => {
                 self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize;
-                self.total_results = Some(result.total);
                 self.results.extend(result.rows);
                 self.select_candidate(select_offset);
             }
         }
         Ok(())
+    }
+
+    pub(super) async fn poll_count(&mut self) {
+        let Some(task) = self.count_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let task = self.count_task.take().expect("count task disappeared");
+        match task.await {
+            Ok(Ok(total)) => {
+                self.total_results = Some(total);
+            }
+            Ok(Err(err)) => {
+                self.status_message = Some(format!("failed to count search results: {err}"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("failed to join count task: {err}"));
+            }
+        }
     }
 
     pub(super) async fn poll_maintenance(&mut self) -> bool {
@@ -454,7 +486,10 @@ impl App {
     }
 
     pub(super) fn has_background_task(&self) -> bool {
-        self.search.is_some() || self.raw_json_task.is_some() || self.cwe_task.is_some()
+        self.search.is_some()
+            || self.count_task.is_some()
+            || self.raw_json_task.is_some()
+            || self.cwe_task.is_some()
     }
 
     pub(super) fn cwe_searching(&self) -> bool {
@@ -487,6 +522,9 @@ impl App {
     pub(super) fn abort_search(&mut self) {
         if let Some(search) = self.search.take() {
             search.handle.abort();
+        }
+        if let Some(task) = self.count_task.take() {
+            task.abort();
         }
         if let Some(task) = self.raw_json_task.take() {
             task.abort();
@@ -1199,9 +1237,14 @@ impl App {
         self.abort_search();
         self.status_message = None;
         self.arm_search_timeout();
+        let count = matches!(&kind, SearchKind::Replace).then(|| PendingCount {
+            db: db.clone(),
+            request: request.clone(),
+        });
         let error_prefix = error_prefix.to_owned();
         self.search = Some(PendingSearch {
             kind,
+            count,
             timed_out_once: false,
             handle: tokio::spawn(async move {
                 run_search_request(db, request, limit, offset)

@@ -52,6 +52,7 @@ async fn run_loop(
 ) -> Result<(), String> {
     loop {
         app.poll_search().await?;
+        app.poll_count().await;
         app.poll_raw_json().await;
         app.poll_cwe_search().await;
         if app.poll_maintenance().await {
