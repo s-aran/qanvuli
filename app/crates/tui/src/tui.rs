@@ -191,6 +191,9 @@ async fn run_loop(
                 KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
                     app.previous_maintenance_choice();
                 }
+                KeyCode::Char(' ') | KeyCode::Char('k') => {
+                    app.toggle_maintenance_keep_downloads();
+                }
                 KeyCode::Char('i') => app.maintenance_choice = MaintenanceChoice::Init,
                 KeyCode::Char('u') => app.maintenance_choice = MaintenanceChoice::Update,
                 KeyCode::Char('c') => app.maintenance_choice = MaintenanceChoice::Cancel,
@@ -264,6 +267,7 @@ async fn run_loop(
 }
 
 async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
+    let keep_downloads = app.maintenance_keep_downloads;
     match app.maintenance_choice {
         MaintenanceChoice::Cancel => app.close_maintenance(),
         MaintenanceChoice::Update => {
@@ -273,7 +277,8 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
                 MaintenanceOperation::Update,
                 progress_rx,
                 spawn_maintenance_task(async move {
-                    update::run_default_with_progress(&db_url, progress).await
+                    update::run_default_with_progress_and_keep(&db_url, progress, keep_downloads)
+                        .await
                 }),
             );
         }
@@ -294,7 +299,8 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
                 MaintenanceOperation::Init,
                 progress_rx,
                 spawn_maintenance_task(async move {
-                    init::run_default_with_progress(&db_url, progress).await
+                    init::run_default_with_progress_and_keep(&db_url, progress, keep_downloads)
+                        .await
                 }),
             );
         }

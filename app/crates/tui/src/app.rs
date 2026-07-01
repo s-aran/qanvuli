@@ -81,6 +81,7 @@ pub(super) struct App {
     pub(super) show_maintenance: bool,
     pub(super) timeout_choice: TimeoutChoice,
     pub(super) maintenance_choice: MaintenanceChoice,
+    pub(super) maintenance_keep_downloads: bool,
     pub(super) status_message: Option<String>,
     pub(super) db_as_of: Option<String>,
     pub(super) maintenance_progress: Option<MaintenanceProgress>,
@@ -246,6 +247,7 @@ impl App {
             show_maintenance: false,
             timeout_choice: TimeoutChoice::Continue,
             maintenance_choice: MaintenanceChoice::Update,
+            maintenance_keep_downloads: false,
             status_message: None,
             db_as_of: None,
             maintenance_progress: None,
@@ -548,6 +550,10 @@ impl App {
 
     pub(super) fn close_maintenance(&mut self) {
         self.show_maintenance = false;
+    }
+
+    pub(super) fn toggle_maintenance_keep_downloads(&mut self) {
+        self.maintenance_keep_downloads = !self.maintenance_keep_downloads;
     }
 
     pub(super) fn next_maintenance_choice(&mut self) {

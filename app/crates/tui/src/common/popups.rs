@@ -2,7 +2,7 @@ use crate::{
     app::{App, MaintenanceChoice, TimeoutChoice},
     common::{
         centered_rect,
-        components::{ActionButton, ButtonRow, RadioOption, SelectableField},
+        components::{ActionButton, ButtonRow, Checkbox, RadioOption, SelectableField},
     },
     display::{DisplayField, DisplaySettings},
     form::{AdvancedField, AdvancedForm, StateScopeUi},
@@ -246,7 +246,15 @@ pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
         }
         .line(),
         Line::from(""),
-        Line::from("Enter run  Esc close  Up/Down choose  I/U/C choose"),
+        Checkbox {
+            label: "Keep downloaded zip files".to_owned(),
+            checked: app.maintenance_keep_downloads,
+            active: false,
+            active_color: Color::Magenta,
+        }
+        .line(),
+        Line::from(""),
+        Line::from("Enter run  Space/K keep  Esc close  Up/Down choose  I/U/C choose"),
     ];
     let popup = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
     frame.render_widget(popup, area);

@@ -138,6 +138,20 @@ pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
 }
 
 pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, String> {
+    download_latest_asset_with_source(kind)
+        .await
+        .map(|asset| asset.path)
+}
+
+#[derive(Clone, Debug)]
+pub struct DownloadedAsset {
+    pub path: PathBuf,
+    pub downloaded: bool,
+}
+
+pub async fn download_latest_asset_with_source(
+    kind: ReleaseAssetKind,
+) -> Result<DownloadedAsset, String> {
     eprintln!("{kind}: fetching GitHub release metadata");
     let asset = match latest_asset(kind).await {
         Ok(asset) => asset,
@@ -147,7 +161,10 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
                     "{kind}: failed to fetch GitHub release metadata ({err}); using local {}",
                     path.display()
                 );
-                return Ok(path);
+                return Ok(DownloadedAsset {
+                    path,
+                    downloaded: false,
+                });
             }
             return Err(err);
         }
@@ -162,7 +179,24 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
         .await
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     eprintln!("{kind}: ready {}", asset.name);
-    Ok(PathBuf::from(filename))
+    Ok(DownloadedAsset {
+        path: PathBuf::from(filename),
+        downloaded: true,
+    })
+}
+
+pub fn remove_downloaded_zip(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            eprintln!("removed downloaded zip {}", path.display());
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed to remove downloaded zip {}: {err}",
+            path.display()
+        )),
+    }
 }
 
 fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
@@ -340,13 +374,14 @@ pub async fn apply_delta_updates(
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
-    apply_delta_updates_with_progress(db, zip, max_chunks, None).await
+    apply_delta_updates_with_progress(db, zip, max_chunks, false, None).await
 }
 
 pub async fn apply_delta_updates_with_progress(
     db: &CveDatabase,
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
+    keep_downloads: bool,
     progress: Option<IngestProgressCallback>,
 ) -> Result<Vec<PathBuf>, String> {
     emit_general_progress(&progress, "update", "syncing cwe");
@@ -369,7 +404,7 @@ pub async fn apply_delta_updates_with_progress(
 
     let Some(anchor) = latest_update_anchor(db).await? else {
         eprintln!("update: no previous CVE zip history; importing latest all midnight archive");
-        return apply_latest_all_midnight(db, max_chunks, progress).await;
+        return apply_latest_all_midnight(db, max_chunks, keep_downloads, progress).await;
     };
     let anchor_datetime = parse_anchor_datetime(&anchor)?;
     let elapsed = Utc::now().signed_duration_since(anchor_datetime);
@@ -377,7 +412,7 @@ pub async fn apply_delta_updates_with_progress(
         eprintln!(
             "update: latest CVE zip is older than 1 week ({anchor}); importing latest all midnight archive"
         );
-        return apply_latest_all_midnight(db, max_chunks, progress).await;
+        return apply_latest_all_midnight(db, max_chunks, keep_downloads, progress).await;
     }
 
     let assets = match update_delta_assets_since(&anchor, elapsed).await {
@@ -442,6 +477,9 @@ pub async fn apply_delta_updates_with_progress(
                 .await
                 .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
         }
+        if !keep_downloads {
+            remove_downloaded_zip(&asset_path)?;
+        }
         applied.push(asset_path);
     }
     Ok(applied)
@@ -463,9 +501,11 @@ fn emit_general_progress(progress: &Option<IngestProgressCallback>, label: &str,
 async fn apply_latest_all_midnight(
     db: &CveDatabase,
     max_chunks: Option<usize>,
+    keep_downloads: bool,
     progress: Option<IngestProgressCallback>,
 ) -> Result<Vec<PathBuf>, String> {
-    let path = download_latest_asset(ReleaseAssetKind::All).await?;
+    let asset = download_latest_asset_with_source(ReleaseAssetKind::All).await?;
+    let path = asset.path;
     ingest_zip_with_progress(
         db,
         "all",
@@ -476,6 +516,9 @@ async fn apply_latest_all_midnight(
         progress,
     )
     .await;
+    if asset.downloaded && !keep_downloads {
+        remove_downloaded_zip(&path)?;
+    }
     Ok(vec![path])
 }
 

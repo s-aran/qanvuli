@@ -1,6 +1,7 @@
 use super::common::{
     IngestMode, IngestProgress, IngestProgressCallback, ReleaseAssetKind, connect_db,
-    download_latest_asset, ingest_zip_with_progress, reset_sqlite_database_files,
+    download_latest_asset_with_source, ingest_zip_with_progress, remove_downloaded_zip,
+    reset_sqlite_database_files,
 };
 use std::path::PathBuf;
 
@@ -14,6 +15,8 @@ pub struct Args {
     zip: Option<PathBuf>,
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
+    #[arg(long)]
+    keep: bool,
 }
 
 impl Default for Args {
@@ -23,6 +26,7 @@ impl Default for Args {
             rebuild: false,
             zip: None,
             max_chunks: None,
+            keep: false,
         }
     }
 }
@@ -61,12 +65,13 @@ async fn run_with_progress(
         return Ok(());
     }
 
-    let asset_path = if let Some(zip) = args.zip {
+    let (asset_path, downloaded_asset) = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
-        zip
+        (zip, false)
     } else {
         emit_init_progress(&progress, "-", "downloading");
-        download_latest_asset(ReleaseAssetKind::All).await?
+        let asset = download_latest_asset_with_source(ReleaseAssetKind::All).await?;
+        (asset.path, asset.downloaded)
     };
 
     emit_init_progress(
@@ -94,6 +99,9 @@ async fn run_with_progress(
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;
+    if downloaded_asset && !args.keep {
+        remove_downloaded_zip(&asset_path)?;
+    }
     Ok(())
 }
 
@@ -119,4 +127,20 @@ pub async fn run_default_with_progress(
     progress: IngestProgressCallback,
 ) -> Result<(), String> {
     run_with_progress(db_url, Args::default(), Some(progress)).await
+}
+
+pub async fn run_default_with_progress_and_keep(
+    db_url: &str,
+    progress: IngestProgressCallback,
+    keep: bool,
+) -> Result<(), String> {
+    run_with_progress(
+        db_url,
+        Args {
+            keep,
+            ..Args::default()
+        },
+        Some(progress),
+    )
+    .await
 }

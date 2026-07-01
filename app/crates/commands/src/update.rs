@@ -7,6 +7,8 @@ pub struct Args {
     zip: Option<PathBuf>,
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
+    #[arg(long)]
+    keep: bool,
 }
 
 impl Default for Args {
@@ -14,6 +16,7 @@ impl Default for Args {
         Self {
             zip: None,
             max_chunks: None,
+            keep: false,
         }
     }
 }
@@ -35,7 +38,8 @@ async fn run_with_progress(
         .map_err(|err| format!("failed to initialize schema: {err}"))?;
 
     let applied =
-        apply_delta_updates_with_progress(&db, args.zip, args.max_chunks, progress).await?;
+        apply_delta_updates_with_progress(&db, args.zip, args.max_chunks, args.keep, progress)
+            .await?;
     eprintln!("update: applied {} delta archive(s)", applied.len());
     db.close()
         .await
@@ -52,4 +56,20 @@ pub async fn run_default_with_progress(
     progress: IngestProgressCallback,
 ) -> Result<(), String> {
     run_with_progress(db_url, Args::default(), Some(progress)).await
+}
+
+pub async fn run_default_with_progress_and_keep(
+    db_url: &str,
+    progress: IngestProgressCallback,
+    keep: bool,
+) -> Result<(), String> {
+    run_with_progress(
+        db_url,
+        Args {
+            keep,
+            ..Args::default()
+        },
+        Some(progress),
+    )
+    .await
 }
