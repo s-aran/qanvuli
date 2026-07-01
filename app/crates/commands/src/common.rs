@@ -835,10 +835,8 @@ pub async fn ingest_zip_with_progress(
                 read_and_parse_extracted_chunk(label, chunk, &mut read_failed)
             } else {
                 read_and_parse_zip_chunk(label, chunk, &mut storage, &mut read_failed)
-            };
+        };
         timings.read += read_elapsed;
-        let hash_elapsed = Duration::ZERO;
-        timings.hash += hash_elapsed;
         timings.parse += parse_elapsed;
 
         let mut models = Vec::new();
@@ -907,10 +905,9 @@ pub async fn ingest_zip_with_progress(
 
                 let chunk_elapsed = chunk_start.elapsed();
                 eprintln!(
-                    "{label}: timings chunk={} read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}, total={:?}",
+                    "{label}: timings chunk={} read={:?}, parse={:?}, db_write={:?}, mark_read={:?}, total={:?}",
                     chunk_index,
                     read_elapsed,
-                    hash_elapsed,
                     parse_elapsed,
                     db_write_elapsed,
                     mark_elapsed,
@@ -940,10 +937,9 @@ pub async fn ingest_zip_with_progress(
     }
 
     eprintln!(
-        "{label}: inserted={inserted}, failed={failed}, elapsed={:?}, read={:?}, hash={:?}, parse={:?}, db_write={:?}, mark_read={:?}",
+        "{label}: inserted={inserted}, failed={failed}, elapsed={:?}, read={:?}, parse={:?}, db_write={:?}, mark_read={:?}",
         total_start.elapsed(),
         timings.read,
-        timings.hash,
         timings.parse,
         timings.db_write,
         timings.mark_read
@@ -1165,7 +1161,6 @@ pub enum IngestMode {
 #[derive(Default)]
 struct IngestTimings {
     read: Duration,
-    hash: Duration,
     parse: Duration,
     db_write: Duration,
     mark_read: Duration,
