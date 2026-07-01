@@ -24,7 +24,11 @@ pub trait FileStorageTrait {
 
     fn enum_json_entries(&self) -> Vec<JsonEntry> {
         self.enum_json_list()
-            .map(|path| JsonEntry { path, index: None })
+            .map(|path| JsonEntry {
+                path,
+                index: None,
+                filesystem_path: None,
+            })
             .collect()
     }
 }
@@ -33,6 +37,7 @@ pub trait FileStorageTrait {
 pub struct JsonEntry {
     pub path: String,
     pub index: Option<usize>,
+    pub filesystem_path: Option<PathBuf>,
 }
 
 pub struct ActualStorage {
@@ -71,8 +76,13 @@ trait ReadSeek: Read + Seek + Send {}
 
 impl<T> ReadSeek for T where T: Read + Seek + Send {}
 
+const ZIP_EXTRACTION_EXPANSION_FACTOR: u64 = 8;
+const ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+
 pub struct ZipStorage {
-    stream: zip::ZipArchive<Box<dyn ReadSeek>>,
+    stream: Option<zip::ZipArchive<Box<dyn ReadSeek>>>,
+    extracted_dir: Option<PathBuf>,
+    extracted_entries: Vec<JsonEntry>,
 }
 
 impl ZipStorage {
@@ -85,29 +95,42 @@ impl ZipStorage {
         if stream.len() == 1 {
             let name = stream.by_index(0).unwrap().name().to_owned();
             if name.ends_with(".zip") && !archive_has_cve_json(&stream) {
-                let inner_filename = format!("{filename}.inner.zip");
-                if std::fs::metadata(&inner_filename).is_err() {
-                    eprintln!("extracting nested zip: {name} -> {inner_filename}");
-                    let mut extracted = std::fs::File::create(&inner_filename).unwrap();
-                    let mut entry = stream.by_index(0).unwrap();
-                    std::io::copy(&mut entry, &mut extracted).unwrap();
-                }
-
-                let file = std::fs::File::open(inner_filename).unwrap();
-                let reader = std::io::BufReader::new(file);
-                let inner = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>).unwrap();
-                return Self { stream: inner };
+                let (extracted_dir, inner) = extract_nested_cve_zip(&mut stream, &name);
+                return Self {
+                    stream: Some(inner),
+                    extracted_dir: Some(extracted_dir),
+                    extracted_entries: Vec::new(),
+                };
             }
         }
 
-        Self { stream }
+        Self {
+            stream: Some(stream),
+            extracted_dir: None,
+            extracted_entries: Vec::new(),
+        }
     }
 }
 
 impl FileStorageTrait for ZipStorage {
     fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
+        let path = path.into();
+        if let Some(filesystem_path) = self
+            .extracted_entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.filesystem_path.as_ref())
+        {
+            return Ok(std::fs::read(filesystem_path)?);
+        }
+
         // TODO: error handling
-        let mut f = self.stream.by_name(path.into().as_str()).unwrap();
+        let mut f = self
+            .stream
+            .as_mut()
+            .expect("zip stream must exist when archive was not extracted")
+            .by_name(path.as_str())
+            .unwrap();
         let mut buf = Vec::new();
         let _ = f.read_to_end(&mut buf);
 
@@ -116,27 +139,47 @@ impl FileStorageTrait for ZipStorage {
 
     fn enum_json_list(&self) -> impl Iterator<Item = String> {
         let re = cve_json_regex();
-        self.stream
-            .file_names()
-            .filter(move |e| {
-                if let Some(r) = re.find(e) {
-                    !r.is_empty()
-                } else {
-                    false
-                }
-            })
-            .map(|e| e.to_owned())
+        let names: Vec<String> = if self.extracted_entries.is_empty() {
+            self.stream
+                .as_ref()
+                .expect("zip stream must exist when archive was not extracted")
+                .file_names()
+                .filter(move |e| {
+                    if let Some(r) = re.find(e) {
+                        !r.is_empty()
+                    } else {
+                        false
+                    }
+                })
+                .map(|e| e.to_owned())
+                .collect()
+        } else {
+            self.extracted_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+        names.into_iter()
     }
 
     fn enum_json_entries(&self) -> Vec<JsonEntry> {
+        if !self.extracted_entries.is_empty() {
+            return self.extracted_entries.clone();
+        }
+
         let re = cve_json_regex();
-        (0..self.stream.len())
+        let stream = self
+            .stream
+            .as_ref()
+            .expect("zip stream must exist when archive was not extracted");
+        (0..stream.len())
             .filter_map(|index| {
-                let path = self.stream.name_for_index(index)?;
+                let path = stream.name_for_index(index)?;
                 if re.is_match(path) {
                     Some(JsonEntry {
                         path: path.to_owned(),
                         index: Some(index),
+                        filesystem_path: None,
                     })
                 } else {
                     None
@@ -146,16 +189,144 @@ impl FileStorageTrait for ZipStorage {
     }
 
     fn get_json_entry_bytes(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        if let Some(filesystem_path) = &entry.filesystem_path {
+            return Ok(std::fs::read(filesystem_path)?);
+        }
+
+        let stream = self
+            .stream
+            .as_mut()
+            .expect("zip stream must exist when archive was not extracted");
         let mut f = if let Some(index) = entry.index {
-            self.stream.by_index(index).unwrap()
+            stream.by_index(index).unwrap()
         } else {
-            self.stream.by_name(entry.path.as_str()).unwrap()
+            stream.by_name(entry.path.as_str()).unwrap()
         };
         let mut buf = Vec::with_capacity(f.size() as usize);
         let _ = f.read_to_end(&mut buf);
 
         Ok(buf)
     }
+}
+
+impl Drop for ZipStorage {
+    fn drop(&mut self) {
+        if let Some(path) = &self.extracted_dir {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn extract_nested_cve_zip(
+    stream: &mut zip::ZipArchive<Box<dyn ReadSeek>>,
+    nested_name: &str,
+) -> (PathBuf, zip::ZipArchive<Box<dyn ReadSeek>>) {
+    let nested_zip_size = stream.by_index(0).unwrap().size();
+    let required_bytes = nested_zip_size
+        .saturating_mul(ZIP_EXTRACTION_EXPANSION_FACTOR)
+        .saturating_add(ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES);
+    let temp_dir = unique_temp_dir(required_bytes);
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let inner_path = temp_dir.join("inner.zip");
+
+    eprintln!(
+        "extracting nested zip: {nested_name} -> {}",
+        temp_dir.display()
+    );
+    {
+        let mut extracted = std::fs::File::create(&inner_path).unwrap();
+        let mut entry = stream.by_index(0).unwrap();
+        std::io::copy(&mut entry, &mut extracted).unwrap();
+    }
+
+    let file = std::fs::File::open(&inner_path).unwrap();
+    let reader = std::io::BufReader::new(file);
+    let inner = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>).unwrap();
+
+    (temp_dir, inner)
+}
+
+fn unique_temp_dir(required_bytes: u64) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    temporary_extraction_root(required_bytes)
+        .join(format!("qanvuli-cve-zip-{}-{nanos}", std::process::id()))
+}
+
+fn temporary_extraction_root(required_bytes: u64) -> PathBuf {
+    let temp_root = std::env::temp_dir();
+    match available_storage_bytes(&temp_root) {
+        Some(available) if available >= required_bytes => temp_root,
+        Some(available) => {
+            let binary_root = binary_directory();
+            eprintln!(
+                "temporary storage {} has only {} bytes available; need about {} bytes, using {}",
+                temp_root.display(),
+                available,
+                required_bytes,
+                binary_root.display()
+            );
+            binary_root
+        }
+        None => temp_root,
+    }
+}
+
+fn binary_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn available_storage_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_ulong};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Statvfs {
+        f_bsize: c_ulong,
+        f_frsize: c_ulong,
+        f_blocks: c_ulong,
+        f_bfree: c_ulong,
+        f_bavail: c_ulong,
+        f_files: c_ulong,
+        f_ffree: c_ulong,
+        f_favail: c_ulong,
+        f_fsid: c_ulong,
+        f_flag: c_ulong,
+        f_namemax: c_ulong,
+        __f_spare: [c_int; 6],
+    }
+
+    unsafe extern "C" {
+        fn statvfs(path: *const c_char, buf: *mut Statvfs) -> c_int;
+    }
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<Statvfs>::uninit();
+    let result = unsafe { statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+
+    let stat = unsafe { stat.assume_init() };
+    let fragment_size = if stat.f_frsize == 0 {
+        stat.f_bsize
+    } else {
+        stat.f_frsize
+    };
+    Some((stat.f_bavail as u64).saturating_mul(fragment_size as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_storage_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 fn archive_has_cve_json(stream: &zip::ZipArchive<Box<dyn ReadSeek>>) -> bool {

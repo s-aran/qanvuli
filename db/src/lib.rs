@@ -33,7 +33,7 @@ const CVSS_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const AFFECTED_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const CWE_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 6;
 const CWE_MASTER_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
-const READ_JSON_FILE_CHUNK_SIZE: usize = 20_000;
+const READ_JSON_FILE_CHUNK_SIZE: usize = 8_000;
 const CVE_ASSET_METADATA_PREFIX: &str = "cve_asset:";
 const PUBLISHED_STATE: i32 = 0;
 const REJECTED_STATE: i32 = 1;
@@ -3000,7 +3000,7 @@ impl CveDatabase {
         &self,
         files: Vec<ReadJsonFileRecord>,
     ) -> Result<usize, DbErr> {
-        mark_json_files_read_on(&self.db, files).await
+        mark_json_files_read_on(&self.db, files, true).await
     }
 
     pub async fn find_read_json_file(
@@ -3349,7 +3349,7 @@ impl CveBulkReplaceSession {
         &self,
         files: Vec<ReadJsonFileRecord>,
     ) -> Result<usize, DbErr> {
-        mark_json_files_read_on(&self.txn, files).await
+        mark_json_files_read_on(&self.txn, files, false).await
     }
 
     pub async fn finish(self, db: &CveDatabase) -> Result<(), DbErr> {
@@ -4563,12 +4563,20 @@ fn read_json_file_upsert_conflict() -> OnConflict {
     .to_owned()
 }
 
-async fn mark_json_files_read_on<C>(db: &C, files: Vec<ReadJsonFileRecord>) -> Result<usize, DbErr>
+async fn mark_json_files_read_on<C>(
+    db: &C,
+    files: Vec<ReadJsonFileRecord>,
+    upsert: bool,
+) -> Result<usize, DbErr>
 where
     C: ConnectionTrait,
 {
     if files.is_empty() {
         return Ok(0);
+    }
+
+    if matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return mark_json_files_read_sqlite(db, files, upsert).await;
     }
 
     let now = Utc::now().to_rfc3339();
@@ -4608,6 +4616,65 @@ where
         .exec(db)
         .await?;
 
+    Ok(())
+}
+
+async fn mark_json_files_read_sqlite<C>(
+    db: &C,
+    files: Vec<ReadJsonFileRecord>,
+    upsert: bool,
+) -> Result<usize, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now().to_rfc3339();
+    let count = files.len();
+    for chunk in files.chunks(READ_JSON_FILE_CHUNK_SIZE) {
+        insert_read_json_file_sqlite_chunk(db, chunk, &now, upsert).await?;
+    }
+    Ok(count)
+}
+
+async fn insert_read_json_file_sqlite_chunk<C>(
+    db: &C,
+    chunk: &[ReadJsonFileRecord],
+    now: &str,
+    upsert: bool,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let mut sql = String::with_capacity(
+        "INSERT INTO read_json_file (created_at, updated_at, filename, md5hash) VALUES ".len()
+            + chunk.len() * "(?, ?, ?, ?),".len()
+            + 80,
+    );
+    sql.push_str("INSERT INTO read_json_file (created_at, updated_at, filename, md5hash) VALUES ");
+
+    let mut values = Vec::with_capacity(chunk.len() * 4);
+    for (index, file) in chunk.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(", ");
+        }
+        sql.push_str("(?, ?, ?, ?)");
+        values.push(SeaValue::from(now.to_owned()));
+        values.push(SeaValue::from(now.to_owned()));
+        values.push(SeaValue::from(file.filename.clone()));
+        values.push(SeaValue::from(file.md5hash.clone()));
+    }
+
+    if upsert {
+        sql.push_str(
+            " ON CONFLICT(filename, md5hash) DO UPDATE SET updated_at = excluded.updated_at",
+        );
+    }
+
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?;
     Ok(())
 }
 
@@ -6147,6 +6214,35 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(count, 1);
+        });
+    }
+
+    #[test]
+    fn mark_json_files_read_splits_large_batches_under_sqlite_variable_limit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+
+            let files = (0..20_000)
+                .map(|index| ReadJsonFileRecord {
+                    filename: format!("cves/CVE-2024-{index:04}.json"),
+                    md5hash: format!("{index:032x}"),
+                })
+                .collect::<Vec<_>>();
+
+            let marked = db.mark_json_files_read(files).await.unwrap();
+            assert_eq!(marked, 20_000);
+
+            let count = read_json_file::Entity::find()
+                .count(db.connection())
+                .await
+                .unwrap();
+            assert_eq!(count, 20_000);
         });
     }
 }

@@ -15,3 +15,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 simd-json = { version = "0.17", features = ["ahash"] }
 url = "2"
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }

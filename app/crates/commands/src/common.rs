@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
 use qanvuli_db::{CveActiveModels, CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
 use qanvuli_models::cwe::read_cwe_catalog_zip;
-use qanvuli_utils::loader::{self, FileStorageTrait};
+use qanvuli_utils::loader::{self, FileStorageTrait, JsonEntry};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ pub const DEFAULT_LIMIT: u64 = 25;
 
 const INGEST_CHUNK_SIZE: usize = 10000;
 const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
+const READ_PARSE_PIPELINE_BATCH_SIZE: usize = 512;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CVE_ZIP_TYPE_ALL_MIDNIGHT: i32 = 0;
@@ -248,6 +249,14 @@ pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
 }
 
 pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(path) = local_test_cwe_catalog_path() {
+        eprintln!("cwe: using local {}", path.display());
+        let count = upsert_cwe_catalog_file(db, &path).await?;
+        eprintln!("cwe: upserted {count} CWE master rows");
+        return Ok(());
+    }
+
     let catalog_file = CweCatalogFile::default();
     let etag = db
         .get_metadata(CWE_ETAG_METADATA_KEY)
@@ -259,21 +268,31 @@ pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
         .map_err(|err| format!("failed to read CWE Last-Modified metadata: {err}"))?;
 
     eprintln!("cwe: checking {}", catalog_file.url);
-    let download = catalog_file
+    let download = match catalog_file
         .async_download_if_changed(etag.as_deref(), last_modified.as_deref())
         .await
-        .map_err(|err| format!("failed to update {}: {err}", catalog_file.name))?;
+    {
+        Ok(download) => download,
+        Err(err) => {
+            if let Some(path) = local_cwe_catalog_path(&catalog_file.name) {
+                eprintln!(
+                    "cwe: failed to update {} ({err}); using local {}",
+                    catalog_file.name,
+                    path.display()
+                );
+                let count = upsert_cwe_catalog_file(db, &path).await?;
+                eprintln!("cwe: upserted {count} CWE master rows");
+                return Ok(());
+            }
+            return Err(format!("failed to update {}: {err}", catalog_file.name));
+        }
+    };
     let Some(path) = download.path else {
         eprintln!("cwe: catalog unchanged");
         return Ok(());
     };
 
-    let catalog = read_cwe_catalog_zip(&path)
-        .map_err(|err| format!("failed to read CWE catalog {}: {err}", path.display()))?;
-    let count = db
-        .upsert_cwe_catalog(&catalog)
-        .await
-        .map_err(|err| format!("failed to write CWE catalog: {err}"))?;
+    let count = upsert_cwe_catalog_file(db, &path).await?;
     if let Some(etag) = download.etag {
         db.set_metadata(CWE_ETAG_METADATA_KEY, &etag)
             .await
@@ -286,6 +305,34 @@ pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
     }
     eprintln!("cwe: upserted {count} CWE master rows");
     Ok(())
+}
+
+async fn upsert_cwe_catalog_file(db: &CveDatabase, path: &Path) -> Result<usize, String> {
+    let catalog = read_cwe_catalog_zip(path)
+        .map_err(|err| format!("failed to read CWE catalog {}: {err}", path.display()))?;
+    db.upsert_cwe_catalog(&catalog)
+        .await
+        .map_err(|err| format!("failed to write CWE catalog: {err}"))
+}
+
+fn local_cwe_catalog_path(filename: &str) -> Option<PathBuf> {
+    let current_dir_path = PathBuf::from(filename);
+    if current_dir_path.exists() {
+        return Some(current_dir_path);
+    }
+
+    let executable_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(filename)));
+    executable_path.filter(|path| path.exists())
+}
+
+#[cfg(test)]
+fn local_test_cwe_catalog_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("cwec_latest.xml.zip");
+    path.exists().then_some(path)
 }
 
 pub async fn apply_delta_updates(
@@ -738,48 +785,17 @@ pub async fn ingest_zip_with_progress(
             failed,
         );
         let chunk_start = Instant::now();
-        let mut jsons = Vec::with_capacity(chunk.len());
         let mut read_failed = 0usize;
 
-        let read_start = Instant::now();
-        for entry in chunk {
-            match storage.get_json_entry_bytes(entry) {
-                Ok(json) => jsons.push((entry.path.clone(), json)),
-                Err(err) => {
-                    read_failed += 1;
-                    eprintln!("{label}: failed to read {}: {err}", entry.path);
-                }
-            }
-        }
-        let read_elapsed = read_start.elapsed();
+        let (parsed, read_elapsed, parse_elapsed) =
+            if chunk.iter().all(|entry| entry.filesystem_path.is_some()) {
+                read_and_parse_extracted_chunk(label, chunk, &mut read_failed)
+            } else {
+                read_and_parse_zip_chunk(label, chunk, &mut storage, &mut read_failed)
+            };
         timings.read += read_elapsed;
-
-        let hash_start = Instant::now();
-        let jsons = jsons
-            .into_par_iter()
-            .map(|(json_path, json)| {
-                let read_file = ReadJsonFileRecord::from_content(json_path.clone(), &json);
-                (json_path, json, read_file)
-            })
-            .collect::<Vec<_>>();
-        let hash_elapsed = hash_start.elapsed();
+        let hash_elapsed = Duration::ZERO;
         timings.hash += hash_elapsed;
-
-        let parse_start = Instant::now();
-        let parsed = jsons
-            .into_par_iter()
-            .map(|(json_path, json, read_file)| {
-                let raw_json = String::from_utf8(json)
-                    .map_err(|err| format!("{label}: invalid UTF-8 in {json_path}: {err}"))?;
-                let model = CveActiveModels::from_raw_json_string(raw_json)
-                    .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
-                if model.cve_id.is_empty() {
-                    return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
-                }
-                Ok((model, read_file))
-            })
-            .collect::<Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>>();
-        let parse_elapsed = parse_start.elapsed();
         timings.parse += parse_elapsed;
 
         let mut models = Vec::new();
@@ -946,6 +962,136 @@ pub async fn ingest_zip_with_progress(
     );
 }
 
+fn parse_json_batch(
+    label: &str,
+    batch: Vec<(String, Vec<u8>)>,
+) -> Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>> {
+    batch
+        .into_iter()
+        .map(|(json_path, json)| parse_json(label, json_path, json))
+        .collect()
+}
+
+fn read_and_parse_extracted_chunk(
+    label: &str,
+    chunk: &[JsonEntry],
+    read_failed: &mut usize,
+) -> (
+    Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>,
+    Duration,
+    Duration,
+) {
+    let total_start = Instant::now();
+    let results = chunk
+        .par_iter()
+        .map(|entry| {
+            let filesystem_path = entry
+                .filesystem_path
+                .as_ref()
+                .expect("extracted entry must have a filesystem path");
+            match std::fs::read(filesystem_path) {
+                Ok(json) => Ok(parse_json(label, entry.path.clone(), json)),
+                Err(err) => Err(format!(
+                    "{label}: failed to read {} from {}: {err}",
+                    entry.path,
+                    filesystem_path.display()
+                )),
+            }
+        })
+        .collect::<Vec<_>>();
+    let elapsed = total_start.elapsed();
+
+    let mut parsed = Vec::with_capacity(chunk.len());
+    for result in results {
+        match result {
+            Ok(parse_result) => parsed.push(parse_result),
+            Err(err) => {
+                *read_failed += 1;
+                eprintln!("{err}");
+            }
+        }
+    }
+
+    (parsed, elapsed, Duration::ZERO)
+}
+
+fn read_and_parse_zip_chunk(
+    label: &str,
+    chunk: &[JsonEntry],
+    storage: &mut loader::ZipStorage,
+    read_failed: &mut usize,
+) -> (
+    Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>,
+    Duration,
+    Duration,
+) {
+    let read_start = Instant::now();
+    let parsed_batches = std::sync::Mutex::new(Vec::new());
+    let mut read_elapsed = Duration::ZERO;
+    rayon::scope(|scope| {
+        let mut batch = Vec::with_capacity(READ_PARSE_PIPELINE_BATCH_SIZE);
+        for entry in chunk {
+            match storage.get_json_entry_bytes(entry) {
+                Ok(json) => batch.push((entry.path.clone(), json)),
+                Err(err) => {
+                    *read_failed += 1;
+                    eprintln!("{label}: failed to read {}: {err}", entry.path);
+                }
+            }
+
+            if batch.len() == READ_PARSE_PIPELINE_BATCH_SIZE {
+                let batch = std::mem::take(&mut batch);
+                let parsed_batches = &parsed_batches;
+                scope.spawn(move |_| {
+                    let parsed = parse_json_batch(label, batch);
+                    parsed_batches
+                        .lock()
+                        .expect("parsed batch mutex poisoned")
+                        .push(parsed);
+                });
+            }
+        }
+
+        if !batch.is_empty() {
+            let parsed_batches = &parsed_batches;
+            scope.spawn(move |_| {
+                let parsed = parse_json_batch(label, batch);
+                parsed_batches
+                    .lock()
+                    .expect("parsed batch mutex poisoned")
+                    .push(parsed);
+            });
+        }
+
+        read_elapsed = read_start.elapsed();
+    });
+    let parse_elapsed = read_start.elapsed().saturating_sub(read_elapsed);
+    let parsed = parsed_batches
+        .into_inner()
+        .expect("parsed batch mutex poisoned")
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    (parsed, read_elapsed, parse_elapsed)
+}
+
+fn parse_json(
+    label: &str,
+    json_path: String,
+    json: Vec<u8>,
+) -> Result<(CveActiveModels, ReadJsonFileRecord), String> {
+    let read_file = ReadJsonFileRecord::from_content(json_path.clone(), &json);
+    let raw_json = String::from_utf8(json)
+        .map_err(|err| format!("{label}: invalid UTF-8 in {json_path}: {err}"))?;
+    let model = CveActiveModels::from_raw_json_string(raw_json)
+        .map_err(|err| format!("{label}: failed to parse {json_path}: {err}"))?;
+    if model.cve_id.is_empty() {
+        return Err(format!("{label}: missing cveMetadata.cveId in {json_path}"));
+    }
+    Ok((model, read_file))
+}
+
 fn emit_ingest_progress(
     progress: &Option<IngestProgressCallback>,
     label: &str,
@@ -999,5 +1145,36 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
 
         assert_eq!(db_path, executable.parent().unwrap().join("db.sqlite"));
+    }
+
+    #[tokio::test]
+    async fn replace_all_ingest_initializes_from_local_archives() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let db_path = std::env::temp_dir().join(format!(
+            "qanvuli-init-ingest-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
+        reset_sqlite_database_files(&db_url).unwrap();
+
+        let db = connect_db(&db_url).await.unwrap();
+        ingest_zip_with_progress(
+            &db,
+            "test-init",
+            &repo_root.join("test/2026-06-04_delta_CVEs_at_0500Z.zip"),
+            IngestMode::ReplaceAll,
+            Some(1),
+            false,
+            None,
+        )
+        .await;
+
+        let status = db.database_status().await.unwrap();
+        assert!(status.cve_count > 0);
+        assert!(status.cwe_count > 0);
+        db.close().await.unwrap();
+
+        reset_sqlite_database_files(&db_url).unwrap();
     }
 }
