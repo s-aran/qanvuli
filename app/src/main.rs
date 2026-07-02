@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use qanvuli_app_commands::common::default_db_connection_string;
+use std::io::IsTerminal;
 
 fn main() {
     if let Err(err) = run() {
@@ -12,6 +13,11 @@ fn run() -> Result<(), String> {
     qanvuli_utils::init_tls_provider();
 
     let cli = Cli::parse();
+    if cli.version {
+        print_version();
+        return Ok(());
+    }
+
     let db_url = cli.db_url()?;
     let command = cli.command.unwrap_or(Command::Help);
 
@@ -45,11 +51,13 @@ fn run() -> Result<(), String> {
 #[derive(Debug, Parser)]
 #[command(
     name = "qanvuli",
-    version,
     about = "CVE DB maintenance and search tool",
-    disable_help_subcommand = true
+    disable_help_subcommand = true,
+    disable_version_flag = true
 )]
 struct Cli {
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
+    version: bool,
     #[arg(long = "db-url", global = true, value_name = "URL")]
     db_url: Option<String>,
     #[command(subcommand)]
@@ -94,4 +102,33 @@ fn print_help() {
     let mut command = Cli::command();
     command.print_help().expect("failed to print help");
     println!();
+}
+
+fn print_version() {
+    if can_show_emoji() {
+        println!(
+            "🐟 {} 🍣️ v{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        );
+    } else {
+        println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+    }
+}
+
+fn can_show_emoji() -> bool {
+    std::io::stdout().is_terminal()
+        && !std::env::var("CI").is_ok_and(|value| !value.is_empty() && value != "0")
+        && !std::env::var("TERM").is_ok_and(|value| value == "dumb")
+        && locale_is_utf8()
+}
+
+fn locale_is_utf8() -> bool {
+    ["LC_ALL", "LC_CTYPE", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .any(|value| {
+            let value = value.to_ascii_uppercase();
+            value.contains("UTF-8") || value.contains("UTF8")
+        })
 }
