@@ -2,6 +2,7 @@
 name = "qanvuli-app-tui"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "../commands" }

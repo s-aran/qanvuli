@@ -2,6 +2,7 @@
 name = "qanvuli-app-commands"
 edition.workspace = true
 version.workspace = true
+license.workspace = true
 
 [dependencies]
 qanvuli-collector = { version = "*", path = "../../../collector" }
