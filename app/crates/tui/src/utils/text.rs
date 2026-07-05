@@ -14,7 +14,7 @@ pub(crate) fn wrapped_line_count(value: &str, width: usize) -> usize {
     let width = width.max(1);
     value
         .lines()
-        .map(|line| (line.chars().count().max(1) + width - 1) / width)
+        .map(|line| line.chars().count().max(1).div_ceil(width))
         .sum::<usize>()
         .max(1)
 }

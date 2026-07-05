@@ -36,5 +36,5 @@ where
     D: Deserializer<'de>,
 {
     let s = add_timezone_if_missing(String::deserialize(deserializer)?);
-    Ok(DateTime::parse_from_rfc3339(&s).map_err(serde::de::Error::custom)?)
+    DateTime::parse_from_rfc3339(&s).map_err(serde::de::Error::custom)
 }

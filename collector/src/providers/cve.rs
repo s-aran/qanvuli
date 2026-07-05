@@ -4,6 +4,12 @@ pub struct CveRelease {
     releases: Vec<GitHubRelease>,
 }
 
+impl Default for CveRelease {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CveRelease {
     pub fn new() -> Self {
         Self {
@@ -43,7 +49,7 @@ impl CveRelease {
     }
 
     fn get_releases<T: Fn(&GitHubRelease) -> bool>(
-        releases: &Vec<GitHubRelease>,
+        releases: &[GitHubRelease],
         filter_func: T,
     ) -> Vec<&GitHubRelease> {
         releases.iter().filter(|r| filter_func(r)).collect()
@@ -73,20 +79,15 @@ impl CveRelease {
         releases: Vec<&GitHubRelease>,
         filter_func: T,
     ) -> Option<&GitHubReleaseFile> {
-        let latest_release = if let Some(e) = releases.get(0) {
-            e
-        } else {
-            return None;
-        };
+        let latest_release = releases.first()?;
 
-        let asset = latest_release
+        latest_release
             .files
             .iter()
             .filter(|f| filter_func(f))
-            .collect::<Vec<&GitHubReleaseFile>>();
-        let asset = asset.get(0).map(|e| *e);
-
-        asset
+            .collect::<Vec<&GitHubReleaseFile>>()
+            .first()
+            .copied()
     }
 
     pub fn get_latest_all_file(&self) -> Option<&GitHubReleaseFile> {

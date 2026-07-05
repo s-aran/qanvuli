@@ -1,5 +1,5 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
-use qanvuli_db::CveStateScope;
+use qanvuli_db::{CveStateScope, detect_identifier_type};
 
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
@@ -37,6 +37,8 @@ pub struct Args {
     offset: Option<u64>,
     #[arg(long)]
     include_rejected: bool,
+    #[arg(long)]
+    enriched: bool,
 }
 
 impl Args {
@@ -88,13 +90,47 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
     let date_filter = args.date_filter()?;
 
-    if let Some(cve_id) = args.cve_id.as_deref() {
-        let cve = db
-            .find_cve_model_by_id(cve_id)
+    if args.enriched
+        && let Some(query) = args.text.as_deref()
+        && detect_identifier_type(query) != "other"
+    {
+        let resolution = db
+            .resolve_identifier(query)
             .await
-            .map_err(|err| format!("failed to fetch {cve_id}: {err}"))?;
-        let cve = cve.map(|cve| cve.into_parts().1);
-        print_json(&cve)?;
+            .map_err(|err| format!("failed to resolve {query}: {err}"))?;
+        let mut results = Vec::with_capacity(resolution.related_cve_ids.len());
+        for cve_id in &resolution.related_cve_ids {
+            results.push(
+                db.get_enriched_cve(cve_id)
+                    .await
+                    .map_err(|err| format!("failed to enrich {cve_id}: {err}"))?,
+            );
+        }
+        print_json(&serde_json::json!({
+            "resolution": resolution,
+            "results": results,
+        }))?;
+        db.close()
+            .await
+            .map_err(|err| format!("failed to close database: {err}"))?;
+        return Ok(());
+    }
+
+    if let Some(cve_id) = args.cve_id.as_deref() {
+        if args.enriched {
+            let cve = db
+                .get_enriched_cve(cve_id)
+                .await
+                .map_err(|err| format!("failed to fetch enriched {cve_id}: {err}"))?;
+            print_json(&cve)?;
+        } else {
+            let cve = db
+                .find_cve_model_by_id(cve_id)
+                .await
+                .map_err(|err| format!("failed to fetch {cve_id}: {err}"))?;
+            let cve = cve.map(|cve| cve.into_parts().1);
+            print_json(&cve)?;
+        }
         db.close()
             .await
             .map_err(|err| format!("failed to close database: {err}"))?;
@@ -188,7 +224,19 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .map_err(|err| format!("failed to search by date: {err}"))?
     };
 
-    print_json(&summaries)?;
+    if args.enriched {
+        let mut enriched = Vec::with_capacity(summaries.len());
+        for summary in &summaries {
+            enriched.push(
+                db.get_enriched_cve(&summary.cve_id)
+                    .await
+                    .map_err(|err| format!("failed to enrich {}: {err}", summary.cve_id))?,
+            );
+        }
+        print_json(&enriched)?;
+    } else {
+        print_json(&summaries)?;
+    }
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;

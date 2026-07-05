@@ -1,35 +1,14 @@
 use crate::{
-    app::{App, PaneFocus},
-    common::{DetailSearch, focus_style, highlighted_line},
+    common::{DetailSearch, highlighted_line},
     utils::text::normalize_spaces,
 };
 use qanvuli_db::CveDetail;
-use ratatui::{
-    layout::Rect,
-    text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
-};
+use ratatui::text::Line;
 
-pub(super) fn render(
-    frame: &mut ratatui::Frame<'_>,
-    app: &mut App,
+pub(super) fn metadata_lines(
+    detail: Option<&CveDetail>,
     detail_search: &DetailSearch,
-    area: Rect,
-) {
-    let metadata_lines = metadata_lines(app.selected().map(|cve| &cve.detail), detail_search);
-    app.clamp_metadata_scroll();
-    let metadata = Paragraph::new(metadata_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(focus_style(app.focus == PaneFocus::Metadata)),
-        )
-        .scroll((app.metadata_scroll, 0))
-        .wrap(Wrap { trim: true });
-    frame.render_widget(metadata, area);
-}
-
-fn metadata_lines(detail: Option<&CveDetail>, detail_search: &DetailSearch) -> Vec<Line<'static>> {
+) -> Vec<Line<'static>> {
     let Some(detail) = detail else {
         return vec![Line::from("Loading")];
     };

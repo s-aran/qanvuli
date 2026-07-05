@@ -117,6 +117,28 @@ async fn search_by_mode(
             )
             .await
         }
+        SearchMode::Identifier => {
+            let resolution = db
+                .resolve_identifier(query)
+                .await
+                .map_err(|err| err.to_string())?;
+            let mut rows = Vec::new();
+            for cve_id in resolution
+                .related_cve_ids
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+            {
+                if let Some(row) = db
+                    .find_cve_summary_with_detail(&cve_id)
+                    .await
+                    .map_err(|err| err.to_string())?
+                {
+                    rows.push(row.summary);
+                }
+            }
+            Ok(rows)
+        }
     }
     .map_err(|err| err.to_string())
 }
@@ -156,6 +178,10 @@ async fn count_by_mode(
             db.count_cve_summaries_by_cve_id_prefix_with_state_scope(query, state_scope)
                 .await
         }
+        SearchMode::Identifier => db
+            .resolve_identifier(query)
+            .await
+            .map(|resolution| resolution.related_cve_ids.len() as u64),
     }
     .map_err(|err| err.to_string())
 }

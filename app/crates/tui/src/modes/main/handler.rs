@@ -1,4 +1,7 @@
-use crate::{app::App, common::input::is_ctrl};
+use crate::{
+    app::{App, PaneFocus},
+    common::input::is_ctrl,
+};
 use crossterm::event::{KeyCode, KeyEvent};
 use qanvuli_db::CveDatabase;
 
@@ -37,6 +40,8 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
         }
         KeyCode::Tab => app.toggle_focus(),
         KeyCode::BackTab => app.previous_focus(),
+        KeyCode::Left if app.focus == PaneFocus::Right => app.previous_right_tab(),
+        KeyCode::Right if app.focus == PaneFocus::Right => app.next_right_tab(),
         KeyCode::Left => app.previous_search_mode(),
         KeyCode::Right => app.next_search_mode(),
         KeyCode::Backspace => {

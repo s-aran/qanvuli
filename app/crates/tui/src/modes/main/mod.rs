@@ -3,11 +3,10 @@ mod detail;
 pub(crate) mod handler;
 mod keyword;
 mod metadata;
+mod right;
 pub(crate) mod status;
 
-use crate::traits::{
-    detail::DetailPanel, keyword::KeywordInput, list::ResultList, status::StatusLine,
-};
+use crate::traits::{keyword::KeywordInput, list::ResultList, status::StatusLine};
 use crate::{app::App, common::DetailSearch};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -28,16 +27,12 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(chunks[0]);
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(68), Constraint::Min(4)])
-        .split(chunks[1]);
     app.set_page_sizes(
         left[1].height.saturating_sub(2) as usize,
-        right[0].height.saturating_sub(2) as usize,
-        right[1].height.saturating_sub(2) as usize,
-        right[0].width.saturating_sub(2) as usize,
-        right[1].width.saturating_sub(2) as usize,
+        chunks[1].height.saturating_sub(2) as usize,
+        chunks[1].height.saturating_sub(2) as usize,
+        chunks[1].width.saturating_sub(2) as usize,
+        chunks[1].width.saturating_sub(2) as usize,
     );
 
     keyword::MainKeywordInput.render(frame, app, left[0]);
@@ -50,6 +45,5 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
     );
     frame.render_widget(footer, main[1]);
 
-    detail::MainDetailPanel.render(frame, app, detail_search, right[0]);
-    metadata::render(frame, app, detail_search, right[1]);
+    right::render(frame, app, detail_search, chunks[1]);
 }

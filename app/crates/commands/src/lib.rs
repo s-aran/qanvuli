@@ -1,7 +1,10 @@
 pub mod common;
 pub mod cwe;
+pub mod db;
 pub mod download_cve;
+pub mod graph;
 pub mod init;
+pub mod query;
 pub mod sbom;
 pub mod search;
 pub mod update;

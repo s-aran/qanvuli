@@ -54,7 +54,9 @@ async fn run_loop(
         app.poll_search().await?;
         app.poll_count().await;
         app.poll_raw_json().await;
+        app.poll_enrichment().await;
         app.poll_cwe_search().await;
+        app.ensure_loaded_enrichment(db.as_ref().cloned());
         if app.poll_maintenance().await {
             refresh_db_after_maintenance(db_url, db, app).await;
         }
@@ -292,6 +294,7 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
                 return;
             }
             app.results.clear();
+            app.enrichment.clear();
             app.total_results = None;
             let db_url = db_url.to_owned();
             let (progress, progress_rx) = maintenance_progress_channel();

@@ -1,13 +1,27 @@
+#![allow(clippy::too_many_arguments)]
+
+pub mod common;
+pub mod cve_types;
 pub mod entity;
+pub mod epss;
+pub mod identifiers;
+pub mod kev;
 pub mod migration;
+pub mod osv;
 
 use chrono::Utc;
+pub use common::detect_identifier_type;
+use common::*;
+pub use cve_types::*;
 use entity::{
     app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cve_zip_file, cwe, read_json_file,
 };
-use md5::{Digest, Md5};
+pub use epss::*;
+pub use identifiers::*;
+pub use kev::*;
 use migration::Migrator;
-use std::collections::{HashMap, HashSet};
+pub use osv::*;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use qanvuli_models::{
     CveStatusData, RawCveRecord, RawCveStatusRecord, cna_affected_raw_values, cna_cvss_raw_values,
@@ -15,8 +29,12 @@ use qanvuli_models::{
     cve::base::cve_metadata::CveState,
     cve::published::cna_description::CnaDescription,
     cwe::{WeaknessCatalog, enumeration::RelatedNature},
+    epss::EpssCurrentCsv,
+    kev::KevCatalog,
+    osv::{OSV_SCHEMA_VERSION, OsvAdvisory},
     parse_value_with_raw,
 };
+use rayon::prelude::*;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction,
@@ -24,7 +42,6 @@ use sea_orm::{
     QuerySelect, Set, Statement, TransactionTrait, Value as SeaValue,
 };
 use sea_orm_migration::prelude::MigratorTrait;
-use serde::{Serialize, Serializer};
 use serde_json::Value;
 use simd_json::{BorrowedValue, prelude::*};
 
@@ -38,27 +55,6 @@ const CVE_ASSET_METADATA_PREFIX: &str = "cve_asset:";
 const PUBLISHED_STATE: i32 = 0;
 const REJECTED_STATE: i32 = 1;
 
-pub struct CveActiveModels {
-    pub cve_id: String,
-    pub cve: cve::ActiveModel,
-    pub cvss_rows: Vec<cve_cvss::ActiveModel>,
-    pub affected_rows: Vec<cve_affected::ActiveModel>,
-    pub cwe_master_rows: Vec<cwe::ActiveModel>,
-    pub cwe_rows: Vec<cve_cwe::ActiveModel>,
-}
-
-pub struct ReadJsonFileRecord {
-    pub filename: String,
-    pub md5hash: String,
-}
-
-#[derive(Clone, Debug)]
-pub struct CveZipFileRecord {
-    pub zip_filename: String,
-    pub zip_datetime: String,
-    pub zip_type: i32,
-}
-
 impl ReadJsonFileRecord {
     pub fn from_content(filename: impl Into<String>, content: &[u8]) -> Self {
         Self {
@@ -66,192 +62,6 @@ impl ReadJsonFileRecord {
             md5hash: md5_hex(content),
         }
     }
-}
-
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
-pub struct CveSummary {
-    pub cve_id: String,
-    #[serde(serialize_with = "serialize_cve_state")]
-    pub state: i32,
-    pub published_at: String,
-    pub updated_at: String,
-    pub title: String,
-    pub description_en: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CveSummaryWithDetail {
-    pub summary: CveSummary,
-    pub detail: CveDetail,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CveIdMapping {
-    id: i32,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CveDbIdByCveId {
-    id: i32,
-    cve_id: String,
-}
-
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
-pub struct CveDatabaseStatus {
-    pub cve_count: i64,
-    pub published_count: i64,
-    pub rejected_count: i64,
-    pub cwe_count: i64,
-    pub affected_count: i64,
-    pub cvss_count: i64,
-    pub latest_cve_updated_at: Option<String>,
-    pub latest_zip_datetime: Option<String>,
-    pub latest_zip_filename: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CveReference {
-    pub url: Option<String>,
-    pub name: Option<String>,
-    pub tags: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct CveDetail {
-    pub cwes: Vec<CveCweDetail>,
-    pub cvss: Vec<CveCvssDetail>,
-    pub affected: Vec<CveAffectedDetail>,
-}
-
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
-pub struct CveCweDetail {
-    pub id: i32,
-    pub description: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CweEntry {
-    pub id: i32,
-    pub description: Option<String>,
-    pub status: Option<String>,
-    pub parent_id: Option<i32>,
-    pub parent_count: usize,
-    pub sibling_count: usize,
-    pub child_count: usize,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CweEntryRow {
-    id: i32,
-    description: Option<String>,
-    status: Option<String>,
-    parent_id: Option<i32>,
-}
-
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
-pub struct CveCvssDetail {
-    pub version: String,
-    pub base_score: Option<f64>,
-    pub base_severity: Option<String>,
-    pub vector_string: Option<String>,
-    pub source: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct CveAffectedDetail {
-    pub vendor: Option<String>,
-    pub product: Option<String>,
-    pub package_name: Option<String>,
-    pub collection_url: Option<String>,
-    pub default_status: Option<String>,
-    pub versions: Vec<CveAffectedVersionDetail>,
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct CveAffectedVersionDetail {
-    pub version: Option<String>,
-    pub status: Option<String>,
-    pub version_type: Option<String>,
-    pub less_than: Option<String>,
-    pub less_than_or_equal: Option<String>,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CveCweDetailRow {
-    cve_db_id: i32,
-    id: i32,
-    description: Option<String>,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CveCvssDetailRow {
-    cve_db_id: i32,
-    version: String,
-    base_score: Option<f64>,
-    base_severity: Option<String>,
-    vector_string: Option<String>,
-    source: Option<String>,
-}
-
-#[derive(Clone, Debug, FromQueryResult)]
-struct CveAffectedDetailRow {
-    cve_db_id: i32,
-    vendor: Option<String>,
-    product: Option<String>,
-    package_name: Option<String>,
-    collection_url: Option<String>,
-    default_status: Option<String>,
-    raw_json: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct CveAdvancedSearch {
-    pub query: Option<String>,
-    pub query_mode: Option<CveAdvancedQueryMode>,
-    pub published_from: Option<String>,
-    pub published_to: Option<String>,
-    pub cwe: Option<String>,
-    pub product: Option<String>,
-    pub product_exact: Option<String>,
-    pub vendor: Option<String>,
-    pub vendor_exact: Option<String>,
-    pub state_scope: CveStateScope,
-    pub sort_order: CveSummarySortOrder,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CveAdvancedQueryMode {
-    FreeText,
-    Product,
-    Vendor,
-    Cwe,
-    Cve,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum CveStateScope {
-    #[default]
-    PublishedOnly,
-    IncludeRejected,
-}
-
-impl CveStateScope {
-    fn includes_rejected(self) -> bool {
-        matches!(self, Self::IncludeRejected)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum CveSummarySortOrder {
-    PublishedAsc,
-    #[default]
-    PublishedDesc,
-    CveIdAsc,
-    CveIdDesc,
-    RelationRankAsc,
-    RelationRankDesc,
-    ScoreAsc,
-    ScoreDesc,
 }
 
 impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
@@ -792,16 +602,6 @@ fn push_json_string(value: &Value, key: &str, parts: &mut Vec<String>) {
     }
 }
 
-fn md5_hex(bytes: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(bytes);
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 fn cve_asset_metadata_key(asset_name: &str) -> String {
     format!("{CVE_ASSET_METADATA_PREFIX}{asset_name}")
 }
@@ -882,14 +682,6 @@ fn cve_state_str_to_int(state: &str) -> i32 {
     match state {
         "REJECTED" => REJECTED_STATE,
         _ => PUBLISHED_STATE,
-    }
-}
-
-pub fn cve_state_label(state: i32) -> &'static str {
-    match state {
-        PUBLISHED_STATE => "PUBLISHED",
-        REJECTED_STATE => "REJECTED",
-        _ => "UNKNOWN",
     }
 }
 
@@ -2310,14 +2102,16 @@ impl CveDatabase {
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
-            return self
-                .search_cve_summaries_by_fts_text_with_state_scope(
+            append_unique_summaries(
+                &mut cves,
+                self.search_cve_summaries_by_fts_text_with_state_scope(
                     &fts_query,
                     state_scope,
-                    limit,
-                    offset,
+                    candidate_limit,
+                    0,
                 )
-                .await;
+                .await?,
+            );
         } else {
             append_unique_summaries(
                 &mut cves,
@@ -2333,6 +2127,13 @@ impl CveDatabase {
             append_unique_summaries(
                 &mut cves,
                 self.search_cve_summaries_by_affected_text(query, state_scope, candidate_limit, 0)
+                    .await?,
+            );
+        }
+        if cwe_id.is_none() && matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            append_unique_summaries(
+                &mut cves,
+                self.search_cve_summaries_by_osv_free_text(query, state_scope, candidate_limit, 0)
                     .await?,
             );
         }
@@ -2390,7 +2191,7 @@ impl CveDatabase {
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
-            self.count_cve_summaries_by_fts_text_with_state_scope(&fts_query, state_scope)
+            self.count_cve_summaries_by_fts_or_osv_text(&fts_query, query, state_scope)
                 .await
         } else {
             let pattern = like_pattern(query);
@@ -2459,6 +2260,42 @@ impl CveDatabase {
             vec![SeaValue::from(query.to_owned())],
         )
         .await
+    }
+
+    async fn search_cve_summaries_by_osv_free_text(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            return Ok(Vec::new());
+        }
+        let pattern = like_pattern(query);
+        let mut values = vec![SeaValue::from(pattern); 6];
+        values.push(SeaValue::from(limit as i64));
+        values.push(SeaValue::from(offset as i64));
+        CveSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            osv_free_text_summary_sql(state_scope),
+            values,
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    async fn count_cve_summaries_by_fts_or_osv_text(
+        &self,
+        fts_query: &str,
+        raw_query: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
+        let pattern = like_pattern(raw_query);
+        let mut values = vec![SeaValue::from(fts_query.to_owned())];
+        values.extend((0..6).map(|_| SeaValue::from(pattern.clone())));
+        self.count_by_statement(fts_or_osv_count_sql(state_scope), values)
+            .await
     }
 
     async fn search_cve_summaries_by_cve_free_text(
@@ -3078,6 +2915,785 @@ impl CveDatabase {
         .ok_or_else(|| DbErr::Custom("database status query returned no row".to_owned()))
     }
 
+    pub async fn database_status_enriched(&self) -> Result<DatabaseStatus, DbErr> {
+        let cve = self.database_status().await?;
+        let sources = self.db_sources().await?;
+        let enrichment = EnrichmentDatabaseStatus::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM osv_advisories) AS osv_record_count,
+                (SELECT COUNT(*) FROM kev_entries) AS kev_entry_count,
+                (SELECT COUNT(*) FROM epss_current) AS epss_current_count,
+                (SELECT COUNT(*) FROM vulnerability_identifiers) AS identifier_node_count,
+                (SELECT COUNT(*) FROM vulnerability_identifier_edges) AS identifier_edge_count
+            "#
+            .to_owned(),
+        ))
+        .one(&self.db)
+        .await?
+        .ok_or_else(|| DbErr::Custom("enrichment status query returned no row".to_owned()))?;
+        Ok(DatabaseStatus {
+            cve,
+            sources,
+            enrichment,
+        })
+    }
+
+    pub async fn source_sync_states(&self) -> Result<Vec<SourceSyncState>, DbErr> {
+        SourceSyncState::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT * FROM source_sync_state ORDER BY source".to_owned(),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    pub async fn db_sources(&self) -> Result<Vec<DbSource>, DbErr> {
+        DbSource::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT source, display_name, source_type, default_filename, raw_format FROM db_sources ORDER BY source".to_owned(),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    async fn raw_record_hashes(
+        &self,
+        source: &str,
+        source_record_ids: &[String],
+    ) -> Result<HashMap<String, String>, DbErr> {
+        if source_record_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                format!(
+                    "SELECT source_record_id, content_hash FROM source_raw_records WHERE source = {} AND source_record_id IN ({})",
+                    sql_string_literal(source),
+                    sql_string_list(source_record_ids)
+                ),
+            ))
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get::<String>("", "source_record_id")?,
+                    row.try_get::<String>("", "content_hash")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub async fn metadata_value(&self, key: &str) -> Result<Option<String>, DbErr> {
+        Ok(app_metadata::Entity::find_by_id(key.to_owned())
+            .one(&self.db)
+            .await?
+            .map(|row| row.value))
+    }
+
+    pub async fn set_metadata_value(&self, key: &str, value: &str) -> Result<(), DbErr> {
+        let model = app_metadata::ActiveModel {
+            key: Set(key.to_owned()),
+            value: Set(value.to_owned()),
+            updated_at: Set(Utc::now().to_rfc3339()),
+        };
+        app_metadata::Entity::insert(model)
+            .on_conflict(
+                OnConflict::column(app_metadata::Column::Key)
+                    .update_columns([app_metadata::Column::Value, app_metadata::Column::UpdatedAt])
+                    .to_owned(),
+            )
+            .exec(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn import_osv_records(
+        &self,
+        records: Vec<OsvRawRecord>,
+    ) -> Result<ImportSummary, DbErr> {
+        self.import_osv_records_with_cursor(records, None).await
+    }
+
+    pub async fn import_osv_records_with_cursor(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+    ) -> Result<ImportSummary, DbErr> {
+        self.import_osv_records_with_cursor_and_count(records, last_cursor, None)
+            .await
+    }
+
+    pub async fn import_osv_records_with_cursor_and_count(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+        record_count_override: Option<usize>,
+    ) -> Result<ImportSummary, DbErr> {
+        let fetched_at = Utc::now().to_rfc3339();
+        let source_hash = md5_hex_concat(records.iter().map(|record| record.raw_json.as_bytes()));
+        let parsed_records = records
+            .into_par_iter()
+            .map(parse_osv_raw_record)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let parsed_osv_ids = parsed_records
+            .iter()
+            .map(|record| record.osv_id.clone())
+            .collect::<Vec<_>>();
+        let existing_hashes = self.raw_record_hashes("OSV", &parsed_osv_ids).await?;
+        let txn = self.db.begin().await?;
+        mark_source_attempt(&txn, "OSV", Some(&source_hash)).await?;
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for record in parsed_records {
+            if existing_hashes.get(&record.osv_id).map(String::as_str)
+                == Some(record.content_hash.as_str())
+            {
+                skipped += 1;
+                continue;
+            }
+            let raw_record_id = upsert_raw_record(
+                &txn,
+                RawRecordInput {
+                    source: "OSV",
+                    source_record_id: &record.osv_id,
+                    source_path: record.source_path.as_deref(),
+                    provider_published_at: record.parsed.published.as_deref(),
+                    provider_modified_at: record.parsed.modified.as_deref(),
+                    score_date: None,
+                    fetched_at: &fetched_at,
+                    content_hash: &record.content_hash,
+                    raw_content: &record.raw_json,
+                    content_type: "application/json",
+                },
+            )
+            .await?;
+            replace_osv_normalized(&txn, &record.parsed, raw_record_id).await?;
+            imported += 1;
+        }
+        mark_source_success(
+            &txn,
+            "OSV",
+            Some(&source_hash),
+            last_cursor,
+            Some(record_count_override.unwrap_or(imported + skipped) as i64),
+            Some(OSV_SCHEMA_VERSION),
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(ImportSummary {
+            source: "OSV".to_owned(),
+            imported,
+            skipped,
+            record_count: record_count_override.unwrap_or(imported + skipped),
+            content_hash: Some(source_hash),
+        })
+    }
+
+    pub async fn import_kev_json(&self, raw_json: &str) -> Result<ImportSummary, DbErr> {
+        let fetched_at = Utc::now().to_rfc3339();
+        let content_hash = md5_hex(raw_json.as_bytes());
+        let parsed = KevCatalog::parse_json(raw_json.as_bytes())
+            .map_err(|err| DbErr::Custom(format!("failed to parse KEV JSON: {err}")))?;
+        parsed
+            .validate_schema_shape()
+            .map_err(|err| DbErr::Custom(format!("invalid KEV JSON: {err}")))?;
+        let txn = self.db.begin().await?;
+        mark_source_attempt(&txn, "KEV", Some(&content_hash)).await?;
+        let _catalog_raw_record_id = upsert_raw_record(
+            &txn,
+            RawRecordInput {
+                source: "KEV",
+                source_record_id: "known_exploited_vulnerabilities.json",
+                source_path: Some("known_exploited_vulnerabilities.json"),
+                provider_published_at: None,
+                provider_modified_at: Some(parsed.date_released.as_str()),
+                score_date: None,
+                fetched_at: &fetched_at,
+                content_hash: &content_hash,
+                raw_content: raw_json,
+                content_type: "application/json",
+            },
+        )
+        .await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "DELETE FROM kev_entries".to_owned(),
+        ))
+        .await?;
+        for entry in &parsed.vulnerabilities {
+            let cve_id = normalize_identifier(&entry.cve_id);
+            let entry_raw = serde_json::to_string(entry)
+                .map_err(|err| DbErr::Custom(format!("failed to encode KEV entry: {err}")))?;
+            let raw_record_id = upsert_raw_record(
+                &txn,
+                RawRecordInput {
+                    source: "KEV",
+                    source_record_id: &cve_id,
+                    source_path: Some("known_exploited_vulnerabilities.json"),
+                    provider_published_at: None,
+                    provider_modified_at: None,
+                    score_date: Some(entry.date_added.as_str()),
+                    fetched_at: &fetched_at,
+                    content_hash: &md5_hex(entry_raw.as_bytes()),
+                    raw_content: &entry_raw,
+                    content_type: "application/json",
+                },
+            )
+            .await?;
+            execute_values(
+                &txn,
+                r#"
+                INSERT INTO kev_entries (
+                    cve_id, vendor_project, product, vulnerability_name, date_added,
+                    short_description, required_action, due_date,
+                    known_ransomware_campaign_use, notes, fetched_at, raw_record_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cve_id) DO UPDATE SET
+                    vendor_project = excluded.vendor_project,
+                    product = excluded.product,
+                    vulnerability_name = excluded.vulnerability_name,
+                    date_added = excluded.date_added,
+                    short_description = excluded.short_description,
+                    required_action = excluded.required_action,
+                    due_date = excluded.due_date,
+                    known_ransomware_campaign_use = excluded.known_ransomware_campaign_use,
+                    notes = excluded.notes,
+                    fetched_at = excluded.fetched_at,
+                    raw_record_id = excluded.raw_record_id
+                "#,
+                vec![
+                    SeaValue::from(cve_id.clone()),
+                    SeaValue::from(entry.vendor_project.clone()),
+                    SeaValue::from(entry.product.clone()),
+                    SeaValue::from(entry.vulnerability_name.clone()),
+                    SeaValue::from(entry.date_added.clone()),
+                    SeaValue::from(entry.short_description.clone()),
+                    SeaValue::from(entry.required_action.clone()),
+                    SeaValue::from(entry.due_date.clone()),
+                    SeaValue::from(entry.known_ransomware_campaign_use.clone()),
+                    SeaValue::from(entry.notes.clone()),
+                    SeaValue::from(fetched_at.clone()),
+                    SeaValue::from(raw_record_id),
+                ],
+            )
+            .await?;
+            upsert_identifier(&txn, &cve_id, "KEV", &fetched_at).await?;
+        }
+        let count = parsed.vulnerabilities.len();
+        mark_source_success(
+            &txn,
+            "KEV",
+            Some(&content_hash),
+            None,
+            Some(count as i64),
+            Some(parsed.catalog_version.as_str()),
+        )
+        .await?;
+        txn.commit().await?;
+        Ok(ImportSummary {
+            source: "KEV".to_owned(),
+            imported: count,
+            skipped: 0,
+            record_count: count,
+            content_hash: Some(content_hash),
+        })
+    }
+
+    pub async fn import_epss_csv(&self, csv: &str) -> Result<ImportSummary, DbErr> {
+        let parsed = EpssCurrentCsv::parse(csv)
+            .map_err(|err| DbErr::Custom(format!("failed to parse EPSS CSV: {err}")))?;
+        let fetched_at = Utc::now().to_rfc3339();
+        let content_hash = md5_hex(csv.as_bytes());
+        let txn = self.db.begin().await?;
+        mark_source_attempt(&txn, "EPSS", Some(&content_hash)).await?;
+        let raw_record_id = upsert_raw_record(
+            &txn,
+            RawRecordInput {
+                source: "EPSS",
+                source_record_id: parsed.score_date.as_deref().unwrap_or("current"),
+                source_path: Some("epss_scores-current.csv"),
+                provider_published_at: None,
+                provider_modified_at: None,
+                score_date: parsed.score_date.as_deref(),
+                fetched_at: &fetched_at,
+                content_hash: &content_hash,
+                raw_content: csv,
+                content_type: "text/csv",
+            },
+        )
+        .await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "DELETE FROM epss_current".to_owned(),
+        ))
+        .await?;
+        for row in &parsed.rows {
+            execute_values(
+                &txn,
+                r#"
+                INSERT INTO epss_current (
+                    cve_id, epss, percentile, score_date, model_version, fetched_at, raw_record_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+                vec![
+                    SeaValue::from(row.cve_id.clone()),
+                    SeaValue::from(row.epss),
+                    SeaValue::from(row.percentile),
+                    text_value(parsed.score_date.clone()),
+                    text_value(parsed.model_version.clone()),
+                    SeaValue::from(fetched_at.clone()),
+                    SeaValue::from(raw_record_id),
+                ],
+            )
+            .await?;
+            upsert_identifier(&txn, &row.cve_id, "EPSS", &fetched_at).await?;
+        }
+        mark_source_success(
+            &txn,
+            "EPSS",
+            Some(&content_hash),
+            parsed.score_date.as_deref(),
+            Some(parsed.rows.len() as i64),
+            parsed.model_version.as_deref(),
+        )
+        .await?;
+        let count = parsed.rows.len();
+        txn.commit().await?;
+        Ok(ImportSummary {
+            source: "EPSS".to_owned(),
+            imported: count,
+            skipped: 0,
+            record_count: count,
+            content_hash: Some(content_hash),
+        })
+    }
+
+    pub async fn rebuild_identifier_graph(&self) -> Result<ImportSummary, DbErr> {
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "DELETE FROM vulnerability_identifier_edges".to_owned(),
+        ))
+        .await?;
+        txn.execute(Statement::from_string(
+            DbBackend::Sqlite,
+            "DELETE FROM vulnerability_identifiers".to_owned(),
+        ))
+        .await?;
+        refresh_identifier_nodes_for_source(&txn, "CVE").await?;
+        refresh_identifier_nodes_for_source(&txn, "OSV").await?;
+        refresh_identifier_nodes_for_source(&txn, "KEV").await?;
+        refresh_identifier_nodes_for_source(&txn, "EPSS").await?;
+        refresh_osv_alias_edges(&txn).await?;
+        txn.commit().await?;
+        let edge_count = self
+            .count_by_statement(
+                "SELECT COUNT(*) AS count FROM vulnerability_identifier_edges",
+                Vec::new(),
+            )
+            .await
+            .unwrap_or(0) as usize;
+        Ok(ImportSummary {
+            source: "identifier_graph".to_owned(),
+            imported: edge_count,
+            skipped: 0,
+            record_count: edge_count,
+            content_hash: None,
+        })
+    }
+
+    pub async fn resolve_identifier(&self, id: &str) -> Result<IdentifierResolution, DbErr> {
+        let normalized_id = normalize_identifier(id);
+        let queried_identifier_type = self.identifier_type_for_id(&normalized_id).await?;
+        let edges = self.related_edges(&normalized_id).await?;
+        let mut seen = BTreeSet::new();
+        let mut queue = VecDeque::from([normalized_id.clone()]);
+        seen.insert(normalized_id.clone());
+        while let Some(current) = queue.pop_front() {
+            for edge in self.related_edges(&current).await? {
+                for id in [edge.from_identifier, edge.to_identifier] {
+                    if seen.insert(id.clone()) {
+                        queue.push_back(id);
+                    }
+                }
+            }
+        }
+        let mut related_cve_ids = Vec::new();
+        let mut related_osv_ids = Vec::new();
+        let mut related_aliases = Vec::new();
+        for id in seen {
+            match self.identifier_type_for_id(&id).await?.as_str() {
+                "cve" => related_cve_ids.push(id),
+                "osv" => related_osv_ids.push(id),
+                _ => related_aliases.push(id),
+            }
+        }
+        related_cve_ids.sort();
+        related_osv_ids.sort();
+        related_aliases.sort();
+        Ok(IdentifierResolution {
+            queried_id: id.to_owned(),
+            normalized_id,
+            identifier_type: queried_identifier_type,
+            related_cve_ids,
+            related_osv_ids,
+            related_aliases,
+            edges,
+            source_sync: self.source_sync_states().await?,
+        })
+    }
+
+    pub async fn related_edges(&self, id: &str) -> Result<Vec<IdentifierEdgeEvidence>, DbErr> {
+        let id = normalize_identifier(id);
+        IdentifierEdgeEvidence::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            SELECT from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
+            FROM vulnerability_identifier_edges
+            WHERE from_identifier = ? OR to_identifier = ?
+            ORDER BY source, from_identifier, to_identifier
+            "#,
+            vec![SeaValue::from(id.clone()), SeaValue::from(id)],
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    async fn identifier_type_for_id(&self, id: &str) -> Result<String, DbErr> {
+        let id = normalize_identifier(id);
+        if identifier_type(&id) == "cve" {
+            return Ok("cve".to_owned());
+        }
+        let exists = self
+            .count_by_statement(
+                "SELECT COUNT(*) AS count FROM osv_advisories WHERE osv_id = ?",
+                vec![SeaValue::from(id.clone())],
+            )
+            .await?
+            > 0;
+        if exists {
+            return Ok("osv".to_owned());
+        }
+        Ok(identifier_type(&id).to_owned())
+    }
+
+    pub async fn get_enriched_cve(&self, cve_id: &str) -> Result<EnrichedCve, DbErr> {
+        let cve_id = normalize_identifier(cve_id);
+        let cve = self.find_cve_summary_with_detail(&cve_id).await?;
+        let resolution = self.resolve_identifier(&cve_id).await?;
+        let mut osv_ids = resolution.related_osv_ids.clone();
+        osv_ids.retain(|id| id != &cve_id);
+        let osv_advisories = load_osv_summaries(&self.db, &osv_ids).await?;
+        let affected_packages = load_affected_packages(&self.db, &osv_ids).await?;
+        let kev = load_kev(&self.db, &cve_id).await?;
+        let epss = load_epss(&self.db, &cve_id).await?;
+        let mut evidence = resolution
+            .edges
+            .iter()
+            .map(|edge| Evidence {
+                kind: "alias_resolution".to_owned(),
+                source: edge.source.clone(),
+                from: Some(edge.from_identifier.clone()),
+                to: Some(edge.to_identifier.clone()),
+                cve_id: None,
+                osv_id: None,
+                detail: Some(edge.evidence_json.clone()),
+            })
+            .collect::<Vec<_>>();
+        if kev.is_some() {
+            evidence.push(Evidence {
+                kind: "kev_join".to_owned(),
+                source: "CISA KEV".to_owned(),
+                from: None,
+                to: None,
+                cve_id: Some(cve_id.clone()),
+                osv_id: None,
+                detail: None,
+            });
+        }
+        if epss.is_some() {
+            evidence.push(Evidence {
+                kind: "epss_join".to_owned(),
+                source: "FIRST EPSS".to_owned(),
+                from: None,
+                to: None,
+                cve_id: Some(cve_id.clone()),
+                osv_id: None,
+                detail: None,
+            });
+        }
+        let (severity, cwe) = cve
+            .as_ref()
+            .map(|cve| {
+                (
+                    cve.detail.cvss.clone(),
+                    cve.detail
+                        .cwes
+                        .iter()
+                        .map(|cwe| format!("CWE-{}", cwe.id))
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        Ok(EnrichedCve {
+            cve_id,
+            cve,
+            aliases: resolution.related_aliases,
+            osv_advisories,
+            affected_packages,
+            kev,
+            epss,
+            severity,
+            cwe,
+            evidence,
+            database_status: EnrichmentStatusSummary {
+                source_sync: self.source_sync_states().await?,
+            },
+        })
+    }
+
+    pub async fn kev_entries(&self, cve_id: Option<&str>) -> Result<Vec<KevInfo>, DbErr> {
+        if let Some(cve_id) = cve_id {
+            return Ok(load_kev(&self.db, cve_id).await?.into_iter().collect());
+        }
+        KevInfo::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            r#"
+            SELECT cve_id, vendor_project, product, vulnerability_name, date_added,
+                   short_description, required_action, due_date,
+                   known_ransomware_campaign_use, notes, fetched_at
+            FROM kev_entries
+            ORDER BY date_added DESC, cve_id
+            "#
+            .to_owned(),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    pub async fn enriched_cve_summaries(
+        &self,
+        cve_ids: &[String],
+    ) -> Result<Vec<EnrichedCveSummary>, DbErr> {
+        if cve_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cve_ids = cve_ids
+            .iter()
+            .map(|id| normalize_identifier(id))
+            .collect::<Vec<_>>();
+        EnrichedCveSummary::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                r#"
+                WITH requested(cve_id, ordinal) AS (
+                    VALUES {}
+                ),
+                alias_edges AS (
+                    SELECT r.cve_id,
+                           CASE
+                               WHEN e.from_identifier = r.cve_id THEN e.to_identifier
+                               ELSE e.from_identifier
+                           END AS identifier
+                    FROM requested r
+                    INNER JOIN vulnerability_identifier_edges e
+                        ON e.source = 'OSV aliases'
+                       AND (e.from_identifier = r.cve_id OR e.to_identifier = r.cve_id)
+                ),
+                aliases AS (
+                    SELECT cve_id,
+                           COALESCE(GROUP_CONCAT(DISTINCT identifier), '') AS aliases
+                    FROM alias_edges
+                    WHERE identifier NOT LIKE 'CVE-%'
+                    GROUP BY cve_id
+                ),
+                osv AS (
+                    SELECT ae.cve_id,
+                           COALESCE(GROUP_CONCAT(DISTINCT o.osv_id), '') AS osv_ids,
+                           COALESCE(GROUP_CONCAT(DISTINCT o.osv_id || ': ' || COALESCE(o.summary, '')), '') AS osv_summaries
+                    FROM alias_edges ae
+                    INNER JOIN osv_advisories o ON o.osv_id = ae.identifier
+                    GROUP BY ae.cve_id
+                ),
+                packages AS (
+                    SELECT ae.cve_id,
+                           COALESCE(GROUP_CONCAT(DISTINCT
+                               COALESCE(p.ecosystem, '-') || '/' || COALESCE(p.package_name, '-')
+                           ), '') AS affected_packages
+                    FROM alias_edges ae
+                    INNER JOIN osv_affected_packages p ON p.osv_id = ae.identifier
+                    GROUP BY ae.cve_id
+                )
+                SELECT
+                    r.cve_id,
+                    COALESCE(aliases.aliases, '') AS aliases,
+                    COALESCE(osv.osv_ids, '') AS osv_ids,
+                    COALESCE(osv.osv_summaries, '') AS osv_summaries,
+                    COALESCE(packages.affected_packages, '') AS affected_packages,
+                    CASE WHEN kev.cve_id IS NULL THEN 0 ELSE 1 END AS kev_listed,
+                    kev.date_added AS kev_date_added,
+                    kev.due_date AS kev_due_date,
+                    kev.known_ransomware_campaign_use AS kev_known_ransomware_campaign_use,
+                    epss.epss AS epss,
+                    epss.percentile AS epss_percentile,
+                    epss.score_date AS epss_score_date,
+                    epss.model_version AS epss_model_version
+                FROM requested r
+                LEFT JOIN aliases ON aliases.cve_id = r.cve_id
+                LEFT JOIN osv ON osv.cve_id = r.cve_id
+                LEFT JOIN packages ON packages.cve_id = r.cve_id
+                LEFT JOIN kev_entries kev ON kev.cve_id = r.cve_id
+                LEFT JOIN epss_current epss ON epss.cve_id = r.cve_id
+                ORDER BY r.ordinal
+                "#,
+                sql_values_list(&cve_ids)
+            ),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    pub async fn get_enriched_osv(&self, osv_id: &str) -> Result<Option<OsvSummary>, DbErr> {
+        load_osv_summaries(&self.db, &[normalize_identifier(osv_id)])
+            .await
+            .map(|mut rows| rows.pop())
+    }
+
+    pub async fn query_package_enriched(
+        &self,
+        ecosystem: &str,
+        package: &str,
+        version: &str,
+        purl: Option<&str>,
+    ) -> Result<Vec<EnrichedFinding>, DbErr> {
+        let package_rows = PackageOsvRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            SELECT p.id, p.osv_id, p.ecosystem, p.package_name, p.purl
+            FROM osv_affected_packages p
+            INNER JOIN osv_advisories a ON a.osv_id = p.osv_id
+            WHERE lower(p.ecosystem) = lower(?)
+              AND lower(p.package_name) = lower(?)
+              AND a.withdrawn_at IS NULL
+            ORDER BY p.osv_id
+            "#,
+            vec![
+                SeaValue::from(ecosystem.to_owned()),
+                SeaValue::from(package.to_owned()),
+            ],
+        ))
+        .all(&self.db)
+        .await?;
+
+        let mut findings = Vec::new();
+        for package_row in package_rows {
+            if purl.is_some()
+                && package_row.purl.as_deref().is_some()
+                && package_row.purl.as_deref() != purl
+            {
+                continue;
+            }
+            let ranges = load_osv_ranges(&self.db, package_row.id).await?;
+            let fixed_versions = fixed_versions_from_ranges(&ranges);
+            let affected =
+                match_version(ecosystem, version, &ranges).unwrap_or_else(|| AffectedStatus {
+                    status: "unknown".to_owned(),
+                    confidence: "low".to_owned(),
+                });
+            if affected.status == "not_affected" {
+                continue;
+            }
+            let resolution = self.resolve_identifier(&package_row.osv_id).await?;
+            let cve_ids = resolution.related_cve_ids.clone();
+            let mut kev = None;
+            let mut epss = None;
+            for cve_id in &cve_ids {
+                if kev.is_none() {
+                    kev = load_kev(&self.db, cve_id).await?;
+                }
+                if epss.is_none() {
+                    epss = load_epss(&self.db, cve_id).await?;
+                }
+            }
+            let mut evidence = vec![Evidence {
+                kind: "osv_range_match".to_owned(),
+                source: "OSV".to_owned(),
+                from: None,
+                to: None,
+                cve_id: None,
+                osv_id: Some(package_row.osv_id.clone()),
+                detail: Some(format!(
+                    "{} {} {}",
+                    affected.status,
+                    package_row.ecosystem.unwrap_or_default(),
+                    package_row.package_name.unwrap_or_default()
+                )),
+            }];
+            evidence.extend(resolution.edges.iter().map(|edge| Evidence {
+                kind: "alias_resolution".to_owned(),
+                source: edge.source.clone(),
+                from: Some(edge.from_identifier.clone()),
+                to: Some(edge.to_identifier.clone()),
+                cve_id: None,
+                osv_id: None,
+                detail: Some(edge.evidence_json.clone()),
+            }));
+            for cve_id in &cve_ids {
+                if kev.is_some() {
+                    evidence.push(Evidence {
+                        kind: "kev_join".to_owned(),
+                        source: "CISA KEV".to_owned(),
+                        from: None,
+                        to: None,
+                        cve_id: Some(cve_id.clone()),
+                        osv_id: None,
+                        detail: None,
+                    });
+                }
+                if epss.is_some() {
+                    evidence.push(Evidence {
+                        kind: "epss_join".to_owned(),
+                        source: "FIRST EPSS".to_owned(),
+                        from: None,
+                        to: None,
+                        cve_id: Some(cve_id.clone()),
+                        osv_id: None,
+                        detail: None,
+                    });
+                }
+            }
+            let priority_signals = priority_signals(
+                kev.as_ref(),
+                epss.as_ref(),
+                !fixed_versions.is_empty(),
+                &affected,
+            );
+            findings.push(EnrichedFinding {
+                primary_id: package_row.osv_id,
+                cve_ids,
+                aliases: resolution.related_aliases,
+                package: PackageQuery {
+                    ecosystem: ecosystem.to_owned(),
+                    package: package.to_owned(),
+                    version: version.to_owned(),
+                    purl: purl.map(ToOwned::to_owned),
+                },
+                affected,
+                fixed_versions,
+                enrichment: FindingEnrichment { kev, epss },
+                priority_signals,
+                evidence,
+            });
+        }
+        Ok(findings)
+    }
+
     pub async fn find_cve_summary_with_detail(
         &self,
         cve_id: &str,
@@ -3516,13 +4132,6 @@ async fn insert_cve_model_batch(
     }
 
     Ok(inserted)
-}
-
-fn serialize_cve_state<S>(state: &i32, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    serializer.serialize_str(cve_state_label(*state))
 }
 
 type CveChildRows = (
@@ -5080,6 +5689,174 @@ fn fts_count_sql(state_scope: CveStateScope) -> &'static str {
     }
 }
 
+fn osv_free_text_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH matching_osv AS (
+            SELECT DISTINCT o.osv_id
+            FROM osv_advisories o
+            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
+            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
+            WHERE o.osv_id LIKE ?
+               OR o.summary LIKE ?
+               OR a.alias_id LIKE ?
+               OR p.ecosystem LIKE ?
+               OR p.package_name LIKE ?
+               OR p.purl LIKE ?
+        ),
+        related_cves AS (
+            SELECT DISTINCT CASE
+                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
+                ELSE e.to_identifier
+            END AS cve_id
+            FROM matching_osv m
+            INNER JOIN vulnerability_identifier_edges e
+                ON e.source = 'OSV aliases'
+               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
+            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
+            UNION
+            SELECT DISTINCT a.alias_id AS cve_id
+            FROM matching_osv m
+            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
+            WHERE a.alias_id LIKE 'CVE-%'
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM related_cves
+        INNER JOIN cve ON cve.cve_id = related_cves.cve_id
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    } else {
+        r#"
+        WITH matching_osv AS (
+            SELECT DISTINCT o.osv_id
+            FROM osv_advisories o
+            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
+            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
+            WHERE o.osv_id LIKE ?
+               OR o.summary LIKE ?
+               OR a.alias_id LIKE ?
+               OR p.ecosystem LIKE ?
+               OR p.package_name LIKE ?
+               OR p.purl LIKE ?
+        ),
+        related_cves AS (
+            SELECT DISTINCT CASE
+                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
+                ELSE e.to_identifier
+            END AS cve_id
+            FROM matching_osv m
+            INNER JOIN vulnerability_identifier_edges e
+                ON e.source = 'OSV aliases'
+               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
+            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
+            UNION
+            SELECT DISTINCT a.alias_id AS cve_id
+            FROM matching_osv m
+            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
+            WHERE a.alias_id LIKE 'CVE-%'
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM related_cves
+        INNER JOIN cve ON cve.cve_id = related_cves.cve_id
+        WHERE cve.state = 0
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    }
+}
+
+fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH fts_cves AS (
+            SELECT cve_id
+            FROM cve_summary_fts
+            WHERE cve_summary_fts MATCH ?
+        ),
+        matching_osv AS (
+            SELECT DISTINCT o.osv_id
+            FROM osv_advisories o
+            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
+            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
+            WHERE o.osv_id LIKE ?
+               OR o.summary LIKE ?
+               OR a.alias_id LIKE ?
+               OR p.ecosystem LIKE ?
+               OR p.package_name LIKE ?
+               OR p.purl LIKE ?
+        ),
+        osv_cves AS (
+            SELECT DISTINCT CASE
+                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
+                ELSE e.to_identifier
+            END AS cve_id
+            FROM matching_osv m
+            INNER JOIN vulnerability_identifier_edges e
+                ON e.source = 'OSV aliases'
+               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
+            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
+            UNION
+            SELECT DISTINCT a.alias_id AS cve_id
+            FROM matching_osv m
+            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
+            WHERE a.alias_id LIKE 'CVE-%'
+        )
+        SELECT COUNT(DISTINCT cve_id) AS count
+        FROM (
+            SELECT cve_id FROM fts_cves
+            UNION
+            SELECT cve_id FROM osv_cves
+        )
+        "#
+    } else {
+        r#"
+        WITH fts_cves AS (
+            SELECT cve_summary_index.cve_id
+            FROM cve_summary_fts
+            INNER JOIN cve_summary_index ON cve_summary_index.cve_id = cve_summary_fts.cve_id
+            WHERE cve_summary_fts MATCH ? AND cve_summary_index.state = 0
+        ),
+        matching_osv AS (
+            SELECT DISTINCT o.osv_id
+            FROM osv_advisories o
+            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
+            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
+            WHERE o.osv_id LIKE ?
+               OR o.summary LIKE ?
+               OR a.alias_id LIKE ?
+               OR p.ecosystem LIKE ?
+               OR p.package_name LIKE ?
+               OR p.purl LIKE ?
+        ),
+        osv_cves AS (
+            SELECT DISTINCT CASE
+                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
+                ELSE e.to_identifier
+            END AS cve_id
+            FROM matching_osv m
+            INNER JOIN vulnerability_identifier_edges e
+                ON e.source = 'OSV aliases'
+               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
+            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
+            UNION
+            SELECT DISTINCT a.alias_id AS cve_id
+            FROM matching_osv m
+            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
+            WHERE a.alias_id LIKE 'CVE-%'
+        )
+        SELECT COUNT(DISTINCT cve_id) AS count
+        FROM (
+            SELECT cve_id FROM fts_cves
+            UNION
+            SELECT cve_id FROM osv_cves
+        ) combined
+        INNER JOIN cve ON cve.cve_id = combined.cve_id
+        WHERE cve.state = 0
+        "#
+    }
+}
+
 fn affected_fts_summary_sql(state_scope: CveStateScope) -> &'static str {
     if state_scope.includes_rejected() {
         r#"
@@ -5689,10 +6466,6 @@ fn ascii_prefix_upper_bound(prefix: &str) -> Option<String> {
     None
 }
 
-fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
 fn option_text(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
@@ -5702,547 +6475,835 @@ fn like_pattern(value: &str) -> String {
     format!("%{value}%")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use qanvuli_models::parse_json_with_raw;
-    use sea_orm::{PaginatorTrait, Set};
-    use serde_json::json;
+struct RawRecordInput<'a> {
+    source: &'a str,
+    source_record_id: &'a str,
+    source_path: Option<&'a str>,
+    provider_published_at: Option<&'a str>,
+    provider_modified_at: Option<&'a str>,
+    score_date: Option<&'a str>,
+    fetched_at: &'a str,
+    content_hash: &'a str,
+    raw_content: &'a str,
+    content_type: &'a str,
+}
 
-    const CVE_JSON: &str = r#"{
-        "dataType": "CVE_RECORD",
-        "dataVersion": "5.1.0",
-        "cveMetadata": {
-            "cveId": "CVE-2024-0001",
-            "assignerOrgId": "00000000-0000-4000-8000-000000000000",
-            "state": "PUBLISHED",
-            "serial": 2,
-            "datePublished": "2024-01-01T00:00:00Z",
-            "dateUpdated": "2024-01-02T00:00:00Z"
-        },
-        "containers": {
-            "cna": {
-                "providerMetadata": {
-                    "orgId": "00000000-0000-4000-8000-000000000000"
-                },
-                "title": "Example CVE",
-                "descriptions": [
-                    {
-                        "lang": "en",
-                        "value": "Example vulnerability."
-                    }
+struct ParsedOsvRawRecord {
+    source_path: Option<String>,
+    raw_json: String,
+    parsed: OsvAdvisory,
+    osv_id: String,
+    content_hash: String,
+}
+
+fn parse_osv_raw_record(record: OsvRawRecord) -> Result<ParsedOsvRawRecord, DbErr> {
+    let parsed = OsvAdvisory::parse_json(record.raw_json.as_bytes())
+        .map_err(|err| DbErr::Custom(format!("failed to parse OSV record: {err}")))?;
+    parsed
+        .validate_schema_shape()
+        .map_err(|err| DbErr::Custom(format!("invalid OSV record {}: {err}", parsed.id)))?;
+    let Some(osv_id) = option_text(Some(parsed.id.as_str())).map(ToOwned::to_owned) else {
+        return Err(DbErr::Custom("OSV record has an empty id".to_owned()));
+    };
+    let content_hash = md5_hex(record.raw_json.as_bytes());
+    Ok(ParsedOsvRawRecord {
+        source_path: record.source_path,
+        raw_json: record.raw_json,
+        parsed,
+        osv_id,
+        content_hash,
+    })
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct PackageOsvRow {
+    id: i64,
+    osv_id: String,
+    ecosystem: Option<String>,
+    package_name: Option<String>,
+    purl: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct RangeEventRow {
+    range_id: i64,
+    range_type: Option<String>,
+    event_type: String,
+    value: String,
+    event_order: i64,
+}
+
+async fn execute_values<C>(db: &C, sql: &str, values: Vec<SeaValue>) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?;
+    Ok(())
+}
+
+fn text_value(value: Option<String>) -> SeaValue {
+    SeaValue::from(value)
+}
+
+async fn upsert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, DbErr>
+where
+    C: ConnectionTrait,
+{
+    execute_values(
+        db,
+        r#"
+        INSERT INTO source_raw_records (
+            source, source_record_id, source_path, provider_published_at,
+            provider_modified_at, score_date, fetched_at, content_hash,
+            raw_content, raw_json, raw_csv, content_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source, source_record_id) DO UPDATE SET
+            source_path = excluded.source_path,
+            provider_published_at = excluded.provider_published_at,
+            provider_modified_at = excluded.provider_modified_at,
+            score_date = excluded.score_date,
+            fetched_at = excluded.fetched_at,
+            content_hash = excluded.content_hash,
+            raw_content = excluded.raw_content,
+            raw_json = excluded.raw_json,
+            raw_csv = excluded.raw_csv,
+            content_type = excluded.content_type
+        "#,
+        vec![
+            SeaValue::from(input.source.to_owned()),
+            SeaValue::from(input.source_record_id.to_owned()),
+            SeaValue::from(input.source_path.map(ToOwned::to_owned)),
+            SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
+            SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
+            SeaValue::from(input.score_date.map(ToOwned::to_owned)),
+            SeaValue::from(input.fetched_at.to_owned()),
+            SeaValue::from(input.content_hash.to_owned()),
+            SeaValue::from(input.raw_content.to_owned()),
+            SeaValue::from(
+                (input.content_type == "application/json").then(|| input.raw_content.to_owned()),
+            ),
+            SeaValue::from(
+                (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
+            ),
+            SeaValue::from(input.content_type.to_owned()),
+        ],
+    )
+    .await?;
+
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT id FROM source_raw_records WHERE source = ? AND source_record_id = ?",
+            vec![
+                SeaValue::from(input.source.to_owned()),
+                SeaValue::from(input.source_record_id.to_owned()),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("raw record upsert did not return a row".to_owned()))?;
+    row.try_get::<i64>("", "id")
+}
+
+async fn replace_osv_normalized<C>(
+    db: &C,
+    parsed: &OsvAdvisory,
+    raw_record_id: i64,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let osv_id = normalize_identifier(&parsed.id);
+    for sql in [
+        "DELETE FROM vulnerability_identifier_edges WHERE source = 'OSV aliases' AND (from_identifier = ? OR to_identifier = ?)",
+        "DELETE FROM osv_references WHERE osv_id = ?",
+        "DELETE FROM osv_aliases WHERE osv_id = ?",
+    ] {
+        let values = if sql.contains("from_identifier") {
+            vec![
+                SeaValue::from(osv_id.clone()),
+                SeaValue::from(osv_id.clone()),
+            ]
+        } else {
+            vec![SeaValue::from(osv_id.clone())]
+        };
+        execute_values(db, sql, values).await?;
+    }
+    for sql in [
+        "DELETE FROM osv_range_events WHERE range_id IN (SELECT r.id FROM osv_ranges r INNER JOIN osv_affected_packages p ON p.id = r.affected_package_id WHERE p.osv_id = ?)",
+        "DELETE FROM osv_ranges WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
+        "DELETE FROM osv_versions WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
+        "DELETE FROM osv_affected_packages WHERE osv_id = ?",
+    ] {
+        execute_values(db, sql, vec![SeaValue::from(osv_id.clone())]).await?;
+    }
+    execute_values(
+        db,
+        r#"
+        INSERT INTO osv_advisories (
+            osv_id, schema_version, published_at, modified_at, withdrawn_at,
+            summary, details, raw_record_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(osv_id) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            published_at = excluded.published_at,
+            modified_at = excluded.modified_at,
+            withdrawn_at = excluded.withdrawn_at,
+            summary = excluded.summary,
+            details = excluded.details,
+            raw_record_id = excluded.raw_record_id
+        "#,
+        vec![
+            SeaValue::from(osv_id.clone()),
+            text_value(parsed.schema_version.clone()),
+            text_value(parsed.published.clone()),
+            text_value(parsed.modified.clone()),
+            text_value(parsed.withdrawn.clone()),
+            text_value(parsed.summary.clone()),
+            text_value(parsed.details.clone()),
+            SeaValue::from(raw_record_id),
+        ],
+    )
+    .await?;
+    let now = Utc::now().to_rfc3339();
+    upsert_identifier_with_type(db, &osv_id, "osv", "OSV", &now).await?;
+    for alias in &parsed.aliases {
+        let alias_id = normalize_identifier(alias);
+        execute_values(
+            db,
+            "INSERT OR IGNORE INTO osv_aliases (osv_id, alias_id) VALUES (?, ?)",
+            vec![
+                SeaValue::from(osv_id.clone()),
+                SeaValue::from(alias_id.clone()),
+            ],
+        )
+        .await?;
+        upsert_identifier(db, &alias_id, "OSV", &now).await?;
+        insert_identifier_edge(
+            db,
+            &osv_id,
+            &alias_id,
+            "alias",
+            "OSV aliases",
+            "high",
+            &serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
+            &now,
+        )
+        .await?;
+        insert_identifier_edge(
+            db,
+            &alias_id,
+            &osv_id,
+            "alias",
+            "OSV aliases",
+            "high",
+            &serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
+            &now,
+        )
+        .await?;
+    }
+    for affected in &parsed.affected {
+        let package = affected.package.as_ref();
+        execute_values(
+            db,
+            r#"
+            INSERT INTO osv_affected_packages (osv_id, ecosystem, package_name, purl)
+            VALUES (?, ?, ?, ?)
+            "#,
+            vec![
+                SeaValue::from(osv_id.clone()),
+                SeaValue::from(package.and_then(|package| package.ecosystem.clone())),
+                SeaValue::from(package.and_then(|package| package.name.clone())),
+                SeaValue::from(package.and_then(|package| package.purl.clone())),
+            ],
+        )
+        .await?;
+        let package_id = last_insert_id(db).await?;
+        for range in &affected.ranges {
+            execute_values(
+                db,
+                "INSERT INTO osv_ranges (affected_package_id, range_type) VALUES (?, ?)",
+                vec![
+                    SeaValue::from(package_id),
+                    text_value(range.range_type.clone()),
                 ],
-                "affected": [
-                    {
-                        "vendor": "Example Vendor",
-                        "product": "Example Product",
-                        "defaultStatus": "affected"
-                    }
-                ],
-                "metrics": [
-                    {
-                        "format": "CVSS",
-                        "cvssV3_1": {
-                            "version": "3.1",
-                            "baseScore": 9.8,
-                            "baseSeverity": "CRITICAL",
-                            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-                        }
-                    }
-                ],
-                "problemTypes": [
-                    {
-                        "descriptions": [
-                            {
-                                "lang": "en",
-                                "cweId": "CWE-79",
-                                "description": "Cross-site Scripting"
-                            }
-                        ]
-                    }
-                ],
-                "references": [
-                    {
-                        "url": "https://example.com/advisory"
-                    }
-                ]
-            }
-        },
-        "x_extraField": {
-            "kept": true
-        }
-    }"#;
-
-    #[test]
-    fn raw_cve_record_converts_to_cve_active_model() {
-        let raw_record = parse_json_with_raw(CVE_JSON).unwrap();
-        let expected_raw_json = raw_record.raw_json().clone();
-        let active_model = cve::ActiveModel::from(raw_record);
-
-        assert_eq!(active_model.cve_id.unwrap(), "CVE-2024-0001");
-        assert_eq!(active_model.state.unwrap(), PUBLISHED_STATE);
-        assert_eq!(
-            active_model.published_at.unwrap(),
-            "2024-01-01T00:00:00+00:00"
-        );
-        assert_eq!(
-            active_model.updated_at.unwrap(),
-            "2024-01-02T00:00:00+00:00"
-        );
-        assert_eq!(active_model.serial.unwrap(), 2);
-        assert_eq!(active_model.title.unwrap(), "Example CVE");
-        assert_eq!(
-            active_model.description_en.unwrap().as_deref(),
-            Some("Example vulnerability.")
-        );
-        assert!(
-            active_model
-                .reference_text
-                .unwrap()
-                .contains("https://example.com/advisory")
-        );
-        assert_eq!(
-            active_model.raw_json.unwrap(),
-            expected_raw_json.to_string()
-        );
-    }
-
-    #[test]
-    fn raw_cve_record_converts_to_all_active_models() {
-        let raw_record = parse_json_with_raw(CVE_JSON).unwrap();
-        let models = CveActiveModels::from(raw_record);
-
-        assert_eq!(models.cve_id, "CVE-2024-0001");
-        assert_eq!(models.cvss_rows.len(), 1);
-        assert_eq!(models.affected_rows.len(), 1);
-        assert_eq!(models.cwe_rows.len(), 1);
-
-        let cvss = models.cvss_rows.into_iter().next().unwrap();
-        assert_eq!(cvss.cve_db_id.unwrap(), 0);
-        assert_eq!(cvss.version.unwrap(), "3.1");
-        assert_eq!(cvss.base_score.unwrap(), Some(9.8));
-        assert_eq!(cvss.base_severity.unwrap().as_deref(), Some("CRITICAL"));
-        assert_eq!(
-            cvss.vector_string.unwrap().as_deref(),
-            Some("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
-        );
-        assert_eq!(
-            raw_json_value(&cvss.raw_json.unwrap()).unwrap()["version"],
-            "3.1"
-        );
-
-        let affected = models.affected_rows.into_iter().next().unwrap();
-        assert_eq!(affected.cve_db_id.unwrap(), 0);
-        assert_eq!(affected.vendor.unwrap().as_deref(), Some("Example Vendor"));
-        assert_eq!(
-            affected.product.unwrap().as_deref(),
-            Some("Example Product")
-        );
-        assert_eq!(
-            affected.default_status.unwrap().as_deref(),
-            Some("affected")
-        );
-        assert!(affected.version_text.unwrap().is_empty());
-        assert_eq!(
-            raw_json_value(&affected.raw_json.unwrap()).unwrap()["vendor"],
-            "Example Vendor"
-        );
-
-        let cwe = models.cwe_rows.into_iter().next().unwrap();
-        assert_eq!(cwe.cve_db_id.unwrap(), 0);
-        assert_eq!(cwe.cwe_id.unwrap(), 79);
-        assert!(models.cwe_master_rows.is_empty());
-    }
-
-    #[test]
-    fn dedupe_summaries_keeps_one_row_per_cve_id() {
-        let cves = vec![
-            test_summary("CVE-2024-1000", "first"),
-            test_summary("CVE-2024-1000", "duplicate"),
-            test_summary("CVE-2024-1001", "second"),
-        ];
-
-        let cves = dedupe_summaries_by_cve_id(cves);
-
-        assert_eq!(cves.len(), 2);
-        assert_eq!(cves[0].cve_id, "CVE-2024-1000");
-        assert_eq!(cves[0].title, "first");
-        assert_eq!(cves[1].cve_id, "CVE-2024-1001");
-    }
-
-    #[test]
-    fn affected_text_search_skips_short_cve_and_date_queries() {
-        assert!(!should_search_affected_text("a"));
-        assert!(!should_search_affected_text("CVE-2024-1000"));
-        assert!(!should_search_affected_text("CWE-79"));
-        assert!(!should_search_affected_text("2026-06-08"));
-        assert!(should_search_affected_text("Cardinarity"));
-    }
-
-    #[test]
-    fn cve_id_prefix_query_accepts_cve_prefix_case_insensitively() {
-        assert!(is_cve_id_prefix_query("CVE-2026"));
-        assert!(is_cve_id_prefix_query("cve-2026"));
-        assert!(!is_cve_id_prefix_query("CWE-79"));
-        assert!(!is_cve_id_prefix_query("2026"));
-    }
-
-    #[test]
-    fn cwe_id_query_accepts_cwe_prefix_case_insensitively() {
-        assert!(is_cwe_id_query("CWE-79"));
-        assert!(is_cwe_id_query("cwe-79"));
-        assert!(!is_cwe_id_query("CVE-2026"));
-        assert!(!is_cwe_id_query("79"));
-    }
-
-    fn test_summary(cve_id: &str, title: &str) -> CveSummary {
-        CveSummary {
-            cve_id: cve_id.to_owned(),
-            state: PUBLISHED_STATE,
-            published_at: "2024-02-01T00:00:00+00:00".to_owned(),
-            updated_at: "2024-02-02T00:00:00+00:00".to_owned(),
-            title: title.to_owned(),
-            description_en: None,
-        }
-    }
-
-    #[test]
-    fn in_memory_sqlite_writes_and_reads_simple_cve() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let db = connect_database("sqlite::memory:").await.unwrap();
-            let cve_db = CveDatabase { db: db.clone() };
-            cve_db.initialize_schema().await.unwrap();
-            insert_test_cwe(&db).await;
-
-            cve_db
-                .upsert_cve(cve::ActiveModel {
-                    id: Default::default(),
-                    cve_id: Set("CVE-2026-0001".to_owned()),
-                    state: Set(PUBLISHED_STATE),
-                    published_at: Set("2026-01-01T00:00:00Z".to_owned()),
-                    updated_at: Set("2026-01-02T00:00:00Z".to_owned()),
-                    serial: Set(1),
-                    title: Set("example".to_owned()),
-                    description_en: Set(Some("description".to_owned())),
-                    reference_text: Set(String::new()),
-                    raw_json: Set(json!({"id": "CVE-2026-0001"}).to_string()),
-                })
-                .await
-                .unwrap();
-
-            cve_db
-                .replace_cve_children(
-                    "CVE-2026-0001",
-                    vec![cve_cvss::ActiveModel {
-                        cve_db_id: Set(0),
-                        version: Set("3.1".to_owned()),
-                        base_score: Set(Some(9.8)),
-                        base_severity: Set(Some("CRITICAL".to_owned())),
-                        vector_string: Set(Some("CVSS:3.1/...".to_owned())),
-                        source: Set(Some("cna".to_owned())),
-                        raw_json: Set(json!({"version": "3.1"}).to_string()),
-                        ..Default::default()
-                    }],
-                    vec![cve_affected::ActiveModel {
-                        cve_db_id: Set(0),
-                        vendor: Set(Some("Example Vendor".to_owned())),
-                        product: Set(Some("Example Product".to_owned())),
-                        version_text: Set(String::new()),
-                        raw_json: Set(json!({"vendor": "Example Vendor"}).to_string()),
-                        ..Default::default()
-                    }],
-                    vec![cve_cwe::ActiveModel {
-                        cve_db_id: Set(0),
-                        cwe_id: Set(79),
-                    }],
-                )
-                .await
-                .unwrap();
-
-            let found = cve_db
-                .find_cve_by_id("CVE-2026-0001")
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(found.cve_id, "CVE-2026-0001");
-            assert_eq!(found.state, PUBLISHED_STATE);
-            assert_eq!(found.published_at, "2026-01-01T00:00:00Z");
-            assert_eq!(found.updated_at, "2026-01-02T00:00:00Z");
-            assert_eq!(found.serial, 1);
-            assert_eq!(found.title, "example");
-            assert_eq!(found.description_en.as_deref(), Some("description"));
-            assert_eq!(
-                raw_json_value(&found.raw_json).unwrap(),
-                json!({"id": "CVE-2026-0001"})
-            );
-
-            let by_cwe = cve_db
-                .search_cves_by_cwe(&["CWE-79".to_owned()], 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(by_cwe.len(), 1);
-
-            let by_product = cve_db
-                .search_cves_by_vendor_product(Some("Vendor"), Some("Product"), 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(by_product.len(), 1);
-
-            let affected_count = cve_affected::Entity::find().count(&db).await.unwrap();
-            assert_eq!(affected_count, 1);
-        });
-    }
-
-    #[test]
-    fn cve_summary_search_defaults_to_published_only() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
-            db.initialize_schema().await.unwrap();
-
-            for (cve_id, state, state_label) in [
-                ("CVE-2026-1000", PUBLISHED_STATE, "PUBLISHED"),
-                ("CVE-2026-1001", REJECTED_STATE, "REJECTED"),
-            ] {
-                db.upsert_cve(cve::ActiveModel {
-                    id: Default::default(),
-                    cve_id: Set(cve_id.to_owned()),
-                    state: Set(state),
-                    published_at: Set("2026-01-01T00:00:00Z".to_owned()),
-                    updated_at: Set("2026-01-02T00:00:00Z".to_owned()),
-                    serial: Set(1),
-                    title: Set(format!("{state_label} example")),
-                    description_en: Set(Some("description".to_owned())),
-                    reference_text: Set(String::new()),
-                    raw_json: Set(json!({"id": cve_id, "state": state_label}).to_string()),
-                })
-                .await
-                .unwrap();
-            }
-            rebuild_cve_summary_indexes(db.connection()).await.unwrap();
-
-            let default = db
-                .search_cve_summaries_by_cve_id_prefix("CVE-2026-100", 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(default.len(), 1);
-            assert_eq!(default[0].state, PUBLISHED_STATE);
-
-            let including_rejected = db
-                .search_cve_summaries_by_cve_id_prefix_with_state_scope(
-                    "CVE-2026-100",
-                    CveStateScope::IncludeRejected,
-                    10,
-                    0,
-                )
-                .await
-                .unwrap();
-            assert_eq!(including_rejected.len(), 2);
-
-            let default_count = db
-                .count_cve_summaries_by_cve_id_prefix("CVE-2026-100")
-                .await
-                .unwrap();
-            assert_eq!(default_count, 1);
-
-            let including_rejected_count = db
-                .count_cve_summaries_by_cve_id_prefix_with_state_scope(
-                    "CVE-2026-100",
-                    CveStateScope::IncludeRejected,
-                )
-                .await
-                .unwrap();
-            assert_eq!(including_rejected_count, 2);
-        });
-    }
-
-    #[test]
-    fn upsert_cve_models_writes_parent_and_children() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let db = connect_database("sqlite::memory:").await.unwrap();
-            let cve_db = CveDatabase { db: db.clone() };
-            cve_db.initialize_schema().await.unwrap();
-            insert_test_cwe(&db).await;
-
-            let models = CveActiveModels::from(parse_json_with_raw(CVE_JSON).unwrap());
-            let inserted = cve_db.upsert_cve_models(vec![models]).await.unwrap();
-            assert_eq!(inserted, 1);
-
-            let found = cve_db
-                .find_cve_by_id("CVE-2024-0001")
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(found.cve_id, "CVE-2024-0001");
-
-            let by_cwe = cve_db
-                .search_cves_by_cwe(&["CWE-79".to_owned()], 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(by_cwe.len(), 1);
-
-            let by_product = cve_db
-                .search_cves_by_vendor_product(Some("Example Vendor"), Some("Product"), 10, 0)
-                .await
-                .unwrap();
-            assert_eq!(by_product.len(), 1);
-
-            let by_product_summary = cve_db
-                .search_cve_summaries_by_vendor_product_with_state_scope(
-                    Some("Example Vendor"),
-                    Some("Product"),
-                    CveStateScope::PublishedOnly,
-                    10,
-                    0,
-                )
-                .await
-                .unwrap();
-            assert_eq!(by_product_summary.len(), 1);
-
-            let by_product_count = cve_db
-                .count_cve_summaries_by_vendor_product_with_state_scope(
-                    Some("Example Vendor"),
-                    Some("Product"),
-                    CveStateScope::PublishedOnly,
-                )
-                .await
-                .unwrap();
-            assert_eq!(by_product_count, 1);
-
-            let by_exact_product = cve_db
-                .search_cve_summaries_by_vendor_product_exact_with_state_scope(
-                    None,
-                    None,
-                    None,
-                    Some("Example Product"),
-                    CveStateScope::PublishedOnly,
-                    10,
-                    0,
-                )
-                .await
-                .unwrap();
-            assert_eq!(by_exact_product.len(), 1);
-
-            let by_partial_as_exact = cve_db
-                .search_cve_summaries_by_vendor_product_exact_with_state_scope(
-                    None,
-                    None,
-                    None,
-                    Some("Product"),
-                    CveStateScope::PublishedOnly,
-                    10,
-                    0,
-                )
-                .await
-                .unwrap();
-            assert!(by_partial_as_exact.is_empty());
-
-            cve_db
-                .replace_cve_children(
-                    "CVE-2024-0001",
-                    Vec::new(),
-                    Vec::new(),
-                    vec![cve_cwe::ActiveModel {
-                        cve_db_id: Set(0),
-                        cwe_id: Set(79),
-                    }],
-                )
-                .await
-                .unwrap();
-
-            let cwe = cwe::Entity::find_by_id(79).one(&db).await.unwrap().unwrap();
-            assert_eq!(cwe.description.as_deref(), Some("Cross-site Scripting"));
-        });
-    }
-
-    async fn insert_test_cwe(db: &DatabaseConnection) {
-        cwe::Entity::insert(cwe::ActiveModel {
-            id: Set(79),
-            description: Set(Some("Cross-site Scripting".to_owned())),
-            status: Set(Some("Stable".to_owned())),
-            parent_id: Set(None),
-        })
-        .exec(db)
-        .await
-        .unwrap();
-    }
-
-    #[test]
-    fn mark_json_file_read_upserts_processed_file() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
-            db.initialize_schema().await.unwrap();
-
-            db.mark_json_file_read("cves/CVE-2024-0001.json", "0123456789abcdef")
-                .await
-                .unwrap();
-            db.mark_json_file_read("cves/CVE-2024-0001.json", "0123456789abcdef")
-                .await
-                .unwrap();
-
-            let found = db
-                .find_read_json_file("cves/CVE-2024-0001.json", "0123456789abcdef")
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(found.filename, "cves/CVE-2024-0001.json");
-            assert_eq!(found.md5hash, "0123456789abcdef");
-            assert!(!found.created_at.is_empty());
-            assert!(!found.updated_at.is_empty());
-
-            let count = read_json_file::Entity::find()
-                .count(db.connection())
-                .await
-                .unwrap();
-            assert_eq!(count, 1);
-        });
-    }
-
-    #[test]
-    fn mark_json_files_read_splits_large_batches_under_sqlite_variable_limit() {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
-            db.initialize_schema().await.unwrap();
-
-            let files = (0..20_000)
-                .map(|index| ReadJsonFileRecord {
-                    filename: format!("cves/CVE-2024-{index:04}.json"),
-                    md5hash: format!("{index:032x}"),
+            )
+            .await?;
+            let range_id = last_insert_id(db).await?;
+            let events = range
+                .events
+                .iter()
+                .enumerate()
+                .flat_map(|(event_order, event)| {
+                    event
+                        .event_pairs()
+                        .into_iter()
+                        .map(move |(event_type, value)| {
+                            (event_order as i64, event_type.to_owned(), value.to_owned())
+                        })
                 })
                 .collect::<Vec<_>>();
+            for (event_order, event_type, value) in events {
+                execute_values(
+                    db,
+                    "INSERT INTO osv_range_events (range_id, event_type, value, event_order) VALUES (?, ?, ?, ?)",
+                    vec![
+                        SeaValue::from(range_id),
+                        SeaValue::from(event_type),
+                        SeaValue::from(value),
+                        SeaValue::from(event_order),
+                    ],
+                )
+                .await?;
+            }
+        }
+        for version in &affected.versions {
+            execute_values(
+                db,
+                "INSERT OR IGNORE INTO osv_versions (affected_package_id, version) VALUES (?, ?)",
+                vec![SeaValue::from(package_id), SeaValue::from(version.clone())],
+            )
+            .await?;
+        }
+    }
+    for reference in &parsed.references {
+        execute_values(
+            db,
+            "INSERT OR IGNORE INTO osv_references (osv_id, reference_type, url) VALUES (?, ?, ?)",
+            vec![
+                SeaValue::from(osv_id.clone()),
+                text_value(reference.reference_type.clone()),
+                SeaValue::from(reference.url.clone()),
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
 
-            let marked = db.mark_json_files_read(files).await.unwrap();
-            assert_eq!(marked, 20_000);
+async fn last_insert_id<C>(db: &C) -> Result<i64, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let row = db
+        .query_one(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT last_insert_rowid() AS id".to_owned(),
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("last_insert_rowid returned no row".to_owned()))?;
+    row.try_get::<i64>("", "id")
+}
 
-            let count = read_json_file::Entity::find()
-                .count(db.connection())
-                .await
-                .unwrap();
-            assert_eq!(count, 20_000);
+async fn mark_source_attempt<C>(
+    db: &C,
+    source: &str,
+    content_hash: Option<&str>,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now().to_rfc3339();
+    execute_values(
+        db,
+        r#"
+        INSERT INTO source_sync_state (source, last_attempt_at, status, content_hash)
+        VALUES (?, ?, 'running', ?)
+        ON CONFLICT(source) DO UPDATE SET
+            last_attempt_at = excluded.last_attempt_at,
+            status = 'running',
+            error_message = NULL,
+            content_hash = excluded.content_hash
+        "#,
+        vec![
+            SeaValue::from(source.to_owned()),
+            SeaValue::from(now),
+            SeaValue::from(content_hash.map(ToOwned::to_owned)),
+        ],
+    )
+    .await
+}
+
+async fn mark_source_success<C>(
+    db: &C,
+    source: &str,
+    content_hash: Option<&str>,
+    last_cursor: Option<&str>,
+    record_count: Option<i64>,
+    schema_version: Option<&str>,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now().to_rfc3339();
+    execute_values(
+        db,
+        r#"
+        INSERT INTO source_sync_state (
+            source, last_attempt_at, last_success_at, status, error_message,
+            last_cursor, content_hash, schema_version, record_count
+        ) VALUES (?, ?, ?, 'success', NULL, ?, ?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET
+            last_attempt_at = excluded.last_attempt_at,
+            last_success_at = excluded.last_success_at,
+            status = 'success',
+            error_message = NULL,
+            last_cursor = excluded.last_cursor,
+            content_hash = excluded.content_hash,
+            schema_version = excluded.schema_version,
+            record_count = excluded.record_count
+        "#,
+        vec![
+            SeaValue::from(source.to_owned()),
+            SeaValue::from(now.clone()),
+            SeaValue::from(now),
+            SeaValue::from(last_cursor.map(ToOwned::to_owned)),
+            SeaValue::from(content_hash.map(ToOwned::to_owned)),
+            SeaValue::from(schema_version.map(ToOwned::to_owned)),
+            SeaValue::from(record_count.unwrap_or_default()),
+        ],
+    )
+    .await
+}
+
+async fn refresh_identifier_nodes_for_source<C>(db: &C, source: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now().to_rfc3339();
+    match source {
+        "CVE" => {
+            execute_values(
+                db,
+                r#"
+                INSERT INTO vulnerability_identifiers (
+                    identifier, identifier_type, source, first_seen_at, last_seen_at
+                )
+                SELECT DISTINCT cve_id, 'cve', 'CVE', ?, ?
+                FROM cve
+                WHERE true
+                ON CONFLICT(identifier) DO UPDATE SET
+                    identifier_type = excluded.identifier_type,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                vec![SeaValue::from(now.clone()), SeaValue::from(now.clone())],
+            )
+            .await?;
+        }
+        "OSV" => {
+            execute_values(
+                db,
+                r#"
+                INSERT INTO vulnerability_identifiers (
+                    identifier, identifier_type, source, first_seen_at, last_seen_at
+                )
+                SELECT DISTINCT osv_id, 'osv', 'OSV', ?, ?
+                FROM osv_advisories
+                WHERE true
+                ON CONFLICT(identifier) DO UPDATE SET
+                    identifier_type = excluded.identifier_type,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                vec![SeaValue::from(now.clone()), SeaValue::from(now.clone())],
+            )
+            .await?;
+            execute_values(
+                db,
+                r#"
+                INSERT INTO vulnerability_identifiers (
+                    identifier, identifier_type, source, first_seen_at, last_seen_at
+                )
+                SELECT DISTINCT
+                    alias_id,
+                    CASE
+                        WHEN alias_id LIKE 'CVE-%' THEN 'cve'
+                        WHEN alias_id LIKE 'GHSA-%' THEN 'ghsa'
+                        WHEN alias_id LIKE 'RUSTSEC-%' THEN 'rustsec'
+                        WHEN alias_id LIKE 'PYSEC-%' THEN 'pysec'
+                        WHEN alias_id LIKE 'GO-%' THEN 'go'
+                        WHEN alias_id LIKE 'OSV-%' THEN 'osv'
+                        ELSE 'other'
+                    END,
+                    'OSV',
+                    ?,
+                    ?
+                FROM osv_aliases
+                WHERE true
+                ON CONFLICT(identifier) DO UPDATE SET
+                    identifier_type = excluded.identifier_type,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                vec![SeaValue::from(now.clone()), SeaValue::from(now.clone())],
+            )
+            .await?;
+        }
+        "KEV" => {
+            execute_values(
+                db,
+                r#"
+                INSERT INTO vulnerability_identifiers (
+                    identifier, identifier_type, source, first_seen_at, last_seen_at
+                )
+                SELECT DISTINCT cve_id, 'cve', 'KEV', ?, ?
+                FROM kev_entries
+                WHERE true
+                ON CONFLICT(identifier) DO UPDATE SET
+                    identifier_type = excluded.identifier_type,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                vec![SeaValue::from(now.clone()), SeaValue::from(now.clone())],
+            )
+            .await?;
+        }
+        "EPSS" => {
+            execute_values(
+                db,
+                r#"
+                INSERT INTO vulnerability_identifiers (
+                    identifier, identifier_type, source, first_seen_at, last_seen_at
+                )
+                SELECT DISTINCT cve_id, 'cve', 'EPSS', ?, ?
+                FROM epss_current
+                WHERE true
+                ON CONFLICT(identifier) DO UPDATE SET
+                    identifier_type = excluded.identifier_type,
+                    last_seen_at = excluded.last_seen_at
+                "#,
+                vec![SeaValue::from(now.clone()), SeaValue::from(now.clone())],
+            )
+            .await?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn refresh_osv_alias_edges<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let now = Utc::now().to_rfc3339();
+    for sql in [
+        r#"
+        INSERT OR IGNORE INTO vulnerability_identifier_edges (
+            from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
+        )
+        SELECT DISTINCT
+            osv_id,
+            alias_id,
+            'alias',
+            'OSV aliases',
+            'high',
+            json_object('osv_id', osv_id, 'alias', alias_id),
+            ?
+        FROM osv_aliases
+        "#,
+        r#"
+        INSERT OR IGNORE INTO vulnerability_identifier_edges (
+            from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
+        )
+        SELECT DISTINCT
+            alias_id,
+            osv_id,
+            'alias',
+            'OSV aliases',
+            'high',
+            json_object('osv_id', osv_id, 'alias', alias_id),
+            ?
+        FROM osv_aliases
+        "#,
+    ] {
+        execute_values(db, sql, vec![SeaValue::from(now.clone())]).await?;
+    }
+    Ok(())
+}
+
+async fn upsert_identifier<C>(db: &C, id: &str, source: &str, now: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let id = normalize_identifier(id);
+    let identifier_type = identifier_type(&id).to_owned();
+    upsert_identifier_with_type(db, &id, &identifier_type, source, now).await
+}
+
+async fn upsert_identifier_with_type<C>(
+    db: &C,
+    id: &str,
+    identifier_type: &str,
+    source: &str,
+    now: &str,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let id = normalize_identifier(id);
+    execute_values(
+        db,
+        r#"
+        INSERT INTO vulnerability_identifiers (
+            identifier, identifier_type, source, first_seen_at, last_seen_at
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(identifier) DO UPDATE SET
+            identifier_type = excluded.identifier_type,
+            last_seen_at = excluded.last_seen_at
+        "#,
+        vec![
+            SeaValue::from(id.clone()),
+            SeaValue::from(identifier_type.to_owned()),
+            SeaValue::from(source.to_owned()),
+            SeaValue::from(now.to_owned()),
+            SeaValue::from(now.to_owned()),
+        ],
+    )
+    .await
+}
+
+async fn insert_identifier_edge<C>(
+    db: &C,
+    from: &str,
+    to: &str,
+    relation_type: &str,
+    source: &str,
+    confidence: &str,
+    evidence_json: &str,
+    created_at: &str,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    execute_values(
+        db,
+        r#"
+        INSERT OR IGNORE INTO vulnerability_identifier_edges (
+            from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        "#,
+        vec![
+            SeaValue::from(normalize_identifier(from)),
+            SeaValue::from(normalize_identifier(to)),
+            SeaValue::from(relation_type.to_owned()),
+            SeaValue::from(source.to_owned()),
+            SeaValue::from(confidence.to_owned()),
+            SeaValue::from(evidence_json.to_owned()),
+            SeaValue::from(created_at.to_owned()),
+        ],
+    )
+    .await
+}
+
+async fn load_osv_summaries<C>(db: &C, ids: &[String]) -> Result<Vec<OsvSummary>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    OsvSummary::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            "SELECT osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details FROM osv_advisories WHERE osv_id IN ({}) ORDER BY osv_id",
+            sql_string_list(ids)
+        ),
+    ))
+    .all(db)
+    .await
+}
+
+async fn load_affected_packages<C>(
+    db: &C,
+    ids: &[String],
+) -> Result<Vec<AffectedPackageSummary>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    AffectedPackageSummary::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            r#"
+            SELECT p.osv_id, p.ecosystem, p.package_name, p.purl,
+                   COALESCE(GROUP_CONCAT(e.value), '') AS fixed_versions
+            FROM osv_affected_packages p
+            LEFT JOIN osv_ranges r ON r.affected_package_id = p.id
+            LEFT JOIN osv_range_events e ON e.range_id = r.id AND e.event_type = 'fixed'
+            WHERE p.osv_id IN ({})
+            GROUP BY p.id
+            ORDER BY p.osv_id, p.ecosystem, p.package_name
+            "#,
+            sql_string_list(ids)
+        ),
+    ))
+    .all(db)
+    .await
+}
+
+async fn load_kev<C>(db: &C, cve_id: &str) -> Result<Option<KevInfo>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    KevInfo::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT cve_id, vendor_project, product, vulnerability_name, date_added, short_description, required_action, due_date, known_ransomware_campaign_use, notes, fetched_at FROM kev_entries WHERE cve_id = ?",
+        vec![SeaValue::from(normalize_identifier(cve_id))],
+    ))
+    .one(db)
+    .await
+}
+
+async fn load_epss<C>(db: &C, cve_id: &str) -> Result<Option<EpssInfo>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    EpssInfo::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT cve_id, epss, percentile, score_date, model_version, fetched_at FROM epss_current WHERE cve_id = ?",
+        vec![SeaValue::from(normalize_identifier(cve_id))],
+    ))
+    .one(db)
+    .await
+}
+
+async fn load_osv_ranges<C>(db: &C, package_id: i64) -> Result<Vec<RangeEventRow>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    RangeEventRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"
+        SELECT r.id AS range_id, r.range_type, e.event_type, e.value, e.event_order
+        FROM osv_ranges r
+        INNER JOIN osv_range_events e ON e.range_id = r.id
+        WHERE r.affected_package_id = ?
+        ORDER BY r.id, e.event_order
+        "#,
+        vec![SeaValue::from(package_id)],
+    ))
+    .all(db)
+    .await
+}
+
+fn fixed_versions_from_ranges(ranges: &[RangeEventRow]) -> Vec<String> {
+    let mut values = ranges
+        .iter()
+        .filter(|row| row.event_type == "fixed")
+        .map(|row| row.value.clone())
+        .collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn match_version(
+    ecosystem: &str,
+    installed: &str,
+    ranges: &[RangeEventRow],
+) -> Option<AffectedStatus> {
+    if !ecosystem.eq_ignore_ascii_case("crates.io") {
+        return Some(AffectedStatus {
+            status: "unsupported_version_scheme".to_owned(),
+            confidence: "low".to_owned(),
         });
     }
+    let installed = semver::Version::parse(installed).ok()?;
+    if ranges.is_empty() {
+        return Some(AffectedStatus {
+            status: "unknown".to_owned(),
+            confidence: "low".to_owned(),
+        });
+    }
+    let mut affected = false;
+    let mut by_range: HashMap<i64, Vec<&RangeEventRow>> = HashMap::new();
+    for row in ranges {
+        if row
+            .range_type
+            .as_deref()
+            .is_some_and(|range_type| !range_type.eq_ignore_ascii_case("SEMVER"))
+        {
+            return Some(AffectedStatus {
+                status: "unsupported_version_scheme".to_owned(),
+                confidence: "low".to_owned(),
+            });
+        }
+        by_range.entry(row.range_id).or_default().push(row);
+    }
+    for events in by_range.values_mut() {
+        events.sort_by_key(|row| row.event_order);
+        let mut introduced = semver::Version::new(0, 0, 0);
+        let mut fixed = None;
+        for event in events.iter() {
+            match event.event_type.as_str() {
+                "introduced" => {
+                    if event.value != "0"
+                        && let Ok(version) = semver::Version::parse(&event.value)
+                    {
+                        introduced = version;
+                    }
+                }
+                "fixed" => {
+                    if let Ok(version) = semver::Version::parse(&event.value) {
+                        fixed = Some(version);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if installed >= introduced && fixed.as_ref().is_none_or(|fixed| installed < *fixed) {
+            affected = true;
+        }
+    }
+    Some(AffectedStatus {
+        status: if affected { "affected" } else { "not_affected" }.to_owned(),
+        confidence: "high".to_owned(),
+    })
 }
+
+fn priority_signals(
+    kev: Option<&KevInfo>,
+    epss: Option<&EpssInfo>,
+    has_fixed_version: bool,
+    affected: &AffectedStatus,
+) -> PrioritySignals {
+    let mut reasons = Vec::new();
+    let known_exploited = kev.is_some();
+    if known_exploited {
+        reasons.push("CVE is listed in CISA KEV".to_owned());
+    }
+    if epss.is_some_and(|epss| epss.percentile >= 0.95) {
+        reasons.push("EPSS percentile is >= 0.95".to_owned());
+    }
+    if affected.status == "affected" {
+        reasons.push("Installed version is within OSV affected range".to_owned());
+    }
+    if has_fixed_version {
+        reasons.push("Fixed version is available".to_owned());
+    }
+    let suggested_priority = if known_exploited {
+        "urgent"
+    } else if epss.is_some_and(|epss| epss.percentile >= 0.95) {
+        "high"
+    } else if affected.status != "affected" || affected.confidence == "low" {
+        "unknown"
+    } else if has_fixed_version {
+        "medium"
+    } else {
+        "low"
+    };
+    PrioritySignals {
+        known_exploited,
+        epss_percentile: epss.map(|epss| epss.percentile),
+        has_fixed_version,
+        affected_confidence: affected.confidence.clone(),
+        suggested_priority: suggested_priority.to_owned(),
+        reasons,
+    }
+}
+
+#[cfg(test)]
+mod tests;

@@ -198,14 +198,14 @@ fn percent_decode_minimal(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
-                if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                    decoded.push(byte as char);
-                    index += 3;
-                    continue;
-                }
-            }
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(byte as char);
+            index += 3;
+            continue;
         }
         decoded.push(bytes[index] as char);
         index += 1;

@@ -65,10 +65,10 @@ impl FileStorageTrait for ActualStorage {
         let mut glob_options = MatchOptions::new();
         glob_options.case_sensitive = false;
 
-        let base_path = format!("{}/**/CVE-*.json", self.base.to_string_lossy().to_string());
+        let base_path = format!("{}/**/CVE-*.json", self.base.to_string_lossy());
         let files = glob_with(base_path.as_str(), glob_options).unwrap();
 
-        files.map(|e| e.unwrap().to_string_lossy().to_owned().to_string())
+        files.map(|e| e.unwrap().to_string_lossy().into_owned())
     }
 }
 
@@ -321,7 +321,7 @@ fn available_storage_bytes(path: &std::path::Path) -> Option<u64> {
     } else {
         stat.f_frsize
     };
-    Some((stat.f_bavail as u64).saturating_mul(fragment_size as u64))
+    Some(stat.f_bavail.saturating_mul(fragment_size))
 }
 
 #[cfg(not(target_os = "linux"))]

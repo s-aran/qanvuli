@@ -13,9 +13,10 @@ use super::{
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_db::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
-    CweEntry,
+    CweEntry, EnrichedCveSummary,
 };
 use ratatui::widgets::ListState;
+use std::collections::HashMap;
 use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
@@ -44,6 +45,7 @@ pub(super) struct App {
     pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
+    pub(super) right_tab: RightPaneTab,
     pub(super) detail_scroll: u16,
     pub(super) metadata_scroll: u16,
     pub(super) view_mode: ViewMode,
@@ -64,6 +66,8 @@ pub(super) struct App {
     search: Option<PendingSearch>,
     count_task: Option<JoinHandle<Result<u64, String>>>,
     raw_json_task: Option<JoinHandle<Result<String, String>>>,
+    pub(super) enrichment: HashMap<String, EnrichedCveSummary>,
+    enrichment_task: Option<PendingEnrichment>,
     cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
     search_started_at: Option<Instant>,
     search_timeout_at: Option<Instant>,
@@ -92,7 +96,39 @@ pub(super) struct App {
 pub(super) enum PaneFocus {
     Left,
     Right,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RightPaneTab {
+    Cve,
     Metadata,
+    Enrichment,
+}
+
+impl RightPaneTab {
+    pub(super) fn next(self) -> Self {
+        match self {
+            Self::Cve => Self::Metadata,
+            Self::Metadata => Self::Enrichment,
+            Self::Enrichment => Self::Cve,
+        }
+    }
+
+    pub(super) fn previous(self) -> Self {
+        match self {
+            Self::Cve => Self::Enrichment,
+            Self::Metadata => Self::Cve,
+            Self::Enrichment => Self::Metadata,
+        }
+    }
+
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Cve => "CVE",
+            Self::Metadata => "Metadata",
+            Self::Enrichment => "Enrichment",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +171,10 @@ struct PendingSearch {
 struct PendingCount {
     db: CveDatabase,
     request: SearchRequest,
+}
+
+struct PendingEnrichment {
+    handle: JoinHandle<Result<Vec<EnrichedCveSummary>, String>>,
 }
 
 struct PendingMaintenance {
@@ -206,11 +246,14 @@ impl App {
             total_results: None,
             list_state,
             focus: PaneFocus::Left,
+            right_tab: RightPaneTab::Cve,
             detail_scroll: 0,
             metadata_scroll: 0,
             view_mode: ViewMode::Normal,
             raw_json: None,
             raw_scroll: 0,
+            enrichment: HashMap::new(),
+            enrichment_task: None,
             cwe_query: String::new(),
             cwe_results: Vec::new(),
             cwe_scroll: 0,
@@ -447,6 +490,58 @@ impl App {
         }
     }
 
+    pub(super) async fn poll_enrichment(&mut self) {
+        let Some(task) = self.enrichment_task.as_ref() else {
+            return;
+        };
+        if !task.handle.is_finished() {
+            return;
+        }
+        let task = self
+            .enrichment_task
+            .take()
+            .expect("enrichment task disappeared");
+        match task.handle.await {
+            Ok(Ok(rows)) => {
+                for row in rows {
+                    self.enrichment.insert(row.cve_id.clone(), row);
+                }
+            }
+            Ok(Err(err)) => {
+                self.status_message = Some(format!("failed to load enrichment summaries: {err}"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("failed to join enrichment task: {err}"));
+            }
+        }
+    }
+
+    pub(super) fn ensure_loaded_enrichment(&mut self, db: Option<CveDatabase>) {
+        if self.results.is_empty() || self.enrichment_task.is_some() {
+            return;
+        }
+        let cve_ids = self
+            .results
+            .iter()
+            .map(|cve| cve.summary.cve_id.clone())
+            .filter(|cve_id| !self.enrichment.contains_key(cve_id))
+            .collect::<Vec<_>>();
+        if cve_ids.is_empty() {
+            return;
+        }
+        let Some(db) = db else {
+            self.status_message = Some("database is unavailable".to_owned());
+            return;
+        };
+        self.enrichment_task = Some(PendingEnrichment {
+            handle: tokio::spawn(async move {
+                db.enriched_cve_summaries(&cve_ids)
+                    .await
+                    .map_err(|err| err.to_string())
+            }),
+        });
+    }
+
     pub(super) async fn poll_cwe_search(&mut self) {
         let Some(task) = self.cwe_task.as_ref() else {
             return;
@@ -491,6 +586,7 @@ impl App {
         self.search.is_some()
             || self.count_task.is_some()
             || self.raw_json_task.is_some()
+            || self.enrichment_task.is_some()
             || self.cwe_task.is_some()
     }
 
@@ -530,6 +626,9 @@ impl App {
         }
         if let Some(task) = self.raw_json_task.take() {
             task.abort();
+        }
+        if let Some(task) = self.enrichment_task.take() {
+            task.handle.abort();
         }
         if let Some(task) = self.cwe_task.take() {
             task.abort();
@@ -810,24 +909,30 @@ impl App {
     pub(super) fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             PaneFocus::Left => PaneFocus::Right,
-            PaneFocus::Right => PaneFocus::Metadata,
-            PaneFocus::Metadata => PaneFocus::Left,
+            PaneFocus::Right => PaneFocus::Left,
         };
     }
 
     pub(super) fn toggle_cwe_focus(&mut self) {
         self.focus = match self.focus {
             PaneFocus::Left => PaneFocus::Right,
-            PaneFocus::Right | PaneFocus::Metadata => PaneFocus::Left,
+            PaneFocus::Right => PaneFocus::Left,
         };
     }
 
     pub(super) fn previous_focus(&mut self) {
         self.focus = match self.focus {
-            PaneFocus::Left => PaneFocus::Metadata,
+            PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Left,
-            PaneFocus::Metadata => PaneFocus::Right,
         };
+    }
+
+    pub(super) fn next_right_tab(&mut self) {
+        self.right_tab = self.right_tab.next();
+    }
+
+    pub(super) fn previous_right_tab(&mut self) {
+        self.right_tab = self.right_tab.previous();
     }
 
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
@@ -852,12 +957,13 @@ impl App {
         match self.focus {
             PaneFocus::Left => self.next_or_load_more(db),
             PaneFocus::Right => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1);
-                self.clamp_detail_scroll();
-            }
-            PaneFocus::Metadata => {
-                self.metadata_scroll = self.metadata_scroll.saturating_add(1);
-                self.clamp_metadata_scroll();
+                if self.right_tab == RightPaneTab::Cve {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                    self.clamp_detail_scroll();
+                } else {
+                    self.metadata_scroll = self.metadata_scroll.saturating_add(1);
+                    self.clamp_metadata_scroll();
+                }
             }
         }
     }
@@ -866,12 +972,13 @@ impl App {
         match self.focus {
             PaneFocus::Left => self.previous(),
             PaneFocus::Right => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                self.clamp_detail_scroll();
-            }
-            PaneFocus::Metadata => {
-                self.metadata_scroll = self.metadata_scroll.saturating_sub(1);
-                self.clamp_metadata_scroll();
+                if self.right_tab == RightPaneTab::Cve {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                    self.clamp_detail_scroll();
+                } else {
+                    self.metadata_scroll = self.metadata_scroll.saturating_sub(1);
+                    self.clamp_metadata_scroll();
+                }
             }
         }
     }
@@ -1154,6 +1261,7 @@ impl App {
         self.advanced = AdvancedForm::default();
         self.display = DisplaySettings::default();
         self.results.clear();
+        self.enrichment.clear();
         self.total_results = None;
         self.list_state.select(Some(0));
         self.focus = PaneFocus::Left;
@@ -1283,16 +1391,22 @@ impl App {
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
         match self.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, Some(db)),
-            PaneFocus::Right => self.move_detail_page(direction, amount),
-            PaneFocus::Metadata => self.move_metadata_page(direction, amount),
+            PaneFocus::Right => self.move_right_page(direction, amount),
         }
     }
 
     fn move_focused_page_without_db(&mut self, direction: PageDirection, amount: PageAmount) {
         match self.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, None),
-            PaneFocus::Right => self.move_detail_page(direction, amount),
-            PaneFocus::Metadata => self.move_metadata_page(direction, amount),
+            PaneFocus::Right => self.move_right_page(direction, amount),
+        }
+    }
+
+    fn move_right_page(&mut self, direction: PageDirection, amount: PageAmount) {
+        if self.right_tab == RightPaneTab::Cve {
+            self.move_detail_page(direction, amount);
+        } else {
+            self.move_metadata_page(direction, amount);
         }
     }
 
@@ -1388,6 +1502,10 @@ impl App {
     fn clear_detail(&mut self) {
         self.detail_scroll = 0;
         self.metadata_scroll = 0;
+        self.enrichment.clear();
+        if let Some(task) = self.enrichment_task.take() {
+            task.handle.abort();
+        }
     }
 
     fn select_candidate(&mut self, index: usize) {

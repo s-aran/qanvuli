@@ -1,26 +1,56 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Utc};
 use clap::ValueEnum;
-use qanvuli_collector::providers::{cve::CveRelease, cwe::CweCatalogFile};
-use qanvuli_db::{CveActiveModels, CveDatabase, CveZipFileRecord, ReadJsonFileRecord};
+use qanvuli_collector::providers::{
+    cve::CveRelease,
+    cwe::CweCatalogFile,
+    epss::download_epss_current_csv,
+    kev::download_kev_json,
+    osv::{OsvGcsSource, parse_modified_id_csv},
+};
+use qanvuli_db::{
+    CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord,
+};
 use qanvuli_models::cwe::read_cwe_catalog_zip;
+use qanvuli_models::osv::is_known_osv_database_prefix;
 use qanvuli_utils::loader::{self, FileStorageTrait, JsonEntry};
 use rayon::prelude::*;
 use serde::Serialize;
+use std::collections::{BTreeSet, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use url::Url;
 
 pub const DEFAULT_LIMIT: u64 = 25;
+pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
+  Any official OSV source DB prefix can be selected with repeatable --osv-{prefix} flags.
+  Prefix matching is case-insensitive. Use hyphens as shown below.
+
+  --osv-alba --osv-alea --osv-alpine --osv-alsa --osv-asb-a --osv-bell --osv-bit
+  --osv-cga --osv-cleanstart --osv-curl --osv-cve --osv-debian --osv-dhi --osv-dla
+  --osv-drupal --osv-dsa --osv-dtsa --osv-echo --osv-eef --osv-ela --osv-ghsa
+  --osv-go --osv-gsd --osv-hsec --osv-jlsec --osv-kube --osv-lbsec --osv-lsn
+  --osv-mal --osv-mgasa --osv-mini --osv-oesa --osv-opensuse-su --osv-osec
+  --osv-osv --osv-phsa --osv-psf --osv-pub-a --osv-pysec --osv-rhba --osv-rhea
+  --osv-rhsa --osv-rlsa --osv-root --osv-rsec --osv-rustsec --osv-rxsa
+  --osv-suse-fu --osv-suse-ou --osv-suse-ru --osv-suse-su --osv-ubuntu --osv-usn --osv-v8
+
+Examples:
+  qanvuli init --osv-ghsa --osv-pysec
+  qanvuli update --osv-rustsec --osv-go
+"#;
 
 const INGEST_CHUNK_SIZE: usize = 10000;
 const REPLACE_ALL_INGEST_CHUNK_SIZE: usize = 20000;
+const OSV_IMPORT_BATCH_SIZE: usize = 5000;
 const READ_PARSE_PIPELINE_BATCH_SIZE: usize = 512;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CVE_ZIP_TYPE_ALL_MIDNIGHT: i32 = 0;
 const CVE_ZIP_TYPE_DELTA_HOURLY: i32 = 1;
 const CVE_ZIP_TYPE_DELTA_END_OF_DAY: i32 = 2;
+pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 
 pub type IngestProgressCallback = Arc<dyn Fn(IngestProgress) + Send + Sync>;
 
@@ -135,6 +165,598 @@ pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
             .map_err(|err| format!("failed to encode JSON: {err}"))?
     );
     Ok(())
+}
+
+pub fn format_elapsed(duration: Duration) -> String {
+    format!("{duration:.2?}")
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OsvImportSelection {
+    all: bool,
+    id_prefixes: BTreeSet<String>,
+}
+
+impl OsvImportSelection {
+    pub fn all() -> Self {
+        Self {
+            all: true,
+            id_prefixes: BTreeSet::new(),
+        }
+    }
+
+    pub fn default_init(include_all: bool, prefixes: &[String]) -> Self {
+        if include_all {
+            return Self::all();
+        }
+        let id_prefixes = if prefixes.is_empty() {
+            BTreeSet::from(["OSV".to_owned()])
+        } else {
+            prefixes
+                .iter()
+                .map(|prefix| normalize_osv_prefix(prefix))
+                .collect()
+        };
+        Self {
+            all: false,
+            id_prefixes,
+        }
+    }
+
+    pub fn update_additions(include_all: bool, prefixes: &[String]) -> Option<Self> {
+        if include_all {
+            return Some(Self::all());
+        }
+        let id_prefixes = prefixes
+            .iter()
+            .map(|prefix| normalize_osv_prefix(prefix))
+            .collect::<BTreeSet<_>>();
+        (!id_prefixes.is_empty()).then_some(Self {
+            all: false,
+            id_prefixes,
+        })
+    }
+
+    pub fn merged_with(&self, other: &Self) -> Self {
+        if self.all || other.all {
+            return Self::all();
+        }
+        let mut id_prefixes = self.id_prefixes.clone();
+        id_prefixes.extend(other.id_prefixes.iter().cloned());
+        Self {
+            all: false,
+            id_prefixes,
+        }
+    }
+
+    pub fn from_metadata(value: Option<&str>) -> Option<Self> {
+        let value = value?.trim();
+        if value.eq_ignore_ascii_case("ALL") {
+            return Some(Self::all());
+        }
+        let id_prefixes = value
+            .split(',')
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(normalize_osv_prefix)
+            .collect::<BTreeSet<_>>();
+        (!id_prefixes.is_empty()).then_some(Self {
+            all: false,
+            id_prefixes,
+        })
+    }
+
+    pub fn as_metadata_value(&self) -> String {
+        if self.all {
+            "ALL".to_owned()
+        } else {
+            self.id_prefixes
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+    }
+
+    pub fn matches_id(&self, id: &str) -> bool {
+        let id = id.to_ascii_uppercase();
+        self.all
+            || self
+                .id_prefixes
+                .iter()
+                .any(|prefix| id.starts_with(&format!("{prefix}-")))
+    }
+
+    pub fn description(&self) -> String {
+        if self.all {
+            "all OSV records".to_owned()
+        } else {
+            self.id_prefixes
+                .iter()
+                .map(|prefix| match prefix.as_str() {
+                    "OSV" => "OSV (OSS-Fuzz)".to_owned(),
+                    "PYSEC" => "PYSEC".to_owned(),
+                    "GHSA" => "GHSA".to_owned(),
+                    other => other.to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    fn prefixes(&self) -> &BTreeSet<String> {
+        &self.id_prefixes
+    }
+
+    fn validate_known_prefixes(&self) -> Result<(), String> {
+        if self.all {
+            return Ok(());
+        }
+        let unknown = self
+            .id_prefixes
+            .iter()
+            .filter(|prefix| !is_known_osv_database_prefix(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown OSV source DB prefix(es): {}",
+                unknown.join(", ")
+            ))
+        }
+    }
+}
+
+fn normalize_osv_prefix(prefix: &str) -> String {
+    prefix.trim().trim_end_matches('-').to_ascii_uppercase()
+}
+
+pub async fn rebuild_graph_and_report(db: &CveDatabase, label: &str) -> Result<(), String> {
+    let started = Instant::now();
+    let summary = db
+        .rebuild_identifier_graph()
+        .await
+        .map_err(|err| format!("{label}: failed to rebuild identifier graph: {err}"))?;
+    eprintln!(
+        "{label}: rebuilt identifier graph ({} edge records) in {}",
+        summary.record_count,
+        format_elapsed(started.elapsed())
+    );
+    Ok(())
+}
+
+pub async fn report_enrichment_source_status(db: &CveDatabase, label: &str) -> Result<(), String> {
+    let states = db
+        .source_sync_states()
+        .await
+        .map_err(|err| format!("{label}: failed to read enrichment source status: {err}"))?;
+    let sources = db
+        .db_sources()
+        .await
+        .map_err(|err| format!("{label}: failed to read DB source registry: {err}"))?;
+    for source in sources {
+        if source.source == "CVE" {
+            continue;
+        }
+        match states.iter().find(|state| state.source == source.source) {
+            Some(state) if state.status == "success" => {
+                eprintln!(
+                    "{label}: {} ({}) last_success_at={} records={} file={}",
+                    source.source,
+                    source.display_name,
+                    state.last_success_at.as_deref().unwrap_or("unknown"),
+                    state.record_count,
+                    source.default_filename
+                );
+            }
+            Some(state) => {
+                eprintln!(
+                    "{label}: {} ({}) status={} last_attempt_at={} error={}",
+                    source.source,
+                    source.display_name,
+                    state.status,
+                    state.last_attempt_at.as_deref().unwrap_or("never"),
+                    state.error_message.as_deref().unwrap_or("-")
+                );
+            }
+            None => {
+                if source.source == "OSV" {
+                    eprintln!(
+                        "{label}: OSV ({}) is not synced; run `qanvuli init` and add `--osv-<prefix>` or `--osv-all` as needed",
+                        source.display_name
+                    );
+                } else {
+                    eprintln!(
+                        "{label}: {} ({}) is not synced; run `qanvuli init` to refresh all DB sources",
+                        source.source, source.display_name
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn sync_all_enrichment_sources_after_init(
+    db: &CveDatabase,
+    label: &str,
+    osv_selection: &OsvImportSelection,
+) -> Result<(), String> {
+    let started = Instant::now();
+    sync_osv_selection_from_gcs(db, label, osv_selection).await?;
+    sync_kev_epss_snapshots(db, label).await?;
+    eprintln!(
+        "{label}: enrichment sync completed in {}",
+        format_elapsed(started.elapsed())
+    );
+    Ok(())
+}
+
+pub async fn sync_all_enrichment_sources_after_update(
+    db: &CveDatabase,
+    label: &str,
+    requested_osv_additions: Option<&OsvImportSelection>,
+) -> Result<(), String> {
+    let started = Instant::now();
+    let osv_started = Instant::now();
+    eprintln!("{label}: syncing OSV modified records from Google Cloud Storage");
+    let osv = OsvGcsSource::new_public().map_err(|err| format!("{label}: {err}"))?;
+    let modified_csv = osv
+        .modified_id_csv()
+        .await
+        .map_err(|err| format!("{label}: failed to download OSV modified_id.csv: {err}"))?;
+    let previous_cursor = db
+        .source_sync_states()
+        .await
+        .map_err(|err| format!("{label}: failed to read source sync state: {err}"))?
+        .into_iter()
+        .find(|state| state.source == "OSV")
+        .and_then(|state| state.last_cursor);
+    let selection_metadata = db
+        .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
+        .await
+        .map_err(|err| format!("{label}: failed to read OSV import selection: {err}"))?;
+    let selection = OsvImportSelection::from_metadata(selection_metadata.as_deref())
+        .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
+    selection
+        .validate_known_prefixes()
+        .map_err(|err| format!("{label}: {err}"))?;
+    if let Some(additions) = requested_osv_additions {
+        let selection = selection.merged_with(additions);
+        eprintln!(
+            "{label}: OSV selection expanded to {}; seeding selected records",
+            selection.description()
+        );
+        sync_osv_selection_from_gcs(db, label, &selection).await?;
+        sync_kev_epss_snapshots(db, label).await?;
+        eprintln!(
+            "{label}: enrichment sync completed in {}",
+            format_elapsed(started.elapsed())
+        );
+        return Ok(());
+    }
+    if previous_cursor.is_none() {
+        eprintln!(
+            "{label}: skipping OSV modified sync because no OSV cursor exists; run `qanvuli init` first"
+        );
+        eprintln!(
+            "{label}: OSV modified sync completed in {}",
+            format_elapsed(osv_started.elapsed())
+        );
+        sync_kev_epss_snapshots(db, label).await?;
+        eprintln!(
+            "{label}: enrichment sync completed in {}",
+            format_elapsed(started.elapsed())
+        );
+        return Ok(());
+    }
+    let mut cursor = previous_cursor.clone();
+    let mut saw_first_modified_row = false;
+    let mut object_paths = HashSet::new();
+    for row in parse_modified_id_csv(&modified_csv) {
+        if !saw_first_modified_row {
+            cursor = Some(row.modified_at.clone());
+            saw_first_modified_row = true;
+        }
+        if previous_cursor
+            .as_deref()
+            .is_some_and(|previous| row.modified_at.as_str() <= previous)
+        {
+            break;
+        }
+        if !selection.matches_id(&osv_id_from_path(&row.object_path)) {
+            continue;
+        }
+        object_paths.insert(row.object_path);
+    }
+    if object_paths.is_empty() {
+        eprintln!("{label}: OSV modified_id.csv has no new records");
+        eprintln!(
+            "{label}: OSV modified sync completed in {}",
+            format_elapsed(osv_started.elapsed())
+        );
+        sync_kev_epss_snapshots(db, label).await?;
+        eprintln!(
+            "{label}: enrichment sync completed in {}",
+            format_elapsed(started.elapsed())
+        );
+        return Ok(());
+    }
+    let zip_path = temp_osv_all_zip_path();
+    osv.download_all_zip_to_file(&zip_path)
+        .await
+        .map_err(|err| format!("{label}: failed to download OSV all.zip: {err}"))?;
+    let summary = import_osv_zip_file_in_batches(
+        db,
+        &zip_path,
+        Some(&object_paths),
+        Some(&selection),
+        cursor.as_deref(),
+        label,
+    )
+    .await;
+    let _ = std::fs::remove_file(&zip_path);
+    let summary = summary?;
+    eprintln!(
+        "{label}: upserted OSV records={} skipped={} in {}",
+        summary.imported,
+        summary.skipped,
+        format_elapsed(osv_started.elapsed())
+    );
+    sync_kev_epss_snapshots(db, label).await?;
+    eprintln!(
+        "{label}: enrichment sync completed in {}",
+        format_elapsed(started.elapsed())
+    );
+    Ok(())
+}
+
+pub async fn sync_osv_selection_from_gcs(
+    db: &CveDatabase,
+    label: &str,
+    selection: &OsvImportSelection,
+) -> Result<(), String> {
+    let started = Instant::now();
+    eprintln!(
+        "{label}: syncing OSV records from Google Cloud Storage ({})",
+        selection.description()
+    );
+    selection
+        .validate_known_prefixes()
+        .map_err(|err| format!("{label}: {err}"))?;
+    let osv = OsvGcsSource::new_public().map_err(|err| format!("{label}: {err}"))?;
+    let modified_csv = osv
+        .modified_id_csv()
+        .await
+        .map_err(|err| format!("{label}: failed to download OSV modified_id.csv: {err}"))?;
+    let modified_rows = parse_modified_id_csv(&modified_csv);
+    let cursor = modified_rows.first().map(|row| row.modified_at.as_str());
+    let zip_path = temp_osv_all_zip_path();
+    osv.download_all_zip_to_file(&zip_path)
+        .await
+        .map_err(|err| format!("{label}: failed to download OSV all.zip: {err}"))?;
+    let summary =
+        import_osv_zip_file_in_batches(db, &zip_path, None, Some(selection), cursor, label).await;
+    let _ = std::fs::remove_file(&zip_path);
+    let summary = summary?;
+    db.set_metadata_value(
+        OSV_IMPORT_ID_PREFIXES_METADATA_KEY,
+        &selection.as_metadata_value(),
+    )
+    .await
+    .map_err(|err| format!("{label}: failed to save OSV import selection: {err}"))?;
+    eprintln!(
+        "{label}: OSV selection sync completed records={} imported={} skipped={} in {}",
+        summary.record_count,
+        summary.imported,
+        summary.skipped,
+        format_elapsed(started.elapsed())
+    );
+    Ok(())
+}
+
+async fn sync_kev_epss_snapshots(db: &CveDatabase, label: &str) -> Result<(), String> {
+    let kev_started = Instant::now();
+    eprintln!("{label}: syncing CISA KEV snapshot");
+    let kev = download_kev_json()
+        .await
+        .map_err(|err| format!("{label}: failed to download CISA KEV: {err}"))?;
+    let kev_summary = db
+        .import_kev_json(&kev)
+        .await
+        .map_err(|err| format!("{label}: failed to import CISA KEV: {err}"))?;
+    eprintln!(
+        "{label}: CISA KEV sync completed records={} imported={} skipped={} in {}",
+        kev_summary.record_count,
+        kev_summary.imported,
+        kev_summary.skipped,
+        format_elapsed(kev_started.elapsed())
+    );
+
+    let epss_started = Instant::now();
+    eprintln!("{label}: syncing FIRST EPSS current snapshot");
+    let epss = download_epss_current_csv()
+        .await
+        .map_err(|err| format!("{label}: failed to download FIRST EPSS: {err}"))?;
+    let epss_summary = db
+        .import_epss_csv(&epss)
+        .await
+        .map_err(|err| format!("{label}: failed to import FIRST EPSS: {err}"))?;
+    eprintln!(
+        "{label}: FIRST EPSS sync completed records={} imported={} skipped={} in {}",
+        epss_summary.record_count,
+        epss_summary.imported,
+        epss_summary.skipped,
+        format_elapsed(epss_started.elapsed())
+    );
+    Ok(())
+}
+
+pub(crate) async fn import_osv_zip_file_in_batches(
+    db: &CveDatabase,
+    path: &Path,
+    target_paths: Option<&HashSet<String>>,
+    selection: Option<&OsvImportSelection>,
+    cursor: Option<&str>,
+    label: &str,
+) -> Result<qanvuli_db::ImportSummary, String> {
+    let started = Instant::now();
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|err| format!("failed to read OSV zip: {err}"))?;
+    let mut records = Vec::new();
+    let mut imported = 0usize;
+    let mut skipped = 0usize;
+    let mut seen = 0usize;
+    let mut matched_prefixes = BTreeSet::new();
+    let mut timings = IngestTimings::default();
+    let mut chunk_index = 0usize;
+    let mut chunk_started = Instant::now();
+    let mut chunk_read_elapsed = Duration::default();
+    for index in 0..archive.len() {
+        let read_started = Instant::now();
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("failed to read OSV zip entry {index}: {err}"))?;
+        let name = entry.name().to_owned();
+        if !name.ends_with(".json") {
+            chunk_read_elapsed += read_started.elapsed();
+            continue;
+        }
+        if let Some(target_paths) = target_paths
+            && !target_paths.contains(&name)
+        {
+            chunk_read_elapsed += read_started.elapsed();
+            continue;
+        }
+        let osv_id = osv_id_from_path(&name);
+        if let Some(selection) = selection
+            && !selection.matches_id(&osv_id)
+        {
+            chunk_read_elapsed += read_started.elapsed();
+            continue;
+        }
+        if let Some(selection) = selection
+            && !selection.all
+        {
+            for prefix in selection.prefixes() {
+                if osv_id.starts_with(&format!("{prefix}-")) {
+                    matched_prefixes.insert(prefix.clone());
+                }
+            }
+        }
+        let mut raw_json = String::new();
+        entry
+            .read_to_string(&mut raw_json)
+            .map_err(|err| format!("failed to read {name}: {err}"))?;
+        chunk_read_elapsed += read_started.elapsed();
+        records.push(OsvRawRecord {
+            source_path: Some(format!("gs://osv-vulnerabilities/{name}")),
+            raw_json,
+        });
+        seen += 1;
+        if records.len() >= OSV_IMPORT_BATCH_SIZE {
+            let batch_count = records.len();
+            let db_write_started = Instant::now();
+            let summary = db
+                .import_osv_records_with_cursor_and_count(records, cursor, Some(seen))
+                .await
+                .map_err(|err| format!("{label}: failed to import OSV batch: {err}"))?;
+            let db_write_elapsed = db_write_started.elapsed();
+            let chunk_elapsed = chunk_started.elapsed();
+            timings.read += chunk_read_elapsed;
+            timings.db_write += db_write_elapsed;
+            imported += summary.imported;
+            skipped += summary.skipped;
+            eprintln!(
+                "{label}: OSV timings chunk={chunk_index} read={}, db_write={}, total={}",
+                format_elapsed(chunk_read_elapsed),
+                format_elapsed(db_write_elapsed),
+                format_elapsed(chunk_elapsed)
+            );
+            eprintln!(
+                "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, imported={}, skipped={}",
+                summary.imported, summary.skipped
+            );
+            records = Vec::with_capacity(OSV_IMPORT_BATCH_SIZE);
+            chunk_index += 1;
+            chunk_started = Instant::now();
+            chunk_read_elapsed = Duration::default();
+        }
+    }
+    if !records.is_empty() {
+        let batch_count = records.len();
+        let db_write_started = Instant::now();
+        let summary = db
+            .import_osv_records_with_cursor_and_count(records, cursor, Some(seen))
+            .await
+            .map_err(|err| format!("{label}: failed to import OSV batch: {err}"))?;
+        let db_write_elapsed = db_write_started.elapsed();
+        let chunk_elapsed = chunk_started.elapsed();
+        timings.read += chunk_read_elapsed;
+        timings.db_write += db_write_elapsed;
+        imported += summary.imported;
+        skipped += summary.skipped;
+        eprintln!(
+            "{label}: OSV timings chunk={chunk_index} read={}, db_write={}, total={}",
+            format_elapsed(chunk_read_elapsed),
+            format_elapsed(db_write_elapsed),
+            format_elapsed(chunk_elapsed)
+        );
+        eprintln!(
+            "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, imported={}, skipped={}",
+            summary.imported, summary.skipped
+        );
+    }
+    if let Some(selection) = selection
+        && !selection.all
+    {
+        let missing = selection
+            .prefixes()
+            .difference(&matched_prefixes)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{label}: OSV all.zip did not contain JSON records for prefix(es): {}",
+                missing.join(", ")
+            ));
+        }
+    }
+    eprintln!(
+        "{label}: OSV import completed records={seen} imported={imported} skipped={skipped} elapsed={}, read={}, db_write={}",
+        format_elapsed(started.elapsed()),
+        format_elapsed(timings.read),
+        format_elapsed(timings.db_write)
+    );
+    Ok(qanvuli_db::ImportSummary {
+        source: "OSV".to_owned(),
+        imported,
+        skipped,
+        record_count: seen,
+        content_hash: None,
+    })
+}
+
+fn osv_id_from_path(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path)
+        .to_ascii_uppercase()
+}
+
+fn temp_osv_all_zip_path() -> PathBuf {
+    let dir = std::env::temp_dir().join("qanvuli");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(format!(
+        "qanvuli-osv-all-{}-{}.zip",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ))
 }
 
 pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, String> {
@@ -623,8 +1245,8 @@ async fn update_delta_assets_since(
     });
 
     let mut latest_end_of_day = None;
-    for index in 0..candidates.len() {
-        if candidates[index].1.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY {
+    for (index, (_, candidate)) in candidates.iter().enumerate() {
+        if candidate.zip_type == CVE_ZIP_TYPE_DELTA_END_OF_DAY {
             latest_end_of_day = Some(index);
         }
     }
@@ -835,7 +1457,7 @@ pub async fn ingest_zip_with_progress(
                 read_and_parse_extracted_chunk(label, chunk, &mut read_failed)
             } else {
                 read_and_parse_zip_chunk(label, chunk, &mut storage, &mut read_failed)
-        };
+            };
         timings.read += read_elapsed;
         timings.parse += parse_elapsed;
 
@@ -1011,6 +1633,7 @@ fn parse_json_batch(
         .collect()
 }
 
+#[allow(clippy::type_complexity)]
 fn read_and_parse_extracted_chunk(
     label: &str,
     chunk: &[JsonEntry],
@@ -1054,6 +1677,7 @@ fn read_and_parse_extracted_chunk(
     (parsed, elapsed, Duration::ZERO)
 }
 
+#[allow(clippy::type_complexity)]
 fn read_and_parse_zip_chunk(
     label: &str,
     chunk: &[JsonEntry],

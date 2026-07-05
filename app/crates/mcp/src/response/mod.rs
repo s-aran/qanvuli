@@ -1,11 +1,11 @@
 use crate::common::error::mcp_error;
 use qanvuli_db::{
-    cve_state_label, CveAffectedDetail, CveCvssDetail, CveCweDetail, CveReference, CveSummary,
-    CveSummaryWithDetail,
+    CveAffectedDetail, CveCvssDetail, CveCweDetail, CveReference, CveSummary, CveSummaryWithDetail,
+    cve_state_label,
 };
 use qanvuli_models::RawCveStatusRecord;
 use rmcp::model::{CallToolResult, ContentBlock};
-use simd_json::{json, OwnedValue as Value};
+use simd_json::{OwnedValue as Value, json};
 
 pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
     let text = simd_json::to_string_pretty(&value)
@@ -117,17 +117,6 @@ pub(crate) fn explain_match(
         "query": if query.is_empty() { None } else { Some(query) },
         "matched_fields": evidence,
         "references": references,
-    }))
-}
-
-pub(crate) fn known_exploited_unavailable(
-    cve_id: Option<&str>,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    tool_result(json!({
-        "available": false,
-        "cve_id": cve_id,
-        "reason": "known exploited vulnerability data is not configured; qanvuli does not import CISA KEV yet",
-        "next_step": "import a KEV provider before using this as an exploit-prioritization signal",
     }))
 }
 

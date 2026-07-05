@@ -160,6 +160,7 @@ impl From<SearchMode> for CveAdvancedQueryMode {
             SearchMode::Vendor => Self::Vendor,
             SearchMode::Cwe => Self::Cwe,
             SearchMode::Cve => Self::Cve,
+            SearchMode::Identifier => Self::FreeText,
         }
     }
 }

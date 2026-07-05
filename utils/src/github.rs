@@ -77,24 +77,22 @@ impl GitHubReleaseFile {
 
     pub async fn async_download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.safe_file_name()?;
-        if self.size > 0 {
-            if let Ok(metadata) = std::fs::metadata(filename) {
-                if metadata.len() == self.size {
-                    return Ok(());
-                }
-            }
+        if self.size > 0
+            && let Ok(metadata) = std::fs::metadata(filename)
+            && metadata.len() == self.size
+        {
+            return Ok(());
         }
         self.async_download_as(filename).await
     }
 
     pub fn download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.safe_file_name()?;
-        if self.size > 0 {
-            if let Ok(metadata) = std::fs::metadata(filename) {
-                if metadata.len() == self.size {
-                    return Ok(());
-                }
-            }
+        if self.size > 0
+            && let Ok(metadata) = std::fs::metadata(filename)
+            && metadata.len() == self.size
+        {
+            return Ok(());
         }
         self.download_as(filename)
     }
@@ -134,7 +132,7 @@ impl From<Release> for GitHubRelease {
         Self {
             version: release.tag_name,
             url: release.html_url.to_string(),
-            published_at: release.published_at.clone(),
+            published_at: release.published_at,
             files: release
                 .assets
                 .into_iter()

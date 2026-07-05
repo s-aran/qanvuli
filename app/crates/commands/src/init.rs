@@ -1,11 +1,13 @@
 use super::common::{
-    IngestMode, IngestProgress, IngestProgressCallback, ReleaseAssetKind, connect_db,
-    download_latest_asset_with_source, ingest_zip_with_progress, remove_downloaded_zip,
-    reset_sqlite_database_files,
+    IngestMode, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
+    ReleaseAssetKind, connect_db, download_latest_asset_with_source, ingest_zip_with_progress,
+    rebuild_graph_and_report, remove_downloaded_zip, report_enrichment_source_status,
+    reset_sqlite_database_files, sync_all_enrichment_sources_after_init,
 };
 use std::path::PathBuf;
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
+#[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
     #[arg(long)]
     schema_only: bool,
@@ -17,18 +19,10 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            schema_only: false,
-            rebuild: false,
-            zip: None,
-            max_chunks: None,
-            keep: false,
-        }
-    }
+    #[arg(long)]
+    osv_all: bool,
+    #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
+    osv_prefixes: Vec<String>,
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
@@ -58,6 +52,7 @@ async fn run_with_progress(
                 .map_err(|err| format!("failed to initialize schema: {err}"))?;
         }
         emit_init_progress(&progress, "-", "done");
+        report_enrichment_source_status(&db, "init").await?;
         println!("initialized schema: {db_url}");
         db.close()
             .await
@@ -96,6 +91,10 @@ async fn run_with_progress(
         progress,
     )
     .await;
+    let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
+    sync_all_enrichment_sources_after_init(&db, "init", &osv_selection).await?;
+    rebuild_graph_and_report(&db, "init").await?;
+    report_enrichment_source_status(&db, "init").await?;
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;

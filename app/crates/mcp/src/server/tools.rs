@@ -204,11 +204,71 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Return local database status including CVE/CWE counts and latest applied CVE archive/update timestamps."
+        description = "Return local database status including CVE/CWE counts, OSV/KEV/EPSS counts, identifier graph counts, and source sync state."
     )]
     pub(crate) async fn get_database_status(&self) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
         db::database_status(db).await
+    }
+
+    #[tool(
+        description = "Resolve a CVE, OSV, GHSA, RUSTSEC, PYSEC, GO, or other vulnerability identifier through the local read-only alias graph and return related IDs plus edge evidence."
+    )]
+    pub(crate) async fn resolve_identifier(
+        &self,
+        Parameters(args): Parameters<ResolveIdentifierArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::resolve_identifier(db, &args.id).await
+    }
+
+    #[tool(
+        description = "Return local identifier graph edges for one vulnerability identifier, including source and evidence JSON."
+    )]
+    pub(crate) async fn get_related_identifiers(
+        &self,
+        Parameters(args): Parameters<ResolveIdentifierArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::get_related_identifiers(db, &args.id).await
+    }
+
+    #[tool(
+        description = "Fetch one CVE with local OSV aliases, affected packages, CISA KEV, FIRST EPSS, CVSS/CWE details, evidence, and source sync status."
+    )]
+    pub(crate) async fn get_enriched_cve(
+        &self,
+        Parameters(args): Parameters<GetEnrichedCveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::get_enriched_cve(db, &args.cve_id).await
+    }
+
+    #[tool(description = "Fetch one local OSV advisory summary by OSV/GHSA/RUSTSEC/PYSEC/GO ID.")]
+    pub(crate) async fn get_enriched_osv(
+        &self,
+        Parameters(args): Parameters<GetEnrichedOsvArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::get_enriched_osv(db, &args.osv_id).await
+    }
+
+    #[tool(
+        description = "Query local OSV records for an ecosystem/package/version, then attach CVE aliases, CISA KEV, FIRST EPSS, priority signals, and evidence. This does not fetch URLs or run commands."
+    )]
+    pub(crate) async fn query_package_enriched(
+        &self,
+        Parameters(args): Parameters<QueryPackageEnrichedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::query_package_enriched(
+            db,
+            &args.ecosystem,
+            &args.package,
+            &args.version,
+            args.purl.as_deref(),
+        )
+        .await
     }
 
     #[tool(
@@ -311,13 +371,14 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Report whether local known-exploited-vulnerability data is available. qanvuli does not import CISA KEV yet, so this tool currently returns available=false."
+        description = "Return locally synced CISA KEV known-exploited-vulnerability entries. With cve_id, reports whether that CVE is KEV-listed; without cve_id, returns all local KEV entries."
     )]
     pub(crate) async fn search_known_exploited(
         &self,
         Parameters(args): Parameters<KnownExploitedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        response::known_exploited_unavailable(args.cve_id.as_deref())
+        let db = self.db.get().await?;
+        db::known_exploited(db, args.cve_id.as_deref()).await
     }
 
     #[tool(
@@ -333,14 +394,21 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Update the local CVE database. With zip, applies that local CVE delta zip. Without zip, downloads and applies the applicable CVE delta archives according to local update history. Returns updated=true and applied_assets, the list of archive paths applied. This mutates the local database and may access GitHub."
+        description = "Update the local database. With zip, applies that local CVE delta zip. Without zip, downloads and applies applicable CVE delta archives, refreshes OSV/KEV/EPSS enrichment, then rebuilds the identifier graph. Optional osv_all or osv_prefixes expand local OSV coverage by official OSV source DB prefix. This mutates the local database and may access GitHub, Google Cloud Storage, CISA, and FIRST."
     )]
     pub(crate) async fn update_db(
         &self,
         Parameters(args): Parameters<UpdateDbArgs>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
-        db::apply_updates(db, args.zip, args.max_chunks).await
+        db::apply_updates(
+            db,
+            args.zip,
+            args.max_chunks,
+            args.osv_all.unwrap_or(false),
+            args.osv_prefixes.as_deref().unwrap_or(&[]),
+        )
+        .await
     }
 }
 

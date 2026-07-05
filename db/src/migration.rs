@@ -64,11 +64,26 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
 
         create_current_indexes(manager.get_connection()).await?;
         create_current_search_tables(manager.get_connection()).await?;
+        create_enrichment_tables(manager.get_connection()).await?;
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         for table in [
+            "vulnerability_identifier_edges",
+            "vulnerability_identifiers",
+            "epss_current",
+            "kev_entries",
+            "osv_references",
+            "osv_versions",
+            "osv_range_events",
+            "osv_ranges",
+            "osv_affected_packages",
+            "osv_aliases",
+            "osv_advisories",
+            "source_raw_records",
+            "source_sync_state",
+            "db_sources",
             "cve_affected_search",
             "cve_cvss_search",
             "cve_cwe_search",
@@ -108,6 +123,158 @@ impl MigrationTrait for M20260616CreateCurrentSchema {
         }
         Ok(())
     }
+}
+
+async fn create_enrichment_tables<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    for sql in [
+        r#"
+        CREATE TABLE IF NOT EXISTS db_sources (
+            source TEXT PRIMARY KEY NOT NULL,
+            display_name TEXT NOT NULL,
+            source_type TEXT NOT NULL,
+            default_filename TEXT NOT NULL,
+            raw_format TEXT NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS source_sync_state (
+            source TEXT PRIMARY KEY NOT NULL,
+            last_attempt_at TEXT,
+            last_success_at TEXT,
+            status TEXT NOT NULL DEFAULT 'never_synced',
+            error_message TEXT,
+            last_cursor TEXT,
+            content_hash TEXT,
+            schema_version TEXT,
+            record_count INTEGER NOT NULL DEFAULT 0
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS source_raw_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            source TEXT NOT NULL,
+            source_record_id TEXT NOT NULL,
+            source_path TEXT,
+            provider_published_at TEXT,
+            provider_modified_at TEXT,
+            score_date TEXT,
+            fetched_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            raw_content TEXT NOT NULL,
+            raw_json TEXT,
+            raw_csv TEXT,
+            content_type TEXT NOT NULL,
+            UNIQUE(source, source_record_id)
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS osv_advisories (
+            osv_id TEXT PRIMARY KEY NOT NULL,
+            schema_version TEXT,
+            published_at TEXT,
+            modified_at TEXT,
+            withdrawn_at TEXT,
+            summary TEXT,
+            details TEXT,
+            raw_record_id INTEGER NOT NULL,
+            FOREIGN KEY(raw_record_id) REFERENCES source_raw_records(id)
+        )
+        "#,
+        "CREATE TABLE IF NOT EXISTS osv_aliases (osv_id TEXT NOT NULL, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id))",
+        r#"
+        CREATE TABLE IF NOT EXISTS osv_affected_packages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            osv_id TEXT NOT NULL,
+            ecosystem TEXT,
+            package_name TEXT,
+            purl TEXT
+        )
+        "#,
+        "CREATE TABLE IF NOT EXISTS osv_ranges (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, affected_package_id INTEGER NOT NULL, range_type TEXT)",
+        "CREATE TABLE IF NOT EXISTS osv_range_events (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, range_id INTEGER NOT NULL, event_type TEXT NOT NULL, value TEXT NOT NULL, event_order INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS osv_versions (affected_package_id INTEGER NOT NULL, version TEXT NOT NULL, PRIMARY KEY(affected_package_id, version))",
+        "CREATE TABLE IF NOT EXISTS osv_references (osv_id TEXT NOT NULL, reference_type TEXT, url TEXT NOT NULL, PRIMARY KEY(osv_id, url))",
+        r#"
+        CREATE TABLE IF NOT EXISTS kev_entries (
+            cve_id TEXT PRIMARY KEY NOT NULL,
+            vendor_project TEXT,
+            product TEXT,
+            vulnerability_name TEXT,
+            date_added TEXT,
+            short_description TEXT,
+            required_action TEXT,
+            due_date TEXT,
+            known_ransomware_campaign_use TEXT,
+            notes TEXT,
+            fetched_at TEXT NOT NULL,
+            raw_record_id INTEGER NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS epss_current (
+            cve_id TEXT PRIMARY KEY NOT NULL,
+            epss REAL NOT NULL,
+            percentile REAL NOT NULL,
+            score_date TEXT,
+            model_version TEXT,
+            fetched_at TEXT NOT NULL,
+            raw_record_id INTEGER
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS vulnerability_identifiers (
+            identifier TEXT PRIMARY KEY NOT NULL,
+            identifier_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE IF NOT EXISTS vulnerability_identifier_edges (
+            from_identifier TEXT NOT NULL,
+            to_identifier TEXT NOT NULL,
+            relation_type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(from_identifier, to_identifier, relation_type, source)
+        )
+        "#,
+        "CREATE INDEX IF NOT EXISTS idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases (alias_id)",
+        "CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
+        "CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges (affected_package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
+        "CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges (to_identifier)",
+        "CREATE INDEX IF NOT EXISTS idx_identifier_edges_from ON vulnerability_identifier_edges (from_identifier)",
+    ] {
+        db.execute_unprepared(sql).await?;
+    }
+
+    for sql in [
+        "ALTER TABLE source_raw_records ADD COLUMN raw_json TEXT",
+        "ALTER TABLE source_raw_records ADD COLUMN raw_csv TEXT",
+    ] {
+        let _ = db.execute_unprepared(sql).await;
+    }
+
+    db.execute_unprepared(
+        r#"
+        INSERT OR REPLACE INTO db_sources (source, display_name, source_type, default_filename, raw_format)
+        VALUES
+            ('CVE', 'CVE List V5', 'vulnerability_db', 'all_CVEs_at_midnight.zip', 'json'),
+            ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json'),
+            ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
+            ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv')
+        "#,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn create_current_indexes<C>(db: &C) -> Result<(), DbErr>

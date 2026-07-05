@@ -210,8 +210,38 @@ pub(crate) struct RecentUpdatesArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct KnownExploitedArgs {
-    /// Optional CVE ID. qanvuli currently needs a KEV provider before it can answer this.
+    /// Optional CVE ID. When omitted, returns all locally synced KEV entries.
     pub(crate) cve_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ResolveIdentifierArgs {
+    /// CVE, OSV, GHSA, RUSTSEC, PYSEC, GO, or other vulnerability identifier.
+    pub(crate) id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetEnrichedCveArgs {
+    /// Exact CVE ID, such as CVE-2026-12345.
+    pub(crate) cve_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetEnrichedOsvArgs {
+    /// Exact OSV advisory ID, such as GHSA-abcd-efgh-ijkl or RUSTSEC-2026-0001.
+    pub(crate) osv_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct QueryPackageEnrichedArgs {
+    /// OSV ecosystem name, such as crates.io.
+    pub(crate) ecosystem: String,
+    /// Package name in the ecosystem.
+    pub(crate) package: String,
+    /// Installed package version.
+    pub(crate) version: String,
+    /// Optional package URL to disambiguate package identity.
+    pub(crate) purl: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -220,6 +250,11 @@ pub(crate) struct UpdateDbArgs {
     pub(crate) zip: Option<String>,
     /// Optional cap on downloaded update chunks. Intended for testing or bounded maintenance runs.
     pub(crate) max_chunks: Option<usize>,
+    /// Expand local OSV sync coverage to all OSV records.
+    pub(crate) osv_all: Option<bool>,
+    /// Additional OSV JSON filename/advisory prefixes from all.zip, case-insensitive.
+    /// Examples: GHSA, PYSEC, RUSTSEC, GO, UBUNTU.
+    pub(crate) osv_prefixes: Option<Vec<String>>,
 }
 
 impl CweArgs {

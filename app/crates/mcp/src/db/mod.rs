@@ -1,5 +1,9 @@
+#![allow(clippy::too_many_arguments)]
+
 use crate::{common::error::mcp_error, response};
-use qanvuli_app_commands::common::apply_delta_updates;
+use qanvuli_app_commands::common::{
+    OsvImportSelection, apply_delta_updates, sync_all_enrichment_sources_after_update,
+};
 use qanvuli_db::{CveDatabase, CveStateScope, CveSummary};
 use qanvuli_models::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
@@ -203,11 +207,94 @@ pub(crate) async fn find_cve_references(
 }
 
 pub(crate) async fn database_status(db: &CveDatabase) -> Result<CallToolResult, McpError> {
-    let status = db
-        .database_status()
+    let mut status = simd_json::serde::to_owned_value(
+        db.database_status_enriched()
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?,
+    )
+    .map_err(|err| mcp_error(err.to_string()))?;
+    status["source_sync"] = simd_json::serde::to_owned_value(
+        db.source_sync_states()
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?,
+    )
+    .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(status))
+}
+
+pub(crate) async fn resolve_identifier(
+    db: &CveDatabase,
+    id: &str,
+) -> Result<CallToolResult, McpError> {
+    let result = db
+        .resolve_identifier(id)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
-    response::tool_result(json!(status))
+    response::tool_result(json!(result))
+}
+
+pub(crate) async fn get_related_identifiers(
+    db: &CveDatabase,
+    id: &str,
+) -> Result<CallToolResult, McpError> {
+    let result = db
+        .related_edges(id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(result))
+}
+
+pub(crate) async fn get_enriched_cve(
+    db: &CveDatabase,
+    cve_id: &str,
+) -> Result<CallToolResult, McpError> {
+    let result = db
+        .get_enriched_cve(cve_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(result))
+}
+
+pub(crate) async fn get_enriched_osv(
+    db: &CveDatabase,
+    osv_id: &str,
+) -> Result<CallToolResult, McpError> {
+    let result = db
+        .get_enriched_osv(osv_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(result))
+}
+
+pub(crate) async fn query_package_enriched(
+    db: &CveDatabase,
+    ecosystem: &str,
+    package: &str,
+    version: &str,
+    purl: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    let result = db
+        .query_package_enriched(ecosystem, package, version, purl)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(result))
+}
+
+pub(crate) async fn known_exploited(
+    db: &CveDatabase,
+    cve_id: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    let entries = db
+        .kev_entries(cve_id)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!({
+        "available": true,
+        "cve_id": cve_id,
+        "known_exploited": if cve_id.is_some() { !entries.is_empty() } else { false },
+        "count": entries.len(),
+        "entries": entries,
+    }))
 }
 
 pub(crate) async fn search_references(
@@ -327,6 +414,8 @@ pub(crate) async fn apply_updates(
     db: &CveDatabase,
     zip: Option<String>,
     max_chunks: Option<usize>,
+    osv_all: bool,
+    osv_prefixes: &[String],
 ) -> Result<CallToolResult, McpError> {
     db.initialize_schema()
         .await
@@ -336,8 +425,19 @@ pub(crate) async fn apply_updates(
         .await
         .map_err(mcp_error)?;
 
+    let osv_additions = OsvImportSelection::update_additions(osv_all, osv_prefixes);
+    sync_all_enrichment_sources_after_update(db, "mcp update_db", osv_additions.as_ref())
+        .await
+        .map_err(mcp_error)?;
+
+    let graph = db
+        .rebuild_identifier_graph()
+        .await
+        .map_err(|err| mcp_error(format!("failed to rebuild identifier graph: {err}")))?;
+
     response::tool_result(json!({
         "updated": true,
         "applied_assets": applied.into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        "identifier_graph": graph,
     }))
 }

@@ -1,7 +1,12 @@
-use super::common::{IngestProgressCallback, apply_delta_updates_with_progress, connect_db};
+use super::common::{
+    IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
+    apply_delta_updates_with_progress, connect_db, rebuild_graph_and_report,
+    report_enrichment_source_status, sync_all_enrichment_sources_after_update,
+};
 use std::path::PathBuf;
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
+#[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
     #[arg(long, value_name = "PATH")]
     zip: Option<PathBuf>,
@@ -9,16 +14,10 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
-}
-
-impl Default for Args {
-    fn default() -> Self {
-        Self {
-            zip: None,
-            max_chunks: None,
-            keep: false,
-        }
-    }
+    #[arg(long)]
+    osv_all: bool,
+    #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
+    osv_prefixes: Vec<String>,
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
@@ -41,6 +40,10 @@ async fn run_with_progress(
         apply_delta_updates_with_progress(&db, args.zip, args.max_chunks, args.keep, progress)
             .await?;
     eprintln!("update: applied {} delta archive(s)", applied.len());
+    let osv_additions = OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes);
+    sync_all_enrichment_sources_after_update(&db, "update", osv_additions.as_ref()).await?;
+    rebuild_graph_and_report(&db, "update").await?;
+    report_enrichment_source_status(&db, "update").await?;
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;

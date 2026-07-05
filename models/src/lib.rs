@@ -1,5 +1,10 @@
+#![allow(clippy::large_enum_variant)]
+
 pub mod cve;
 pub mod cwe;
+pub mod epss;
+pub mod kev;
+pub mod osv;
 
 use anyhow::{Error, Result, anyhow};
 use cve::{

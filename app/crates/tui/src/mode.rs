@@ -7,6 +7,7 @@ pub(super) enum SearchMode {
     Vendor,
     Cwe,
     Cve,
+    Identifier,
 }
 
 impl SearchMode {
@@ -16,17 +17,19 @@ impl SearchMode {
             Self::Product => Self::Vendor,
             Self::Vendor => Self::Cwe,
             Self::Cwe => Self::Cve,
-            Self::Cve => Self::FreeText,
+            Self::Cve => Self::Identifier,
+            Self::Identifier => Self::FreeText,
         }
     }
 
     pub(super) fn previous(self) -> Self {
         match self {
-            Self::FreeText => Self::Cve,
+            Self::FreeText => Self::Identifier,
             Self::Product => Self::FreeText,
             Self::Vendor => Self::Product,
             Self::Cwe => Self::Vendor,
             Self::Cve => Self::Cwe,
+            Self::Identifier => Self::Cve,
         }
     }
 
@@ -42,6 +45,8 @@ impl SearchMode {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CVE-"))
         {
             Some(Self::Cve)
+        } else if query.contains('-') {
+            Some(Self::Identifier)
         } else {
             None
         }
@@ -54,6 +59,7 @@ impl SearchMode {
             Self::Vendor => "vendor",
             Self::Cwe => "CWE",
             Self::Cve => "CVE prefix",
+            Self::Identifier => "identifier",
         }
     }
 
@@ -64,6 +70,7 @@ impl SearchMode {
             Self::Vendor => Color::Magenta,
             Self::Cwe => Color::Yellow,
             Self::Cve => Color::Blue,
+            Self::Identifier => Color::LightCyan,
         }
     }
 }
