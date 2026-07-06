@@ -6554,9 +6554,10 @@ async fn upsert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
-    execute_values(
-        db,
-        r#"
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
         INSERT INTO source_raw_records (
             source, source_record_id, source_path, provider_published_at,
             provider_modified_at, score_date, fetched_at, content_hash,
@@ -6573,35 +6574,25 @@ where
             raw_json = excluded.raw_json,
             raw_csv = excluded.raw_csv,
             content_type = excluded.content_type
+        RETURNING id
         "#,
-        vec![
-            SeaValue::from(input.source.to_owned()),
-            SeaValue::from(input.source_record_id.to_owned()),
-            SeaValue::from(input.source_path.map(ToOwned::to_owned)),
-            SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
-            SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
-            SeaValue::from(input.score_date.map(ToOwned::to_owned)),
-            SeaValue::from(input.fetched_at.to_owned()),
-            SeaValue::from(input.content_hash.to_owned()),
-            SeaValue::from(input.raw_content.to_owned()),
-            SeaValue::from(
-                (input.content_type == "application/json").then(|| input.raw_content.to_owned()),
-            ),
-            SeaValue::from(
-                (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
-            ),
-            SeaValue::from(input.content_type.to_owned()),
-        ],
-    )
-    .await?;
-
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "SELECT id FROM source_raw_records WHERE source = ? AND source_record_id = ?",
             vec![
                 SeaValue::from(input.source.to_owned()),
                 SeaValue::from(input.source_record_id.to_owned()),
+                SeaValue::from(input.source_path.map(ToOwned::to_owned)),
+                SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
+                SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
+                SeaValue::from(input.score_date.map(ToOwned::to_owned)),
+                SeaValue::from(input.fetched_at.to_owned()),
+                SeaValue::from(input.content_hash.to_owned()),
+                SeaValue::from(input.raw_content.to_owned()),
+                SeaValue::from(
+                    (input.content_type == "application/json").then(|| input.raw_content.to_owned()),
+                ),
+                SeaValue::from(
+                    (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
+                ),
+                SeaValue::from(input.content_type.to_owned()),
             ],
         ))
         .await?

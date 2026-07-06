@@ -11,11 +11,11 @@ use qanvuli_db::{
     CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord,
 };
 use qanvuli_models::cwe::read_cwe_catalog_zip;
-use qanvuli_models::osv::is_known_osv_database_prefix;
+use qanvuli_models::osv::{OSV_DATABASE_SOURCE_PREFIXES, is_known_osv_database_prefix};
 use qanvuli_utils::loader::{self, FileStorageTrait, JsonEntry};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -612,6 +612,8 @@ pub(crate) async fn import_osv_zip_file_in_batches(
     let mut skipped = 0usize;
     let mut seen = 0usize;
     let mut matched_prefixes = BTreeSet::new();
+    let source_totals = osv_source_totals(&archive, target_paths, selection);
+    let mut source_seen = BTreeMap::new();
     let mut timings = IngestTimings::default();
     let mut chunk_index = 0usize;
     let mut chunk_started = Instant::now();
@@ -639,6 +641,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
             chunk_read_elapsed += read_started.elapsed();
             continue;
         }
+        let source_prefix = osv_source_prefix(&osv_id);
         if let Some(selection) = selection
             && !selection.all
         {
@@ -648,6 +651,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
                 }
             }
         }
+        *source_seen.entry(source_prefix.clone()).or_insert(0usize) += 1;
         let mut raw_json = String::new();
         entry
             .read_to_string(&mut raw_json)
@@ -678,8 +682,10 @@ pub(crate) async fn import_osv_zip_file_in_batches(
                 format_elapsed(chunk_elapsed)
             );
             eprintln!(
-                "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, imported={}, skipped={}",
-                summary.imported, summary.skipped
+                "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, source_positions={}, imported={}, skipped={}",
+                source_progress_summary(&source_seen, &source_totals),
+                summary.imported,
+                summary.skipped
             );
             records = Vec::with_capacity(OSV_IMPORT_BATCH_SIZE);
             chunk_index += 1;
@@ -707,8 +713,10 @@ pub(crate) async fn import_osv_zip_file_in_batches(
             format_elapsed(chunk_elapsed)
         );
         eprintln!(
-            "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, imported={}, skipped={}",
-            summary.imported, summary.skipped
+            "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, source_positions={}, imported={}, skipped={}",
+            source_progress_summary(&source_seen, &source_totals),
+            summary.imported,
+            summary.skipped
         );
     }
     if let Some(selection) = selection
@@ -747,6 +755,61 @@ fn osv_id_from_path(path: &str) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or(path)
         .to_ascii_uppercase()
+}
+
+fn osv_source_totals(
+    archive: &zip::ZipArchive<std::fs::File>,
+    target_paths: Option<&HashSet<String>>,
+    selection: Option<&OsvImportSelection>,
+) -> BTreeMap<String, usize> {
+    let mut totals = BTreeMap::new();
+    for name in archive.file_names() {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        if let Some(target_paths) = target_paths
+            && !target_paths.contains(name)
+        {
+            continue;
+        }
+        let osv_id = osv_id_from_path(name);
+        if let Some(selection) = selection
+            && !selection.matches_id(&osv_id)
+        {
+            continue;
+        }
+        *totals.entry(osv_source_prefix(&osv_id)).or_insert(0usize) += 1;
+    }
+    totals
+}
+
+fn osv_source_prefix(osv_id: &str) -> String {
+    OSV_DATABASE_SOURCE_PREFIXES
+        .iter()
+        .filter(|prefix| osv_id.starts_with(&format!("{prefix}-")))
+        .max_by_key(|prefix| prefix.len())
+        .copied()
+        .unwrap_or_else(|| osv_id.split_once('-').map_or(osv_id, |(prefix, _)| prefix))
+        .to_owned()
+}
+
+fn source_progress_summary(
+    source_seen: &BTreeMap<String, usize>,
+    source_totals: &BTreeMap<String, usize>,
+) -> String {
+    if source_seen.is_empty() {
+        return "-".to_owned();
+    }
+    source_seen
+        .iter()
+        .map(|(source, seen)| {
+            source_totals
+                .get(source)
+                .map(|total| format!("{source}:{seen}/{total}"))
+                .unwrap_or_else(|| format!("{source}:{seen}"))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn temp_osv_all_zip_path() -> PathBuf {
