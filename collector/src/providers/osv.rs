@@ -1,8 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use object_store::{ObjectStoreExt, gcp::GoogleCloudStorageBuilder, path::Path};
 use std::path::Path as FsPath;
 use tokio::io::AsyncWriteExt;
+use url::Url;
 
 pub const OSV_BUCKET: &str = "osv-vulnerabilities";
 pub const OSV_ALL_ZIP: &str = "all.zip";
@@ -40,21 +41,46 @@ impl OsvGcsSource {
     }
 
     async fn download_zip_to_file(&self, object_path: &str, output: &FsPath) -> Result<()> {
-        let result = self
-            .store
-            .get(&Path::from(object_path))
-            .await
-            .with_context(|| format!("failed to fetch gs://{OSV_BUCKET}/{object_path}"))?;
-        let mut stream = result.into_stream();
         let mut file = tokio::fs::File::create(output)
             .await
             .with_context(|| format!("failed to create {}", output.display()))?;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .with_context(|| format!("failed to read OSV zip chunk from {object_path}"))?;
-            file.write_all(&chunk)
-                .await
-                .with_context(|| format!("failed to write {}", output.display()))?;
+        match self.store.get(&Path::from(object_path)).await {
+            Ok(result) => {
+                let mut stream = result.into_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.with_context(|| {
+                        format!("failed to read OSV zip chunk from {object_path}")
+                    })?;
+                    file.write_all(&chunk)
+                        .await
+                        .with_context(|| format!("failed to write {}", output.display()))?;
+                }
+            }
+            Err(gcs_err) => {
+                let url = object_url(object_path)?;
+                let response = reqwest::get(url.clone())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}"
+                        )
+                    })?
+                    .error_for_status()
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}"
+                        )
+                    })?;
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.with_context(|| {
+                        format!("failed to read OSV zip chunk from HTTPS fallback {url}")
+                    })?;
+                    file.write_all(&chunk)
+                        .await
+                        .with_context(|| format!("failed to write {}", output.display()))?;
+                }
+            }
         }
         file.flush()
             .await
@@ -74,13 +100,47 @@ impl OsvGcsSource {
     }
 
     async fn get_object(&self, object_path: &str) -> Result<Vec<u8>> {
-        let result = self
-            .store
-            .get(&Path::from(object_path))
-            .await
-            .with_context(|| format!("failed to fetch gs://{OSV_BUCKET}/{object_path}"))?;
-        Ok(result.bytes().await?.to_vec())
+        match self.store.get(&Path::from(object_path)).await {
+            Ok(result) => Ok(result.bytes().await?.to_vec()),
+            Err(gcs_err) => {
+                let url = object_url(object_path)?;
+                let bytes = reqwest::get(url.clone())
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}"
+                        )
+                    })?
+                    .error_for_status()
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}"
+                        )
+                    })?
+                    .bytes()
+                    .await
+                    .with_context(|| {
+                        format!("failed to read OSV object bytes from HTTPS fallback {url}")
+                    })?;
+                Ok(bytes.to_vec())
+            }
+        }
     }
+}
+
+fn object_url(object_path: &str) -> Result<Url> {
+    let mut url = Url::parse("https://storage.googleapis.com/")
+        .context("failed to build OSV HTTPS fallback URL")?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("failed to append OSV object path to HTTPS fallback URL"))?;
+        segments.push(OSV_BUCKET);
+        for segment in object_path.split('/') {
+            segments.push(segment);
+        }
+    }
+    Ok(url)
 }
 
 #[derive(Clone, Debug)]

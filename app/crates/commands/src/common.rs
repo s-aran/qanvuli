@@ -5,7 +5,7 @@ use qanvuli_collector::providers::{
     cwe::CweCatalogFile,
     epss::download_epss_current_csv,
     kev::download_kev_json,
-    osv::{OSV_ALL_ZIP, OsvGcsSource, parse_modified_id_csv},
+    osv::{OSV_ALL_ZIP, OsvGcsSource, OsvModifiedId, parse_modified_id_csv},
 };
 use qanvuli_db::{
     CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord,
@@ -79,6 +79,12 @@ struct OsvImportBatch {
     source_seen: BTreeMap<String, usize>,
     read_elapsed: Duration,
     send_wait_elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct OsvZipReadResult {
+    matched_prefixes: BTreeSet<String>,
+    seen_osv_ids: HashSet<String>,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -500,6 +506,7 @@ pub async fn sync_all_enrichment_sources_after_update(
         &zip_path,
         Some(&object_paths),
         Some(&selection),
+        None,
         cursor.as_deref(),
         label,
         false,
@@ -555,8 +562,16 @@ async fn sync_osv_selection_from_gcs_with_mode(
             .await
             .map_err(|err| format!("{label}: failed to prepare OSV bulk import: {err}"))?;
     }
-    let summary =
-        import_osv_selection_zips_from_gcs(db, &osv, selection, cursor, label, bulk_init).await;
+    let summary = import_osv_selection_zips_from_gcs(
+        db,
+        &osv,
+        selection,
+        &modified_rows,
+        cursor,
+        label,
+        bulk_init,
+    )
+    .await;
     let finish_result = if bulk_init {
         let finish_started = Instant::now();
         let result = db
@@ -595,6 +610,7 @@ async fn import_osv_selection_zips_from_gcs(
     db: &CveDatabase,
     osv: &OsvGcsSource,
     selection: &OsvImportSelection,
+    modified_rows: &[OsvModifiedId],
     cursor: Option<&str>,
     label: &str,
     bulk_init: bool,
@@ -606,6 +622,7 @@ async fn import_osv_selection_zips_from_gcs(
             &zip_path,
             None,
             Some(selection),
+            None,
             cursor,
             label,
             bulk_init,
@@ -622,18 +639,37 @@ async fn import_osv_selection_zips_from_gcs(
         record_count: 0,
         content_hash: None,
     };
-    for prefix in selection.prefixes() {
+    let database_dirs = osv_database_dirs_for_selection(selection, modified_rows);
+    if database_dirs.is_empty() {
+        eprintln!(
+            "{label}: OSV modified_id.csv did not contain importable JSON records for prefix(es): {}; skipping OSV zip download",
+            selection
+                .prefixes()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        return Ok(total);
+    }
+    eprintln!(
+        "{label}: resolved OSV database zip(s): {}",
+        database_dirs.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    let mut imported_osv_ids = HashSet::new();
+    for (database_dir, prefixes) in database_dirs {
         let single_selection = OsvImportSelection {
             all: false,
-            id_prefixes: BTreeSet::from([prefix.clone()]),
+            id_prefixes: prefixes,
         };
-        let object_path = format!("{prefix}/{OSV_ALL_ZIP}");
+        let object_path = format!("{database_dir}/{OSV_ALL_ZIP}");
         let zip_path = download_osv_zip_to_temp(osv, &object_path, label).await?;
         let summary = import_osv_zip_file_in_batches(
             db,
             &zip_path,
             None,
             Some(&single_selection),
+            Some(&mut imported_osv_ids),
             cursor,
             label,
             bulk_init,
@@ -646,6 +682,35 @@ async fn import_osv_selection_zips_from_gcs(
         total.record_count += summary.record_count;
     }
     Ok(total)
+}
+
+fn osv_database_dirs_for_selection(
+    selection: &OsvImportSelection,
+    modified_rows: &[OsvModifiedId],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut database_dirs = BTreeMap::new();
+    for row in modified_rows {
+        let Some((database_dir, _)) = row.object_path.split_once('/') else {
+            continue;
+        };
+        if is_empty_osv_database_dir(database_dir) {
+            continue;
+        }
+        let osv_id = osv_id_from_path(&row.object_path);
+        if !selection.matches_id(&osv_id) {
+            continue;
+        }
+        database_dirs
+            .entry(database_dir.to_owned())
+            .or_insert_with(BTreeSet::new)
+            .insert(osv_source_prefix(&osv_id));
+    }
+    database_dirs
+}
+
+fn is_empty_osv_database_dir(database_dir: &str) -> bool {
+    let database_dir = database_dir.trim();
+    database_dir.is_empty() || database_dir.eq_ignore_ascii_case("empty")
 }
 
 async fn sync_kev_epss_snapshots(db: &CveDatabase, label: &str) -> Result<(), String> {
@@ -690,6 +755,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
     path: &Path,
     target_paths: Option<&HashSet<String>>,
     selection: Option<&OsvImportSelection>,
+    seen_osv_ids: Option<&mut HashSet<String>>,
     cursor: Option<&str>,
     label: &str,
     bulk_init: bool,
@@ -699,17 +765,25 @@ pub(crate) async fn import_osv_zip_file_in_batches(
         .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let archive =
         zip::ZipArchive::new(file).map_err(|err| format!("failed to read OSV zip: {err}"))?;
-    let source_totals = osv_source_totals(&archive, target_paths, selection);
+    let reader_skip_osv_ids = seen_osv_ids.as_ref().map(|ids| (**ids).clone());
+    let source_totals = osv_source_totals(
+        &archive,
+        target_paths,
+        selection,
+        reader_skip_osv_ids.as_ref(),
+    );
 
     let (batch_tx, batch_rx) = mpsc::sync_channel(8);
     let reader_path = path.to_path_buf();
     let reader_target_paths = target_paths.cloned();
     let reader_selection = selection.cloned();
+    let reader_skip_osv_ids = reader_skip_osv_ids.clone();
     let reader = std::thread::spawn(move || {
         read_osv_zip_batches(
             &reader_path,
             reader_target_paths.as_ref(),
             reader_selection.as_ref(),
+            reader_skip_osv_ids.as_ref(),
             batch_tx,
         )
     });
@@ -789,7 +863,11 @@ pub(crate) async fn import_osv_zip_file_in_batches(
     if let Some(err) = import_error {
         return Err(err);
     }
-    let matched_prefixes = reader_result?;
+    let reader_result = reader_result?;
+    if let Some(seen_osv_ids) = seen_osv_ids {
+        seen_osv_ids.extend(reader_result.seen_osv_ids.iter().cloned());
+    }
+    let matched_prefixes = reader_result.matched_prefixes;
     if let Some(selection) = selection
         && !selection.all
     {
@@ -828,8 +906,9 @@ fn read_osv_zip_batches(
     path: &Path,
     target_paths: Option<&HashSet<String>>,
     selection: Option<&OsvImportSelection>,
+    skip_osv_ids: Option<&HashSet<String>>,
     batch_tx: mpsc::SyncSender<Result<OsvImportBatch, String>>,
-) -> Result<BTreeSet<String>, String> {
+) -> Result<OsvZipReadResult, String> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
     let mut archive =
@@ -837,6 +916,7 @@ fn read_osv_zip_batches(
     let mut records = Vec::with_capacity(OSV_IMPORT_BATCH_SIZE);
     let mut seen = 0usize;
     let mut matched_prefixes = BTreeSet::new();
+    let mut seen_osv_ids = HashSet::new();
     let mut source_seen = BTreeMap::new();
     let mut read_elapsed = Duration::default();
 
@@ -863,7 +943,6 @@ fn read_osv_zip_batches(
             read_elapsed += read_started.elapsed();
             continue;
         }
-        let source_prefix = osv_source_prefix(&osv_id);
         if let Some(selection) = selection
             && !selection.all
         {
@@ -873,6 +952,11 @@ fn read_osv_zip_batches(
                 }
             }
         }
+        if skip_osv_ids.is_some_and(|ids| ids.contains(&osv_id)) || seen_osv_ids.contains(&osv_id) {
+            read_elapsed += read_started.elapsed();
+            continue;
+        }
+        let source_prefix = osv_source_prefix(&osv_id);
         *source_seen.entry(source_prefix).or_insert(0usize) += 1;
         let mut raw_json = String::new();
         entry
@@ -883,6 +967,7 @@ fn read_osv_zip_batches(
             source_path: Some(format!("gs://osv-vulnerabilities/{name}")),
             raw_json,
         });
+        seen_osv_ids.insert(osv_id);
         seen += 1;
 
         if records.len() >= OSV_IMPORT_BATCH_SIZE {
@@ -906,7 +991,10 @@ fn read_osv_zip_batches(
         )?;
     }
 
-    Ok(matched_prefixes)
+    Ok(OsvZipReadResult {
+        matched_prefixes,
+        seen_osv_ids,
+    })
 }
 
 fn send_osv_import_batch(
@@ -963,8 +1051,10 @@ fn osv_source_totals(
     archive: &zip::ZipArchive<std::fs::File>,
     target_paths: Option<&HashSet<String>>,
     selection: Option<&OsvImportSelection>,
+    skip_osv_ids: Option<&HashSet<String>>,
 ) -> BTreeMap<String, usize> {
     let mut totals = BTreeMap::new();
+    let mut seen_osv_ids = HashSet::new();
     for name in archive.file_names() {
         if !name.ends_with(".json") {
             continue;
@@ -980,6 +1070,10 @@ fn osv_source_totals(
         {
             continue;
         }
+        if skip_osv_ids.is_some_and(|ids| ids.contains(&osv_id)) || seen_osv_ids.contains(&osv_id) {
+            continue;
+        }
+        seen_osv_ids.insert(osv_id.clone());
         *totals.entry(osv_source_prefix(&osv_id)).or_insert(0usize) += 1;
     }
     totals
@@ -2228,6 +2322,102 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
 
         assert_eq!(db_path, executable.parent().unwrap().join("db.sqlite"));
+    }
+
+    #[test]
+    fn osv_selection_resolves_gcs_database_dirs_from_modified_paths() {
+        let selection =
+            OsvImportSelection::default_init(false, &["ghsa".to_owned(), "pysec".to_owned()]);
+        let rows = vec![
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "PyPI/GHSA-73jc-5mrq-prw7.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "RubyGems/GHSA-8p34-64r3-mwg8.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "PyPI/PYSEC-2026-1.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "crates.io/RUSTSEC-2026-1.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "[EMPTY]/GHSA-empty.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "empty/GHSA-lowercase-empty.json".to_owned(),
+            },
+        ];
+
+        let database_dirs = osv_database_dirs_for_selection(&selection, &rows);
+
+        assert_eq!(
+            database_dirs.get("PyPI"),
+            Some(&BTreeSet::from(["GHSA".to_owned(), "PYSEC".to_owned()]))
+        );
+        assert_eq!(
+            database_dirs.get("RubyGems"),
+            Some(&BTreeSet::from(["GHSA".to_owned()]))
+        );
+        assert_eq!(
+            database_dirs.get("[EMPTY]"),
+            Some(&BTreeSet::from(["GHSA".to_owned()]))
+        );
+        assert!(!database_dirs.contains_key("crates.io"));
+        assert!(!database_dirs.contains_key("empty"));
+    }
+
+    #[test]
+    fn osv_zip_reader_skips_seen_and_duplicate_osv_ids() {
+        use std::io::Write;
+
+        let zip_path = std::env::temp_dir().join(format!(
+            "qanvuli-osv-reader-dedupe-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        for (name, raw_json) in [
+            ("GHSA-skip.json", r#"{"id":"GHSA-skip"}"#),
+            ("GHSA-keep.json", r#"{"id":"GHSA-keep"}"#),
+            ("nested/GHSA-keep.json", r#"{"id":"GHSA-keep"}"#),
+        ] {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(raw_json.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+
+        let selection = OsvImportSelection::default_init(false, &["ghsa".to_owned()]);
+        let skip_osv_ids = HashSet::from(["GHSA-SKIP".to_owned()]);
+        let (batch_tx, batch_rx) = mpsc::sync_channel(8);
+        let result = read_osv_zip_batches(
+            &zip_path,
+            None,
+            Some(&selection),
+            Some(&skip_osv_ids),
+            batch_tx,
+        )
+        .unwrap();
+        let batches = batch_rx.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(result.seen_osv_ids, HashSet::from(["GHSA-KEEP".to_owned()]));
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.records.len())
+                .sum::<usize>(),
+            1
+        );
+
+        let _ = std::fs::remove_file(zip_path);
     }
 
     #[tokio::test]
