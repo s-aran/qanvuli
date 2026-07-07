@@ -8,6 +8,7 @@ use crate::{
 };
 use sea_orm::FromQueryResult;
 use serde::Serialize;
+use std::time::Duration;
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct DbSource {
@@ -48,6 +49,15 @@ pub struct ImportSummary {
     pub skipped: usize,
     pub record_count: usize,
     pub content_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImportTimings {
+    pub hash: Duration,
+    pub parse: Duration,
+    pub hash_lookup: Duration,
+    pub db_write: Duration,
+    pub total: Duration,
 }
 
 #[derive(Clone, Debug, Serialize)]

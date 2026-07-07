@@ -32,6 +32,16 @@ impl CweCatalogFile {
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<CweCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
+        self.async_download_if_changed_as(PathBuf::from(&self.name), etag, last_modified)
+            .await
+    }
+
+    pub async fn async_download_if_changed_as(
+        &self,
+        path: impl AsRef<Path>,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<CweCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
         let client = reqwest::Client::new();
         let mut request = client.get(&self.url);
         if let Some(etag) = etag {
@@ -53,7 +63,7 @@ impl CweCatalogFile {
         response = response.error_for_status()?;
         let etag = header_string(response.headers(), reqwest::header::ETAG);
         let last_modified = header_string(response.headers(), reqwest::header::LAST_MODIFIED);
-        let path = PathBuf::from(&self.name);
+        let path = path.as_ref().to_path_buf();
         let mut file = std::fs::File::create(&path)?;
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;

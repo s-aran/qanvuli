@@ -27,17 +27,31 @@ impl OsvGcsSource {
     }
 
     pub async fn download_all_zip_to_file(&self, output: &FsPath) -> Result<()> {
+        self.download_zip_to_file(OSV_ALL_ZIP, output).await
+    }
+
+    pub async fn download_source_zip_to_file(
+        &self,
+        source_prefix: &str,
+        output: &FsPath,
+    ) -> Result<()> {
+        self.download_zip_to_file(&format!("{source_prefix}/{OSV_ALL_ZIP}"), output)
+            .await
+    }
+
+    async fn download_zip_to_file(&self, object_path: &str, output: &FsPath) -> Result<()> {
         let result = self
             .store
-            .get(&Path::from(OSV_ALL_ZIP))
+            .get(&Path::from(object_path))
             .await
-            .with_context(|| format!("failed to fetch gs://{OSV_BUCKET}/{OSV_ALL_ZIP}"))?;
+            .with_context(|| format!("failed to fetch gs://{OSV_BUCKET}/{object_path}"))?;
         let mut stream = result.into_stream();
         let mut file = tokio::fs::File::create(output)
             .await
             .with_context(|| format!("failed to create {}", output.display()))?;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("failed to read OSV all.zip chunk")?;
+            let chunk = chunk
+                .with_context(|| format!("failed to read OSV zip chunk from {object_path}"))?;
             file.write_all(&chunk)
                 .await
                 .with_context(|| format!("failed to write {}", output.display()))?;

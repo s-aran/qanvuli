@@ -31,7 +31,7 @@ use qanvuli_models::{
     cwe::{WeaknessCatalog, enumeration::RelatedNature},
     epss::EpssCurrentCsv,
     kev::KevCatalog,
-    osv::{OSV_SCHEMA_VERSION, OsvAdvisory},
+    osv::OSV_SCHEMA_VERSION,
     parse_value_with_raw,
 };
 use rayon::prelude::*;
@@ -42,6 +42,7 @@ use sea_orm::{
     QuerySelect, Set, Statement, TransactionTrait, Value as SeaValue,
 };
 use sea_orm_migration::prelude::MigratorTrait;
+use serde::Deserialize;
 use serde_json::Value;
 use simd_json::{BorrowedValue, prelude::*};
 
@@ -836,6 +837,14 @@ impl CveDatabase {
 
     pub async fn finish_bulk_replace_all(&self) -> Result<(), DbErr> {
         finish_bulk_replace_all_on(&self.db).await
+    }
+
+    pub async fn prepare_bulk_osv_import(&self) -> Result<(), DbErr> {
+        prepare_bulk_osv_import_on(&self.db).await
+    }
+
+    pub async fn finish_bulk_osv_import(&self) -> Result<(), DbErr> {
+        finish_bulk_osv_import_on(&self.db).await
     }
 
     pub async fn compact_storage(&self) -> Result<(), DbErr> {
@@ -3033,19 +3042,82 @@ impl CveDatabase {
         last_cursor: Option<&str>,
         record_count_override: Option<usize>,
     ) -> Result<ImportSummary, DbErr> {
+        self.import_osv_records_with_cursor_count_and_timings(
+            records,
+            last_cursor,
+            record_count_override,
+        )
+        .await
+        .map(|(summary, _timings)| summary)
+    }
+
+    pub async fn import_osv_records_with_cursor_count_and_timings(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+        record_count_override: Option<usize>,
+    ) -> Result<(ImportSummary, ImportTimings), DbErr> {
+        self.import_osv_records_with_cursor_count_timings_and_mode(
+            records,
+            last_cursor,
+            record_count_override,
+            false,
+        )
+        .await
+    }
+
+    pub async fn import_osv_records_bulk_init_with_cursor_count_and_timings(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+        record_count_override: Option<usize>,
+    ) -> Result<(ImportSummary, ImportTimings), DbErr> {
+        self.import_osv_records_with_cursor_count_timings_and_mode(
+            records,
+            last_cursor,
+            record_count_override,
+            true,
+        )
+        .await
+    }
+
+    async fn import_osv_records_with_cursor_count_timings_and_mode(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+        record_count_override: Option<usize>,
+        bulk_init: bool,
+    ) -> Result<(ImportSummary, ImportTimings), DbErr> {
+        let total_start = std::time::Instant::now();
         let fetched_at = Utc::now().to_rfc3339();
+        let hash_start = std::time::Instant::now();
         let source_hash = md5_hex_concat(records.iter().map(|record| record.raw_json.as_bytes()));
+        let content_hashes = records
+            .iter()
+            .map(|record| md5_hex(record.raw_json.as_bytes()))
+            .collect::<Vec<_>>();
+        let hash_elapsed = hash_start.elapsed();
+        let parse_start = std::time::Instant::now();
         let parsed_records = records
             .into_par_iter()
-            .map(parse_osv_raw_record)
+            .zip(content_hashes)
+            .map(|(record, content_hash)| parse_osv_raw_record(record, content_hash))
             .collect::<Vec<_>>()
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+        let parse_elapsed = parse_start.elapsed();
         let parsed_osv_ids = parsed_records
             .iter()
             .map(|record| record.osv_id.clone())
             .collect::<Vec<_>>();
-        let existing_hashes = self.raw_record_hashes("OSV", &parsed_osv_ids).await?;
+        let hash_lookup_start = std::time::Instant::now();
+        let existing_hashes = if bulk_init {
+            HashMap::new()
+        } else {
+            self.raw_record_hashes("OSV", &parsed_osv_ids).await?
+        };
+        let hash_lookup_elapsed = hash_lookup_start.elapsed();
+        let db_write_start = std::time::Instant::now();
         let txn = self.db.begin().await?;
         mark_source_attempt(&txn, "OSV", Some(&source_hash)).await?;
         let mut imported = 0usize;
@@ -3057,23 +3129,28 @@ impl CveDatabase {
                 skipped += 1;
                 continue;
             }
-            let raw_record_id = upsert_raw_record(
-                &txn,
-                RawRecordInput {
-                    source: "OSV",
-                    source_record_id: &record.osv_id,
-                    source_path: record.source_path.as_deref(),
-                    provider_published_at: record.parsed.published.as_deref(),
-                    provider_modified_at: record.parsed.modified.as_deref(),
-                    score_date: None,
-                    fetched_at: &fetched_at,
-                    content_hash: &record.content_hash,
-                    raw_content: &record.raw_json,
-                    content_type: "application/json",
-                },
-            )
-            .await?;
-            replace_osv_normalized(&txn, &record.parsed, raw_record_id).await?;
+            let input = RawRecordInput {
+                source: "OSV",
+                source_record_id: &record.osv_id,
+                source_path: record.source_path.as_deref(),
+                provider_published_at: record.parsed.published.as_deref(),
+                provider_modified_at: record.parsed.modified.as_deref(),
+                score_date: None,
+                fetched_at: &fetched_at,
+                content_hash: &record.content_hash,
+                raw_content: &record.raw_json,
+                content_type: "application/json",
+            };
+            let raw_record_id = if bulk_init {
+                insert_raw_record(&txn, input).await?
+            } else {
+                upsert_raw_record(&txn, input).await?
+            };
+            if bulk_init {
+                insert_osv_normalized(&txn, &record.parsed, raw_record_id).await?;
+            } else {
+                replace_osv_normalized(&txn, &record.parsed, raw_record_id).await?;
+            }
             imported += 1;
         }
         mark_source_success(
@@ -3086,13 +3163,23 @@ impl CveDatabase {
         )
         .await?;
         txn.commit().await?;
-        Ok(ImportSummary {
-            source: "OSV".to_owned(),
-            imported,
-            skipped,
-            record_count: record_count_override.unwrap_or(imported + skipped),
-            content_hash: Some(source_hash),
-        })
+        let db_write_elapsed = db_write_start.elapsed();
+        Ok((
+            ImportSummary {
+                source: "OSV".to_owned(),
+                imported,
+                skipped,
+                record_count: record_count_override.unwrap_or(imported + skipped),
+                content_hash: Some(source_hash),
+            },
+            ImportTimings {
+                hash: hash_elapsed,
+                parse: parse_elapsed,
+                hash_lookup: hash_lookup_elapsed,
+                db_write: db_write_elapsed,
+                total: total_start.elapsed(),
+            },
+        ))
     }
 
     pub async fn import_kev_json(&self, raw_json: &str) -> Result<ImportSummary, DbErr> {
@@ -4459,6 +4546,52 @@ where
     Ok(())
 }
 
+async fn prepare_bulk_osv_import_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
+    db.execute_unprepared("PRAGMA journal_mode = MEMORY")
+        .await?;
+    db.execute_unprepared("PRAGMA synchronous = OFF").await?;
+    db.execute_unprepared("PRAGMA temp_store = MEMORY").await?;
+    db.execute_unprepared("PRAGMA cache_size = -400000").await?;
+    db.execute_unprepared("PRAGMA locking_mode = EXCLUSIVE")
+        .await?;
+    for index_name in OSV_BULK_LOAD_DROPPED_INDEXES {
+        db.execute_unprepared(&format!("DROP INDEX IF EXISTS {index_name}"))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn finish_bulk_osv_import_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    for sql in OSV_BULK_LOAD_FINAL_INDEXES {
+        db.execute_unprepared(sql).await?;
+    }
+    db.execute_unprepared("ANALYZE").await?;
+    db.execute_unprepared("PRAGMA optimize").await?;
+    db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
+    db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
+    db.execute_unprepared("PRAGMA synchronous = NORMAL").await?;
+    db.execute_unprepared("PRAGMA locking_mode = NORMAL")
+        .await?;
+    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
+        .await?;
+    Ok(())
+}
+
 async fn compact_storage_on<C>(db: &C) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
@@ -4528,6 +4661,26 @@ const BULK_LOAD_FINAL_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
     "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected (vendor, product, cve_db_id)",
     "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
+];
+
+const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
+    "idx_source_raw_records_source_hash",
+    "idx_osv_aliases_alias",
+    "idx_osv_affected_packages_lookup",
+    "idx_osv_ranges_package",
+    "idx_osv_range_events_range",
+    "idx_identifier_edges_to",
+    "idx_identifier_edges_from",
+];
+
+const OSV_BULK_LOAD_FINAL_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases (alias_id)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges (affected_package_id)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
+    "CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges (to_identifier)",
+    "CREATE INDEX IF NOT EXISTS idx_identifier_edges_from ON vulnerability_identifier_edges (from_identifier)",
 ];
 
 async fn create_cve_summary_indexes<C>(db: &C) -> Result<(), DbErr>
@@ -6491,13 +6644,145 @@ struct RawRecordInput<'a> {
 struct ParsedOsvRawRecord {
     source_path: Option<String>,
     raw_json: String,
-    parsed: OsvAdvisory,
+    parsed: OsvImportAdvisory,
     osv_id: String,
     content_hash: String,
 }
 
-fn parse_osv_raw_record(record: OsvRawRecord) -> Result<ParsedOsvRawRecord, DbErr> {
-    let parsed = OsvAdvisory::parse_json(record.raw_json.as_bytes())
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportAdvisory {
+    #[serde(default)]
+    schema_version: Option<String>,
+    id: String,
+    #[serde(default)]
+    modified: Option<String>,
+    #[serde(default)]
+    published: Option<String>,
+    #[serde(default)]
+    withdrawn: Option<String>,
+    #[serde(default)]
+    aliases: Vec<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    details: Option<String>,
+    #[serde(default)]
+    affected: Vec<OsvImportAffected>,
+    #[serde(default)]
+    references: Vec<OsvImportReference>,
+}
+
+impl OsvImportAdvisory {
+    fn parse_json(bytes: &[u8]) -> Result<Self, simd_json::Error> {
+        let mut bytes = bytes.to_vec();
+        simd_json::from_slice(&mut bytes)
+    }
+
+    fn validate_schema_shape(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("OSV record is missing required field `id`".to_owned());
+        }
+        match self.modified.as_deref().map(str::trim) {
+            Some(modified) if !modified.is_empty() => {}
+            _ => return Err("OSV record is missing required field `modified`".to_owned()),
+        }
+        for (affected_index, affected) in self.affected.iter().enumerate() {
+            for (range_index, range) in affected.ranges.iter().enumerate() {
+                for (event_index, event) in range.events.iter().enumerate() {
+                    event.validate_oneof().map_err(|reason| {
+                        format!(
+                            "OSV affected[{affected_index}].ranges[{range_index}].events[{event_index}] is invalid: {reason}"
+                        )
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportAffected {
+    #[serde(default)]
+    package: Option<OsvImportPackage>,
+    #[serde(default)]
+    ranges: Vec<OsvImportRange>,
+    #[serde(default)]
+    versions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportPackage {
+    #[serde(default)]
+    ecosystem: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    purl: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportRange {
+    #[serde(rename = "type", default)]
+    range_type: Option<String>,
+    #[serde(default)]
+    events: Vec<OsvImportRangeEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportRangeEvent {
+    #[serde(default)]
+    introduced: Option<String>,
+    #[serde(default)]
+    fixed: Option<String>,
+    #[serde(default)]
+    last_affected: Option<String>,
+    #[serde(default)]
+    limit: Option<String>,
+}
+
+impl OsvImportRangeEvent {
+    fn event_pairs(&self) -> Vec<(&'static str, &str)> {
+        let mut pairs = Vec::new();
+        if let Some(value) = self.introduced.as_deref() {
+            pairs.push(("introduced", value));
+        }
+        if let Some(value) = self.fixed.as_deref() {
+            pairs.push(("fixed", value));
+        }
+        if let Some(value) = self.last_affected.as_deref() {
+            pairs.push(("last_affected", value));
+        }
+        if let Some(value) = self.limit.as_deref() {
+            pairs.push(("limit", value));
+        }
+        pairs
+    }
+
+    fn validate_oneof(&self) -> Result<(), String> {
+        let actual = self.event_pairs().len();
+        if actual == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly one of introduced, fixed, last_affected, or limit; found {actual}"
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OsvImportReference {
+    #[serde(rename = "type", default)]
+    reference_type: Option<String>,
+    url: String,
+}
+
+fn parse_osv_raw_record(
+    record: OsvRawRecord,
+    content_hash: String,
+) -> Result<ParsedOsvRawRecord, DbErr> {
+    let parsed = OsvImportAdvisory::parse_json(record.raw_json.as_bytes())
         .map_err(|err| DbErr::Custom(format!("failed to parse OSV record: {err}")))?;
     parsed
         .validate_schema_shape()
@@ -6505,7 +6790,6 @@ fn parse_osv_raw_record(record: OsvRawRecord) -> Result<ParsedOsvRawRecord, DbEr
     let Some(osv_id) = option_text(Some(parsed.id.as_str())).map(ToOwned::to_owned) else {
         return Err(DbErr::Custom("OSV record has an empty id".to_owned()));
     };
-    let content_hash = md5_hex(record.raw_json.as_bytes());
     Ok(ParsedOsvRawRecord {
         source_path: record.source_path,
         raw_json: record.raw_json,
@@ -6543,6 +6827,49 @@ where
         values,
     ))
     .await?;
+    Ok(())
+}
+
+async fn execute_many_rows<C>(
+    db: &C,
+    insert_sql: &str,
+    row_width: usize,
+    mut rows: Vec<Vec<SeaValue>>,
+    suffix_sql: &str,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let max_rows = (900 / row_width).max(1);
+    while !rows.is_empty() {
+        let take = rows.len().min(max_rows);
+        let chunk = rows.drain(..take);
+        let placeholders = std::iter::repeat_n(
+            format!(
+                "({})",
+                std::iter::repeat_n("?", row_width)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            take,
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+        let mut values = Vec::with_capacity(take * row_width);
+        for mut row in chunk {
+            debug_assert_eq!(row.len(), row_width);
+            values.append(&mut row);
+        }
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("{insert_sql} VALUES {placeholders} {suffix_sql}"),
+            values,
+        ))
+        .await?;
+    }
     Ok(())
 }
 
@@ -6587,7 +6914,8 @@ where
                 SeaValue::from(input.content_hash.to_owned()),
                 SeaValue::from(input.raw_content.to_owned()),
                 SeaValue::from(
-                    (input.content_type == "application/json").then(|| input.raw_content.to_owned()),
+                    (input.content_type == "application/json")
+                        .then(|| input.raw_content.to_owned()),
                 ),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
@@ -6600,37 +6928,102 @@ where
     row.try_get::<i64>("", "id")
 }
 
-async fn replace_osv_normalized<C>(
+async fn insert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let row = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+        INSERT INTO source_raw_records (
+            source, source_record_id, source_path, provider_published_at,
+            provider_modified_at, score_date, fetched_at, content_hash,
+            raw_content, raw_json, raw_csv, content_type
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        RETURNING id
+        "#,
+            vec![
+                SeaValue::from(input.source.to_owned()),
+                SeaValue::from(input.source_record_id.to_owned()),
+                SeaValue::from(input.source_path.map(ToOwned::to_owned)),
+                SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
+                SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
+                SeaValue::from(input.score_date.map(ToOwned::to_owned)),
+                SeaValue::from(input.fetched_at.to_owned()),
+                SeaValue::from(input.content_hash.to_owned()),
+                SeaValue::from(input.raw_content.to_owned()),
+                SeaValue::from(
+                    (input.content_type == "application/json")
+                        .then(|| input.raw_content.to_owned()),
+                ),
+                SeaValue::from(
+                    (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
+                ),
+                SeaValue::from(input.content_type.to_owned()),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| DbErr::Custom("raw record insert did not return a row".to_owned()))?;
+    row.try_get::<i64>("", "id")
+}
+
+async fn insert_osv_normalized<C>(
     db: &C,
-    parsed: &OsvAdvisory,
+    parsed: &OsvImportAdvisory,
     raw_record_id: i64,
 ) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
 {
+    write_osv_normalized(db, parsed, raw_record_id, false).await
+}
+
+async fn replace_osv_normalized<C>(
+    db: &C,
+    parsed: &OsvImportAdvisory,
+    raw_record_id: i64,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    write_osv_normalized(db, parsed, raw_record_id, true).await
+}
+
+async fn write_osv_normalized<C>(
+    db: &C,
+    parsed: &OsvImportAdvisory,
+    raw_record_id: i64,
+    replace_existing: bool,
+) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
     let osv_id = normalize_identifier(&parsed.id);
-    for sql in [
-        "DELETE FROM vulnerability_identifier_edges WHERE source = 'OSV aliases' AND (from_identifier = ? OR to_identifier = ?)",
-        "DELETE FROM osv_references WHERE osv_id = ?",
-        "DELETE FROM osv_aliases WHERE osv_id = ?",
-    ] {
-        let values = if sql.contains("from_identifier") {
-            vec![
-                SeaValue::from(osv_id.clone()),
-                SeaValue::from(osv_id.clone()),
-            ]
-        } else {
-            vec![SeaValue::from(osv_id.clone())]
-        };
-        execute_values(db, sql, values).await?;
-    }
-    for sql in [
-        "DELETE FROM osv_range_events WHERE range_id IN (SELECT r.id FROM osv_ranges r INNER JOIN osv_affected_packages p ON p.id = r.affected_package_id WHERE p.osv_id = ?)",
-        "DELETE FROM osv_ranges WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
-        "DELETE FROM osv_versions WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
-        "DELETE FROM osv_affected_packages WHERE osv_id = ?",
-    ] {
-        execute_values(db, sql, vec![SeaValue::from(osv_id.clone())]).await?;
+    if replace_existing {
+        for sql in [
+            "DELETE FROM vulnerability_identifier_edges WHERE source = 'OSV aliases' AND (from_identifier = ? OR to_identifier = ?)",
+            "DELETE FROM osv_references WHERE osv_id = ?",
+            "DELETE FROM osv_aliases WHERE osv_id = ?",
+        ] {
+            let values = if sql.contains("from_identifier") {
+                vec![
+                    SeaValue::from(osv_id.clone()),
+                    SeaValue::from(osv_id.clone()),
+                ]
+            } else {
+                vec![SeaValue::from(osv_id.clone())]
+            };
+            execute_values(db, sql, values).await?;
+        }
+        for sql in [
+            "DELETE FROM osv_range_events WHERE range_id IN (SELECT r.id FROM osv_ranges r INNER JOIN osv_affected_packages p ON p.id = r.affected_package_id WHERE p.osv_id = ?)",
+            "DELETE FROM osv_ranges WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
+            "DELETE FROM osv_versions WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id = ?)",
+            "DELETE FROM osv_affected_packages WHERE osv_id = ?",
+        ] {
+            execute_values(db, sql, vec![SeaValue::from(osv_id.clone())]).await?;
+        }
     }
     execute_values(
         db,
@@ -6662,132 +7055,267 @@ where
     .await?;
     let now = Utc::now().to_rfc3339();
     upsert_identifier_with_type(db, &osv_id, "osv", "OSV", &now).await?;
-    for alias in &parsed.aliases {
-        let alias_id = normalize_identifier(alias);
-        execute_values(
-            db,
-            "INSERT OR IGNORE INTO osv_aliases (osv_id, alias_id) VALUES (?, ?)",
-            vec![
-                SeaValue::from(osv_id.clone()),
-                SeaValue::from(alias_id.clone()),
-            ],
-        )
-        .await?;
-        upsert_identifier(db, &alias_id, "OSV", &now).await?;
-        insert_identifier_edge(
-            db,
-            &osv_id,
-            &alias_id,
-            "alias",
-            "OSV aliases",
-            "high",
-            &serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
-            &now,
-        )
-        .await?;
-        insert_identifier_edge(
-            db,
-            &alias_id,
-            &osv_id,
-            "alias",
-            "OSV aliases",
-            "high",
-            &serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
-            &now,
-        )
-        .await?;
-    }
-    for affected in &parsed.affected {
-        let package = affected.package.as_ref();
-        execute_values(
-            db,
-            r#"
-            INSERT INTO osv_affected_packages (osv_id, ecosystem, package_name, purl)
-            VALUES (?, ?, ?, ?)
-            "#,
-            vec![
-                SeaValue::from(osv_id.clone()),
-                SeaValue::from(package.and_then(|package| package.ecosystem.clone())),
-                SeaValue::from(package.and_then(|package| package.name.clone())),
-                SeaValue::from(package.and_then(|package| package.purl.clone())),
-            ],
-        )
-        .await?;
-        let package_id = last_insert_id(db).await?;
-        for range in &affected.ranges {
-            execute_values(
-                db,
-                "INSERT INTO osv_ranges (affected_package_id, range_type) VALUES (?, ?)",
+    let aliases = parsed
+        .aliases
+        .iter()
+        .map(|alias| normalize_identifier(alias))
+        .collect::<Vec<_>>();
+    execute_many_rows(
+        db,
+        "INSERT OR IGNORE INTO osv_aliases (osv_id, alias_id)",
+        2,
+        aliases
+            .iter()
+            .map(|alias_id| {
                 vec![
-                    SeaValue::from(package_id),
-                    text_value(range.range_type.clone()),
-                ],
-            )
-            .await?;
-            let range_id = last_insert_id(db).await?;
-            let events = range
-                .events
-                .iter()
-                .enumerate()
-                .flat_map(|(event_order, event)| {
-                    event
-                        .event_pairs()
-                        .into_iter()
-                        .map(move |(event_type, value)| {
-                            (event_order as i64, event_type.to_owned(), value.to_owned())
-                        })
-                })
-                .collect::<Vec<_>>();
-            for (event_order, event_type, value) in events {
-                execute_values(
-                    db,
-                    "INSERT INTO osv_range_events (range_id, event_type, value, event_order) VALUES (?, ?, ?, ?)",
+                    SeaValue::from(osv_id.clone()),
+                    SeaValue::from(alias_id.clone()),
+                ]
+            })
+            .collect(),
+        "",
+    )
+    .await?;
+    upsert_identifiers(db, &aliases, "OSV", &now).await?;
+    execute_many_rows(
+        db,
+        r#"
+        INSERT OR IGNORE INTO vulnerability_identifier_edges (
+            from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
+        )
+        "#,
+        7,
+        aliases
+            .iter()
+            .flat_map(|alias_id| {
+                [
                     vec![
-                        SeaValue::from(range_id),
-                        SeaValue::from(event_type),
-                        SeaValue::from(value),
-                        SeaValue::from(event_order),
+                        SeaValue::from(osv_id.clone()),
+                        SeaValue::from(alias_id.clone()),
+                        SeaValue::from("alias".to_owned()),
+                        SeaValue::from("OSV aliases".to_owned()),
+                        SeaValue::from("high".to_owned()),
+                        SeaValue::from(
+                            serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
+                        ),
+                        SeaValue::from(now.clone()),
                     ],
+                    vec![
+                        SeaValue::from(alias_id.clone()),
+                        SeaValue::from(osv_id.clone()),
+                        SeaValue::from("alias".to_owned()),
+                        SeaValue::from("OSV aliases".to_owned()),
+                        SeaValue::from("high".to_owned()),
+                        SeaValue::from(
+                            serde_json::json!({"osv_id": osv_id, "alias": alias_id}).to_string(),
+                        ),
+                        SeaValue::from(now.clone()),
+                    ],
+                ]
+            })
+            .collect(),
+        "",
+    )
+    .await?;
+    let affected_package_ids = insert_osv_affected_packages(
+        db,
+        &osv_id,
+        parsed
+            .affected
+            .iter()
+            .enumerate()
+            .map(|(affected_order, affected)| {
+                let package = affected.package.as_ref();
+                (
+                    affected_order,
+                    package.and_then(|package| package.ecosystem.clone()),
+                    package.and_then(|package| package.name.clone()),
+                    package.and_then(|package| package.purl.clone()),
                 )
-                .await?;
+            })
+            .collect(),
+    )
+    .await?;
+    let range_ids = insert_osv_ranges(
+        db,
+        parsed
+            .affected
+            .iter()
+            .enumerate()
+            .flat_map(|(affected_order, affected)| {
+                let package_id = affected_package_ids[&affected_order];
+                affected
+                    .ranges
+                    .iter()
+                    .enumerate()
+                    .map(move |(range_order, range)| {
+                        (
+                            affected_order,
+                            range_order,
+                            package_id,
+                            range.range_type.clone(),
+                        )
+                    })
+            })
+            .collect(),
+    )
+    .await?;
+    let mut event_rows = Vec::new();
+    let mut version_rows = Vec::new();
+    for (affected_order, affected) in parsed.affected.iter().enumerate() {
+        let package_id = affected_package_ids[&affected_order];
+        for (range_order, range) in affected.ranges.iter().enumerate() {
+            let range_id = range_ids[&(affected_order, range_order)];
+            for (event_order, event) in range.events.iter().enumerate() {
+                for (event_type, value) in event.event_pairs() {
+                    event_rows.push(vec![
+                        SeaValue::from(range_id),
+                        SeaValue::from(event_type.to_owned()),
+                        SeaValue::from(value.to_owned()),
+                        SeaValue::from(event_order as i64),
+                    ]);
+                }
             }
         }
         for version in &affected.versions {
-            execute_values(
-                db,
-                "INSERT OR IGNORE INTO osv_versions (affected_package_id, version) VALUES (?, ?)",
-                vec![SeaValue::from(package_id), SeaValue::from(version.clone())],
-            )
-            .await?;
+            version_rows.push(vec![
+                SeaValue::from(package_id),
+                SeaValue::from(version.clone()),
+            ]);
         }
     }
-    for reference in &parsed.references {
-        execute_values(
-            db,
-            "INSERT OR IGNORE INTO osv_references (osv_id, reference_type, url) VALUES (?, ?, ?)",
-            vec![
-                SeaValue::from(osv_id.clone()),
-                text_value(reference.reference_type.clone()),
-                SeaValue::from(reference.url.clone()),
-            ],
-        )
-        .await?;
-    }
+    execute_many_rows(
+        db,
+        "INSERT INTO osv_range_events (range_id, event_type, value, event_order)",
+        4,
+        event_rows,
+        "",
+    )
+    .await?;
+    execute_many_rows(
+        db,
+        "INSERT OR IGNORE INTO osv_versions (affected_package_id, version)",
+        2,
+        version_rows,
+        "",
+    )
+    .await?;
+    execute_many_rows(
+        db,
+        "INSERT OR IGNORE INTO osv_references (osv_id, reference_type, url)",
+        3,
+        parsed
+            .references
+            .iter()
+            .map(|reference| {
+                vec![
+                    SeaValue::from(osv_id.clone()),
+                    text_value(reference.reference_type.clone()),
+                    SeaValue::from(reference.url.clone()),
+                ]
+            })
+            .collect(),
+        "",
+    )
+    .await?;
     Ok(())
 }
 
-async fn last_insert_id<C>(db: &C) -> Result<i64, DbErr>
+async fn insert_osv_affected_packages<C>(
+    db: &C,
+    osv_id: &str,
+    mut rows: Vec<(usize, Option<String>, Option<String>, Option<String>)>,
+) -> Result<HashMap<usize, i64>, DbErr>
 where
     C: ConnectionTrait,
 {
-    let row = db
-        .query_one(Statement::from_string(
-            DbBackend::Sqlite,
-            "SELECT last_insert_rowid() AS id".to_owned(),
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("last_insert_rowid returned no row".to_owned()))?;
-    row.try_get::<i64>("", "id")
+    let mut ids = HashMap::with_capacity(rows.len());
+    let max_rows = 900 / 5;
+    while !rows.is_empty() {
+        let take = rows.len().min(max_rows);
+        let chunk = rows.drain(..take);
+        let placeholders = std::iter::repeat_n("(?, ?, ?, ?, ?)", take)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut values = Vec::with_capacity(take * 5);
+        for (affected_order, ecosystem, package_name, purl) in chunk {
+            values.push(SeaValue::from(osv_id.to_owned()));
+            values.push(SeaValue::from(affected_order as i64));
+            values.push(SeaValue::from(ecosystem));
+            values.push(SeaValue::from(package_name));
+            values.push(SeaValue::from(purl));
+        }
+        let returned = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    r#"
+                INSERT INTO osv_affected_packages (
+                    osv_id, affected_order, ecosystem, package_name, purl
+                ) VALUES {placeholders}
+                RETURNING id, affected_order
+                "#
+                ),
+                values,
+            ))
+            .await?;
+        for row in returned {
+            ids.insert(
+                row.try_get::<i64>("", "affected_order")? as usize,
+                row.try_get::<i64>("", "id")?,
+            );
+        }
+    }
+    Ok(ids)
+}
+
+async fn insert_osv_ranges<C>(
+    db: &C,
+    mut rows: Vec<(usize, usize, i64, Option<String>)>,
+) -> Result<HashMap<(usize, usize), i64>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let mut ids = HashMap::with_capacity(rows.len());
+    let max_rows = 900 / 4;
+    while !rows.is_empty() {
+        let take = rows.len().min(max_rows);
+        let chunk = rows.drain(..take);
+        let placeholders = std::iter::repeat_n("(?, ?, ?, ?)", take)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut values = Vec::with_capacity(take * 4);
+        for (affected_order, range_order, affected_package_id, range_type) in chunk {
+            values.push(SeaValue::from(affected_package_id));
+            values.push(SeaValue::from(affected_order as i64));
+            values.push(SeaValue::from(range_order as i64));
+            values.push(SeaValue::from(range_type));
+        }
+        let returned = db
+            .query_all(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!(
+                    r#"
+                INSERT INTO osv_ranges (
+                    affected_package_id, affected_order, range_order, range_type
+                ) VALUES {placeholders}
+                RETURNING id, affected_order, range_order
+                "#
+                ),
+                values,
+            ))
+            .await?;
+        for row in returned {
+            ids.insert(
+                (
+                    row.try_get::<i64>("", "affected_order")? as usize,
+                    row.try_get::<i64>("", "range_order")? as usize,
+                ),
+                row.try_get::<i64>("", "id")?,
+            );
+        }
+    }
+    Ok(ids)
 }
 
 async fn mark_source_attempt<C>(
@@ -7022,6 +7550,39 @@ where
     upsert_identifier_with_type(db, &id, &identifier_type, source, now).await
 }
 
+async fn upsert_identifiers<C>(db: &C, ids: &[String], source: &str, now: &str) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    execute_many_rows(
+        db,
+        r#"
+        INSERT INTO vulnerability_identifiers (
+            identifier, identifier_type, source, first_seen_at, last_seen_at
+        )
+        "#,
+        5,
+        ids.iter()
+            .map(|id| {
+                let id = normalize_identifier(id);
+                vec![
+                    SeaValue::from(id.clone()),
+                    SeaValue::from(identifier_type(&id).to_owned()),
+                    SeaValue::from(source.to_owned()),
+                    SeaValue::from(now.to_owned()),
+                    SeaValue::from(now.to_owned()),
+                ]
+            })
+            .collect(),
+        r#"
+        ON CONFLICT(identifier) DO UPDATE SET
+            identifier_type = excluded.identifier_type,
+            last_seen_at = excluded.last_seen_at
+        "#,
+    )
+    .await
+}
+
 async fn upsert_identifier_with_type<C>(
     db: &C,
     id: &str,
@@ -7049,39 +7610,6 @@ where
             SeaValue::from(source.to_owned()),
             SeaValue::from(now.to_owned()),
             SeaValue::from(now.to_owned()),
-        ],
-    )
-    .await
-}
-
-async fn insert_identifier_edge<C>(
-    db: &C,
-    from: &str,
-    to: &str,
-    relation_type: &str,
-    source: &str,
-    confidence: &str,
-    evidence_json: &str,
-    created_at: &str,
-) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    execute_values(
-        db,
-        r#"
-        INSERT OR IGNORE INTO vulnerability_identifier_edges (
-            from_identifier, to_identifier, relation_type, source, confidence, evidence_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        "#,
-        vec![
-            SeaValue::from(normalize_identifier(from)),
-            SeaValue::from(normalize_identifier(to)),
-            SeaValue::from(relation_type.to_owned()),
-            SeaValue::from(source.to_owned()),
-            SeaValue::from(confidence.to_owned()),
-            SeaValue::from(evidence_json.to_owned()),
-            SeaValue::from(created_at.to_owned()),
         ],
     )
     .await

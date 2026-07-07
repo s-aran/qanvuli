@@ -4,9 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = ["enrichment"]
+enrichment = ["qanvuli-db/enrichment"]
+
 [dependencies]
 qanvuli-collector = { version = "*", path = "../../../collector" }
-qanvuli-db = { version = "*", path = "../../../db" }
+qanvuli-db = { version = "*", path = "../../../db", default-features = false }
 qanvuli-models = { version = "*", path = "../../../models" }
 qanvuli-utils = { version = "*", path = "../../../utils" }
 chrono = { version = "0.4", features = ["serde"] }

@@ -9,6 +9,7 @@ pub struct Model {
     pub id: i32,
     #[sea_orm(column_type = "Text")]
     pub osv_id: String,
+    pub affected_order: i32,
     #[sea_orm(column_type = "Text", nullable)]
     pub ecosystem: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]

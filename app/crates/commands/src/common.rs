@@ -5,7 +5,7 @@ use qanvuli_collector::providers::{
     cwe::CweCatalogFile,
     epss::download_epss_current_csv,
     kev::download_kev_json,
-    osv::{OsvGcsSource, parse_modified_id_csv},
+    osv::{OSV_ALL_ZIP, OsvGcsSource, parse_modified_id_csv},
 };
 use qanvuli_db::{
     CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord,
@@ -18,7 +18,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -69,6 +69,16 @@ struct CveZipAsset {
     path_or_name: String,
     zip_datetime: String,
     zip_type: i32,
+}
+
+#[derive(Debug)]
+struct OsvImportBatch {
+    records: Vec<OsvRawRecord>,
+    batch_count: usize,
+    seen: usize,
+    source_seen: BTreeMap<String, usize>,
+    read_elapsed: Duration,
+    send_wait_elapsed: Duration,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -385,7 +395,7 @@ pub async fn sync_all_enrichment_sources_after_init(
     osv_selection: &OsvImportSelection,
 ) -> Result<(), String> {
     let started = Instant::now();
-    sync_osv_selection_from_gcs(db, label, osv_selection).await?;
+    sync_osv_selection_from_gcs_with_mode(db, label, osv_selection, true).await?;
     sync_kev_epss_snapshots(db, label).await?;
     eprintln!(
         "{label}: enrichment sync completed in {}",
@@ -484,10 +494,7 @@ pub async fn sync_all_enrichment_sources_after_update(
         );
         return Ok(());
     }
-    let zip_path = temp_osv_all_zip_path();
-    osv.download_all_zip_to_file(&zip_path)
-        .await
-        .map_err(|err| format!("{label}: failed to download OSV all.zip: {err}"))?;
+    let zip_path = download_osv_all_zip_to_temp(&osv, label).await?;
     let summary = import_osv_zip_file_in_batches(
         db,
         &zip_path,
@@ -495,6 +502,7 @@ pub async fn sync_all_enrichment_sources_after_update(
         Some(&selection),
         cursor.as_deref(),
         label,
+        false,
     )
     .await;
     let _ = std::fs::remove_file(&zip_path);
@@ -518,6 +526,15 @@ pub async fn sync_osv_selection_from_gcs(
     label: &str,
     selection: &OsvImportSelection,
 ) -> Result<(), String> {
+    sync_osv_selection_from_gcs_with_mode(db, label, selection, false).await
+}
+
+async fn sync_osv_selection_from_gcs_with_mode(
+    db: &CveDatabase,
+    label: &str,
+    selection: &OsvImportSelection,
+    bulk_init: bool,
+) -> Result<(), String> {
     let started = Instant::now();
     eprintln!(
         "{label}: syncing OSV records from Google Cloud Storage ({})",
@@ -533,14 +550,31 @@ pub async fn sync_osv_selection_from_gcs(
         .map_err(|err| format!("{label}: failed to download OSV modified_id.csv: {err}"))?;
     let modified_rows = parse_modified_id_csv(&modified_csv);
     let cursor = modified_rows.first().map(|row| row.modified_at.as_str());
-    let zip_path = temp_osv_all_zip_path();
-    osv.download_all_zip_to_file(&zip_path)
-        .await
-        .map_err(|err| format!("{label}: failed to download OSV all.zip: {err}"))?;
+    if bulk_init {
+        db.prepare_bulk_osv_import()
+            .await
+            .map_err(|err| format!("{label}: failed to prepare OSV bulk import: {err}"))?;
+    }
     let summary =
-        import_osv_zip_file_in_batches(db, &zip_path, None, Some(selection), cursor, label).await;
-    let _ = std::fs::remove_file(&zip_path);
+        import_osv_selection_zips_from_gcs(db, &osv, selection, cursor, label, bulk_init).await;
+    let finish_result = if bulk_init {
+        let finish_started = Instant::now();
+        let result = db
+            .finish_bulk_osv_import()
+            .await
+            .map_err(|err| format!("{label}: failed to finish OSV bulk import: {err}"));
+        Some((finish_started.elapsed(), result))
+    } else {
+        None
+    };
     let summary = summary?;
+    if let Some((elapsed, result)) = finish_result {
+        result?;
+        eprintln!(
+            "{label}: rebuilt OSV indexes in {}",
+            format_elapsed(elapsed)
+        );
+    }
     db.set_metadata_value(
         OSV_IMPORT_ID_PREFIXES_METADATA_KEY,
         &selection.as_metadata_value(),
@@ -555,6 +589,63 @@ pub async fn sync_osv_selection_from_gcs(
         format_elapsed(started.elapsed())
     );
     Ok(())
+}
+
+async fn import_osv_selection_zips_from_gcs(
+    db: &CveDatabase,
+    osv: &OsvGcsSource,
+    selection: &OsvImportSelection,
+    cursor: Option<&str>,
+    label: &str,
+    bulk_init: bool,
+) -> Result<qanvuli_db::ImportSummary, String> {
+    if selection.all {
+        let zip_path = download_osv_zip_to_temp(osv, OSV_ALL_ZIP, label).await?;
+        let summary = import_osv_zip_file_in_batches(
+            db,
+            &zip_path,
+            None,
+            Some(selection),
+            cursor,
+            label,
+            bulk_init,
+        )
+        .await;
+        let _ = std::fs::remove_file(&zip_path);
+        return summary;
+    }
+
+    let mut total = qanvuli_db::ImportSummary {
+        source: "OSV".to_owned(),
+        imported: 0,
+        skipped: 0,
+        record_count: 0,
+        content_hash: None,
+    };
+    for prefix in selection.prefixes() {
+        let single_selection = OsvImportSelection {
+            all: false,
+            id_prefixes: BTreeSet::from([prefix.clone()]),
+        };
+        let object_path = format!("{prefix}/{OSV_ALL_ZIP}");
+        let zip_path = download_osv_zip_to_temp(osv, &object_path, label).await?;
+        let summary = import_osv_zip_file_in_batches(
+            db,
+            &zip_path,
+            None,
+            Some(&single_selection),
+            cursor,
+            label,
+            bulk_init,
+        )
+        .await;
+        let _ = std::fs::remove_file(&zip_path);
+        let summary = summary?;
+        total.imported += summary.imported;
+        total.skipped += summary.skipped;
+        total.record_count += summary.record_count;
+    }
+    Ok(total)
 }
 
 async fn sync_kev_epss_snapshots(db: &CveDatabase, label: &str) -> Result<(), String> {
@@ -601,124 +692,104 @@ pub(crate) async fn import_osv_zip_file_in_batches(
     selection: Option<&OsvImportSelection>,
     cursor: Option<&str>,
     label: &str,
+    bulk_init: bool,
 ) -> Result<qanvuli_db::ImportSummary, String> {
     let started = Instant::now();
     let file = std::fs::File::open(path)
         .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
-    let mut archive =
+    let archive =
         zip::ZipArchive::new(file).map_err(|err| format!("failed to read OSV zip: {err}"))?;
-    let mut records = Vec::new();
+    let source_totals = osv_source_totals(&archive, target_paths, selection);
+
+    let (batch_tx, batch_rx) = mpsc::sync_channel(8);
+    let reader_path = path.to_path_buf();
+    let reader_target_paths = target_paths.cloned();
+    let reader_selection = selection.cloned();
+    let reader = std::thread::spawn(move || {
+        read_osv_zip_batches(
+            &reader_path,
+            reader_target_paths.as_ref(),
+            reader_selection.as_ref(),
+            batch_tx,
+        )
+    });
+
     let mut imported = 0usize;
     let mut skipped = 0usize;
     let mut seen = 0usize;
-    let mut matched_prefixes = BTreeSet::new();
-    let source_totals = osv_source_totals(&archive, target_paths, selection);
-    let mut source_seen = BTreeMap::new();
     let mut timings = IngestTimings::default();
     let mut chunk_index = 0usize;
-    let mut chunk_started = Instant::now();
-    let mut chunk_read_elapsed = Duration::default();
-    for index in 0..archive.len() {
-        let read_started = Instant::now();
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|err| format!("failed to read OSV zip entry {index}: {err}"))?;
-        let name = entry.name().to_owned();
-        if !name.ends_with(".json") {
-            chunk_read_elapsed += read_started.elapsed();
-            continue;
-        }
-        if let Some(target_paths) = target_paths
-            && !target_paths.contains(&name)
-        {
-            chunk_read_elapsed += read_started.elapsed();
-            continue;
-        }
-        let osv_id = osv_id_from_path(&name);
-        if let Some(selection) = selection
-            && !selection.matches_id(&osv_id)
-        {
-            chunk_read_elapsed += read_started.elapsed();
-            continue;
-        }
-        let source_prefix = osv_source_prefix(&osv_id);
-        if let Some(selection) = selection
-            && !selection.all
-        {
-            for prefix in selection.prefixes() {
-                if osv_id.starts_with(&format!("{prefix}-")) {
-                    matched_prefixes.insert(prefix.clone());
-                }
+    let mut import_error = None;
+    while let Ok(batch) = batch_rx.recv() {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(err) => {
+                import_error = Some(err);
+                break;
             }
-        }
-        *source_seen.entry(source_prefix.clone()).or_insert(0usize) += 1;
-        let mut raw_json = String::new();
-        entry
-            .read_to_string(&mut raw_json)
-            .map_err(|err| format!("failed to read {name}: {err}"))?;
-        chunk_read_elapsed += read_started.elapsed();
-        records.push(OsvRawRecord {
-            source_path: Some(format!("gs://osv-vulnerabilities/{name}")),
-            raw_json,
-        });
-        seen += 1;
-        if records.len() >= OSV_IMPORT_BATCH_SIZE {
-            let batch_count = records.len();
-            let db_write_started = Instant::now();
-            let summary = db
-                .import_osv_records_with_cursor_and_count(records, cursor, Some(seen))
-                .await
-                .map_err(|err| format!("{label}: failed to import OSV batch: {err}"))?;
-            let db_write_elapsed = db_write_started.elapsed();
-            let chunk_elapsed = chunk_started.elapsed();
-            timings.read += chunk_read_elapsed;
-            timings.db_write += db_write_elapsed;
-            imported += summary.imported;
-            skipped += summary.skipped;
-            eprintln!(
-                "{label}: OSV timings chunk={chunk_index} read={}, db_write={}, total={}",
-                format_elapsed(chunk_read_elapsed),
-                format_elapsed(db_write_elapsed),
-                format_elapsed(chunk_elapsed)
-            );
-            eprintln!(
-                "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, source_positions={}, imported={}, skipped={}",
-                source_progress_summary(&source_seen, &source_totals),
-                summary.imported,
-                summary.skipped
-            );
-            records = Vec::with_capacity(OSV_IMPORT_BATCH_SIZE);
-            chunk_index += 1;
-            chunk_started = Instant::now();
-            chunk_read_elapsed = Duration::default();
-        }
-    }
-    if !records.is_empty() {
-        let batch_count = records.len();
-        let db_write_started = Instant::now();
-        let summary = db
-            .import_osv_records_with_cursor_and_count(records, cursor, Some(seen))
+        };
+        seen = batch.seen;
+        let import_result = if bulk_init {
+            db.import_osv_records_bulk_init_with_cursor_count_and_timings(
+                batch.records,
+                cursor,
+                Some(batch.seen),
+            )
             .await
-            .map_err(|err| format!("{label}: failed to import OSV batch: {err}"))?;
-        let db_write_elapsed = db_write_started.elapsed();
-        let chunk_elapsed = chunk_started.elapsed();
-        timings.read += chunk_read_elapsed;
-        timings.db_write += db_write_elapsed;
+        } else {
+            db.import_osv_records_with_cursor_count_and_timings(
+                batch.records,
+                cursor,
+                Some(batch.seen),
+            )
+            .await
+        };
+        let summary = match import_result {
+            Ok(summary) => summary,
+            Err(err) => {
+                import_error = Some(format!("{label}: failed to import OSV batch: {err}"));
+                break;
+            }
+        };
+        let (summary, import_timings) = summary;
+        let chunk_elapsed = batch.read_elapsed + import_timings.total;
+        timings.read += batch.read_elapsed;
+        timings.send_wait += batch.send_wait_elapsed;
+        timings.hash += import_timings.hash;
+        timings.parse += import_timings.parse;
+        timings.hash_lookup += import_timings.hash_lookup;
+        timings.db_write += import_timings.db_write;
         imported += summary.imported;
         skipped += summary.skipped;
         eprintln!(
-            "{label}: OSV timings chunk={chunk_index} read={}, db_write={}, total={}",
-            format_elapsed(chunk_read_elapsed),
-            format_elapsed(db_write_elapsed),
-            format_elapsed(chunk_elapsed)
+            "{label}: OSV timings chunk={} read={:?}, send_wait={:?}, hash={:?}, parse={:?}, hash_lookup={:?}, db_write={:?}, total={:?}",
+            chunk_index,
+            batch.read_elapsed,
+            batch.send_wait_elapsed,
+            import_timings.hash,
+            import_timings.parse,
+            import_timings.hash_lookup,
+            import_timings.db_write,
+            chunk_elapsed
         );
         eprintln!(
-            "{label}: OSV progress chunk={chunk_index}, batch={batch_count}, processed={seen}, source_positions={}, imported={}, skipped={}",
-            source_progress_summary(&source_seen, &source_totals),
+            "{label}: OSV progress chunk={chunk_index}, batch={}, processed={}, db_sources={}, imported={}, skipped={}",
+            batch.batch_count,
+            batch.seen,
+            source_progress_summary(&batch.source_seen, &source_totals),
             summary.imported,
             summary.skipped
         );
+        chunk_index += 1;
     }
+    drop(batch_rx);
+    let reader_result = reader
+        .join()
+        .map_err(|_| format!("{label}: OSV zip reader thread panicked"))?;
+    if let Some(err) = import_error {
+        return Err(err);
+    }
+    let matched_prefixes = reader_result?;
     if let Some(selection) = selection
         && !selection.all
     {
@@ -735,10 +806,14 @@ pub(crate) async fn import_osv_zip_file_in_batches(
         }
     }
     eprintln!(
-        "{label}: OSV import completed records={seen} imported={imported} skipped={skipped} elapsed={}, read={}, db_write={}",
-        format_elapsed(started.elapsed()),
-        format_elapsed(timings.read),
-        format_elapsed(timings.db_write)
+        "{label}: OSV import completed records={seen} imported={imported} skipped={skipped} elapsed={:?}, read={:?}, send_wait={:?}, hash={:?}, parse={:?}, hash_lookup={:?}, db_write={:?}",
+        started.elapsed(),
+        timings.read,
+        timings.send_wait,
+        timings.hash,
+        timings.parse,
+        timings.hash_lookup,
+        timings.db_write
     );
     Ok(qanvuli_db::ImportSummary {
         source: "OSV".to_owned(),
@@ -747,6 +822,133 @@ pub(crate) async fn import_osv_zip_file_in_batches(
         record_count: seen,
         content_hash: None,
     })
+}
+
+fn read_osv_zip_batches(
+    path: &Path,
+    target_paths: Option<&HashSet<String>>,
+    selection: Option<&OsvImportSelection>,
+    batch_tx: mpsc::SyncSender<Result<OsvImportBatch, String>>,
+) -> Result<BTreeSet<String>, String> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|err| format!("failed to read OSV zip: {err}"))?;
+    let mut records = Vec::with_capacity(OSV_IMPORT_BATCH_SIZE);
+    let mut seen = 0usize;
+    let mut matched_prefixes = BTreeSet::new();
+    let mut source_seen = BTreeMap::new();
+    let mut read_elapsed = Duration::default();
+
+    for index in 0..archive.len() {
+        let read_started = Instant::now();
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|err| format!("failed to read OSV zip entry {index}: {err}"))?;
+        let name = entry.name().to_owned();
+        if !name.ends_with(".json") {
+            read_elapsed += read_started.elapsed();
+            continue;
+        }
+        if let Some(target_paths) = target_paths
+            && !target_paths.contains(&name)
+        {
+            read_elapsed += read_started.elapsed();
+            continue;
+        }
+        let osv_id = osv_id_from_path(&name);
+        if let Some(selection) = selection
+            && !selection.matches_id(&osv_id)
+        {
+            read_elapsed += read_started.elapsed();
+            continue;
+        }
+        let source_prefix = osv_source_prefix(&osv_id);
+        if let Some(selection) = selection
+            && !selection.all
+        {
+            for prefix in selection.prefixes() {
+                if osv_id.starts_with(&format!("{prefix}-")) {
+                    matched_prefixes.insert(prefix.clone());
+                }
+            }
+        }
+        *source_seen.entry(source_prefix).or_insert(0usize) += 1;
+        let mut raw_json = String::new();
+        entry
+            .read_to_string(&mut raw_json)
+            .map_err(|err| format!("failed to read {name}: {err}"))?;
+        read_elapsed += read_started.elapsed();
+        records.push(OsvRawRecord {
+            source_path: Some(format!("gs://osv-vulnerabilities/{name}")),
+            raw_json,
+        });
+        seen += 1;
+
+        if records.len() >= OSV_IMPORT_BATCH_SIZE {
+            send_osv_import_batch(
+                &batch_tx,
+                &mut records,
+                seen,
+                &source_seen,
+                &mut read_elapsed,
+            )?;
+        }
+    }
+
+    if !records.is_empty() {
+        send_osv_import_batch(
+            &batch_tx,
+            &mut records,
+            seen,
+            &source_seen,
+            &mut read_elapsed,
+        )?;
+    }
+
+    Ok(matched_prefixes)
+}
+
+fn send_osv_import_batch(
+    batch_tx: &mpsc::SyncSender<Result<OsvImportBatch, String>>,
+    records: &mut Vec<OsvRawRecord>,
+    seen: usize,
+    source_seen: &BTreeMap<String, usize>,
+    read_elapsed: &mut Duration,
+) -> Result<(), String> {
+    let batch_records = std::mem::replace(records, Vec::with_capacity(OSV_IMPORT_BATCH_SIZE));
+    let batch_count = batch_records.len();
+    let batch = OsvImportBatch {
+        records: batch_records,
+        batch_count,
+        seen,
+        source_seen: source_seen.clone(),
+        read_elapsed: *read_elapsed,
+        send_wait_elapsed: Duration::default(),
+    };
+    *read_elapsed = Duration::default();
+    send_osv_import_batch_with_wait(batch_tx, batch)
+}
+
+fn send_osv_import_batch_with_wait(
+    batch_tx: &mpsc::SyncSender<Result<OsvImportBatch, String>>,
+    mut batch: OsvImportBatch,
+) -> Result<(), String> {
+    let wait_started = Instant::now();
+    loop {
+        batch.send_wait_elapsed = wait_started.elapsed();
+        match batch_tx.try_send(Ok(batch)) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(Ok(returned))) => {
+                batch = returned;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err("OSV import pipeline stopped before zip reader completed".to_owned());
+            }
+            Err(mpsc::TrySendError::Full(Err(err))) => return Err(err),
+        }
+    }
 }
 
 fn osv_id_from_path(path: &str) -> String {
@@ -812,14 +1014,149 @@ fn source_progress_summary(
         .join(",")
 }
 
-fn temp_osv_all_zip_path() -> PathBuf {
-    let dir = std::env::temp_dir().join("qanvuli");
-    let _ = std::fs::create_dir_all(&dir);
-    dir.join(format!(
-        "qanvuli-osv-all-{}-{}.zip",
+async fn download_osv_all_zip_to_temp(osv: &OsvGcsSource, label: &str) -> Result<PathBuf, String> {
+    download_osv_zip_to_temp(osv, OSV_ALL_ZIP, label).await
+}
+
+async fn download_osv_zip_to_temp(
+    osv: &OsvGcsSource,
+    object_path: &str,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let object_filename = object_path.replace('/', "-");
+    let filename = format!(
+        "qanvuli-osv-{object_filename}-{}-{}.zip",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ))
+    );
+    let primary = temporary_zip_file_path(&filename, None)
+        .map_err(|err| format!("{label}: failed to prepare temporary OSV zip path: {err}"))?;
+    match download_osv_zip_object(osv, object_path, &primary).await {
+        Ok(()) => Ok(primary),
+        Err(err) => {
+            let fallback = temporary_zip_file_path_in(binary_temporary_directory(), &filename)
+                .map_err(|fallback_err| {
+                    format!(
+                        "{label}: failed to download OSV {object_path} to {} ({err}); also failed to prepare fallback path: {fallback_err}",
+                        primary.display()
+                    )
+                })?;
+            if fallback == primary {
+                return Err(format!(
+                    "{label}: failed to download OSV {object_path} to {}: {err}",
+                    primary.display()
+                ));
+            }
+            eprintln!(
+                "{label}: failed to download OSV {object_path} to {} ({err}); retrying {}",
+                primary.display(),
+                fallback.display()
+            );
+            let _ = std::fs::remove_file(&primary);
+            download_osv_zip_object(osv, object_path, &fallback)
+                .await
+                .map_err(|fallback_err| {
+                    format!(
+                        "{label}: failed to download OSV {object_path} to fallback {}: {fallback_err}",
+                        fallback.display()
+                    )
+                })?;
+            Ok(fallback)
+        }
+    }
+}
+
+async fn download_osv_zip_object(
+    osv: &OsvGcsSource,
+    object_path: &str,
+    output: &Path,
+) -> Result<(), String> {
+    let result = if object_path == OSV_ALL_ZIP {
+        osv.download_all_zip_to_file(output).await
+    } else {
+        let Some((source_prefix, filename)) = object_path.split_once('/') else {
+            return osv
+                .download_all_zip_to_file(output)
+                .await
+                .map_err(|err| err.to_string());
+        };
+        if filename == OSV_ALL_ZIP {
+            osv.download_source_zip_to_file(source_prefix, output).await
+        } else {
+            osv.download_all_zip_to_file(output).await
+        }
+    };
+    result.map_err(|err| err.to_string())
+}
+
+fn temporary_zip_file_path(filename: &str, required_bytes: Option<u64>) -> Result<PathBuf, String> {
+    let system_temp_root = std::env::temp_dir();
+    let temp_root = system_temp_root.join("qanvuli");
+    if required_bytes.is_some_and(|required| {
+        available_storage_bytes(&system_temp_root).is_some_and(|available| available < required)
+    }) {
+        return temporary_zip_file_path_in(binary_temporary_directory(), filename);
+    }
+    temporary_zip_file_path_in(temp_root, filename)
+        .or_else(|_| temporary_zip_file_path_in(binary_temporary_directory(), filename))
+}
+
+fn temporary_zip_file_path_in(dir: PathBuf, filename: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    Ok(dir.join(filename))
+}
+
+fn binary_temporary_directory() -> PathBuf {
+    binary_directory().join("tmp")
+}
+
+fn binary_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn available_storage_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_ulong};
+
+    #[repr(C)]
+    struct Statvfs {
+        f_bsize: c_ulong,
+        f_frsize: c_ulong,
+        f_blocks: c_ulong,
+        f_bfree: c_ulong,
+        f_bavail: c_ulong,
+        f_files: c_ulong,
+        f_ffree: c_ulong,
+        f_favail: c_ulong,
+        f_fsid: c_ulong,
+        f_flag: c_ulong,
+        f_namemax: c_ulong,
+        __f_spare: [c_int; 6],
+    }
+
+    unsafe extern "C" {
+        fn statvfs(path: *const c_char, buf: *mut Statvfs) -> c_int;
+    }
+
+    let path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<Statvfs>::uninit();
+    let rc = unsafe { statvfs(path.as_ptr(), stats.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let stats = unsafe { stats.assume_init() };
+    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_storage_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, String> {
@@ -859,13 +1196,16 @@ pub async fn download_latest_asset_with_source(
         .safe_file_name()
         .map_err(|err| format!("unsafe asset name {}: {err}", asset.name))?
         .to_owned();
+    let output_path = temporary_zip_file_path(&filename, Some(asset.size)).map_err(|err| {
+        format!("failed to prepare temporary download path for {filename}: {err}")
+    })?;
     asset
-        .async_download_as_file()
+        .async_download_as(&output_path)
         .await
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
-    eprintln!("{kind}: ready {}", asset.name);
+    eprintln!("{kind}: ready {}", output_path.display());
     Ok(DownloadedAsset {
-        path: PathBuf::from(filename),
+        path: output_path,
         downloaded: true,
     })
 }
@@ -959,8 +1299,14 @@ fn cve_zip_asset_from_filename(filename: &str) -> Option<CveZipAsset> {
 pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
     let catalog = CweCatalogFile::default();
     eprintln!("cwe: downloading {}", catalog.url);
-    let path = catalog
-        .async_download_as_file()
+    let path = temporary_zip_file_path(&catalog.name, None).map_err(|err| {
+        format!(
+            "failed to prepare temporary download path for {}: {err}",
+            catalog.name
+        )
+    })?;
+    catalog
+        .async_download_as(&path)
         .await
         .map_err(|err| format!("failed to download {}: {err}", catalog.name))?;
     eprintln!("cwe: ready {}", path.display());
@@ -987,8 +1333,14 @@ pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
         .map_err(|err| format!("failed to read CWE Last-Modified metadata: {err}"))?;
 
     eprintln!("cwe: checking {}", catalog_file.url);
+    let catalog_path = temporary_zip_file_path(&catalog_file.name, None).map_err(|err| {
+        format!(
+            "failed to prepare temporary download path for {}: {err}",
+            catalog_file.name
+        )
+    })?;
     let download = match catalog_file
-        .async_download_if_changed(etag.as_deref(), last_modified.as_deref())
+        .async_download_if_changed_as(&catalog_path, etag.as_deref(), last_modified.as_deref())
         .await
     {
         Ok(download) => download,
@@ -1012,6 +1364,7 @@ pub async fn sync_cwe_catalog(db: &CveDatabase) -> Result<(), String> {
     };
 
     let count = upsert_cwe_catalog_file(db, &path).await?;
+    let _ = std::fs::remove_file(&path);
     if let Some(etag) = download.etag {
         db.set_metadata(CWE_ETAG_METADATA_KEY, &etag)
             .await
@@ -1142,11 +1495,13 @@ pub async fn apply_delta_updates_with_progress(
             .safe_file_name()
             .map_err(|err| format!("unsafe asset name {}: {err}", asset.name))?
             .to_owned();
+        let asset_path = temporary_zip_file_path(&filename, Some(asset.size)).map_err(|err| {
+            format!("failed to prepare temporary download path for {filename}: {err}")
+        })?;
         asset
-            .async_download_as_file()
+            .async_download_as(&asset_path)
             .await
             .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
-        let asset_path = PathBuf::from(filename);
         ingest_zip_with_progress(
             db,
             "delta",
@@ -1848,7 +2203,10 @@ pub enum IngestMode {
 #[derive(Default)]
 struct IngestTimings {
     read: Duration,
+    send_wait: Duration,
+    hash: Duration,
     parse: Duration,
+    hash_lookup: Duration,
     db_write: Duration,
     mark_read: Duration,
 }
