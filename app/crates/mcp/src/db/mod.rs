@@ -7,7 +7,7 @@ use qanvuli_app_commands::common::{
 use qanvuli_db::{CveDatabase, CveStateScope, CveSummary};
 use qanvuli_models::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
-use simd_json::json;
+use simd_json::{OwnedValue as Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -213,13 +213,17 @@ pub(crate) async fn database_status(db: &CveDatabase) -> Result<CallToolResult, 
             .map_err(|err| mcp_error(err.to_string()))?,
     )
     .map_err(|err| mcp_error(err.to_string()))?;
-    status["source_sync"] = simd_json::serde::to_owned_value(
+    let source_sync = simd_json::serde::to_owned_value(
         db.source_sync_states()
             .await
             .map_err(|err| mcp_error(err.to_string()))?,
     )
     .map_err(|err| mcp_error(err.to_string()))?;
-    response::tool_result(json!(status))
+    let Value::Object(ref mut object) = status else {
+        return Err(mcp_error("database status did not serialize to an object"));
+    };
+    object.insert("source_sync".into(), source_sync);
+    response::tool_result(status)
 }
 
 pub(crate) async fn resolve_identifier(
@@ -440,4 +444,19 @@ pub(crate) async fn apply_updates(
         "applied_assets": applied.into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "identifier_graph": graph,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn database_status_returns_tool_result_without_panicking() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+
+        let result = database_status(&db).await.unwrap();
+
+        assert_eq!(result.content.len(), 1);
+    }
 }
