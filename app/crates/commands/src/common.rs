@@ -575,7 +575,7 @@ async fn sync_osv_selection_from_gcs_with_mode(
     let finish_result = if bulk_init {
         let finish_started = Instant::now();
         let result = db
-            .finish_bulk_osv_import()
+            .finish_bulk_osv_import_storage_only()
             .await
             .map_err(|err| format!("{label}: failed to finish OSV bulk import: {err}"));
         Some((finish_started.elapsed(), result))
@@ -586,7 +586,7 @@ async fn sync_osv_selection_from_gcs_with_mode(
     if let Some((elapsed, result)) = finish_result {
         result?;
         eprintln!(
-            "{label}: rebuilt OSV indexes in {}",
+            "{label}: finalized OSV bulk import in {}",
             format_elapsed(elapsed)
         );
     }
@@ -2093,11 +2093,11 @@ pub async fn ingest_zip_with_progress(
         let session = bulk_replace
             .take()
             .expect("bulk replace session must exist in replace-all mode");
-        if let Err(err) = session.finish(db).await {
+        if let Err(err) = session.finish_storage_with_text_search(db).await {
             panic!("{label}: failed to finish bulk load: {err}");
         }
         eprintln!(
-            "{label}: rebuilt search indexes and FTS in {:?}",
+            "{label}: finalized storage and text search in {:?}",
             finish_start.elapsed()
         );
     }

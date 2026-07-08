@@ -1,8 +1,8 @@
 use super::common::{
     IngestMode, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
     ReleaseAssetKind, connect_db, download_latest_asset_with_source, ingest_zip_with_progress,
-    rebuild_graph_and_report, remove_downloaded_zip, report_enrichment_source_status,
-    reset_sqlite_database_files, sync_all_enrichment_sources_after_init,
+    remove_downloaded_zip, report_enrichment_source_status, reset_sqlite_database_files,
+    sync_all_enrichment_sources_after_init,
 };
 use std::path::PathBuf;
 
@@ -93,7 +93,6 @@ async fn run_with_progress(
     .await;
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
     sync_all_enrichment_sources_after_init(&db, "init", &osv_selection).await?;
-    rebuild_graph_and_report(&db, "init").await?;
     report_enrichment_source_status(&db, "init").await?;
     db.close()
         .await

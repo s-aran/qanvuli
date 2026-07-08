@@ -1,9 +1,13 @@
 use crate::mode::SearchMode;
-use qanvuli_db::{CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary, CveSummaryWithDetail};
+use qanvuli_db::{
+    CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary, CveSummaryWithDetail,
+    EnrichedCveSummary,
+};
 
 #[derive(Debug)]
 pub(crate) struct SearchResult {
     pub(crate) rows: Vec<CveSummaryWithDetail>,
+    pub(crate) enrichment: Vec<EnrichedCveSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -30,10 +34,11 @@ pub(crate) async fn run_search_request(
         } => {
             let rows = search_by_mode(&db, mode, &query, state_scope, limit, offset).await?;
             let rows = db
-                .attach_cve_details(rows)
+                .attach_cve_overview_details(rows)
                 .await
                 .map_err(|err| err.to_string())?;
-            Ok(SearchResult { rows })
+            let enrichment = load_enrichment_summaries(&db, &rows).await?;
+            Ok(SearchResult { rows, enrichment })
         }
         SearchRequest::Advanced(options) => {
             let rows = db
@@ -41,12 +46,26 @@ pub(crate) async fn run_search_request(
                 .await
                 .map_err(|err| err.to_string())?;
             let rows = db
-                .attach_cve_details(rows)
+                .attach_cve_overview_details(rows)
                 .await
                 .map_err(|err| err.to_string())?;
-            Ok(SearchResult { rows })
+            let enrichment = load_enrichment_summaries(&db, &rows).await?;
+            Ok(SearchResult { rows, enrichment })
         }
     }
+}
+
+async fn load_enrichment_summaries(
+    db: &CveDatabase,
+    rows: &[CveSummaryWithDetail],
+) -> Result<Vec<EnrichedCveSummary>, String> {
+    let cve_ids = rows
+        .iter()
+        .map(|row| row.summary.cve_id.clone())
+        .collect::<Vec<_>>();
+    db.enriched_cve_summaries(&cve_ids)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 pub(crate) async fn run_count_request(

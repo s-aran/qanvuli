@@ -507,6 +507,27 @@ fn enrichment_imports_and_queries_joined_sources() {
         })
         .await
         .unwrap();
+        let cve_db_id = cve::Entity::find()
+            .filter(cve::Column::CveId.eq("CVE-2099-0001"))
+            .one(db.connection())
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        cve_affected::Entity::insert(cve_affected::ActiveModel {
+            id: Default::default(),
+            cve_db_id: Set(cve_db_id),
+            vendor: Set(Some("Example Vendor".to_owned())),
+            product: Set(Some("Django".to_owned())),
+            package_name: Set(Some("django".to_owned())),
+            collection_url: Set(None),
+            default_status: Set(Some("affected".to_owned())),
+            version_text: Set(String::new()),
+            raw_json: Set("{}".to_owned()),
+        })
+        .exec(db.connection())
+        .await
+        .unwrap();
         rebuild_cve_summary_indexes(db.connection()).await.unwrap();
 
         db.import_osv_records(vec![
@@ -584,6 +605,21 @@ fn enrichment_imports_and_queries_joined_sources() {
                 .iter()
                 .any(|row| row.osv_ids.contains("RUSTSEC-TEST-0001"))
         );
+        let overview = db
+            .attach_cve_overview_details(vec![CveSummary {
+                cve_id: "CVE-2099-0001".to_owned(),
+                state: PUBLISHED_STATE,
+                published_at: "2099-01-01T00:00:00Z".to_owned(),
+                updated_at: "2099-01-02T00:00:00Z".to_owned(),
+                title: "fixture".to_owned(),
+                description_en: Some("fixture cve".to_owned()),
+            }])
+            .await
+            .unwrap();
+        assert!(overview[0].detail.affected.iter().any(|row| {
+            row.vendor.as_deref() == Some("Example Vendor")
+                && row.product.as_deref() == Some("Django")
+        }));
 
         let findings = db
             .query_package_enriched("crates.io", "foo", "1.2.3", None)

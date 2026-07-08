@@ -109,11 +109,15 @@ impl MigrationTrait for M20260617CreateEnrichmentSchema {
             "vulnerability_identifiers",
             "epss_current",
             "kev_entries",
+            "osv_text_vocab",
+            "osv_text_fts",
+            "osv_token_cve_search",
             "osv_references",
             "osv_versions",
             "osv_range_events",
             "osv_ranges",
             "osv_affected_packages",
+            "osv_cve_search",
             "osv_aliases",
             "osv_advisories",
             "source_raw_records",
@@ -189,6 +193,8 @@ where
         )
         "#,
         "CREATE TABLE osv_aliases (osv_id TEXT NOT NULL, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id))",
+        "CREATE TABLE osv_cve_search (osv_id TEXT NOT NULL, cve_id TEXT NOT NULL, PRIMARY KEY(osv_id, cve_id))",
+        "CREATE TABLE osv_token_cve_search (token TEXT NOT NULL, cve_id TEXT NOT NULL, state INTEGER NOT NULL, published_at TEXT NOT NULL, PRIMARY KEY(token, cve_id))",
         r#"
         CREATE TABLE osv_affected_packages (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -203,6 +209,16 @@ where
         "CREATE TABLE osv_range_events (id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, range_id INTEGER NOT NULL, event_type TEXT NOT NULL, value TEXT NOT NULL, event_order INTEGER NOT NULL)",
         "CREATE TABLE osv_versions (affected_package_id INTEGER NOT NULL, version TEXT NOT NULL, PRIMARY KEY(affected_package_id, version))",
         "CREATE TABLE osv_references (osv_id TEXT NOT NULL, reference_type TEXT, url TEXT NOT NULL, PRIMARY KEY(osv_id, url))",
+        r#"
+        CREATE VIRTUAL TABLE osv_text_fts USING fts5(
+            osv_id UNINDEXED,
+            summary,
+            details,
+            aliases,
+            packages,
+            tokenize = 'unicode61'
+        )
+        "#,
         r#"
         CREATE TABLE kev_entries (
             cve_id TEXT PRIMARY KEY NOT NULL,
@@ -253,6 +269,7 @@ where
         "#,
         "CREATE INDEX idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
         "CREATE INDEX idx_osv_aliases_alias ON osv_aliases (alias_id)",
+        "CREATE INDEX idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
         "CREATE INDEX idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
         "CREATE INDEX idx_osv_ranges_package ON osv_ranges (affected_package_id)",
         "CREATE INDEX idx_osv_range_events_range ON osv_range_events (range_id, event_order)",

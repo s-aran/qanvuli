@@ -847,6 +847,10 @@ impl CveDatabase {
         finish_bulk_osv_import_on(&self.db).await
     }
 
+    pub async fn finish_bulk_osv_import_storage_only(&self) -> Result<(), DbErr> {
+        finish_bulk_osv_import_storage_on(&self.db).await
+    }
+
     pub async fn compact_storage(&self) -> Result<(), DbErr> {
         compact_storage_on(&self.db).await
     }
@@ -1157,6 +1161,130 @@ impl CveDatabase {
                 && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
             {
                 detail.affected.push(cve_affected_detail_from_row(affected));
+            }
+        }
+
+        Ok(rows
+            .into_iter()
+            .map(|summary| {
+                let detail = detail_by_cve_id.remove(&summary.cve_id).unwrap_or_default();
+                CveSummaryWithDetail { summary, detail }
+            })
+            .collect())
+    }
+
+    pub async fn attach_cve_overview_details(
+        &self,
+        rows: Vec<CveSummary>,
+    ) -> Result<Vec<CveSummaryWithDetail>, DbErr> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let cve_ids = rows
+            .iter()
+            .map(|row| row.cve_id.clone())
+            .collect::<Vec<_>>();
+        let id_rows = cve::Entity::find()
+            .select_only()
+            .columns([cve::Column::Id, cve::Column::CveId])
+            .filter(cve::Column::CveId.is_in(cve_ids))
+            .into_model::<CveDbIdByCveId>()
+            .all(&self.db)
+            .await?;
+        let cve_db_ids = id_rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let cve_id_by_db_id = id_rows
+            .iter()
+            .map(|row| (row.id, row.cve_id.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut detail_by_cve_id = id_rows
+            .into_iter()
+            .map(|row| (row.cve_id, CveDetail::default()))
+            .collect::<HashMap<_, _>>();
+
+        let cwes = cve_cwe::Entity::find()
+            .select_only()
+            .column(cve_cwe::Column::CveDbId)
+            .column_as(cve_cwe::Column::CweId, "id")
+            .column_as(cwe::Column::Description, "description")
+            .inner_join(cwe::Entity)
+            .filter(cve_cwe::Column::CveDbId.is_in(cve_db_ids.clone()))
+            .order_by_asc(cve_cwe::Column::CveDbId)
+            .order_by_asc(cve_cwe::Column::CweId)
+            .into_model::<CveCweDetailRow>()
+            .all(&self.db)
+            .await?;
+        for cwe in cwes {
+            if let Some(cve_id) = cve_id_by_db_id.get(&cwe.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.cwes.push(CveCweDetail {
+                    id: cwe.id,
+                    description: cwe.description,
+                });
+            }
+        }
+
+        let cvss = cve_cvss::Entity::find()
+            .select_only()
+            .column(cve_cvss::Column::CveDbId)
+            .columns([
+                cve_cvss::Column::Version,
+                cve_cvss::Column::BaseScore,
+                cve_cvss::Column::BaseSeverity,
+                cve_cvss::Column::VectorString,
+                cve_cvss::Column::Source,
+            ])
+            .filter(cve_cvss::Column::CveDbId.is_in(cve_db_ids.clone()))
+            .order_by_asc(cve_cvss::Column::CveDbId)
+            .order_by_desc(cve_cvss::Column::BaseScore)
+            .order_by_asc(cve_cvss::Column::Version)
+            .into_model::<CveCvssDetailRow>()
+            .all(&self.db)
+            .await?;
+        for cvss in cvss {
+            if let Some(cve_id) = cve_id_by_db_id.get(&cvss.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.cvss.push(CveCvssDetail {
+                    version: cvss.version,
+                    base_score: cvss.base_score,
+                    base_severity: cvss.base_severity,
+                    vector_string: cvss.vector_string,
+                    source: cvss.source,
+                });
+            }
+        }
+
+        let affected = cve_affected::Entity::find()
+            .select_only()
+            .column(cve_affected::Column::CveDbId)
+            .columns([
+                cve_affected::Column::Vendor,
+                cve_affected::Column::Product,
+                cve_affected::Column::PackageName,
+                cve_affected::Column::CollectionUrl,
+                cve_affected::Column::DefaultStatus,
+            ])
+            .filter(cve_affected::Column::CveDbId.is_in(cve_db_ids))
+            .order_by_asc(cve_affected::Column::CveDbId)
+            .order_by_asc(cve_affected::Column::Vendor)
+            .order_by_asc(cve_affected::Column::Product)
+            .into_model::<CveAffectedOverviewRow>()
+            .all(&self.db)
+            .await?;
+        for affected in affected {
+            if let Some(cve_id) = cve_id_by_db_id.get(&affected.cve_db_id)
+                && let Some(detail) = detail_by_cve_id.get_mut(cve_id)
+            {
+                detail.affected.push(CveAffectedDetail {
+                    vendor: affected.vendor,
+                    product: affected.product,
+                    package_name: affected.package_name,
+                    collection_url: affected.collection_url,
+                    default_status: affected.default_status,
+                    versions: Vec::new(),
+                });
             }
         }
 
@@ -2060,6 +2188,7 @@ impl CveDatabase {
         let candidate_limit = limit.saturating_add(offset).max(limit);
         let cwe_id = cwe_number(query);
         let mut cves = Vec::new();
+        let mut searched_osv = false;
 
         if is_cve_id_prefix_query(query) {
             append_unique_summaries(
@@ -2111,16 +2240,34 @@ impl CveDatabase {
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
-            append_unique_summaries(
-                &mut cves,
-                self.search_cve_summaries_by_fts_text_with_state_scope(
-                    &fts_query,
-                    state_scope,
-                    candidate_limit,
-                    0,
-                )
-                .await?,
-            );
+            if cwe_id.is_none() {
+                searched_osv = true;
+                let osv_cves = if let Some(token) = single_fts_token(query) {
+                    self.search_cve_summaries_by_osv_token(&token, state_scope, candidate_limit, 0)
+                        .await?
+                } else {
+                    self.search_cve_summaries_by_osv_free_text(
+                        query,
+                        state_scope,
+                        candidate_limit,
+                        0,
+                    )
+                    .await?
+                };
+                append_unique_summaries(&mut cves, osv_cves);
+            }
+            if cves.len() < candidate_limit as usize {
+                append_unique_summaries(
+                    &mut cves,
+                    self.search_cve_summaries_by_fts_text_with_state_scope(
+                        &fts_query,
+                        state_scope,
+                        candidate_limit,
+                        0,
+                    )
+                    .await?,
+                );
+            }
         } else {
             append_unique_summaries(
                 &mut cves,
@@ -2139,7 +2286,10 @@ impl CveDatabase {
                     .await?,
             );
         }
-        if cwe_id.is_none() && matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+        if cwe_id.is_none()
+            && matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && !searched_osv
+        {
             append_unique_summaries(
                 &mut cves,
                 self.search_cve_summaries_by_osv_free_text(query, state_scope, candidate_limit, 0)
@@ -2200,8 +2350,13 @@ impl CveDatabase {
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
-            self.count_cve_summaries_by_fts_or_osv_text(&fts_query, query, state_scope)
-                .await
+            if let Some(token) = single_fts_token(query) {
+                self.count_cve_summaries_by_fts_or_osv_token(&token, state_scope)
+                    .await
+            } else {
+                self.count_cve_summaries_by_fts_or_osv_text(&fts_query, query, state_scope)
+                    .await
+            }
         } else {
             let pattern = like_pattern(query);
             let mut count = cve::Entity::find().filter(
@@ -2281,8 +2436,10 @@ impl CveDatabase {
         if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
             return Ok(Vec::new());
         }
-        let pattern = like_pattern(query);
-        let mut values = vec![SeaValue::from(pattern); 6];
+        let Some(fts_query) = fts_query(query) else {
+            return Ok(Vec::new());
+        };
+        let mut values = vec![SeaValue::from(fts_query)];
         values.push(SeaValue::from(limit as i64));
         values.push(SeaValue::from(offset as i64));
         CveSummary::find_by_statement(Statement::from_sql_and_values(
@@ -2294,17 +2451,60 @@ impl CveDatabase {
         .await
     }
 
+    async fn search_cve_summaries_by_osv_token(
+        &self,
+        token: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            return Ok(Vec::new());
+        }
+        let upper = token_prefix_upper_bound(token);
+        let mut values = vec![SeaValue::from(token.to_owned())];
+        values.push(SeaValue::from(upper));
+        values.push(SeaValue::from(limit as i64));
+        values.push(SeaValue::from(offset as i64));
+        CveSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            osv_token_summary_sql(state_scope),
+            values,
+        ))
+        .all(&self.db)
+        .await
+    }
+
     async fn count_cve_summaries_by_fts_or_osv_text(
         &self,
-        fts_query: &str,
+        cve_fts_query: &str,
         raw_query: &str,
         state_scope: CveStateScope,
     ) -> Result<u64, DbErr> {
         let pattern = like_pattern(raw_query);
-        let mut values = vec![SeaValue::from(fts_query.to_owned())];
-        values.extend((0..6).map(|_| SeaValue::from(pattern.clone())));
+        let mut values = vec![SeaValue::from(cve_fts_query.to_owned())];
+        values.push(SeaValue::from(
+            fts_query(raw_query).unwrap_or_else(|| pattern.clone()),
+        ));
         self.count_by_statement(fts_or_osv_count_sql(state_scope), values)
             .await
+    }
+
+    async fn count_cve_summaries_by_fts_or_osv_token(
+        &self,
+        token: &str,
+        state_scope: CveStateScope,
+    ) -> Result<u64, DbErr> {
+        let upper = token_prefix_upper_bound(token);
+        self.count_by_statement(
+            fts_or_osv_token_count_sql(state_scope),
+            vec![
+                SeaValue::from(format!("{token}*")),
+                SeaValue::from(token.to_owned()),
+                SeaValue::from(upper),
+            ],
+        )
+        .await
     }
 
     async fn search_cve_summaries_by_cve_free_text(
@@ -3164,6 +3364,9 @@ impl CveDatabase {
         .await?;
         txn.commit().await?;
         let db_write_elapsed = db_write_start.elapsed();
+        if imported > 0 && !bulk_init {
+            rebuild_osv_text_search(&self.db).await?;
+        }
         Ok((
             ImportSummary {
                 source: "OSV".to_owned(),
@@ -3473,26 +3676,13 @@ impl CveDatabase {
     pub async fn get_enriched_cve(&self, cve_id: &str) -> Result<EnrichedCve, DbErr> {
         let cve_id = normalize_identifier(cve_id);
         let cve = self.find_cve_summary_with_detail(&cve_id).await?;
-        let resolution = self.resolve_identifier(&cve_id).await?;
-        let mut osv_ids = resolution.related_osv_ids.clone();
-        osv_ids.retain(|id| id != &cve_id);
+        let osv_ids = load_osv_ids_for_cve(&self.db, &cve_id).await?;
+        let aliases = load_aliases_for_cve(&self.db, &cve_id).await?;
         let osv_advisories = load_osv_summaries(&self.db, &osv_ids).await?;
         let affected_packages = load_affected_packages(&self.db, &osv_ids).await?;
         let kev = load_kev(&self.db, &cve_id).await?;
         let epss = load_epss(&self.db, &cve_id).await?;
-        let mut evidence = resolution
-            .edges
-            .iter()
-            .map(|edge| Evidence {
-                kind: "alias_resolution".to_owned(),
-                source: edge.source.clone(),
-                from: Some(edge.from_identifier.clone()),
-                to: Some(edge.to_identifier.clone()),
-                cve_id: None,
-                osv_id: None,
-                detail: Some(edge.evidence_json.clone()),
-            })
-            .collect::<Vec<_>>();
+        let mut evidence = Vec::new();
         if kev.is_some() {
             evidence.push(Evidence {
                 kind: "kev_join".to_owned(),
@@ -3531,7 +3721,7 @@ impl CveDatabase {
         Ok(EnrichedCve {
             cve_id,
             cve,
-            aliases: resolution.related_aliases,
+            aliases,
             osv_advisories,
             affected_packages,
             kev,
@@ -3543,6 +3733,128 @@ impl CveDatabase {
                 source_sync: self.source_sync_states().await?,
             },
         })
+    }
+
+    pub async fn enrich_cve_summaries_full(
+        &self,
+        summaries: Vec<CveSummary>,
+    ) -> Result<Vec<EnrichedCve>, DbErr> {
+        if summaries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cve_ids = summaries
+            .iter()
+            .map(|summary| normalize_identifier(&summary.cve_id))
+            .collect::<Vec<_>>();
+        let details = summaries
+            .into_iter()
+            .map(|summary| CveSummaryWithDetail {
+                summary,
+                detail: CveDetail::default(),
+            })
+            .collect::<Vec<_>>();
+        let summary_rows = self.enriched_cve_summaries(&cve_ids).await?;
+        let all_osv_ids = summary_rows
+            .iter()
+            .flat_map(|row| split_concat_values(&row.osv_ids))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let osv_rows = load_osv_summaries(&self.db, &all_osv_ids).await?;
+        let package_rows = load_affected_packages(&self.db, &all_osv_ids).await?;
+        let kev_rows = load_kev_many(&self.db, &cve_ids).await?;
+        let epss_rows = load_epss_many(&self.db, &cve_ids).await?;
+        let source_sync = self.source_sync_states().await?;
+
+        let mut detail_by_cve_id = details
+            .into_iter()
+            .map(|row| (row.summary.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let summary_by_cve_id = summary_rows
+            .into_iter()
+            .map(|row| (row.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let osv_by_id = osv_rows
+            .into_iter()
+            .map(|row| (row.osv_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut packages_by_osv_id: HashMap<String, Vec<AffectedPackageSummary>> = HashMap::new();
+        for package in package_rows {
+            packages_by_osv_id
+                .entry(package.osv_id.clone())
+                .or_default()
+                .push(package);
+        }
+        let kev_by_cve_id = kev_rows
+            .into_iter()
+            .map(|row| (row.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let epss_by_cve_id = epss_rows
+            .into_iter()
+            .map(|row| (row.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        Ok(cve_ids
+            .into_iter()
+            .map(|cve_id| {
+                let cve = detail_by_cve_id.remove(&cve_id);
+                let summary = summary_by_cve_id.get(&cve_id);
+                let osv_ids = summary
+                    .map(|row| split_concat_values(&row.osv_ids))
+                    .unwrap_or_default();
+                let aliases = summary
+                    .map(|row| split_concat_values(&row.aliases))
+                    .unwrap_or_default();
+                let osv_advisories = osv_ids
+                    .iter()
+                    .filter_map(|osv_id| osv_by_id.get(osv_id).cloned())
+                    .collect::<Vec<_>>();
+                let affected_packages = osv_ids
+                    .iter()
+                    .flat_map(|osv_id| packages_by_osv_id.get(osv_id).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>();
+                let kev = kev_by_cve_id.get(&cve_id).cloned();
+                let epss = epss_by_cve_id.get(&cve_id).cloned();
+                let mut evidence = Vec::new();
+                if kev.is_some() {
+                    evidence.push(Evidence {
+                        kind: "kev_join".to_owned(),
+                        source: "CISA KEV".to_owned(),
+                        from: None,
+                        to: None,
+                        cve_id: Some(cve_id.clone()),
+                        osv_id: None,
+                        detail: None,
+                    });
+                }
+                if epss.is_some() {
+                    evidence.push(Evidence {
+                        kind: "epss_join".to_owned(),
+                        source: "FIRST EPSS".to_owned(),
+                        from: None,
+                        to: None,
+                        cve_id: Some(cve_id.clone()),
+                        osv_id: None,
+                        detail: None,
+                    });
+                }
+                EnrichedCve {
+                    cve_id,
+                    cve,
+                    aliases,
+                    osv_advisories,
+                    affected_packages,
+                    kev,
+                    epss,
+                    severity: Vec::new(),
+                    cwe: Vec::new(),
+                    evidence,
+                    database_status: EnrichmentStatusSummary {
+                        source_sync: source_sync.clone(),
+                    },
+                }
+            })
+            .collect())
     }
 
     pub async fn kev_entries(&self, cve_id: Option<&str>) -> Result<Vec<KevInfo>, DbErr> {
@@ -3582,40 +3894,35 @@ impl CveDatabase {
                 WITH requested(cve_id, ordinal) AS (
                     VALUES {}
                 ),
-                alias_edges AS (
-                    SELECT r.cve_id,
-                           CASE
-                               WHEN e.from_identifier = r.cve_id THEN e.to_identifier
-                               ELSE e.from_identifier
-                           END AS identifier
+                related_osv AS (
+                    SELECT r.cve_id, s.osv_id
                     FROM requested r
-                    INNER JOIN vulnerability_identifier_edges e
-                        ON e.source = 'OSV aliases'
-                       AND (e.from_identifier = r.cve_id OR e.to_identifier = r.cve_id)
+                    INNER JOIN osv_cve_search s ON s.cve_id = r.cve_id
                 ),
                 aliases AS (
-                    SELECT cve_id,
-                           COALESCE(GROUP_CONCAT(DISTINCT identifier), '') AS aliases
-                    FROM alias_edges
-                    WHERE identifier NOT LIKE 'CVE-%'
-                    GROUP BY cve_id
+                    SELECT ro.cve_id,
+                           COALESCE(GROUP_CONCAT(DISTINCT a.alias_id), '') AS aliases
+                    FROM related_osv ro
+                    INNER JOIN osv_aliases a ON a.osv_id = ro.osv_id
+                    WHERE a.alias_id NOT LIKE 'CVE-%'
+                    GROUP BY ro.cve_id
                 ),
                 osv AS (
-                    SELECT ae.cve_id,
+                    SELECT ro.cve_id,
                            COALESCE(GROUP_CONCAT(DISTINCT o.osv_id), '') AS osv_ids,
                            COALESCE(GROUP_CONCAT(DISTINCT o.osv_id || ': ' || COALESCE(o.summary, '')), '') AS osv_summaries
-                    FROM alias_edges ae
-                    INNER JOIN osv_advisories o ON o.osv_id = ae.identifier
-                    GROUP BY ae.cve_id
+                    FROM related_osv ro
+                    INNER JOIN osv_advisories o ON o.osv_id = ro.osv_id
+                    GROUP BY ro.cve_id
                 ),
                 packages AS (
-                    SELECT ae.cve_id,
+                    SELECT ro.cve_id,
                            COALESCE(GROUP_CONCAT(DISTINCT
                                COALESCE(p.ecosystem, '-') || '/' || COALESCE(p.package_name, '-')
                            ), '') AS affected_packages
-                    FROM alias_edges ae
-                    INNER JOIN osv_affected_packages p ON p.osv_id = ae.identifier
-                    GROUP BY ae.cve_id
+                    FROM related_osv ro
+                    INNER JOIN osv_affected_packages p ON p.osv_id = ro.osv_id
+                    GROUP BY ro.cve_id
                 )
                 SELECT
                     r.cve_id,
@@ -4059,6 +4366,16 @@ impl CveBulkReplaceSession {
         self.txn.commit().await?;
         finish_bulk_replace_all_on(&db.db).await
     }
+
+    pub async fn finish_storage_only(self, db: &CveDatabase) -> Result<(), DbErr> {
+        self.txn.commit().await?;
+        finish_bulk_replace_all_storage_on(&db.db).await
+    }
+
+    pub async fn finish_storage_with_text_search(self, db: &CveDatabase) -> Result<(), DbErr> {
+        self.txn.commit().await?;
+        finish_bulk_replace_all_storage_with_text_search_on(&db.db).await
+    }
 }
 
 pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, DbErr> {
@@ -4086,6 +4403,11 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
     db.execute(Statement::from_string(
         DbBackend::Sqlite,
         "PRAGMA cache_size = -200000;".to_owned(),
+    ))
+    .await?;
+    db.execute(Statement::from_string(
+        DbBackend::Sqlite,
+        "PRAGMA mmap_size = 1073741824;".to_owned(),
     ))
     .await?;
     Ok(db)
@@ -4533,16 +4855,52 @@ where
     for sql in BULK_LOAD_FINAL_INDEXES {
         db.execute_unprepared(sql).await?;
     }
-    rebuild_cve_summary_indexes(db).await?;
     db.execute_unprepared("ANALYZE").await?;
     db.execute_unprepared("PRAGMA optimize").await?;
-    db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-    db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
-    db.execute_unprepared("PRAGMA synchronous = NORMAL").await?;
-    db.execute_unprepared("PRAGMA locking_mode = NORMAL")
-        .await?;
-    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
-        .await?;
+    rebuild_cve_summary_indexes(db).await?;
+    restore_sqlite_bulk_pragmas(db).await?;
+    Ok(())
+}
+
+async fn finish_bulk_replace_all_storage_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    restore_sqlite_bulk_pragmas(db).await
+}
+
+async fn finish_bulk_replace_all_storage_with_text_search_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    rebuild_minimal_cve_text_search(db).await?;
+    create_cve_overview_indexes(db).await?;
+    restore_sqlite_bulk_pragmas(db).await
+}
+
+async fn create_cve_overview_indexes<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_db_id ON cve_cwe (cve_db_id)",
+    ] {
+        db.execute_unprepared(sql).await?;
+    }
     Ok(())
 }
 
@@ -4580,8 +4938,25 @@ where
     for sql in OSV_BULK_LOAD_FINAL_INDEXES {
         db.execute_unprepared(sql).await?;
     }
-    db.execute_unprepared("ANALYZE").await?;
-    db.execute_unprepared("PRAGMA optimize").await?;
+    restore_sqlite_bulk_pragmas(db).await
+}
+
+async fn finish_bulk_osv_import_storage_on<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+
+    rebuild_osv_text_search(db).await?;
+    restore_sqlite_bulk_pragmas(db).await
+}
+
+async fn restore_sqlite_bulk_pragmas<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
     db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
     db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
     db.execute_unprepared("PRAGMA synchronous = NORMAL").await?;
@@ -4666,6 +5041,7 @@ const BULK_LOAD_FINAL_INDEXES: &[&str] = &[
 const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
     "idx_source_raw_records_source_hash",
     "idx_osv_aliases_alias",
+    "idx_osv_cve_search_cve_id",
     "idx_osv_affected_packages_lookup",
     "idx_osv_ranges_package",
     "idx_osv_range_events_range",
@@ -4676,6 +5052,7 @@ const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
 const OSV_BULK_LOAD_FINAL_INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases (alias_id)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
     "CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
     "CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges (affected_package_id)",
     "CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
@@ -4868,6 +5245,152 @@ where
     insert_cve_cwe_search_sql(db, None).await?;
     insert_cve_cvss_search_sql(db, None).await?;
     insert_cve_affected_search_sql(db, None).await?;
+    Ok(())
+}
+
+async fn rebuild_minimal_cve_text_search<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+    create_cve_summary_indexes(db).await?;
+    for sql in [
+        "DELETE FROM cve_summary_index",
+        "DELETE FROM cve_summary_fts",
+        "DELETE FROM cve_affected_summary_fts",
+    ] {
+        db.execute_unprepared(sql).await?;
+    }
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_summary_index (
+            cve_db_id, cve_id, state, published_at, updated_at, title, description_en,
+            reference_text
+        )
+        SELECT id, cve_id, state, published_at, updated_at, title, description_en,
+            COALESCE(reference_text, '')
+        FROM cve
+        "#,
+    )
+    .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_summary_fts (cve_id, title, description_en, affected_text, reference_text)
+        SELECT cve_id, title, COALESCE(description_en, ''), '', reference_text
+        FROM cve_summary_index
+        "#,
+    )
+    .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO cve_affected_summary_fts (cve_id, vendor_text, product_text, affected_text)
+        SELECT
+            cve.cve_id,
+            COALESCE(cve_affected.vendor, ''),
+            COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, ''),
+            COALESCE(cve_affected.vendor, '') || ' ' || COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, '')
+        FROM cve_affected
+        INNER JOIN cve ON cve.id = cve_affected.cve_db_id
+        "#,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn rebuild_osv_text_search<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
+        return Ok(());
+    }
+    db.execute_unprepared(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS osv_text_fts USING fts5(
+            osv_id UNINDEXED,
+            summary,
+            details,
+            aliases,
+            packages,
+            tokenize = 'unicode61'
+        )
+        "#,
+    )
+    .await?;
+    db.execute_unprepared("DELETE FROM osv_text_fts").await?;
+    db.execute_unprepared(
+        "CREATE TABLE IF NOT EXISTS osv_cve_search (osv_id TEXT NOT NULL, cve_id TEXT NOT NULL, PRIMARY KEY(osv_id, cve_id))",
+    )
+    .await?;
+    db.execute_unprepared(
+        "CREATE TABLE IF NOT EXISTS osv_token_cve_search (token TEXT NOT NULL, cve_id TEXT NOT NULL, state INTEGER NOT NULL, published_at TEXT NOT NULL, PRIMARY KEY(token, cve_id))",
+    )
+    .await?;
+    db.execute_unprepared("DELETE FROM osv_cve_search").await?;
+    db.execute_unprepared("DELETE FROM osv_token_cve_search")
+        .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT OR IGNORE INTO osv_cve_search (osv_id, cve_id)
+        SELECT osv_id, osv_id
+        FROM osv_advisories
+        WHERE osv_id LIKE 'CVE-%'
+        UNION
+        SELECT osv_id, alias_id
+        FROM osv_aliases
+        WHERE alias_id LIKE 'CVE-%'
+        "#,
+    )
+    .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO osv_text_fts (osv_id, summary, details, aliases, packages)
+        WITH
+            alias_agg AS (
+                SELECT osv_id, GROUP_CONCAT(alias_id, ' ') AS aliases
+                FROM osv_aliases
+                GROUP BY osv_id
+            ),
+            package_agg AS (
+                SELECT
+                    osv_id,
+                    GROUP_CONCAT(
+                        COALESCE(ecosystem, '') || ' ' || COALESCE(package_name, '') || ' ' || COALESCE(purl, ''),
+                        ' '
+                    ) AS packages
+                FROM osv_affected_packages
+                GROUP BY osv_id
+            )
+        SELECT
+            o.osv_id,
+            COALESCE(o.summary, ''),
+            COALESCE(o.details, ''),
+            COALESCE(alias_agg.aliases, ''),
+            COALESCE(package_agg.packages, '')
+        FROM osv_advisories o
+        LEFT JOIN alias_agg ON alias_agg.osv_id = o.osv_id
+        LEFT JOIN package_agg ON package_agg.osv_id = o.osv_id
+        "#,
+    )
+    .await?;
+    db.execute_unprepared(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS osv_text_vocab USING fts5vocab(osv_text_fts, 'instance')",
+    )
+    .await?;
+    db.execute_unprepared(
+        r#"
+        INSERT OR IGNORE INTO osv_token_cve_search (token, cve_id, state, published_at)
+        SELECT vocab.term, search.cve_id, cve.state, cve.published_at
+        FROM osv_text_vocab vocab
+        INNER JOIN osv_text_fts fts ON fts.rowid = vocab.doc
+        INNER JOIN osv_cve_search search ON search.osv_id = fts.osv_id
+        INNER JOIN cve ON cve.cve_id = search.cve_id
+        WHERE LENGTH(vocab.term) >= 2
+        "#,
+    )
+    .await?;
     Ok(())
 }
 
@@ -5845,76 +6368,57 @@ fn fts_count_sql(state_scope: CveStateScope) -> &'static str {
 fn osv_free_text_summary_sql(state_scope: CveStateScope) -> &'static str {
     if state_scope.includes_rejected() {
         r#"
-        WITH matching_osv AS (
-            SELECT DISTINCT o.osv_id
-            FROM osv_advisories o
-            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
-            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
-            WHERE o.osv_id LIKE ?
-               OR o.summary LIKE ?
-               OR a.alias_id LIKE ?
-               OR p.ecosystem LIKE ?
-               OR p.package_name LIKE ?
-               OR p.purl LIKE ?
-        ),
-        related_cves AS (
-            SELECT DISTINCT CASE
-                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
-                ELSE e.to_identifier
-            END AS cve_id
-            FROM matching_osv m
-            INNER JOIN vulnerability_identifier_edges e
-                ON e.source = 'OSV aliases'
-               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
-            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
-            UNION
-            SELECT DISTINCT a.alias_id AS cve_id
-            FROM matching_osv m
-            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
-            WHERE a.alias_id LIKE 'CVE-%'
-        )
-        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
-        FROM related_cves
-        INNER JOIN cve ON cve.cve_id = related_cves.cve_id
+        SELECT DISTINCT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM osv_text_fts
+        INNER JOIN osv_cve_search s ON s.osv_id = osv_text_fts.osv_id
+        INNER JOIN cve ON cve.cve_id = s.cve_id
+        WHERE osv_text_fts MATCH ?
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT ? OFFSET ?
         "#
     } else {
         r#"
-        WITH matching_osv AS (
-            SELECT DISTINCT o.osv_id
-            FROM osv_advisories o
-            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
-            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
-            WHERE o.osv_id LIKE ?
-               OR o.summary LIKE ?
-               OR a.alias_id LIKE ?
-               OR p.ecosystem LIKE ?
-               OR p.package_name LIKE ?
-               OR p.purl LIKE ?
-        ),
-        related_cves AS (
-            SELECT DISTINCT CASE
-                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
-                ELSE e.to_identifier
-            END AS cve_id
-            FROM matching_osv m
-            INNER JOIN vulnerability_identifier_edges e
-                ON e.source = 'OSV aliases'
-               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
-            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
-            UNION
-            SELECT DISTINCT a.alias_id AS cve_id
-            FROM matching_osv m
-            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
-            WHERE a.alias_id LIKE 'CVE-%'
-        )
-        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
-        FROM related_cves
-        INNER JOIN cve ON cve.cve_id = related_cves.cve_id
-        WHERE cve.state = 0
+        SELECT DISTINCT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM osv_text_fts
+        INNER JOIN osv_cve_search s ON s.osv_id = osv_text_fts.osv_id
+        INNER JOIN cve ON cve.cve_id = s.cve_id
+        WHERE osv_text_fts MATCH ? AND cve.state = 0
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT ? OFFSET ?
+        "#
+    }
+}
+
+fn osv_token_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH matches AS (
+            SELECT cve_id, MAX(published_at) AS published_at
+            FROM osv_token_cve_search
+            WHERE token >= ? AND token < ?
+            GROUP BY cve_id
+            ORDER BY published_at DESC, cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM matches
+        INNER JOIN cve ON cve.cve_id = matches.cve_id
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        "#
+    } else {
+        r#"
+        WITH matches AS (
+            SELECT cve_id, MAX(published_at) AS published_at
+            FROM osv_token_cve_search
+            WHERE token >= ? AND token < ? AND state = 0
+            GROUP BY cve_id
+            ORDER BY published_at DESC, cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM matches
+        INNER JOIN cve ON cve.cve_id = matches.cve_id
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
         "#
     }
 }
@@ -5928,34 +6432,17 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             WHERE cve_summary_fts MATCH ?
         ),
         matching_osv AS (
-            SELECT DISTINCT o.osv_id
-            FROM osv_advisories o
-            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
-            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
-            WHERE o.osv_id LIKE ?
-               OR o.summary LIKE ?
-               OR a.alias_id LIKE ?
-               OR p.ecosystem LIKE ?
-               OR p.package_name LIKE ?
-               OR p.purl LIKE ?
+            SELECT DISTINCT osv_text_fts.osv_id
+            FROM osv_text_fts
+            INNER JOIN osv_cve_search s ON s.osv_id = osv_text_fts.osv_id
+            WHERE osv_text_fts MATCH ?
         ),
         osv_cves AS (
-            SELECT DISTINCT CASE
-                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
-                ELSE e.to_identifier
-            END AS cve_id
+            SELECT DISTINCT s.cve_id
             FROM matching_osv m
-            INNER JOIN vulnerability_identifier_edges e
-                ON e.source = 'OSV aliases'
-               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
-            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
-            UNION
-            SELECT DISTINCT a.alias_id AS cve_id
-            FROM matching_osv m
-            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
-            WHERE a.alias_id LIKE 'CVE-%'
+            INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
         )
-        SELECT COUNT(DISTINCT cve_id) AS count
+        SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
@@ -5971,34 +6458,17 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             WHERE cve_summary_fts MATCH ? AND cve_summary_index.state = 0
         ),
         matching_osv AS (
-            SELECT DISTINCT o.osv_id
-            FROM osv_advisories o
-            LEFT JOIN osv_aliases a ON a.osv_id = o.osv_id
-            LEFT JOIN osv_affected_packages p ON p.osv_id = o.osv_id
-            WHERE o.osv_id LIKE ?
-               OR o.summary LIKE ?
-               OR a.alias_id LIKE ?
-               OR p.ecosystem LIKE ?
-               OR p.package_name LIKE ?
-               OR p.purl LIKE ?
+            SELECT DISTINCT osv_text_fts.osv_id
+            FROM osv_text_fts
+            INNER JOIN osv_cve_search s ON s.osv_id = osv_text_fts.osv_id
+            WHERE osv_text_fts MATCH ?
         ),
         osv_cves AS (
-            SELECT DISTINCT CASE
-                WHEN e.from_identifier LIKE 'CVE-%' THEN e.from_identifier
-                ELSE e.to_identifier
-            END AS cve_id
+            SELECT DISTINCT s.cve_id
             FROM matching_osv m
-            INNER JOIN vulnerability_identifier_edges e
-                ON e.source = 'OSV aliases'
-               AND (e.from_identifier = m.osv_id OR e.to_identifier = m.osv_id)
-            WHERE e.from_identifier LIKE 'CVE-%' OR e.to_identifier LIKE 'CVE-%'
-            UNION
-            SELECT DISTINCT a.alias_id AS cve_id
-            FROM matching_osv m
-            INNER JOIN osv_aliases a ON a.osv_id = m.osv_id
-            WHERE a.alias_id LIKE 'CVE-%'
+            INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
         )
-        SELECT COUNT(DISTINCT cve_id) AS count
+        SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
@@ -6006,6 +6476,49 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
         ) combined
         INNER JOIN cve ON cve.cve_id = combined.cve_id
         WHERE cve.state = 0
+        "#
+    }
+}
+
+fn fts_or_osv_token_count_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH fts_cves AS (
+            SELECT cve_id
+            FROM cve_summary_fts
+            WHERE cve_summary_fts MATCH ?
+        ),
+        osv_cves AS (
+            SELECT cve_id
+            FROM osv_token_cve_search
+            WHERE token >= ? AND token < ?
+        )
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT cve_id FROM fts_cves
+            UNION
+            SELECT cve_id FROM osv_cves
+        )
+        "#
+    } else {
+        r#"
+        WITH fts_cves AS (
+            SELECT cve_summary_index.cve_id
+            FROM cve_summary_fts
+            INNER JOIN cve_summary_index ON cve_summary_index.cve_id = cve_summary_fts.cve_id
+            WHERE cve_summary_fts MATCH ? AND cve_summary_index.state = 0
+        ),
+        osv_cves AS (
+            SELECT cve_id
+            FROM osv_token_cve_search
+            WHERE token >= ? AND token < ? AND state = 0
+        )
+        SELECT COUNT(*) AS count
+        FROM (
+            SELECT cve_id FROM fts_cves
+            UNION
+            SELECT cve_id FROM osv_cves
+        )
         "#
     }
 }
@@ -6532,16 +7045,34 @@ fn append_unique_summaries(target: &mut Vec<CveSummary>, cves: Vec<CveSummary>) 
 }
 
 fn fts_query(query: &str) -> Option<String> {
-    let tokens = query
-        .split(|ch: char| !ch.is_alphanumeric())
-        .filter(|token| token.len() >= 2)
-        .map(|token| format!("{}*", fts_token(token)))
+    let tokens = fts_tokens(query)
+        .into_iter()
+        .map(|token| format!("{token}*"))
         .collect::<Vec<_>>();
     if tokens.is_empty() {
         None
     } else {
         Some(tokens.join(" AND "))
     }
+}
+
+fn single_fts_token(query: &str) -> Option<String> {
+    let tokens = fts_tokens(query);
+    (tokens.len() == 1).then(|| tokens[0].clone())
+}
+
+fn fts_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|token| token.len() >= 2)
+        .map(fts_token)
+        .collect::<Vec<_>>()
+}
+
+fn token_prefix_upper_bound(token: &str) -> String {
+    let mut upper = token.to_owned();
+    upper.push(char::MAX);
+    upper
 }
 
 fn affected_fts_query(vendor: Option<&str>, product: Option<&str>) -> Option<String> {
@@ -7005,6 +7536,7 @@ where
             "DELETE FROM vulnerability_identifier_edges WHERE source = 'OSV aliases' AND (from_identifier = ? OR to_identifier = ?)",
             "DELETE FROM osv_references WHERE osv_id = ?",
             "DELETE FROM osv_aliases WHERE osv_id = ?",
+            "DELETE FROM osv_cve_search WHERE osv_id = ?",
         ] {
             let values = if sql.contains("from_identifier") {
                 vec![
@@ -7070,6 +7602,27 @@ where
                 vec![
                     SeaValue::from(osv_id.clone()),
                     SeaValue::from(alias_id.clone()),
+                ]
+            })
+            .collect(),
+        "",
+    )
+    .await?;
+    let cve_ids = std::iter::once(osv_id.as_str())
+        .chain(aliases.iter().map(String::as_str))
+        .filter(|identifier| identifier.starts_with("CVE-"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    execute_many_rows(
+        db,
+        "INSERT OR IGNORE INTO osv_cve_search (osv_id, cve_id)",
+        2,
+        cve_ids
+            .iter()
+            .map(|cve_id| {
+                vec![
+                    SeaValue::from(osv_id.clone()),
+                    SeaValue::from(cve_id.clone()),
                 ]
             })
             .collect(),
@@ -7633,6 +8186,60 @@ where
     .await
 }
 
+#[derive(Debug, FromQueryResult)]
+struct IdentifierValueRow {
+    value: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct CveAffectedOverviewRow {
+    cve_db_id: i32,
+    vendor: Option<String>,
+    product: Option<String>,
+    package_name: Option<String>,
+    collection_url: Option<String>,
+    default_status: Option<String>,
+}
+
+async fn load_osv_ids_for_cve<C>(db: &C, cve_id: &str) -> Result<Vec<String>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    IdentifierValueRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"
+        SELECT DISTINCT osv_id AS value
+        FROM osv_cve_search
+        WHERE cve_id = ?
+        ORDER BY osv_id
+        "#,
+        vec![SeaValue::from(normalize_identifier(cve_id))],
+    ))
+    .all(db)
+    .await
+    .map(|rows| rows.into_iter().map(|row| row.value).collect())
+}
+
+async fn load_aliases_for_cve<C>(db: &C, cve_id: &str) -> Result<Vec<String>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    IdentifierValueRow::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        r#"
+        SELECT DISTINCT a.alias_id AS value
+        FROM osv_cve_search s
+        INNER JOIN osv_aliases a ON a.osv_id = s.osv_id
+        WHERE s.cve_id = ? AND a.alias_id NOT LIKE 'CVE-%'
+        ORDER BY a.alias_id
+        "#,
+        vec![SeaValue::from(normalize_identifier(cve_id))],
+    ))
+    .all(db)
+    .await
+    .map(|rows| rows.into_iter().map(|row| row.value).collect())
+}
+
 async fn load_affected_packages<C>(
     db: &C,
     ids: &[String],
@@ -7676,6 +8283,30 @@ where
     .await
 }
 
+async fn load_kev_many<C>(db: &C, cve_ids: &[String]) -> Result<Vec<KevInfo>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if cve_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    KevInfo::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            r#"
+            SELECT cve_id, vendor_project, product, vulnerability_name, date_added,
+                   short_description, required_action, due_date,
+                   known_ransomware_campaign_use, notes, fetched_at
+            FROM kev_entries
+            WHERE cve_id IN ({})
+            "#,
+            sql_string_list(cve_ids)
+        ),
+    ))
+    .all(db)
+    .await
+}
+
 async fn load_epss<C>(db: &C, cve_id: &str) -> Result<Option<EpssInfo>, DbErr>
 where
     C: ConnectionTrait,
@@ -7687,6 +8318,36 @@ where
     ))
     .one(db)
     .await
+}
+
+async fn load_epss_many<C>(db: &C, cve_ids: &[String]) -> Result<Vec<EpssInfo>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if cve_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    EpssInfo::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            r#"
+            SELECT cve_id, epss, percentile, score_date, model_version, fetched_at
+            FROM epss_current
+            WHERE cve_id IN ({})
+            "#,
+            sql_string_list(cve_ids)
+        ),
+    ))
+    .all(db)
+    .await
+}
+
+fn split_concat_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 async fn load_osv_ranges<C>(db: &C, package_id: i64) -> Result<Vec<RangeEventRow>, DbErr>

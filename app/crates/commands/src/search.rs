@@ -25,8 +25,8 @@ pub struct Args {
     max_score: Option<f64>,
     #[arg(long)]
     severity: Option<String>,
-    #[arg(long)]
-    version: Option<String>,
+    #[arg(long = "version")]
+    cvss_version: Option<String>,
     #[arg(long)]
     published_since: Option<String>,
     #[arg(long, alias = "since")]
@@ -46,14 +46,7 @@ impl Args {
         self.min_score.is_some()
             || self.max_score.is_some()
             || self.severity.is_some()
-            || self.version.is_some()
-    }
-
-    fn component_name(&self) -> Option<&str> {
-        self.component
-            .as_deref()
-            .or(self.product.as_deref())
-            .filter(|value| !value.is_empty())
+            || self.cvss_version.is_some()
     }
 
     fn has_affected_filter(&self) -> bool {
@@ -145,9 +138,9 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         CveStateScope::PublishedOnly
     };
     let summaries = if let Some(query) = args.text.as_deref() {
-        db.search_cve_summaries_by_text_with_state_scope(query, state_scope, limit, offset)
+        db.search_cve_summaries_free_text_with_state_scope(query, state_scope, limit, offset)
             .await
-            .map_err(|err| format!("failed to search text: {err}"))?
+            .map_err(|err| format!("failed to search free text: {err}"))?
     } else if !args.cwe_ids.is_empty() {
         db.search_cve_summaries_by_cwe_with_state_scope(&args.cwe_ids, state_scope, limit, offset)
             .await
@@ -162,7 +155,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 args.min_score,
                 args.max_score,
                 args.severity.as_deref(),
-                args.version.as_deref(),
+                args.cvss_version.as_deref(),
                 state_scope,
                 limit,
                 offset,
@@ -174,7 +167,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 args.min_score,
                 args.max_score,
                 args.severity.as_deref(),
-                args.version.as_deref(),
+                args.cvss_version.as_deref(),
                 state_scope,
                 limit,
                 offset,
@@ -183,7 +176,12 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             .map_err(|err| format!("failed to search CVSS: {err}"))?
         }
     } else if args.has_affected_filter() {
-        if let Some(component) = args.component_name().or(args.product_exact.as_deref()) {
+        if let Some(component) = args
+            .component
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or(args.product_exact.as_deref())
+        {
             db.search_cve_summaries_by_affected_component_exact_with_state_scope(
                 args.vendor.as_deref(),
                 component,
@@ -225,14 +223,10 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     };
 
     if args.enriched {
-        let mut enriched = Vec::with_capacity(summaries.len());
-        for summary in &summaries {
-            enriched.push(
-                db.get_enriched_cve(&summary.cve_id)
-                    .await
-                    .map_err(|err| format!("failed to enrich {}: {err}", summary.cve_id))?,
-            );
-        }
+        let enriched = db
+            .enrich_cve_summaries_full(summaries)
+            .await
+            .map_err(|err| format!("failed to enrich search results: {err}"))?;
         print_json(&enriched)?;
     } else {
         print_json(&summaries)?;

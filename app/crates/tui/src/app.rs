@@ -381,6 +381,9 @@ impl App {
         self.search_timeout_at = None;
         self.show_timeout_prompt = false;
         let count = search.count;
+        for row in result.enrichment {
+            self.enrichment.insert(row.cve_id.clone(), row);
+        }
         match kind {
             SearchKind::Replace => {
                 self.exhausted = result.rows.len() < self.limit as usize;

@@ -99,7 +99,7 @@ pub(crate) async fn search_text(
     limit: u64,
     offset: u64,
 ) -> Result<Vec<CveSummary>, McpError> {
-    db.search_cve_summaries_by_text_with_state_scope(query, state_scope, limit, offset)
+    db.search_cve_summaries_free_text_with_state_scope(query, state_scope, limit, offset)
         .await
         .map_err(|err| mcp_error(err.to_string()))
 }
