@@ -4895,8 +4895,11 @@ where
     }
     for sql in [
         "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id_base_score ON cve_cvss (cve_db_id, base_score)",
         "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
         "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_cve_db_id ON cve_affected (vendor, cve_db_id)",
+        "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
         "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_db_id ON cve_cwe (cve_db_id)",
     ] {
         db.execute_unprepared(sql).await?;
@@ -6816,17 +6819,26 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
             "EXISTS (SELECT 1 FROM cve_cwe INDEXED BY idx_cve_cwe_cwe_id_cve_db_id WHERE cve_cwe.cwe_id = {cwe_id} AND cve_cwe.cve_db_id = cve.id)"
         ));
     }
-    if let Some(vendor) = option_text(options.vendor.as_deref()) {
+    let vendor = option_text(options.vendor.as_deref());
+    let product = option_text(options.product.as_deref());
+    if let Some(query) = affected_fts_query(vendor, product) {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
-            sql_string_literal(&like_pattern(vendor))
+            "cve.cve_id IN (SELECT cve_id FROM cve_affected_summary_fts WHERE cve_affected_summary_fts MATCH {})",
+            sql_string_literal(&query)
         ));
-    }
-    if let Some(product) = option_text(options.product.as_deref()) {
-        conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
-            sql_string_literal(&like_pattern(product))
-        ));
+    } else {
+        if let Some(vendor) = vendor {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
+                sql_string_literal(&like_pattern(vendor))
+            ));
+        }
+        if let Some(product) = product {
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
+                sql_string_literal(&like_pattern(product))
+            ));
+        }
     }
     if let Some(vendor_exact) = option_text(options.vendor_exact.as_deref()) {
         conditions.push(format!(
@@ -6855,22 +6867,43 @@ fn advanced_query_conditions(
 ) {
     match mode.unwrap_or(CveAdvancedQueryMode::FreeText) {
         CveAdvancedQueryMode::FreeText => {
-            let pattern = sql_string_literal(&like_pattern(query));
-            conditions.push(format!(
-                "(cve.cve_id LIKE {pattern} OR cve.title LIKE {pattern} OR cve.description_en LIKE {pattern})"
-            ));
+            if let Some(query) = fts_query(query) {
+                conditions.push(format!(
+                    "cve.cve_id IN (SELECT cve_id FROM cve_summary_fts WHERE cve_summary_fts MATCH {})",
+                    sql_string_literal(&query)
+                ));
+            } else {
+                let pattern = sql_string_literal(&like_pattern(query));
+                conditions.push(format!(
+                    "(cve.cve_id LIKE {pattern} OR cve.title LIKE {pattern} OR cve.description_en LIKE {pattern})"
+                ));
+            }
         }
         CveAdvancedQueryMode::Product => {
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
-                sql_string_literal(&like_pattern(query))
-            ));
+            if let Some(query) = affected_fts_query(None, Some(query)) {
+                conditions.push(format!(
+                    "cve.cve_id IN (SELECT cve_id FROM cve_affected_summary_fts WHERE cve_affected_summary_fts MATCH {})",
+                    sql_string_literal(&query)
+                ));
+            } else {
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product LIKE {})",
+                    sql_string_literal(&like_pattern(query))
+                ));
+            }
         }
         CveAdvancedQueryMode::Vendor => {
-            conditions.push(format!(
-                "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
-                sql_string_literal(&like_pattern(query))
-            ));
+            if let Some(query) = affected_fts_query(Some(query), None) {
+                conditions.push(format!(
+                    "cve.cve_id IN (SELECT cve_id FROM cve_affected_summary_fts WHERE cve_affected_summary_fts MATCH {})",
+                    sql_string_literal(&query)
+                ));
+            } else {
+                conditions.push(format!(
+                    "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor LIKE {})",
+                    sql_string_literal(&like_pattern(query))
+                ));
+            }
         }
         CveAdvancedQueryMode::Cwe => {
             if let Some(cwe_id) = cwe_number(query) {

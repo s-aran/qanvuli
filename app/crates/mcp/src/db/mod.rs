@@ -48,7 +48,7 @@ pub(crate) async fn paged_search_result(
     let has_more = cves.len() > requested_limit as usize;
     cves.truncate(requested_limit as usize);
     let cves = db
-        .attach_cve_details(cves)
+        .attach_cve_overview_details(cves)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     response::tool_result(json!({
