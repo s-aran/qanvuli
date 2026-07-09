@@ -24,7 +24,7 @@ fn run() -> Result<(), String> {
     let command = cli.command.unwrap_or(Command::Help);
 
     if matches!(command, Command::Help) {
-        print_help();
+        print_help()?;
         return Ok(());
     }
     if matches!(command, Command::Mcp) {
@@ -112,10 +112,13 @@ enum Command {
     Mcp,
 }
 
-fn print_help() {
+fn print_help() -> Result<(), String> {
     let mut command = Cli::command();
-    command.print_help().expect("failed to print help");
+    command
+        .print_help()
+        .map_err(|err| format!("failed to print help: {err}"))?;
     println!();
+    Ok(())
 }
 
 fn print_version() {

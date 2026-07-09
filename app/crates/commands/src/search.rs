@@ -25,7 +25,7 @@ pub struct Args {
     max_score: Option<f64>,
     #[arg(long)]
     severity: Option<String>,
-    #[arg(long = "version")]
+    #[arg(long = "cvss-version")]
     cvss_version: Option<String>,
     #[arg(long)]
     published_since: Option<String>,

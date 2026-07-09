@@ -90,7 +90,7 @@ async fn run_with_progress(
         false,
         progress,
     )
-    .await;
+    .await?;
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
     sync_all_enrichment_sources_after_init(&db, "init", &osv_selection).await?;
     report_enrichment_source_status(&db, "init").await?;

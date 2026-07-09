@@ -102,7 +102,7 @@ impl CveActiveModels {
         let mut bytes = raw_json.as_bytes().to_vec();
         let value: BorrowedValue<'_> =
             simd_json::to_borrowed_value(&mut bytes).map_err(json_parse_db_err)?;
-        let compact_raw_json = compact_json_str(&raw_json);
+        let compact_raw_json = compact_json_str(&raw_json)?;
         let cve_id = borrowed_cve_id(&value).unwrap_or_default().to_owned();
         let cvss_rows = borrowed_cvss_active_models(&value)?;
         let affected_rows = borrowed_affected_active_models(&value)?;
@@ -482,7 +482,7 @@ fn borrowed_json_string(value: &BorrowedValue<'_>) -> Result<String, DbErr> {
     simd_json::to_string(value).map_err(json_parse_db_err)
 }
 
-fn compact_json_str(value: &str) -> String {
+fn compact_json_str(value: &str) -> Result<String, DbErr> {
     let mut compact = String::with_capacity(value.len());
     let mut in_string = false;
     let mut escaped = false;
@@ -503,7 +503,17 @@ fn compact_json_str(value: &str) -> String {
             compact.push(ch);
         }
     }
-    compact
+    if escaped || in_string {
+        return Err(DbErr::Custom(
+            "failed to compact JSON: unterminated string literal".to_owned(),
+        ));
+    }
+    if compact.is_empty() {
+        return Err(DbErr::Custom(
+            "failed to compact JSON: empty JSON payload".to_owned(),
+        ));
+    }
+    Ok(compact)
 }
 
 fn json_parse_db_err(err: simd_json::Error) -> DbErr {
@@ -2267,6 +2277,11 @@ impl CveDatabase {
         {
             if cwe_id.is_none() {
                 searched_osv = true;
+                append_unique_summaries(
+                    &mut cves,
+                    self.search_cve_summaries_by_osv_alias(query, state_scope, candidate_limit, 0)
+                        .await?,
+                );
                 let osv_cves = if let Some(token) = single_fts_token(query) {
                     self.search_cve_summaries_by_osv_token(&token, state_scope, candidate_limit, 0)
                         .await?
@@ -2511,6 +2526,9 @@ impl CveDatabase {
         values.push(SeaValue::from(
             fts_query(raw_query).unwrap_or_else(|| pattern.clone()),
         ));
+        let alias = normalize_identifier(raw_query);
+        values.push(SeaValue::from(alias.clone()));
+        values.push(SeaValue::from(token_prefix_upper_bound(&alias)));
         self.count_by_statement(fts_or_osv_count_sql(state_scope), values)
             .await
     }
@@ -2527,8 +2545,39 @@ impl CveDatabase {
                 SeaValue::from(format!("{token}*")),
                 SeaValue::from(token.to_owned()),
                 SeaValue::from(upper),
+                SeaValue::from(normalize_identifier(token)),
+                SeaValue::from(token_prefix_upper_bound(&normalize_identifier(token))),
             ],
         )
+        .await
+    }
+
+    async fn search_cve_summaries_by_osv_alias(
+        &self,
+        query: &str,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, DbErr> {
+        if !matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+            return Ok(Vec::new());
+        }
+        let alias = normalize_identifier(query);
+        if alias.len() < 2 {
+            return Ok(Vec::new());
+        }
+        let upper = token_prefix_upper_bound(&alias);
+        CveSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            osv_alias_summary_sql(state_scope),
+            vec![
+                SeaValue::from(alias),
+                SeaValue::from(upper),
+                SeaValue::from(limit as i64),
+                SeaValue::from(offset as i64),
+            ],
+        ))
+        .all(&self.db)
         .await
     }
 
@@ -6599,6 +6648,39 @@ fn osv_token_summary_sql(state_scope: CveStateScope) -> &'static str {
     }
 }
 
+fn osv_alias_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH matches AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            WHERE a.alias_id >= ? AND a.alias_id < ?
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM matches
+        INNER JOIN cve ON cve.cve_id = matches.cve_id
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    } else {
+        r#"
+        WITH matches AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            WHERE a.alias_id >= ? AND a.alias_id < ?
+        )
+        SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
+        FROM matches
+        INNER JOIN cve ON cve.cve_id = matches.cve_id
+        WHERE cve.state = 0
+        ORDER BY cve.published_at DESC, cve.cve_id ASC
+        LIMIT ? OFFSET ?
+        "#
+    }
+}
+
 fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
     if state_scope.includes_rejected() {
         r#"
@@ -6617,12 +6699,20 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             SELECT DISTINCT s.cve_id
             FROM matching_osv m
             INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
+        ),
+        alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            WHERE a.alias_id >= ? AND a.alias_id < ?
         )
         SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
             SELECT cve_id FROM osv_cves
+            UNION
+            SELECT cve_id FROM alias_cves
         )
         "#
     } else {
@@ -6643,12 +6733,20 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             SELECT DISTINCT s.cve_id
             FROM matching_osv m
             INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
+        ),
+        alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            WHERE a.alias_id >= ? AND a.alias_id < ?
         )
         SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
             SELECT cve_id FROM osv_cves
+            UNION
+            SELECT cve_id FROM alias_cves
         ) combined
         INNER JOIN cve ON cve.cve_id = combined.cve_id
         WHERE cve.state = 0
@@ -6668,12 +6766,20 @@ fn fts_or_osv_token_count_sql(state_scope: CveStateScope) -> &'static str {
             SELECT cve_id
             FROM osv_token_cve_search
             WHERE token >= ? AND token < ?
+        ),
+        alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            WHERE a.alias_id >= ? AND a.alias_id < ?
         )
         SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
             SELECT cve_id FROM osv_cves
+            UNION
+            SELECT cve_id FROM alias_cves
         )
         "#
     } else {
@@ -6688,12 +6794,21 @@ fn fts_or_osv_token_count_sql(state_scope: CveStateScope) -> &'static str {
             SELECT cve_id
             FROM osv_token_cve_search
             WHERE token >= ? AND token < ? AND state = 0
+        ),
+        alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_aliases a
+            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+            INNER JOIN cve ON cve.cve_id = s.cve_id
+            WHERE a.alias_id >= ? AND a.alias_id < ? AND cve.state = 0
         )
         SELECT COUNT(*) AS count
         FROM (
             SELECT cve_id FROM fts_cves
             UNION
             SELECT cve_id FROM osv_cves
+            UNION
+            SELECT cve_id FROM alias_cves
         )
         "#
     }
@@ -7618,12 +7733,7 @@ async fn upsert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
-    let compact_raw_content =
-        (input.content_type == "application/json").then(|| compact_json_str(input.raw_content));
-    let stored_raw_content = compact_raw_content
-        .as_deref()
-        .unwrap_or(input.raw_content)
-        .to_owned();
+    let (stored_raw_content, raw_json) = raw_record_content_values(&input)?;
     let row = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -7656,7 +7766,7 @@ where
                 SeaValue::from(input.fetched_at.to_owned()),
                 SeaValue::from(input.content_hash.to_owned()),
                 SeaValue::from(stored_raw_content),
-                SeaValue::from(compact_raw_content),
+                SeaValue::from(raw_json),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
                 ),
@@ -7672,12 +7782,7 @@ async fn insert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
-    let compact_raw_content =
-        (input.content_type == "application/json").then(|| compact_json_str(input.raw_content));
-    let stored_raw_content = compact_raw_content
-        .as_deref()
-        .unwrap_or(input.raw_content)
-        .to_owned();
+    let (stored_raw_content, raw_json) = raw_record_content_values(&input)?;
     let row = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -7699,7 +7804,7 @@ where
                 SeaValue::from(input.fetched_at.to_owned()),
                 SeaValue::from(input.content_hash.to_owned()),
                 SeaValue::from(stored_raw_content),
-                SeaValue::from(compact_raw_content),
+                SeaValue::from(raw_json),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
                 ),
@@ -7709,6 +7814,21 @@ where
         .await?
         .ok_or_else(|| DbErr::Custom("raw record insert did not return a row".to_owned()))?;
     row.try_get::<i64>("", "id")
+}
+
+fn raw_record_content_values(
+    input: &RawRecordInput<'_>,
+) -> Result<(String, Option<String>), DbErr> {
+    if input.content_type != "application/json" {
+        return Ok((input.raw_content.to_owned(), None));
+    }
+    let compact = compact_json_str(input.raw_content).map_err(|err| {
+        DbErr::Custom(format!(
+            "failed to store raw JSON for {} {}: {err}",
+            input.source, input.source_record_id
+        ))
+    })?;
+    Ok((compact.clone(), Some(compact)))
 }
 
 async fn insert_osv_normalized<C>(

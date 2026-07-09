@@ -53,6 +53,7 @@ const CVE_ZIP_TYPE_DELTA_END_OF_DAY: i32 = 2;
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 
 pub type IngestProgressCallback = Arc<dyn Fn(IngestProgress) + Send + Sync>;
+type ParsedCveFile = Result<(CveActiveModels, ReadJsonFileRecord), String>;
 
 #[derive(Clone, Debug)]
 pub struct IngestProgress {
@@ -1532,7 +1533,7 @@ pub async fn apply_delta_updates_with_progress(
             true,
             progress,
         )
-        .await;
+        .await?;
         return Ok(vec![zip]);
     }
 
@@ -1607,7 +1608,7 @@ pub async fn apply_delta_updates_with_progress(
             true,
             progress.clone(),
         )
-        .await;
+        .await?;
         if max_chunks.is_none() {
             db.mark_cve_asset_applied(&asset.name, &asset.url)
                 .await
@@ -1651,7 +1652,7 @@ async fn apply_latest_all_midnight(
         true,
         progress,
     )
-    .await;
+    .await?;
     if asset.downloaded && !keep_downloads {
         remove_downloaded_zip(&path)?;
     }
@@ -1695,7 +1696,7 @@ async fn apply_local_delta_updates(
             true,
             progress.clone(),
         )
-        .await;
+        .await?;
         if max_chunks.is_none() && !asset_name.is_empty() {
             db.mark_cve_asset_applied(&asset_name, "local")
                 .await
@@ -1842,8 +1843,8 @@ pub async fn ingest_zip(
     mode: IngestMode,
     max_chunks: Option<usize>,
     cwe_synced: bool,
-) {
-    ingest_zip_with_progress(db, label, asset_path, mode, max_chunks, cwe_synced, None).await;
+) -> Result<(), String> {
+    ingest_zip_with_progress(db, label, asset_path, mode, max_chunks, cwe_synced, None).await
 }
 
 pub async fn ingest_zip_with_progress(
@@ -1854,10 +1855,11 @@ pub async fn ingest_zip_with_progress(
     max_chunks: Option<usize>,
     cwe_synced: bool,
     progress: Option<IngestProgressCallback>,
-) {
+) -> Result<(), String> {
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
-    let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string());
+    let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string())
+        .map_err(|err| format!("{label}: failed to open {}: {err}", asset_path.display()))?;
     eprintln!("{label}: enumerating CVE JSON entries");
     let json_entries = storage.enum_json_entries();
     eprintln!(
@@ -1885,9 +1887,9 @@ pub async fn ingest_zip_with_progress(
             0,
         );
         let rebuild_start = Instant::now();
-        if let Err(err) = db.rebuild_schema().await {
-            panic!("{label}: failed to rebuild schema: {err}");
-        }
+        db.rebuild_schema()
+            .await
+            .map_err(|err| format!("{label}: failed to rebuild schema: {err}"))?;
         eprintln!("{label}: rebuilt schema in {:?}", rebuild_start.elapsed());
 
         let compact_start = Instant::now();
@@ -1911,9 +1913,9 @@ pub async fn ingest_zip_with_progress(
             0,
             0,
         );
-        if let Err(err) = sync_cwe_catalog(db).await {
-            panic!("{label}: {err}");
-        }
+        sync_cwe_catalog(db)
+            .await
+            .map_err(|err| format!("{label}: {err}"))?;
     }
 
     let mut bulk_replace = None;
@@ -1931,7 +1933,7 @@ pub async fn ingest_zip_with_progress(
         let session = db
             .begin_bulk_replace_all()
             .await
-            .unwrap_or_else(|err| panic!("{label}: failed to begin bulk load: {err}"));
+            .map_err(|err| format!("{label}: failed to begin bulk load: {err}"))?;
         eprintln!(
             "{label}: prepared bulk load in {:?}",
             prepare_start.elapsed()
@@ -1968,9 +1970,9 @@ pub async fn ingest_zip_with_progress(
 
         let (parsed, read_elapsed, parse_elapsed) =
             if chunk.iter().all(|entry| entry.filesystem_path.is_some()) {
-                read_and_parse_extracted_chunk(label, chunk, &mut read_failed)
+                read_and_parse_extracted_chunk(label, chunk, &mut read_failed)?
             } else {
-                read_and_parse_zip_chunk(label, chunk, &mut storage, &mut read_failed)
+                read_and_parse_zip_chunk(label, chunk, &mut storage, &mut read_failed)?
             };
         timings.read += read_elapsed;
         timings.parse += parse_elapsed;
@@ -2007,7 +2009,9 @@ pub async fn ingest_zip_with_progress(
             IngestMode::ReplaceAll => {
                 bulk_replace
                     .as_ref()
-                    .expect("bulk replace session must exist in replace-all mode")
+                    .ok_or_else(|| {
+                        format!("{label}: bulk replace session is missing in replace-all mode")
+                    })?
                     .insert_cve_models(models)
                     .await
             }
@@ -2021,20 +2025,23 @@ pub async fn ingest_zip_with_progress(
                 timings.db_write += db_write_elapsed;
 
                 let mark_start = Instant::now();
-                let mark_result = match mode {
-                    IngestMode::ReplaceAll => {
-                        bulk_replace
+                let mark_result =
+                    match mode {
+                        IngestMode::ReplaceAll => bulk_replace
                             .as_ref()
-                            .expect("bulk replace session must exist in replace-all mode")
+                            .ok_or_else(|| {
+                                format!(
+                                    "{label}: bulk replace session is missing in replace-all mode"
+                                )
+                            })?
                             .mark_json_files_read(read_files)
-                            .await
-                    }
-                    IngestMode::Upsert => db.mark_json_files_read(read_files).await,
-                };
+                            .await,
+                        IngestMode::Upsert => db.mark_json_files_read(read_files).await,
+                    };
                 if let Err(err) = mark_result {
-                    eprintln!(
+                    return Err(format!(
                         "{label}: failed to mark read json files in chunk {chunk_index}: {err}"
-                    );
+                    ));
                 }
                 let mark_elapsed = mark_start.elapsed();
                 timings.mark_read += mark_elapsed;
@@ -2052,8 +2059,10 @@ pub async fn ingest_zip_with_progress(
             }
             Err(err) => {
                 timings.db_write += db_write_start.elapsed();
-                failed += chunk.len();
-                eprintln!("{label}: failed to write chunk {chunk_index}: {err}");
+                let failed_total = failed + chunk.len();
+                return Err(format!(
+                    "{label}: failed to write chunk {chunk_index}: {err}; inserted={inserted}, failed={failed_total}"
+                ));
             }
         }
 
@@ -2082,6 +2091,11 @@ pub async fn ingest_zip_with_progress(
     );
 
     if matches!(mode, IngestMode::ReplaceAll) {
+        if failed > 0 {
+            return Err(format!(
+                "{label}: refusing to finalize partial replace-all import; inserted={inserted}, failed={failed}"
+            ));
+        }
         emit_ingest_progress(
             &progress,
             label,
@@ -2092,12 +2106,13 @@ pub async fn ingest_zip_with_progress(
             failed,
         );
         let finish_start = Instant::now();
-        let session = bulk_replace
-            .take()
-            .expect("bulk replace session must exist in replace-all mode");
-        if let Err(err) = session.finish_storage_with_text_search(db).await {
-            panic!("{label}: failed to finish bulk load: {err}");
-        }
+        let session = bulk_replace.take().ok_or_else(|| {
+            format!("{label}: bulk replace session is missing in replace-all mode")
+        })?;
+        session
+            .finish_storage_with_text_search(db)
+            .await
+            .map_err(|err| format!("{label}: failed to finish bulk load: {err}"))?;
         eprintln!(
             "{label}: finalized storage and text search in {:?}",
             finish_start.elapsed()
@@ -2135,12 +2150,15 @@ pub async fn ingest_zip_with_progress(
         inserted,
         failed,
     );
+    if failed > 0 {
+        return Err(format!(
+            "{label}: completed with failed CVE files; inserted={inserted}, failed={failed}"
+        ));
+    }
+    Ok(())
 }
 
-fn parse_json_batch(
-    label: &str,
-    batch: Vec<(String, Vec<u8>)>,
-) -> Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>> {
+fn parse_json_batch(label: &str, batch: Vec<(String, Vec<u8>)>) -> Vec<ParsedCveFile> {
     batch
         .into_iter()
         .map(|(json_path, json)| parse_json(label, json_path, json))
@@ -2152,19 +2170,17 @@ fn read_and_parse_extracted_chunk(
     label: &str,
     chunk: &[JsonEntry],
     read_failed: &mut usize,
-) -> (
-    Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>,
-    Duration,
-    Duration,
-) {
+) -> Result<(Vec<ParsedCveFile>, Duration, Duration), String> {
     let total_start = Instant::now();
     let results = chunk
         .par_iter()
         .map(|entry| {
-            let filesystem_path = entry
-                .filesystem_path
-                .as_ref()
-                .expect("extracted entry must have a filesystem path");
+            let Some(filesystem_path) = entry.filesystem_path.as_ref() else {
+                return Err(format!(
+                    "{label}: extracted entry {} has no filesystem path",
+                    entry.path
+                ));
+            };
             match std::fs::read(filesystem_path) {
                 Ok(json) => Ok(parse_json(label, entry.path.clone(), json)),
                 Err(err) => Err(format!(
@@ -2188,7 +2204,7 @@ fn read_and_parse_extracted_chunk(
         }
     }
 
-    (parsed, elapsed, Duration::ZERO)
+    Ok((parsed, elapsed, Duration::ZERO))
 }
 
 #[allow(clippy::type_complexity)]
@@ -2197,13 +2213,9 @@ fn read_and_parse_zip_chunk(
     chunk: &[JsonEntry],
     storage: &mut loader::ZipStorage,
     read_failed: &mut usize,
-) -> (
-    Vec<Result<(CveActiveModels, ReadJsonFileRecord), String>>,
-    Duration,
-    Duration,
-) {
+) -> Result<(Vec<ParsedCveFile>, Duration, Duration), String> {
     let read_start = Instant::now();
-    let parsed_batches = std::sync::Mutex::new(Vec::new());
+    let parsed_batches = std::sync::Mutex::new(Vec::<Vec<ParsedCveFile>>::new());
     let mut read_elapsed = Duration::ZERO;
     rayon::scope(|scope| {
         let mut batch = Vec::with_capacity(READ_PARSE_PIPELINE_BATCH_SIZE);
@@ -2221,10 +2233,7 @@ fn read_and_parse_zip_chunk(
                 let parsed_batches = &parsed_batches;
                 scope.spawn(move |_| {
                     let parsed = parse_json_batch(label, batch);
-                    parsed_batches
-                        .lock()
-                        .expect("parsed batch mutex poisoned")
-                        .push(parsed);
+                    push_parsed_batch(label, parsed_batches, parsed);
                 });
             }
         }
@@ -2233,10 +2242,7 @@ fn read_and_parse_zip_chunk(
             let parsed_batches = &parsed_batches;
             scope.spawn(move |_| {
                 let parsed = parse_json_batch(label, batch);
-                parsed_batches
-                    .lock()
-                    .expect("parsed batch mutex poisoned")
-                    .push(parsed);
+                push_parsed_batch(label, parsed_batches, parsed);
             });
         }
 
@@ -2245,12 +2251,26 @@ fn read_and_parse_zip_chunk(
     let parse_elapsed = read_start.elapsed().saturating_sub(read_elapsed);
     let parsed = parsed_batches
         .into_inner()
-        .expect("parsed batch mutex poisoned")
+        .map_err(|_| format!("{label}: parsed batch mutex poisoned"))?
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
 
-    (parsed, read_elapsed, parse_elapsed)
+    Ok((parsed, read_elapsed, parse_elapsed))
+}
+
+fn push_parsed_batch(
+    label: &str,
+    parsed_batches: &std::sync::Mutex<Vec<Vec<ParsedCveFile>>>,
+    parsed: Vec<ParsedCveFile>,
+) {
+    match parsed_batches.lock() {
+        Ok(mut batches) => batches.push(parsed),
+        Err(poisoned) => {
+            let mut batches = poisoned.into_inner();
+            batches.push(vec![Err(format!("{label}: parsed batch mutex poisoned"))]);
+        }
+    }
 }
 
 fn parse_json(
@@ -2424,12 +2444,51 @@ mod tests {
 
     #[tokio::test]
     async fn replace_all_ingest_initializes_from_local_archives() {
-        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        use std::io::Write;
+
         let db_path = std::env::temp_dir().join(format!(
             "qanvuli-init-ingest-{}-{}.sqlite",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
+        let zip_path = std::env::temp_dir().join(format!(
+            "qanvuli-init-ingest-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("cves/2024/CVE-2024-0001.json", options)
+            .unwrap();
+        zip.write_all(
+            br#"{
+                "dataType":"CVE_RECORD",
+                "dataVersion":"5.1.0",
+                "cveMetadata":{
+                    "cveId":"CVE-2024-0001",
+                    "assignerOrgId":"00000000-0000-4000-8000-000000000000",
+                    "state":"PUBLISHED",
+                    "serial":1,
+                    "datePublished":"2024-01-01T00:00:00Z",
+                    "dateUpdated":"2024-01-02T00:00:00Z"
+                },
+                "containers":{
+                    "cna":{
+                        "providerMetadata":{"orgId":"00000000-0000-4000-8000-000000000000"},
+                        "title":"Example CVE",
+                        "descriptions":[{"lang":"en","value":"Example vulnerability."}],
+                        "affected":[{"vendor":"Example Vendor","product":"Example Product","defaultStatus":"affected"}],
+                        "metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}],
+                        "problemTypes":[{"descriptions":[{"lang":"en","type":"CWE","cweId":"CWE-79","description":"Cross-site Scripting"}]}],
+                        "references":[{"url":"https://example.com/advisory"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        zip.finish().unwrap();
+
         let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
         reset_sqlite_database_files(&db_url).unwrap();
 
@@ -2437,13 +2496,14 @@ mod tests {
         ingest_zip_with_progress(
             &db,
             "test-init",
-            &repo_root.join("test/2026-06-04_delta_CVEs_at_0500Z.zip"),
+            &zip_path,
             IngestMode::ReplaceAll,
             Some(1),
             false,
             None,
         )
-        .await;
+        .await
+        .unwrap();
 
         let status = db.database_status().await.unwrap();
         assert!(status.cve_count > 0);
@@ -2451,5 +2511,33 @@ mod tests {
         db.close().await.unwrap();
 
         reset_sqlite_database_files(&db_url).unwrap();
+        let _ = std::fs::remove_file(zip_path);
+    }
+
+    #[tokio::test]
+    async fn ingest_zip_reports_missing_archive_without_panicking() {
+        let db = connect_db("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        let missing_zip = std::env::temp_dir().join(format!(
+            "qanvuli-missing-ingest-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let err = ingest_zip_with_progress(
+            &db,
+            "test-missing",
+            &missing_zip,
+            IngestMode::Upsert,
+            Some(1),
+            true,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("test-missing: failed to open"));
+        assert!(err.contains("failed to open zip archive"));
+        db.close().await.unwrap();
     }
 }

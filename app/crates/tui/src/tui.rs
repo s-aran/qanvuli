@@ -273,6 +273,11 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
     match app.maintenance_choice {
         MaintenanceChoice::Cancel => app.close_maintenance(),
         MaintenanceChoice::Update => {
+            if let Err(err) = close_db_before_maintenance(db, app, "update").await {
+                app.status_message = Some(err);
+                app.close_maintenance();
+                return;
+            }
             let db_url = db_url.to_owned();
             let (progress, progress_rx) = maintenance_progress_channel();
             app.start_maintenance(
@@ -285,17 +290,11 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
             );
         }
         MaintenanceChoice::Init => {
-            app.abort_search();
-            if let Some(current_db) = db.take()
-                && let Err(err) = connection::close(current_db).await
-            {
-                app.status_message = Some(format!("failed to close database before init: {err}"));
+            if let Err(err) = close_db_before_maintenance(db, app, "init").await {
+                app.status_message = Some(err);
                 app.close_maintenance();
                 return;
             }
-            app.results.clear();
-            app.enrichment.clear();
-            app.total_results = None;
             let db_url = db_url.to_owned();
             let (progress, progress_rx) = maintenance_progress_channel();
             app.start_maintenance(
@@ -310,9 +309,28 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
     }
 }
 
+async fn close_db_before_maintenance(
+    db: &mut Option<CveDatabase>,
+    app: &mut App,
+    operation: &str,
+) -> Result<(), String> {
+    app.abort_search();
+    if let Some(current_db) = db.take() {
+        connection::close(current_db)
+            .await
+            .map_err(|err| format!("failed to close database before {operation}: {err}"))?;
+    }
+    app.results.clear();
+    app.enrichment.clear();
+    app.total_results = None;
+    Ok(())
+}
+
 async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
-    if db.is_some() {
-        return;
+    if let Some(current_db) = db.take()
+        && let Err(err) = connection::close(current_db).await
+    {
+        app.status_message = Some(format!("failed to close stale database connection: {err}"));
     }
     match connection::connect(db_url).await {
         Ok(reconnected) => {
@@ -331,5 +349,58 @@ async fn update_db_as_of(app: &mut App, db: &CveDatabase) {
         Err(err) => {
             app.status_message = Some(err);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn close_db_before_maintenance_drops_connection_and_clears_search_state() {
+        let mut db = Some(CveDatabase::connect("sqlite::memory:").await.unwrap());
+        let mut app = App::new("django".to_owned(), 30);
+        app.total_results = Some(42);
+        app.status_message = Some("existing status".to_owned());
+
+        close_db_before_maintenance(&mut db, &mut app, "update")
+            .await
+            .unwrap();
+
+        assert!(db.is_none());
+        assert!(app.results.is_empty());
+        assert!(app.enrichment.is_empty());
+        assert_eq!(app.total_results, None);
+    }
+
+    #[tokio::test]
+    async fn poll_maintenance_consumes_success_and_requests_refresh() {
+        let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(String::new(), 30);
+        app.start_maintenance(MaintenanceOperation::Update, progress_rx, result_rx);
+        result_tx.send(Ok(())).unwrap();
+
+        assert!(app.poll_maintenance().await);
+        assert!(!app.maintenance_running());
+        assert_eq!(app.status_message.as_deref(), Some("update completed"));
+        assert!(app.maintenance_progress.is_none());
+        assert!(!app.show_maintenance);
+    }
+
+    #[tokio::test]
+    async fn poll_maintenance_reports_failure_and_requests_refresh() {
+        let (_progress_tx, progress_rx) = mpsc::unbounded_channel();
+        let (result_tx, result_rx) = mpsc::unbounded_channel();
+        let mut app = App::new(String::new(), 30);
+        app.start_maintenance(MaintenanceOperation::Init, progress_rx, result_rx);
+        result_tx.send(Err("boom".to_owned())).unwrap();
+
+        assert!(app.poll_maintenance().await);
+        assert!(!app.maintenance_running());
+        assert_eq!(app.status_message.as_deref(), Some("init failed: boom"));
+        assert!(app.maintenance_progress.is_none());
+        assert!(!app.show_maintenance);
     }
 }

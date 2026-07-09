@@ -364,7 +364,13 @@ impl App {
             return Ok(());
         }
 
-        let search = self.search.take().expect("search handle disappeared");
+        let Some(search) = self.search.take() else {
+            self.status_message = Some("search task disappeared".to_owned());
+            self.search_started_at = None;
+            self.search_timeout_at = None;
+            self.show_timeout_prompt = false;
+            return Ok(());
+        };
         let kind = search.kind;
         let result = match search.handle.await {
             Ok(Ok(result)) => result,
@@ -411,7 +417,10 @@ impl App {
         if !task.is_finished() {
             return;
         }
-        let task = self.count_task.take().expect("count task disappeared");
+        let Some(task) = self.count_task.take() else {
+            self.status_message = Some("count task disappeared".to_owned());
+            return;
+        };
         match task.await {
             Ok(Ok(total)) => {
                 self.total_results = Some(total);
@@ -473,10 +482,11 @@ impl App {
         if !task.is_finished() {
             return;
         }
-        let task = self
-            .raw_json_task
-            .take()
-            .expect("raw JSON task disappeared");
+        let Some(task) = self.raw_json_task.take() else {
+            self.raw_json = Some("raw JSON task disappeared".to_owned());
+            self.raw_scroll = 0;
+            return;
+        };
         match task.await {
             Ok(Ok(raw_json)) => {
                 self.raw_json = Some(raw_json);
@@ -500,10 +510,10 @@ impl App {
         if !task.handle.is_finished() {
             return;
         }
-        let task = self
-            .enrichment_task
-            .take()
-            .expect("enrichment task disappeared");
+        let Some(task) = self.enrichment_task.take() else {
+            self.status_message = Some("enrichment task disappeared".to_owned());
+            return;
+        };
         match task.handle.await {
             Ok(Ok(rows)) => {
                 for row in rows {
@@ -552,7 +562,10 @@ impl App {
         if !task.is_finished() {
             return;
         }
-        let task = self.cwe_task.take().expect("CWE task disappeared");
+        let Some(task) = self.cwe_task.take() else {
+            self.status_message = Some("CWE task disappeared".to_owned());
+            return;
+        };
         match task.await {
             Ok(Ok(rows)) => {
                 self.cwe_results = rows;
@@ -591,6 +604,7 @@ impl App {
             || self.raw_json_task.is_some()
             || self.enrichment_task.is_some()
             || self.cwe_task.is_some()
+            || self.maintenance.is_some()
     }
 
     pub(super) fn cwe_searching(&self) -> bool {

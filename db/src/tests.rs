@@ -115,6 +115,15 @@ fn raw_cve_json_string_storage_is_compact() {
 }
 
 #[test]
+fn compact_json_str_rejects_unterminated_string() {
+    let err = compact_json_str(r#"{"id":"CVE-2099-0001}"#).unwrap_err();
+    assert!(
+        err.to_string().contains("unterminated string literal"),
+        "{err}"
+    );
+}
+
+#[test]
 fn raw_cve_record_converts_to_all_active_models() {
     let raw_record = parse_json_with_raw(CVE_JSON).unwrap();
     let models = CveActiveModels::from(raw_record);
@@ -674,6 +683,31 @@ fn enrichment_imports_and_queries_joined_sources() {
                 .iter()
                 .any(|row| row.cve_id == "CVE-2099-0001")
         );
+        let osv_alias_hits = db
+            .search_cve_summaries_free_text("GHSA-TEST-0001", 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            osv_alias_hits
+                .iter()
+                .any(|row| row.cve_id == "CVE-2099-0001")
+        );
+        let osv_alias_count = db
+            .count_cve_summaries_free_text("GHSA-TEST-0001")
+            .await
+            .unwrap();
+        assert_eq!(osv_alias_count, 1);
+        let osv_alias_prefix_hits = db
+            .search_cve_summaries_free_text("GHSA-TEST", 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            osv_alias_prefix_hits
+                .iter()
+                .any(|row| row.cve_id == "CVE-2099-0001")
+        );
+        let osv_alias_prefix_count = db.count_cve_summaries_free_text("GHSA-TEST").await.unwrap();
+        assert_eq!(osv_alias_prefix_count, 1);
         let osv_text_enrichment = db
             .enriched_cve_summaries(&["CVE-2099-0001".to_owned()])
             .await
