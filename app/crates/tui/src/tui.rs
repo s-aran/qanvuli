@@ -135,6 +135,10 @@ async fn run_loop(
                     app.advanced.backspace();
                     app.sync_main_from_advanced();
                 }
+                KeyCode::Char(' ') => {
+                    app.advanced.toggle_current();
+                    app.sync_main_from_advanced();
+                }
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Char(ch) => {
                     app.advanced.push(ch);

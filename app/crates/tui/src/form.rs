@@ -10,9 +10,9 @@ pub(super) struct AdvancedForm {
     pub(super) published_to: String,
     pub(super) cwe: String,
     pub(super) product: String,
-    pub(super) product_exact: String,
+    pub(super) product_exact: bool,
     pub(super) vendor: String,
-    pub(super) vendor_exact: String,
+    pub(super) vendor_exact: bool,
     pub(super) state_scope: CveStateScope,
     pub(super) active_field: AdvancedField,
 }
@@ -39,9 +39,9 @@ impl Default for AdvancedForm {
             published_to: String::new(),
             cwe: String::new(),
             product: String::new(),
-            product_exact: String::new(),
+            product_exact: false,
             vendor: String::new(),
-            vendor_exact: String::new(),
+            vendor_exact: false,
             state_scope: CveStateScope::PublishedOnly,
             active_field: AdvancedField::Query,
         }
@@ -70,10 +70,10 @@ impl AdvancedForm {
             AdvancedField::PublishedTo => Some(&mut self.published_to),
             AdvancedField::Cwe => Some(&mut self.cwe),
             AdvancedField::Product => Some(&mut self.product),
-            AdvancedField::ProductExact => Some(&mut self.product_exact),
             AdvancedField::Vendor => Some(&mut self.vendor),
-            AdvancedField::VendorExact => Some(&mut self.vendor_exact),
-            AdvancedField::StateScope => None,
+            AdvancedField::ProductExact
+            | AdvancedField::VendorExact
+            | AdvancedField::StateScope => None,
         }
     }
 
@@ -86,28 +86,45 @@ impl AdvancedForm {
     }
 
     pub(super) fn next_value(&mut self) {
-        if matches!(self.active_field, AdvancedField::StateScope) {
-            self.state_scope = self.state_scope.next();
+        match self.active_field {
+            AdvancedField::ProductExact => self.product_exact = !self.product_exact,
+            AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
+            AdvancedField::StateScope => self.state_scope = self.state_scope.next(),
+            _ => {}
         }
     }
 
     pub(super) fn previous_value(&mut self) {
-        if matches!(self.active_field, AdvancedField::StateScope) {
-            self.state_scope = self.state_scope.previous();
+        match self.active_field {
+            AdvancedField::ProductExact => self.product_exact = !self.product_exact,
+            AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
+            AdvancedField::StateScope => self.state_scope = self.state_scope.previous(),
+            _ => {}
+        }
+    }
+
+    pub(super) fn toggle_current(&mut self) {
+        match self.active_field {
+            AdvancedField::ProductExact => self.product_exact = !self.product_exact,
+            AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
+            AdvancedField::StateScope => self.state_scope = self.state_scope.next(),
+            _ => {}
         }
     }
 
     pub(super) fn to_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
+        let product = option_string(&self.product);
+        let vendor = option_string(&self.vendor);
         CveAdvancedSearch {
             query: option_string(&self.query),
             query_mode: Some(self.query_mode.into()),
             published_from: option_string(&self.published_from),
             published_to: option_string(&self.published_to),
             cwe: option_string(&self.cwe),
-            product: option_string(&self.product),
-            product_exact: option_string(&self.product_exact),
-            vendor: option_string(&self.vendor),
-            vendor_exact: option_string(&self.vendor_exact),
+            product: (!self.product_exact).then(|| product.clone()).flatten(),
+            product_exact: self.product_exact.then_some(product).flatten(),
+            vendor: (!self.vendor_exact).then(|| vendor.clone()).flatten(),
+            vendor_exact: self.vendor_exact.then_some(vendor).flatten(),
             state_scope: self.state_scope,
             sort_order,
         }
@@ -119,6 +136,45 @@ impl AdvancedForm {
         {
             self.query_mode = mode;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_checkboxes_route_values_to_exact_options() {
+        let form = AdvancedForm {
+            product: "Django".to_owned(),
+            product_exact: true,
+            vendor: "Example".to_owned(),
+            vendor_exact: false,
+            ..AdvancedForm::default()
+        };
+
+        let options = form.to_search_options(CveSummarySortOrder::PublishedDesc);
+
+        assert_eq!(options.product, None);
+        assert_eq!(options.product_exact.as_deref(), Some("Django"));
+        assert_eq!(options.vendor.as_deref(), Some("Example"));
+        assert_eq!(options.vendor_exact, None);
+    }
+
+    #[test]
+    fn exact_checkbox_toggle_does_not_edit_text_fields() {
+        let mut form = AdvancedForm {
+            product: "Django".to_owned(),
+            active_field: AdvancedField::ProductExact,
+            ..AdvancedForm::default()
+        };
+
+        form.push('x');
+        assert_eq!(form.product, "Django");
+        assert!(!form.product_exact);
+
+        form.toggle_current();
+        assert!(form.product_exact);
     }
 }
 

@@ -18,6 +18,7 @@ pub(super) enum DisplayField {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SortField {
     Published,
+    Updated,
     CveId,
     RelationRank,
     Score,
@@ -76,6 +77,8 @@ impl DisplaySettings {
         match (self.sort_field, self.sort_direction) {
             (SortField::Published, SortDirection::Asc) => CveSummarySortOrder::PublishedAsc,
             (SortField::Published, SortDirection::Desc) => CveSummarySortOrder::PublishedDesc,
+            (SortField::Updated, SortDirection::Asc) => CveSummarySortOrder::UpdatedAsc,
+            (SortField::Updated, SortDirection::Desc) => CveSummarySortOrder::UpdatedDesc,
             (SortField::CveId, SortDirection::Asc) => CveSummarySortOrder::CveIdAsc,
             (SortField::CveId, SortDirection::Desc) => CveSummarySortOrder::CveIdDesc,
             (SortField::RelationRank, SortDirection::Asc) => CveSummarySortOrder::RelationRankAsc,
@@ -107,7 +110,8 @@ impl DisplayField {
 impl SortField {
     fn next(self) -> Self {
         match self {
-            Self::Published => Self::CveId,
+            Self::Published => Self::Updated,
+            Self::Updated => Self::CveId,
             Self::CveId => Self::RelationRank,
             Self::RelationRank => Self::Score,
             Self::Score => Self::Published,
@@ -117,7 +121,8 @@ impl SortField {
     fn previous(self) -> Self {
         match self {
             Self::Published => Self::Score,
-            Self::CveId => Self::Published,
+            Self::Updated => Self::Published,
+            Self::CveId => Self::Updated,
             Self::RelationRank => Self::CveId,
             Self::Score => Self::RelationRank,
         }
@@ -126,6 +131,7 @@ impl SortField {
     pub(super) fn label(self) -> &'static str {
         match self {
             Self::Published => "published",
+            Self::Updated => "updated",
             Self::CveId => "a-z",
             Self::RelationRank => "relation rank",
             Self::Score => "score",

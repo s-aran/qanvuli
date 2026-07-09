@@ -2990,6 +2990,8 @@ impl CveDatabase {
 
         let query = match options.sort_order {
             CveSummarySortOrder::PublishedAsc => query.order_by_asc(cve::Column::PublishedAt),
+            CveSummarySortOrder::UpdatedAsc => query.order_by_asc(cve::Column::UpdatedAt),
+            CveSummarySortOrder::UpdatedDesc => query.order_by_desc(cve::Column::UpdatedAt),
             CveSummarySortOrder::PublishedDesc
             | CveSummarySortOrder::RelationRankAsc
             | CveSummarySortOrder::RelationRankDesc
@@ -6999,6 +7001,12 @@ fn affected_exact_order_by(sort_order: CveSummarySortOrder) -> &'static str {
         CveSummarySortOrder::PublishedAsc | CveSummarySortOrder::RelationRankAsc => {
             "cve_summary_index.published_at ASC, cve_summary_index.cve_id ASC"
         }
+        CveSummarySortOrder::UpdatedAsc => {
+            "cve_summary_index.updated_at ASC, cve_summary_index.cve_id ASC"
+        }
+        CveSummarySortOrder::UpdatedDesc => {
+            "cve_summary_index.updated_at DESC, cve_summary_index.cve_id ASC"
+        }
         CveSummarySortOrder::CveIdAsc => "cve_summary_index.cve_id ASC",
         CveSummarySortOrder::CveIdDesc => "cve_summary_index.cve_id DESC",
         CveSummarySortOrder::ScoreAsc => {
@@ -7017,6 +7025,8 @@ fn advanced_summary_sql(options: &CveAdvancedSearch, limit: u64, offset: u64) ->
     let order_by = match options.sort_order {
         CveSummarySortOrder::PublishedAsc => "cve.published_at ASC, cve.cve_id ASC",
         CveSummarySortOrder::PublishedDesc => "cve.published_at DESC, cve.cve_id ASC",
+        CveSummarySortOrder::UpdatedAsc => "cve.updated_at ASC, cve.cve_id ASC",
+        CveSummarySortOrder::UpdatedDesc => "cve.updated_at DESC, cve.cve_id ASC",
         CveSummarySortOrder::CveIdAsc => "cve.cve_id ASC",
         CveSummarySortOrder::CveIdDesc => "cve.cve_id DESC",
         CveSummarySortOrder::RelationRankAsc => "cve.published_at ASC, cve.cve_id ASC",

@@ -33,7 +33,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by affected vendor and/or product name. vendor/product are substring filters; vendor_exact/product_exact require exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by affected vendor and/or product name. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     pub(crate) async fn search_by_product(
         &self,
@@ -96,7 +96,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search high-risk CVEs for a specific affected vendor/product. vendor/product are substring filters; vendor_exact/product_exact require exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search high-risk CVEs for a specific affected vendor/product. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     pub(crate) async fn search_product_by_cvss(
         &self,

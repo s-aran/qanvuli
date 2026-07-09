@@ -149,6 +149,8 @@ pub enum CveSummarySortOrder {
     PublishedAsc,
     #[default]
     PublishedDesc,
+    UpdatedAsc,
+    UpdatedDesc,
     CveIdAsc,
     CveIdDesc,
     RelationRankAsc,

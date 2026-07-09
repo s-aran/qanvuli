@@ -69,18 +69,18 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         ),
         advanced_line(form, AdvancedField::Cwe, "CWE", &form.cwe),
         advanced_line(form, AdvancedField::Product, "Product", &form.product),
-        advanced_line(
+        advanced_checkbox(
             form,
             AdvancedField::ProductExact,
-            "Product exact",
-            &form.product_exact,
+            "Product exact match",
+            form.product_exact,
         ),
         advanced_line(form, AdvancedField::Vendor, "Vendor", &form.vendor),
-        advanced_line(
+        advanced_checkbox(
             form,
             AdvancedField::VendorExact,
-            "Vendor exact",
-            &form.vendor_exact,
+            "Vendor exact match",
+            form.vendor_exact,
         ),
         advanced_line(
             form,
@@ -90,7 +90,7 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         ),
         Line::from(""),
         Line::from(
-            "Enter search  Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right mode/state",
+            "Enter search  Esc close  Space toggle exact  Tab/Down next  Shift+Tab/Up previous",
         ),
     ];
     let popup = Paragraph::new(lines)
@@ -269,6 +269,21 @@ fn advanced_line(
     SelectableField {
         label,
         value: value.to_owned(),
+        active: form.active_field == field,
+        active_color: Color::Yellow,
+    }
+    .line()
+}
+
+fn advanced_checkbox(
+    form: &AdvancedForm,
+    field: AdvancedField,
+    label: &'static str,
+    checked: bool,
+) -> Line<'static> {
+    Checkbox {
+        label: label.to_owned(),
+        checked,
         active: form.active_field == field,
         active_color: Color::Yellow,
     }

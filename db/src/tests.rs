@@ -402,6 +402,80 @@ fn cve_summary_search_defaults_to_published_only() {
 }
 
 #[test]
+fn advanced_summary_search_sorts_by_updated_at() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+
+        for (cve_id, published_at, updated_at) in [
+            (
+                "CVE-2026-2000",
+                "2026-01-03T00:00:00Z",
+                "2026-01-04T00:00:00Z",
+            ),
+            (
+                "CVE-2026-2001",
+                "2026-01-02T00:00:00Z",
+                "2026-01-06T00:00:00Z",
+            ),
+            (
+                "CVE-2026-2002",
+                "2026-01-01T00:00:00Z",
+                "2026-01-05T00:00:00Z",
+            ),
+        ] {
+            db.upsert_cve(cve::ActiveModel {
+                id: Default::default(),
+                cve_id: Set(cve_id.to_owned()),
+                state: Set(PUBLISHED_STATE),
+                published_at: Set(published_at.to_owned()),
+                updated_at: Set(updated_at.to_owned()),
+                serial: Set(1),
+                title: Set("updated sort fixture".to_owned()),
+                description_en: Set(Some("description".to_owned())),
+                reference_text: Set(String::new()),
+                raw_json: Set(json!({"id": cve_id}).to_string()),
+            })
+            .await
+            .unwrap();
+        }
+        rebuild_cve_summary_indexes(db.connection()).await.unwrap();
+
+        let mut options = CveAdvancedSearch {
+            sort_order: CveSummarySortOrder::UpdatedDesc,
+            ..Default::default()
+        };
+        let desc = db
+            .search_cve_summaries_advanced(&options, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            desc.iter()
+                .map(|summary| summary.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2026-2001", "CVE-2026-2002", "CVE-2026-2000"]
+        );
+
+        options.sort_order = CveSummarySortOrder::UpdatedAsc;
+        let asc = db
+            .search_cve_summaries_advanced(&options, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            asc.iter()
+                .map(|summary| summary.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2026-2000", "CVE-2026-2002", "CVE-2026-2001"]
+        );
+    });
+}
+
+#[test]
 fn upsert_cve_models_writes_parent_and_children() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
