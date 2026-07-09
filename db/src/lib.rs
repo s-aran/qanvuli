@@ -7618,6 +7618,12 @@ async fn upsert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
+    let compact_raw_content =
+        (input.content_type == "application/json").then(|| compact_json_str(input.raw_content));
+    let stored_raw_content = compact_raw_content
+        .as_deref()
+        .unwrap_or(input.raw_content)
+        .to_owned();
     let row = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -7649,11 +7655,8 @@ where
                 SeaValue::from(input.score_date.map(ToOwned::to_owned)),
                 SeaValue::from(input.fetched_at.to_owned()),
                 SeaValue::from(input.content_hash.to_owned()),
-                SeaValue::from(input.raw_content.to_owned()),
-                SeaValue::from(
-                    (input.content_type == "application/json")
-                        .then(|| compact_json_str(input.raw_content)),
-                ),
+                SeaValue::from(stored_raw_content),
+                SeaValue::from(compact_raw_content),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
                 ),
@@ -7669,6 +7672,12 @@ async fn insert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
+    let compact_raw_content =
+        (input.content_type == "application/json").then(|| compact_json_str(input.raw_content));
+    let stored_raw_content = compact_raw_content
+        .as_deref()
+        .unwrap_or(input.raw_content)
+        .to_owned();
     let row = db
         .query_one(Statement::from_sql_and_values(
             DbBackend::Sqlite,
@@ -7689,11 +7698,8 @@ where
                 SeaValue::from(input.score_date.map(ToOwned::to_owned)),
                 SeaValue::from(input.fetched_at.to_owned()),
                 SeaValue::from(input.content_hash.to_owned()),
-                SeaValue::from(input.raw_content.to_owned()),
-                SeaValue::from(
-                    (input.content_type == "application/json")
-                        .then(|| compact_json_str(input.raw_content)),
-                ),
+                SeaValue::from(stored_raw_content),
+                SeaValue::from(compact_raw_content),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
                 ),

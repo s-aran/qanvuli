@@ -586,6 +586,43 @@ fn enrichment_imports_and_queries_joined_sources() {
             .await
             .unwrap();
 
+        let raw_rows = db
+            .connection()
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                r#"
+                SELECT source, source_record_id, raw_content, raw_json, raw_csv, content_type
+                FROM source_raw_records
+                ORDER BY source, source_record_id
+                "#
+                .to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert!(!raw_rows.is_empty());
+        for row in raw_rows {
+            let source = row.try_get::<String>("", "source").unwrap();
+            let content_type = row.try_get::<String>("", "content_type").unwrap();
+            let raw_content = row.try_get::<String>("", "raw_content").unwrap();
+            if content_type == "application/json" {
+                let raw_json = row
+                    .try_get::<Option<String>>("", "raw_json")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(raw_content, raw_json, "{source} JSON raw columns differ");
+                assert!(!raw_json.contains('\n'), "{source} raw_json is pretty");
+                assert!(!raw_json.contains("  "), "{source} raw_json is pretty");
+                raw_json_value(&raw_json).unwrap();
+            } else if source == "EPSS" {
+                let raw_csv = row
+                    .try_get::<Option<String>>("", "raw_csv")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(raw_content, raw_csv);
+                assert!(raw_csv.starts_with("#model_version:"));
+            }
+        }
+
         let resolution = db.resolve_identifier("RUSTSEC-TEST-0001").await.unwrap();
         assert!(
             resolution
