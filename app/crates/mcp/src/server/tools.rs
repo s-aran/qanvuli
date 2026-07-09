@@ -120,6 +120,26 @@ impl CveSearchServer {
     }
 
     #[tool(
+        description = "Search CVEs by FIRST EPSS score or percentile, ordered by highest EPSS. Returns lightweight risk rows with KEV flag, EPSS, and max CVSS for triage."
+    )]
+    pub(crate) async fn search_by_epss(
+        &self,
+        Parameters(args): Parameters<EpssArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        let limit = limit(args.limit);
+        db::search_by_epss(
+            db,
+            args.min_score,
+            args.min_percentile,
+            state_scope(args.include_rejected),
+            limit,
+            offset(args.offset),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
     )]
     pub(crate) async fn search_recent(
@@ -242,6 +262,17 @@ impl CveSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
         db::get_enriched_cve(db, &args.cve_id).await
+    }
+
+    #[tool(
+        description = "Batch-check CVE IDs for local CISA KEV listing, FIRST EPSS, and max CVSS. Accepts up to 200 CVE IDs and returns compact risk rows in input order."
+    )]
+    pub(crate) async fn lookup_cve_risk(
+        &self,
+        Parameters(args): Parameters<CveRiskLookupArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::lookup_cve_risk(db, &args.cve_ids).await
     }
 
     #[tool(description = "Fetch one local OSV advisory summary by OSV/GHSA/RUSTSEC/PYSEC/GO ID.")]
@@ -378,7 +409,13 @@ impl CveSearchServer {
         Parameters(args): Parameters<KnownExploitedArgs>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
-        db::known_exploited(db, args.cve_id.as_deref()).await
+        db::known_exploited(
+            db,
+            args.cve_id.as_deref(),
+            limit(args.limit),
+            offset(args.offset),
+        )
+        .await
     }
 
     #[tool(

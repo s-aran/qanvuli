@@ -102,6 +102,7 @@ impl CveActiveModels {
         let mut bytes = raw_json.as_bytes().to_vec();
         let value: BorrowedValue<'_> =
             simd_json::to_borrowed_value(&mut bytes).map_err(json_parse_db_err)?;
+        let compact_raw_json = compact_json_str(&raw_json);
         let cve_id = borrowed_cve_id(&value).unwrap_or_default().to_owned();
         let cvss_rows = borrowed_cvss_active_models(&value)?;
         let affected_rows = borrowed_affected_active_models(&value)?;
@@ -109,7 +110,7 @@ impl CveActiveModels {
 
         Ok(Self {
             cve_id: cve_id.clone(),
-            cve: borrowed_cve_active_model(raw_json, &value, &cve_id),
+            cve: borrowed_cve_active_model(compact_raw_json, &value, &cve_id),
             cvss_rows,
             affected_rows,
             cwe_master_rows: Vec::new(),
@@ -479,6 +480,30 @@ fn borrowed_string_or_json(value: &BorrowedValue<'_>, key: &str) -> Result<Optio
 
 fn borrowed_json_string(value: &BorrowedValue<'_>) -> Result<String, DbErr> {
     simd_json::to_string(value).map_err(json_parse_db_err)
+}
+
+fn compact_json_str(value: &str) -> String {
+    let mut compact = String::with_capacity(value.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in value.chars() {
+        if in_string {
+            compact.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+        } else if ch == '"' {
+            in_string = true;
+            compact.push(ch);
+        } else if !ch.is_whitespace() {
+            compact.push(ch);
+        }
+    }
+    compact
 }
 
 fn json_parse_db_err(err: simd_json::Error) -> DbErr {
@@ -3861,19 +3886,30 @@ impl CveDatabase {
         if let Some(cve_id) = cve_id {
             return Ok(load_kev(&self.db, cve_id).await?.into_iter().collect());
         }
+        self.kev_entries_paged(i64::MAX as u64, 0).await
+    }
+
+    pub async fn kev_entries_paged(&self, limit: u64, offset: u64) -> Result<Vec<KevInfo>, DbErr> {
         KevInfo::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
-            r#"
+            format!(
+                r#"
             SELECT cve_id, vendor_project, product, vulnerability_name, date_added,
                    short_description, required_action, due_date,
                    known_ransomware_campaign_use, notes, fetched_at
             FROM kev_entries
             ORDER BY date_added DESC, cve_id
+            LIMIT {limit} OFFSET {offset}
             "#
-            .to_owned(),
+            ),
         ))
         .all(&self.db)
         .await
+    }
+
+    pub async fn kev_entries_count(&self) -> Result<u64, DbErr> {
+        self.count_by_sql("SELECT COUNT(*) AS count FROM kev_entries".to_owned())
+            .await
     }
 
     pub async fn enriched_cve_summaries(
@@ -3947,6 +3983,131 @@ impl CveDatabase {
                 ORDER BY r.ordinal
                 "#,
                 sql_values_list(&cve_ids)
+            ),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    pub async fn cve_risk_summaries(
+        &self,
+        cve_ids: &[String],
+    ) -> Result<Vec<CveRiskSummary>, DbErr> {
+        if cve_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cve_ids = cve_ids
+            .iter()
+            .map(|id| normalize_identifier(id))
+            .collect::<Vec<_>>();
+        CveRiskSummary::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                r#"
+                WITH requested(cve_id, ordinal) AS (
+                    VALUES {}
+                )
+                SELECT
+                    r.cve_id,
+                    cve.title,
+                    cve.published_at,
+                    cve.updated_at,
+                    cve.state,
+                    CASE WHEN kev.cve_id IS NULL THEN 0 ELSE 1 END AS kev_listed,
+                    kev.date_added AS kev_date_added,
+                    kev.due_date AS kev_due_date,
+                    kev.known_ransomware_campaign_use AS kev_known_ransomware_campaign_use,
+                    epss.epss AS epss,
+                    epss.percentile AS epss_percentile,
+                    epss.score_date AS epss_score_date,
+                    epss.model_version AS epss_model_version,
+                    COALESCE(cvss.max_cvss_score, summary.max_cvss_score, (
+                        SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_db_id = cve.id
+                    )) AS max_cvss_score,
+                    COALESCE(cvss.max_cvss_severity, summary.max_cvss_severity, (
+                        SELECT base_severity
+                        FROM cve_cvss
+                        WHERE cve_cvss.cve_db_id = cve.id AND base_severity IS NOT NULL
+                        ORDER BY COALESCE(base_score, -1) DESC
+                        LIMIT 1
+                    )) AS max_cvss_severity,
+                    NULL AS max_cvss_version
+                FROM requested r
+                LEFT JOIN cve ON cve.cve_id = r.cve_id
+                LEFT JOIN kev_entries kev ON kev.cve_id = r.cve_id
+                LEFT JOIN epss_current epss ON epss.cve_id = r.cve_id
+                LEFT JOIN cve_cvss_search cvss ON cvss.cve_id = r.cve_id
+                LEFT JOIN cve_summary_index summary ON summary.cve_id = r.cve_id
+                ORDER BY r.ordinal
+                "#,
+                sql_values_list(&cve_ids)
+            ),
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    pub async fn search_cve_risk_by_epss(
+        &self,
+        min_score: Option<f64>,
+        min_percentile: Option<f64>,
+        state_scope: CveStateScope,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveRiskSummary>, DbErr> {
+        let mut conditions = Vec::new();
+        if let Some(min_score) = min_score {
+            conditions.push(format!("epss.epss >= {min_score}"));
+        }
+        if let Some(min_percentile) = min_percentile {
+            conditions.push(format!("epss.percentile >= {min_percentile}"));
+        }
+        if !state_scope.includes_rejected() {
+            conditions.push("cve.state = 0".to_owned());
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conditions.join(" AND "))
+        };
+        CveRiskSummary::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            format!(
+                r#"
+                SELECT
+                    cve.cve_id,
+                    cve.title,
+                    cve.published_at,
+                    cve.updated_at,
+                    cve.state,
+                    CASE WHEN kev.cve_id IS NULL THEN 0 ELSE 1 END AS kev_listed,
+                    kev.date_added AS kev_date_added,
+                    kev.due_date AS kev_due_date,
+                    kev.known_ransomware_campaign_use AS kev_known_ransomware_campaign_use,
+                    epss.epss AS epss,
+                    epss.percentile AS epss_percentile,
+                    epss.score_date AS epss_score_date,
+                    epss.model_version AS epss_model_version,
+                    COALESCE(cvss.max_cvss_score, summary.max_cvss_score, (
+                        SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_db_id = cve.id
+                    )) AS max_cvss_score,
+                    COALESCE(cvss.max_cvss_severity, summary.max_cvss_severity, (
+                        SELECT base_severity
+                        FROM cve_cvss
+                        WHERE cve_cvss.cve_db_id = cve.id AND base_severity IS NOT NULL
+                        ORDER BY COALESCE(base_score, -1) DESC
+                        LIMIT 1
+                    )) AS max_cvss_severity,
+                    NULL AS max_cvss_version
+                FROM epss_current epss
+                INNER JOIN cve ON cve.cve_id = epss.cve_id
+                LEFT JOIN kev_entries kev ON kev.cve_id = cve.cve_id
+                LEFT JOIN cve_cvss_search cvss ON cvss.cve_id = cve.cve_id
+                LEFT JOIN cve_summary_index summary ON summary.cve_id = cve.cve_id
+                {where_clause}
+                ORDER BY epss.epss DESC, epss.percentile DESC, cve.published_at DESC, cve.cve_id ASC
+                LIMIT {limit} OFFSET {offset}
+                "#
             ),
         ))
         .all(&self.db)
@@ -5616,7 +5777,7 @@ where
     C: ConnectionTrait,
 {
     let where_clause = cve_ids
-        .map(|ids| format!("WHERE cve_id IN ({ids})"))
+        .map(|ids| format!("WHERE cve.cve_id IN ({ids})"))
         .unwrap_or_default();
     db.execute_unprepared(&format!(
         r#"
@@ -5625,14 +5786,26 @@ where
             max_cvss_score, max_cvss_severity, cvss_versions
         )
         SELECT
-            cve_id, state, published_at, updated_at, title, description_en,
-            max_cvss_score, max_cvss_severity,
+            cve.cve_id,
+            cve.state,
+            cve.published_at,
+            cve.updated_at,
+            cve.title,
+            cve.description_en,
+            (SELECT MAX(base_score) FROM cve_cvss WHERE cve_cvss.cve_db_id = cve.id),
+            (
+                SELECT base_severity
+                FROM cve_cvss
+                WHERE cve_cvss.cve_db_id = cve.id AND base_severity IS NOT NULL
+                ORDER BY COALESCE(base_score, -1) DESC
+                LIMIT 1
+            ),
             COALESCE((
                 SELECT '|' || REPLACE(GROUP_CONCAT(DISTINCT version), ',', '|') || '|'
                 FROM cve_cvss
-                WHERE cve_cvss.cve_db_id = cve_summary_index.cve_db_id
+                WHERE cve_cvss.cve_db_id = cve.id
             ), '')
-        FROM cve_summary_index
+        FROM cve
         {where_clause}
         "#
     ))
@@ -7479,7 +7652,7 @@ where
                 SeaValue::from(input.raw_content.to_owned()),
                 SeaValue::from(
                     (input.content_type == "application/json")
-                        .then(|| input.raw_content.to_owned()),
+                        .then(|| compact_json_str(input.raw_content)),
                 ),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
@@ -7519,7 +7692,7 @@ where
                 SeaValue::from(input.raw_content.to_owned()),
                 SeaValue::from(
                     (input.content_type == "application/json")
-                        .then(|| input.raw_content.to_owned()),
+                        .then(|| compact_json_str(input.raw_content)),
                 ),
                 SeaValue::from(
                     (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),

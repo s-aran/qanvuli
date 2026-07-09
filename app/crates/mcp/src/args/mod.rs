@@ -210,8 +210,32 @@ pub(crate) struct RecentUpdatesArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct KnownExploitedArgs {
-    /// Optional CVE ID. When omitted, returns all locally synced KEV entries.
+    /// Optional CVE ID. When omitted, returns locally synced KEV entries with pagination.
     pub(crate) cve_id: Option<String>,
+    /// Maximum number of KEV entries to return when cve_id is omitted. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of KEV entries to skip when cve_id is omitted. Default is 0.
+    pub(crate) offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CveRiskLookupArgs {
+    /// CVE IDs to check for KEV, EPSS, and max CVSS. Intended for batch triage.
+    pub(crate) cve_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct EpssArgs {
+    /// Minimum EPSS score, inclusive. Omit to return top EPSS records.
+    pub(crate) min_score: Option<f64>,
+    /// Minimum EPSS percentile, inclusive.
+    pub(crate) min_percentile: Option<f64>,
+    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching results to skip for pagination. Default is 0.
+    pub(crate) offset: Option<u64>,
+    /// Include rejected CVE records when true. Default returns only published CVEs.
+    pub(crate) include_rejected: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

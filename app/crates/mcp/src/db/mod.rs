@@ -287,17 +287,70 @@ pub(crate) async fn query_package_enriched(
 pub(crate) async fn known_exploited(
     db: &CveDatabase,
     cve_id: Option<&str>,
+    limit: u64,
+    offset: u64,
 ) -> Result<CallToolResult, McpError> {
-    let entries = db
-        .kev_entries(cve_id)
-        .await
-        .map_err(|err| mcp_error(err.to_string()))?;
+    let (count, entries) = if cve_id.is_some() {
+        let entries = db
+            .kev_entries(cve_id)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        (entries.len() as u64, entries)
+    } else {
+        let count = db
+            .kev_entries_count()
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        let entries = db
+            .kev_entries_paged(limit, offset)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?;
+        (count, entries)
+    };
+    let has_more = cve_id.is_none() && offset + (entries.len() as u64) < count;
     response::tool_result(json!({
         "available": true,
         "cve_id": cve_id,
         "known_exploited": if cve_id.is_some() { !entries.is_empty() } else { false },
-        "count": entries.len(),
+        "count": count,
+        "has_more": has_more,
         "entries": entries,
+    }))
+}
+
+pub(crate) async fn lookup_cve_risk(
+    db: &CveDatabase,
+    cve_ids: &[String],
+) -> Result<CallToolResult, McpError> {
+    let requested = cve_ids.len();
+    let cve_ids = cve_ids.iter().take(200).cloned().collect::<Vec<_>>();
+    let results = db
+        .cve_risk_summaries(&cve_ids)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!({
+        "requested": requested,
+        "truncated": requested > cve_ids.len(),
+        "results": results,
+    }))
+}
+
+pub(crate) async fn search_by_epss(
+    db: &CveDatabase,
+    min_score: Option<f64>,
+    min_percentile: Option<f64>,
+    state_scope: CveStateScope,
+    limit: u64,
+    offset: u64,
+) -> Result<CallToolResult, McpError> {
+    let results = db
+        .search_cve_risk_by_epss(min_score, min_percentile, state_scope, limit + 1, offset)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    let has_more = results.len() > limit as usize;
+    response::tool_result(json!({
+        "has_more": has_more,
+        "results": results.into_iter().take(limit as usize).collect::<Vec<_>>(),
     }))
 }
 

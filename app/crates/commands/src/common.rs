@@ -175,11 +175,13 @@ fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
 }
 
 pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
-    println!(
-        "{}",
+    let text = if std::env::args_os().any(|arg| arg == "--pretty") {
         simd_json::to_string_pretty(value)
-            .map_err(|err| format!("failed to encode JSON: {err}"))?
-    );
+    } else {
+        simd_json::to_string(value)
+    }
+    .map_err(|err| format!("failed to encode JSON: {err}"))?;
+    println!("{text}");
     Ok(())
 }
 

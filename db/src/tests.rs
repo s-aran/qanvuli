@@ -102,6 +102,19 @@ fn raw_cve_record_converts_to_cve_active_model() {
 }
 
 #[test]
+fn raw_cve_json_string_storage_is_compact() {
+    let models = CveActiveModels::from_raw_json_string(CVE_JSON.to_owned()).unwrap();
+    let raw_json = models.cve.raw_json.unwrap();
+
+    assert!(!raw_json.contains('\n'));
+    assert!(!raw_json.contains("  "));
+    assert_eq!(
+        raw_json_value(&raw_json).unwrap()["cveMetadata"]["cveId"],
+        "CVE-2024-0001"
+    );
+}
+
+#[test]
 fn raw_cve_record_converts_to_all_active_models() {
     let raw_record = parse_json_with_raw(CVE_JSON).unwrap();
     let models = CveActiveModels::from(raw_record);
@@ -528,6 +541,21 @@ fn enrichment_imports_and_queries_joined_sources() {
         .exec(db.connection())
         .await
         .unwrap();
+        cve_cvss::Entity::insert(cve_cvss::ActiveModel {
+            id: Default::default(),
+            cve_db_id: Set(cve_db_id),
+            version: Set("3.1".to_owned()),
+            base_score: Set(Some(9.8)),
+            base_severity: Set(Some("CRITICAL".to_owned())),
+            vector_string: Set(Some(
+                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_owned(),
+            )),
+            source: Set(Some("fixture".to_owned())),
+            raw_json: Set("{}".to_owned()),
+        })
+        .exec(db.connection())
+        .await
+        .unwrap();
         rebuild_cve_summary_indexes(db.connection()).await.unwrap();
 
         db.import_osv_records(vec![
@@ -581,6 +609,19 @@ fn enrichment_imports_and_queries_joined_sources() {
         let enriched = db.get_enriched_cve("CVE-2099-0001").await.unwrap();
         assert!(enriched.kev.is_some());
         assert!(enriched.epss.is_some());
+        let risk = db
+            .cve_risk_summaries(&["CVE-2099-0001".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(risk.len(), 1);
+        assert!(risk[0].kev_listed);
+        assert!(risk[0].epss.is_some());
+        assert_eq!(risk[0].max_cvss_score, Some(9.8));
+        let epss_hits = db
+            .search_cve_risk_by_epss(Some(0.01), None, CveStateScope::PublishedOnly, 10, 0)
+            .await
+            .unwrap();
+        assert!(epss_hits.iter().any(|row| row.cve_id == "CVE-2099-0001"));
         assert!(
             enriched
                 .osv_advisories

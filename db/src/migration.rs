@@ -275,6 +275,9 @@ where
         "CREATE INDEX idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
         "CREATE INDEX idx_identifier_edges_to ON vulnerability_identifier_edges (to_identifier)",
         "CREATE INDEX idx_identifier_edges_from ON vulnerability_identifier_edges (from_identifier)",
+        "CREATE INDEX idx_kev_entries_date_added_cve_id ON kev_entries (date_added DESC, cve_id)",
+        "CREATE INDEX idx_epss_current_score ON epss_current (epss DESC, percentile DESC, cve_id)",
+        "CREATE INDEX idx_epss_current_percentile ON epss_current (percentile DESC, epss DESC, cve_id)",
     ] {
         db.execute_unprepared(sql).await?;
     }

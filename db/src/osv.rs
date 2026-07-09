@@ -93,6 +93,26 @@ pub struct EnrichedCveSummary {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+pub struct CveRiskSummary {
+    pub cve_id: String,
+    pub title: Option<String>,
+    pub published_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub state: Option<i32>,
+    pub kev_listed: bool,
+    pub kev_date_added: Option<String>,
+    pub kev_due_date: Option<String>,
+    pub kev_known_ransomware_campaign_use: Option<String>,
+    pub epss: Option<f64>,
+    pub epss_percentile: Option<f64>,
+    pub epss_score_date: Option<String>,
+    pub epss_model_version: Option<String>,
+    pub max_cvss_score: Option<f64>,
+    pub max_cvss_severity: Option<String>,
+    pub max_cvss_version: Option<String>,
+}
+
+#[derive(Clone, Debug, FromQueryResult, Serialize)]
 pub struct OsvSummary {
     pub osv_id: String,
     pub schema_version: Option<String>,

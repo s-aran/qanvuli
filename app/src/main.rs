@@ -18,6 +18,7 @@ fn run() -> Result<(), String> {
         print_version();
         return Ok(());
     }
+    let _pretty = cli.pretty;
 
     let db_url = cli.db_url()?;
     let command = cli.command.unwrap_or(Command::Help);
@@ -64,6 +65,8 @@ struct Cli {
     version: bool,
     #[arg(long = "db-url", global = true, value_name = "URL")]
     db_url: Option<String>,
+    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
+    pretty: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }

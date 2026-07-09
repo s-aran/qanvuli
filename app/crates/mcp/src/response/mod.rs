@@ -8,7 +8,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use simd_json::{OwnedValue as Value, json};
 
 pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
-    let text = simd_json::to_string_pretty(&value)
+    let text = simd_json::to_string(&value)
         .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
