@@ -1349,7 +1349,7 @@ pub async fn download_latest_asset_with_source(
     })
 }
 
-pub fn remove_downloaded_zip(path: &Path) -> Result<(), String> {
+pub fn remove_processed_zip(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => {
             eprintln!("removed downloaded zip {}", path.display());
@@ -1571,11 +1571,17 @@ pub async fn apply_delta_updates_with_progress(
             "delta",
             &zip,
             IngestMode::Upsert,
-            max_chunks,
-            true,
-            progress,
+            IngestOptions {
+                max_chunks,
+                cwe_synced: true,
+                keep_artifacts: keep_downloads,
+                progress,
+            },
         )
         .await?;
+        if !keep_downloads {
+            remove_processed_zip(&zip)?;
+        }
         return Ok(vec![zip]);
     }
 
@@ -1600,7 +1606,14 @@ pub async fn apply_delta_updates_with_progress(
                     "delta: failed to fetch GitHub release metadata ({err}); using latest local {}",
                     path.display()
                 );
-                return apply_local_delta_updates(db, vec![path], max_chunks, progress).await;
+                return apply_local_delta_updates(
+                    db,
+                    vec![path],
+                    max_chunks,
+                    keep_downloads,
+                    progress,
+                )
+                .await;
             }
             return Err(err);
         }
@@ -1612,7 +1625,8 @@ pub async fn apply_delta_updates_with_progress(
                 "delta: no GitHub delta asset found; using latest local {}",
                 path.display()
             );
-            return apply_local_delta_updates(db, vec![path], max_chunks, progress).await;
+            return apply_local_delta_updates(db, vec![path], max_chunks, keep_downloads, progress)
+                .await;
         }
         assets
     } else {
@@ -1646,9 +1660,12 @@ pub async fn apply_delta_updates_with_progress(
             "delta",
             &asset_path,
             IngestMode::Upsert,
-            max_chunks,
-            true,
-            progress.clone(),
+            IngestOptions {
+                max_chunks,
+                cwe_synced: true,
+                keep_artifacts: keep_downloads,
+                progress: progress.clone(),
+            },
         )
         .await?;
         if max_chunks.is_none() {
@@ -1657,7 +1674,7 @@ pub async fn apply_delta_updates_with_progress(
                 .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
         }
         if !keep_downloads {
-            remove_downloaded_zip(&asset_path)?;
+            remove_processed_zip(&asset_path)?;
         }
         applied.push(asset_path);
     }
@@ -1690,13 +1707,16 @@ async fn apply_latest_all_midnight(
         "all",
         &path,
         IngestMode::ReplaceAll,
-        max_chunks,
-        true,
-        progress,
+        IngestOptions {
+            max_chunks,
+            cwe_synced: true,
+            keep_artifacts: keep_downloads,
+            progress,
+        },
     )
     .await?;
-    if asset.downloaded && !keep_downloads {
-        remove_downloaded_zip(&path)?;
+    if !keep_downloads {
+        remove_processed_zip(&path)?;
     }
     Ok(vec![path])
 }
@@ -1705,6 +1725,7 @@ async fn apply_local_delta_updates(
     db: &CveDatabase,
     assets: Vec<PathBuf>,
     max_chunks: Option<usize>,
+    keep_downloads: bool,
     progress: Option<IngestProgressCallback>,
 ) -> Result<Vec<PathBuf>, String> {
     let anchor = latest_update_anchor(db).await?;
@@ -1734,15 +1755,21 @@ async fn apply_local_delta_updates(
             "delta",
             &asset_path,
             IngestMode::Upsert,
-            max_chunks,
-            true,
-            progress.clone(),
+            IngestOptions {
+                max_chunks,
+                cwe_synced: true,
+                keep_artifacts: keep_downloads,
+                progress: progress.clone(),
+            },
         )
         .await?;
         if max_chunks.is_none() && !asset_name.is_empty() {
             db.mark_cve_asset_applied(&asset_name, "local")
                 .await
                 .map_err(|err| format!("failed to mark CVE asset applied: {err}"))?;
+        }
+        if !keep_downloads {
+            remove_processed_zip(&asset_path)?;
         }
         applied.push(asset_path);
     }
@@ -1878,6 +1905,13 @@ pub async fn delta_assets_oldest_first()
     Ok(cve.get_delta_files_oldest_first())
 }
 
+pub struct IngestOptions {
+    pub max_chunks: Option<usize>,
+    pub cwe_synced: bool,
+    pub keep_artifacts: bool,
+    pub progress: Option<IngestProgressCallback>,
+}
+
 pub async fn ingest_zip(
     db: &CveDatabase,
     label: &str,
@@ -1885,8 +1919,21 @@ pub async fn ingest_zip(
     mode: IngestMode,
     max_chunks: Option<usize>,
     cwe_synced: bool,
+    keep_artifacts: bool,
 ) -> Result<(), String> {
-    ingest_zip_with_progress(db, label, asset_path, mode, max_chunks, cwe_synced, None).await
+    ingest_zip_with_progress(
+        db,
+        label,
+        asset_path,
+        mode,
+        IngestOptions {
+            max_chunks,
+            cwe_synced,
+            keep_artifacts,
+            progress: None,
+        },
+    )
+    .await
 }
 
 pub async fn ingest_zip_with_progress(
@@ -1894,14 +1941,20 @@ pub async fn ingest_zip_with_progress(
     label: &str,
     asset_path: &Path,
     mode: IngestMode,
-    max_chunks: Option<usize>,
-    cwe_synced: bool,
-    progress: Option<IngestProgressCallback>,
+    options: IngestOptions,
 ) -> Result<(), String> {
+    let IngestOptions {
+        max_chunks,
+        cwe_synced,
+        keep_artifacts,
+        progress,
+    } = options;
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
     let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|err| format!("{label}: failed to open {}: {err}", asset_path.display()))?;
+    // Preserve nested archive extraction until the database write has completed.
+    storage.retain_extracted_dir();
     eprintln!("{label}: enumerating CVE JSON entries");
     let json_entries = storage.enum_json_entries();
     eprintln!(
@@ -2197,6 +2250,9 @@ pub async fn ingest_zip_with_progress(
             "{label}: completed with failed CVE files; inserted={inserted}, failed={failed}"
         ));
     }
+    if !keep_artifacts && let Err(err) = storage.cleanup_extracted_dir() {
+        eprintln!("{label}: failed to clean extracted archive: {err}");
+    }
     Ok(())
 }
 
@@ -2389,6 +2445,20 @@ mod tests {
     }
 
     #[test]
+    fn remove_processed_zip_deletes_existing_file() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-processed-zip-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, b"zip").unwrap();
+
+        remove_processed_zip(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn osv_selection_resolves_gcs_database_dirs_from_modified_paths() {
         let selection =
             OsvImportSelection::default_init(false, &["ghsa".to_owned(), "pysec".to_owned()]);
@@ -2540,9 +2610,12 @@ mod tests {
             "test-init",
             &zip_path,
             IngestMode::ReplaceAll,
-            Some(1),
-            false,
-            None,
+            IngestOptions {
+                max_chunks: Some(1),
+                cwe_synced: false,
+                keep_artifacts: false,
+                progress: None,
+            },
         )
         .await
         .unwrap();
@@ -2571,9 +2644,12 @@ mod tests {
             "test-missing",
             &missing_zip,
             IngestMode::Upsert,
-            Some(1),
-            true,
-            None,
+            IngestOptions {
+                max_chunks: Some(1),
+                cwe_synced: true,
+                keep_artifacts: false,
+                progress: None,
+            },
         )
         .await
         .unwrap_err();

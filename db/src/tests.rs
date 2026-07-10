@@ -214,6 +214,14 @@ fn identifier_type_detection_handles_common_aliases() {
 }
 
 #[test]
+fn identifier_like_query_rejects_plain_search_terms() {
+    assert!(is_identifier_like_query("GHSA-test-0001"));
+    assert!(is_identifier_like_query("DSA-1234-1"));
+    assert!(!is_identifier_like_query("openssl"));
+    assert!(!is_identifier_like_query("remote code execution"));
+}
+
+#[test]
 fn epss_csv_comment_header_parses() {
     let parsed = EpssCurrentCsv::parse(include_str!("../../fixtures/epss/epss-test.csv")).unwrap();
     assert_eq!(parsed.model_version.as_deref(), Some("v2099.01.01"));

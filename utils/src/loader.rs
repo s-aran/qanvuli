@@ -90,6 +90,7 @@ pub struct ZipStorage {
     stream: Option<zip::ZipArchive<Box<dyn ReadSeek>>>,
     extracted_dir: Option<PathBuf>,
     extracted_entries: Vec<JsonEntry>,
+    cleanup_extracted_dir_on_drop: bool,
 }
 
 impl ZipStorage {
@@ -112,6 +113,7 @@ impl ZipStorage {
                     stream: Some(inner),
                     extracted_dir: Some(extracted_dir),
                     extracted_entries: Vec::new(),
+                    cleanup_extracted_dir_on_drop: true,
                 });
             }
         }
@@ -120,6 +122,30 @@ impl ZipStorage {
             stream: Some(stream),
             extracted_dir: None,
             extracted_entries: Vec::new(),
+            cleanup_extracted_dir_on_drop: true,
+        })
+    }
+
+    /// Keeps any temporary nested archive extraction directory after this storage is dropped.
+    pub fn retain_extracted_dir(&mut self) {
+        self.cleanup_extracted_dir_on_drop = false;
+    }
+
+    /// Returns the temporary nested archive extraction directory, if one was created.
+    pub fn extracted_dir(&self) -> Option<&std::path::Path> {
+        self.extracted_dir.as_deref()
+    }
+
+    /// Deletes the temporary nested archive extraction directory, if one was created.
+    pub fn cleanup_extracted_dir(&mut self) -> Result<(), Error> {
+        let Some(path) = self.extracted_dir.take() else {
+            return Ok(());
+        };
+        std::fs::remove_dir_all(&path).with_context(|| {
+            format!(
+                "failed to remove temporary extraction directory {}",
+                path.display()
+            )
         })
     }
 }
@@ -219,7 +245,9 @@ impl FileStorageTrait for ZipStorage {
 
 impl Drop for ZipStorage {
     fn drop(&mut self) {
-        if let Some(path) = &self.extracted_dir {
+        if self.cleanup_extracted_dir_on_drop
+            && let Some(path) = &self.extracted_dir
+        {
             let _ = std::fs::remove_dir_all(path);
         }
     }
@@ -385,6 +413,37 @@ fn is_cve_json_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn nested_cve_zip_path(label: &str) -> PathBuf {
+        let suffix = format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let inner_path = std::env::temp_dir().join(format!("qanvuli-inner-{suffix}.zip"));
+        let outer_path = std::env::temp_dir().join(format!("qanvuli-outer-{suffix}.zip"));
+
+        let inner_file = std::fs::File::create(&inner_path).unwrap();
+        let mut inner = zip::ZipWriter::new(inner_file);
+        inner
+            .start_file("CVE-2024-1.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        inner.write_all(b"{}").unwrap();
+        inner.finish().unwrap();
+
+        let outer_file = std::fs::File::create(&outer_path).unwrap();
+        let mut outer = zip::ZipWriter::new(outer_file);
+        outer
+            .start_file("cves.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        outer
+            .write_all(&std::fs::read(&inner_path).unwrap())
+            .unwrap();
+        outer.finish().unwrap();
+        std::fs::remove_file(inner_path).unwrap();
+        outer_path
+    }
 
     #[test]
     fn zip_storage_new_returns_error_for_missing_zip() {
@@ -428,5 +487,31 @@ mod tests {
         assert!(!is_cve_json_path("nested/CVE-20X4-12345.json"));
         assert!(!is_cve_json_path("nested/CVE-2024-.json"));
         assert!(!is_cve_json_path("nested/CVE-2024-12345.JSON"));
+    }
+
+    #[test]
+    fn retained_nested_extraction_survives_drop() {
+        let outer_path = nested_cve_zip_path("retain");
+        let extracted_dir = {
+            let mut storage = ZipStorage::new(outer_path.to_string_lossy().to_string()).unwrap();
+            storage.retain_extracted_dir();
+            storage.extracted_dir().unwrap().to_path_buf()
+        };
+
+        assert!(extracted_dir.exists());
+        std::fs::remove_dir_all(extracted_dir).unwrap();
+        std::fs::remove_file(outer_path).unwrap();
+    }
+
+    #[test]
+    fn nested_extraction_is_removed_by_default() {
+        let outer_path = nested_cve_zip_path("cleanup");
+        let extracted_dir = {
+            let storage = ZipStorage::new(outer_path.to_string_lossy().to_string()).unwrap();
+            storage.extracted_dir().unwrap().to_path_buf()
+        };
+
+        assert!(!extracted_dir.exists());
+        std::fs::remove_file(outer_path).unwrap();
     }
 }

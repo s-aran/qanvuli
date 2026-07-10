@@ -52,6 +52,7 @@ const AFFECTED_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const CWE_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 6;
 const CWE_MASTER_CHUNK_SIZE: usize = CVE_CHUNK_SIZE * 2;
 const READ_JSON_FILE_CHUNK_SIZE: usize = 8_000;
+const FTS_ORDER_SCAN_THRESHOLD: u64 = 100;
 const CVE_ASSET_METADATA_PREFIX: &str = "cve_asset:";
 const PUBLISHED_STATE: i32 = 0;
 const REJECTED_STATE: i32 = 1;
@@ -765,11 +766,6 @@ impl CveDatabase {
     pub async fn connect(database_url: &str) -> Result<Self, DbErr> {
         let db = connect_database(database_url).await?;
         Ok(Self { db })
-    }
-
-    /// Compatibility alias for `connect`.
-    pub async fn new_async(database_url: &str) -> Result<Self, DbErr> {
-        Self::connect(database_url).await
     }
 
     /// Borrows the underlying SeaORM connection.
@@ -1666,9 +1662,20 @@ impl CveDatabase {
             && updated_since.is_none()
             && let Some(query) = affected_fts_query(vendor, product)
         {
+            let match_count = self
+                .count_by_statement(
+                    "SELECT COUNT(*) AS count FROM cve_affected_summary_fts WHERE cve_affected_summary_fts MATCH ?",
+                    vec![SeaValue::from(query.clone())],
+                )
+                .await?;
+            let sql = if match_count >= FTS_ORDER_SCAN_THRESHOLD {
+                affected_fts_ordered_rowid_summary_sql(state_scope)
+            } else {
+                affected_fts_summary_sql(state_scope)
+            };
             return CveSummary::find_by_statement(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                affected_fts_summary_sql(state_scope),
+                sql,
                 vec![
                     SeaValue::from(query),
                     SeaValue::from(limit as i64),
@@ -2349,11 +2356,18 @@ impl CveDatabase {
         {
             if cwe_id.is_none() {
                 searched_osv = true;
-                append_unique_summaries(
-                    &mut cves,
-                    self.search_cve_summaries_by_osv_alias(query, state_scope, candidate_limit, 0)
+                if is_identifier_like_query(query) {
+                    append_unique_summaries(
+                        &mut cves,
+                        self.search_cve_summaries_by_osv_alias(
+                            query,
+                            state_scope,
+                            candidate_limit,
+                            0,
+                        )
                         .await?,
-                );
+                    );
+                }
                 let osv_cves = if let Some(token) = single_fts_token(query) {
                     self.search_cve_summaries_by_osv_token(&token, state_scope, candidate_limit, 0)
                         .await?
@@ -2438,6 +2452,14 @@ impl CveDatabase {
     ) -> Result<u64, DbErr> {
         let query = query.trim();
         if query.is_empty() {
+            if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
+                let sql = if state_scope.includes_rejected() {
+                    "SELECT COUNT(*) AS count FROM cve_summary_index INDEXED BY idx_cve_summary_cve_id"
+                } else {
+                    "SELECT COUNT(*) AS count FROM cve_summary_index INDEXED BY idx_cve_summary_state_published WHERE state = 0"
+                };
+                return self.count_by_sql(sql.to_owned()).await;
+            }
             let mut count = cve::Entity::find();
             if !state_scope.includes_rejected() {
                 count = count.filter(cve::Column::State.eq(PUBLISHED_STATE));
@@ -2512,9 +2534,20 @@ impl CveDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, DbErr> {
+        let match_count = self
+            .count_by_statement(
+                "SELECT COUNT(*) AS count FROM cve_summary_fts WHERE cve_summary_fts MATCH ?",
+                vec![SeaValue::from(query.to_owned())],
+            )
+            .await?;
+        let sql = if match_count >= FTS_ORDER_SCAN_THRESHOLD {
+            fts_ordered_summary_sql(state_scope)
+        } else {
+            fts_summary_sql(state_scope)
+        };
         CveSummary::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            fts_summary_sql(state_scope),
+            sql,
             vec![
                 SeaValue::from(query.to_owned()),
                 SeaValue::from(limit as i64),
@@ -5655,22 +5688,34 @@ where
     .await?;
     db.execute_unprepared(
         r#"
-        INSERT INTO cve_summary_fts (cve_id, title, description_en, affected_text, reference_text)
-        SELECT cve_id, title, COALESCE(description_en, ''), '', reference_text
+        INSERT INTO cve_summary_fts (
+            rowid, cve_id, title, description_en, affected_text, reference_text
+        )
+        SELECT cve_db_id, cve_id, title, COALESCE(description_en, ''), '', reference_text
         FROM cve_summary_index
         "#,
     )
     .await?;
     db.execute_unprepared(
         r#"
-        INSERT INTO cve_affected_summary_fts (cve_id, vendor_text, product_text, affected_text)
+        INSERT INTO cve_affected_summary_fts (
+            rowid, cve_id, vendor_text, product_text, affected_text
+        )
         SELECT
+            cve.id,
             cve.cve_id,
-            COALESCE(cve_affected.vendor, ''),
-            COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, ''),
-            COALESCE(cve_affected.vendor, '') || ' ' || COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, '')
-        FROM cve_affected
-        INNER JOIN cve ON cve.id = cve_affected.cve_db_id
+            COALESCE(GROUP_CONCAT(COALESCE(cve_affected.vendor, ''), ' '), ''),
+            COALESCE(GROUP_CONCAT(
+                COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, ''),
+                ' '
+            ), ''),
+            COALESCE(GROUP_CONCAT(
+                COALESCE(cve_affected.vendor, '') || ' ' || COALESCE(cve_affected.product, '') || ' ' || COALESCE(cve_affected.package_name, ''),
+                ' '
+            ), '')
+        FROM cve
+        LEFT JOIN cve_affected ON cve_affected.cve_db_id = cve.id
+        GROUP BY cve.id
         "#,
     )
     .await?;
@@ -5937,21 +5982,11 @@ where
         .map(|ids| format!("WHERE cve_id IN ({ids})"))
         .unwrap_or_default();
     db.execute_unprepared(&format!(
-        r#"
-        INSERT INTO cve_summary_fts (cve_id, title, description_en, affected_text, reference_text)
-        SELECT cve_id, title, COALESCE(description_en, ''), affected_text, reference_text
-        FROM cve_summary_index
-        {where_clause}
-        "#
+        "INSERT INTO cve_summary_fts (rowid, cve_id, title, description_en, affected_text, reference_text) SELECT cve_db_id, cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index {where_clause}"
     ))
     .await?;
     db.execute_unprepared(&format!(
-        r#"
-        INSERT INTO cve_affected_summary_fts (cve_id, vendor_text, product_text, affected_text)
-        SELECT cve_id, vendor_text, product_text, affected_text
-        FROM cve_summary_index
-        {where_clause}
-        "#
+        "INSERT INTO cve_affected_summary_fts (rowid, cve_id, vendor_text, product_text, affected_text) SELECT cve_db_id, cve_id, vendor_text, product_text, affected_text FROM cve_summary_index {where_clause}"
     ))
     .await?;
     Ok(())
@@ -6742,6 +6777,53 @@ fn fts_summary_sql(state_scope: CveStateScope) -> &'static str {
     }
 }
 
+fn fts_ordered_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH fts_matches AS MATERIALIZED (
+            SELECT rowid AS cve_db_id
+            FROM cve_summary_fts
+            WHERE cve_summary_fts MATCH ?
+        ),
+        matches AS MATERIALIZED (
+            SELECT summary.cve_db_id, summary.cve_id, summary.state, summary.published_at
+            FROM cve_summary_index summary INDEXED BY idx_cve_summary_published
+            WHERE summary.cve_db_id IN (SELECT cve_db_id FROM fts_matches)
+            ORDER BY summary.published_at DESC, summary.cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT matches.cve_id, matches.state, matches.published_at,
+               summary.updated_at, summary.title, summary.description_en
+        FROM matches
+        CROSS JOIN cve_summary_index summary
+        WHERE summary.cve_db_id = matches.cve_db_id
+        ORDER BY matches.published_at DESC, matches.cve_id ASC
+        "#
+    } else {
+        r#"
+        WITH fts_matches AS MATERIALIZED (
+            SELECT rowid AS cve_db_id
+            FROM cve_summary_fts
+            WHERE cve_summary_fts MATCH ?
+        ),
+        matches AS MATERIALIZED (
+            SELECT summary.cve_db_id, summary.cve_id, summary.state, summary.published_at
+            FROM cve_summary_index summary INDEXED BY idx_cve_summary_state_published
+            WHERE summary.state = 0
+              AND summary.cve_db_id IN (SELECT cve_db_id FROM fts_matches)
+            ORDER BY summary.published_at DESC, summary.cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT matches.cve_id, matches.state, matches.published_at,
+               summary.updated_at, summary.title, summary.description_en
+        FROM matches
+        CROSS JOIN cve_summary_index summary
+        WHERE summary.cve_db_id = matches.cve_db_id
+        ORDER BY matches.published_at DESC, matches.cve_id ASC
+        "#
+    }
+}
+
 fn fts_count_sql(state_scope: CveStateScope) -> &'static str {
     if state_scope.includes_rejected() {
         "SELECT COUNT(*) AS count FROM cve_summary_fts WHERE cve_summary_fts MATCH ?"
@@ -6820,19 +6902,22 @@ fn osv_alias_summary_sql(state_scope: CveStateScope) -> &'static str {
             VALUES (?, ?)
         ),
         matches AS (
-            SELECT DISTINCT s.cve_id
-            FROM osv_cve_search s, bounds
+            SELECT s.cve_id
+            FROM bounds
+            CROSS JOIN osv_cve_search s
             WHERE s.osv_id >= bounds.alias AND s.osv_id < bounds.upper
             UNION
-            SELECT DISTINCT s.cve_id
-            FROM osv_aliases a
-            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
-            CROSS JOIN bounds
+            SELECT s.cve_id
+            FROM bounds
+            CROSS JOIN osv_aliases a
+            CROSS JOIN osv_cve_search s
             WHERE a.alias_id >= bounds.alias AND a.alias_id < bounds.upper
+              AND s.osv_id = a.osv_id
         )
         SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
         FROM matches
-        INNER JOIN cve ON cve.cve_id = matches.cve_id
+        CROSS JOIN cve
+        WHERE cve.cve_id = matches.cve_id
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT ? OFFSET ?
         "#
@@ -6842,20 +6927,22 @@ fn osv_alias_summary_sql(state_scope: CveStateScope) -> &'static str {
             VALUES (?, ?)
         ),
         matches AS (
-            SELECT DISTINCT s.cve_id
-            FROM osv_cve_search s, bounds
+            SELECT s.cve_id
+            FROM bounds
+            CROSS JOIN osv_cve_search s
             WHERE s.osv_id >= bounds.alias AND s.osv_id < bounds.upper
             UNION
-            SELECT DISTINCT s.cve_id
-            FROM osv_aliases a
-            INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
-            CROSS JOIN bounds
+            SELECT s.cve_id
+            FROM bounds
+            CROSS JOIN osv_aliases a
+            CROSS JOIN osv_cve_search s
             WHERE a.alias_id >= bounds.alias AND a.alias_id < bounds.upper
+              AND s.osv_id = a.osv_id
         )
         SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
         FROM matches
-        INNER JOIN cve ON cve.cve_id = matches.cve_id
-        WHERE cve.state = 0
+        CROSS JOIN cve
+        WHERE cve.cve_id = matches.cve_id AND cve.state = 0
         ORDER BY cve.published_at DESC, cve.cve_id ASC
         LIMIT ? OFFSET ?
         "#
@@ -7042,6 +7129,53 @@ fn affected_fts_summary_sql(state_scope: CveStateScope) -> &'static str {
         WHERE cve_affected_summary_fts MATCH ? AND cve_summary_index.state = 0
         ORDER BY cve_summary_index.published_at DESC, cve_summary_index.cve_id ASC
         LIMIT ? OFFSET ?
+        "#
+    }
+}
+
+fn affected_fts_ordered_rowid_summary_sql(state_scope: CveStateScope) -> &'static str {
+    if state_scope.includes_rejected() {
+        r#"
+        WITH fts_matches AS MATERIALIZED (
+            SELECT rowid AS cve_db_id
+            FROM cve_affected_summary_fts
+            WHERE cve_affected_summary_fts MATCH ?
+        ),
+        matches AS MATERIALIZED (
+            SELECT summary.cve_db_id, summary.cve_id, summary.state, summary.published_at
+            FROM cve_summary_index summary INDEXED BY idx_cve_summary_published
+            WHERE summary.cve_db_id IN (SELECT cve_db_id FROM fts_matches)
+            ORDER BY summary.published_at DESC, summary.cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT matches.cve_id, matches.state, matches.published_at,
+               summary.updated_at, summary.title, summary.description_en
+        FROM matches
+        CROSS JOIN cve_summary_index summary
+        WHERE summary.cve_db_id = matches.cve_db_id
+        ORDER BY matches.published_at DESC, matches.cve_id ASC
+        "#
+    } else {
+        r#"
+        WITH fts_matches AS MATERIALIZED (
+            SELECT rowid AS cve_db_id
+            FROM cve_affected_summary_fts
+            WHERE cve_affected_summary_fts MATCH ?
+        ),
+        matches AS MATERIALIZED (
+            SELECT summary.cve_db_id, summary.cve_id, summary.state, summary.published_at
+            FROM cve_summary_index summary INDEXED BY idx_cve_summary_state_published
+            WHERE summary.state = 0
+              AND summary.cve_db_id IN (SELECT cve_db_id FROM fts_matches)
+            ORDER BY summary.published_at DESC, summary.cve_id ASC
+            LIMIT ? OFFSET ?
+        )
+        SELECT matches.cve_id, matches.state, matches.published_at,
+               summary.updated_at, summary.title, summary.description_en
+        FROM matches
+        CROSS JOIN cve_summary_index summary
+        WHERE summary.cve_db_id = matches.cve_db_id
+        ORDER BY matches.published_at DESC, matches.cve_id ASC
         "#
     }
 }
@@ -7600,6 +7734,15 @@ fn token_prefix_upper_bound(token: &str) -> String {
     let mut upper = token.to_owned();
     upper.push(char::MAX);
     upper
+}
+
+fn is_identifier_like_query(query: &str) -> bool {
+    let query = query.trim();
+    query.len() >= 4
+        && query.contains('-')
+        && query
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
 }
 
 fn affected_fts_query(vendor: Option<&str>, product: Option<&str>) -> Option<String> {

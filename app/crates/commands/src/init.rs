@@ -1,8 +1,8 @@
 use super::common::{
-    IngestMode, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
-    ReleaseAssetKind, connect_db, download_latest_asset_with_source, ingest_zip_with_progress,
-    remove_downloaded_zip, report_enrichment_source_status, reset_sqlite_database_files,
-    sync_all_enrichment_sources_after_init,
+    IngestMode, IngestOptions, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
+    OsvImportSelection, ReleaseAssetKind, connect_db, download_latest_asset_with_source,
+    ingest_zip_with_progress, remove_processed_zip, report_enrichment_source_status,
+    reset_sqlite_database_files, sync_all_enrichment_sources_after_init,
 };
 use std::path::PathBuf;
 
@@ -62,13 +62,14 @@ async fn run_with_progress(
         return Ok(());
     }
 
-    let (asset_path, downloaded_asset) = if let Some(zip) = args.zip {
+    let asset_path = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
-        (zip, false)
+        zip
     } else {
         emit_init_progress(&progress, "-", "downloading");
-        let asset = download_latest_asset_with_source(ReleaseAssetKind::All).await?;
-        (asset.path, asset.downloaded)
+        download_latest_asset_with_source(ReleaseAssetKind::All)
+            .await?
+            .path
     };
 
     emit_init_progress(
@@ -88,20 +89,23 @@ async fn run_with_progress(
         "all",
         &asset_path,
         IngestMode::ReplaceAll,
-        args.max_chunks,
-        false,
-        progress,
+        IngestOptions {
+            max_chunks: args.max_chunks,
+            cwe_synced: false,
+            keep_artifacts: args.keep,
+            progress,
+        },
     )
     .await?;
+    if !args.keep {
+        remove_processed_zip(&asset_path)?;
+    }
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
     sync_all_enrichment_sources_after_init(&db, "init", &osv_selection).await?;
     report_enrichment_source_status(&db, "init").await?;
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))?;
-    if downloaded_asset && !args.keep {
-        remove_downloaded_zip(&asset_path)?;
-    }
     Ok(())
 }
 
