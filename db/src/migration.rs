@@ -9,11 +9,7 @@ pub struct Migrator;
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(M20260616CreateCveCoreSchema),
-            #[cfg(feature = "enrichment")]
-            Box::new(M20260617CreateEnrichmentSchema),
-        ]
+        vec![Box::new(M20260616CreateCveCoreSchema)]
     }
 }
 
@@ -52,10 +48,15 @@ impl MigrationTrait for M20260616CreateCveCoreSchema {
 
         create_current_indexes(manager.get_connection()).await?;
         create_current_search_tables(manager.get_connection()).await?;
+        #[cfg(feature = "enrichment")]
+        create_enrichment_tables(manager.get_connection()).await?;
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        #[cfg(feature = "enrichment")]
+        drop_enrichment_tables(manager.get_connection()).await?;
+
         for table in [
             "cve_affected_search",
             "cve_cvss_search",
@@ -87,50 +88,34 @@ impl MigrationTrait for M20260616CreateCveCoreSchema {
 }
 
 #[cfg(feature = "enrichment")]
-pub struct M20260617CreateEnrichmentSchema;
-
-#[cfg(feature = "enrichment")]
-impl MigrationName for M20260617CreateEnrichmentSchema {
-    fn name(&self) -> &str {
-        "m20260617_create_enrichment_schema"
+async fn drop_enrichment_tables<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    for table in [
+        "vulnerability_identifier_edges",
+        "vulnerability_identifiers",
+        "epss_current",
+        "kev_entries",
+        "osv_text_vocab",
+        "osv_text_fts",
+        "osv_token_cve_search",
+        "osv_references",
+        "osv_versions",
+        "osv_range_events",
+        "osv_ranges",
+        "osv_affected_packages",
+        "osv_cve_search",
+        "osv_aliases",
+        "osv_advisories",
+        "source_raw_records",
+        "source_sync_state",
+        "db_sources",
+    ] {
+        db.execute_unprepared(&format!("DROP TABLE IF EXISTS {table}"))
+            .await?;
     }
-}
-
-#[cfg(feature = "enrichment")]
-#[async_trait::async_trait]
-impl MigrationTrait for M20260617CreateEnrichmentSchema {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        create_enrichment_tables(manager.get_connection()).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for table in [
-            "vulnerability_identifier_edges",
-            "vulnerability_identifiers",
-            "epss_current",
-            "kev_entries",
-            "osv_text_vocab",
-            "osv_text_fts",
-            "osv_token_cve_search",
-            "osv_references",
-            "osv_versions",
-            "osv_range_events",
-            "osv_ranges",
-            "osv_affected_packages",
-            "osv_cve_search",
-            "osv_aliases",
-            "osv_advisories",
-            "source_raw_records",
-            "source_sync_state",
-            "db_sources",
-        ] {
-            manager
-                .get_connection()
-                .execute_unprepared(&format!("DROP TABLE {table}"))
-                .await?;
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 #[cfg(feature = "enrichment")]

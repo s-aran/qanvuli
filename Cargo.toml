@@ -10,12 +10,14 @@ version.workspace = true
 license.workspace = true
 
 [features]
-default = ["enrichment"]
+default = ["enrichment", "mcp", "tui"]
 enrichment = [
     "qanvuli-app-commands/enrichment",
-    "qanvuli-app-mcp/enrichment",
-    "qanvuli-app-tui/enrichment",
+    "qanvuli-app-mcp?/enrichment",
+    "qanvuli-app-tui?/enrichment",
 ]
+mcp = ["dep:qanvuli-app-mcp"]
+tui = ["dep:qanvuli-app-tui"]
 
 [[bin]]
 name = "qanvuli"
@@ -23,8 +25,8 @@ path = "app/src/main.rs"
 
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "app/crates/commands", default-features = false }
-qanvuli-app-mcp = { version = "*", path = "app/crates/mcp", default-features = false }
-qanvuli-app-tui = { version = "*", path = "app/crates/tui", default-features = false }
+qanvuli-app-mcp = { version = "*", path = "app/crates/mcp", default-features = false, optional = true }
+qanvuli-app-tui = { version = "*", path = "app/crates/tui", default-features = false, optional = true }
 qanvuli-utils = { version = "*", path = "utils" }
 clap = { version = "4.6", features = ["derive"] }
 tokio = { version = "1.52", features = ["io-std", "macros", "rt", "sync"] }

@@ -27,6 +27,7 @@ fn run() -> Result<(), String> {
         print_help()?;
         return Ok(());
     }
+    #[cfg(feature = "mcp")]
     if matches!(command, Command::Mcp) {
         return qanvuli_app_mcp::run(db_url);
     }
@@ -38,7 +39,7 @@ fn run() -> Result<(), String> {
 
     runtime.block_on(async {
         match command {
-            Command::Help | Command::Mcp => Ok(()),
+            Command::Help => Ok(()),
             Command::Init(args) => qanvuli_app_commands::init::run(&db_url, args).await,
             Command::Update(args) => qanvuli_app_commands::update::run(&db_url, args).await,
             Command::DownloadCve(args) => qanvuli_app_commands::download_cve::run(args).await,
@@ -47,8 +48,11 @@ fn run() -> Result<(), String> {
             Command::Db(args) => qanvuli_app_commands::db::run(&db_url, args).await,
             Command::Cwe(args) => qanvuli_app_commands::cwe::run(&db_url, args).await,
             Command::Search(args) => qanvuli_app_commands::search::run(&db_url, args).await,
+            #[cfg(feature = "tui")]
             Command::Tui(args) => qanvuli_app_tui::run(&db_url, args).await,
             Command::Sbom(args) => qanvuli_app_commands::sbom::run(&db_url, args).await,
+            #[cfg(feature = "mcp")]
+            Command::Mcp => Ok(()),
         }
     })
 }
@@ -105,10 +109,12 @@ enum Command {
     /// Search existing CVE DB records.
     Search(qanvuli_app_commands::search::Args),
     /// Open an interactive terminal UI for free-word CVE search.
+    #[cfg(feature = "tui")]
     Tui(qanvuli_app_tui::Args),
     /// Read a GitHub SBOM JSON and report matching CVEs.
     Sbom(qanvuli_app_commands::sbom::Args),
     /// Run the MCP server over stdio.
+    #[cfg(feature = "mcp")]
     Mcp,
 }
 
