@@ -1,6 +1,7 @@
 use super::common::{DEFAULT_LIMIT, connect_db, print_json};
 use qanvuli_db::CveStateScope;
 
+/// CLI arguments for `qanvuli cwe`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[arg(value_name = "CWE")]
@@ -9,6 +10,7 @@ pub struct Args {
     include_rejected: bool,
 }
 
+/// Runs a CWE search and prints matching CVE summaries as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
     let state_scope = if args.include_rejected {

@@ -1,6 +1,7 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
 use qanvuli_db::{CveStateScope, detect_identifier_type};
 
+/// CLI arguments for `qanvuli search`.
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
     #[arg(long = "cve", value_name = "ID")]
@@ -129,6 +130,7 @@ impl Args {
     }
 }
 
+/// Runs a CVE search and prints raw, summary, or enriched JSON results.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
     let date_filter = args.date_filter()?;

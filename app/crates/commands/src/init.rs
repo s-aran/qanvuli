@@ -6,6 +6,7 @@ use super::common::{
 };
 use std::path::PathBuf;
 
+/// CLI arguments for `qanvuli init`.
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
@@ -25,6 +26,7 @@ pub struct Args {
     osv_prefixes: Vec<String>,
 }
 
+/// Initializes the database schema and, unless schema-only, imports CVE data.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
@@ -116,10 +118,12 @@ fn emit_init_progress(progress: &Option<IngestProgressCallback>, asset: &str, ph
     }
 }
 
+/// Runs initialization with default CLI arguments.
 pub async fn run_default(db_url: &str) -> Result<(), String> {
     run(db_url, Args::default()).await
 }
 
+/// Runs default initialization and reports progress through the callback.
 pub async fn run_default_with_progress(
     db_url: &str,
     progress: IngestProgressCallback,
@@ -127,6 +131,7 @@ pub async fn run_default_with_progress(
     run_with_progress(db_url, Args::default(), Some(progress)).await
 }
 
+/// Runs default initialization with progress and optional archive retention.
 pub async fn run_default_with_progress_and_keep(
     db_url: &str,
     progress: IngestProgressCallback,

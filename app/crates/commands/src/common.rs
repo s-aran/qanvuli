@@ -22,7 +22,10 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 use url::Url;
 
+/// Default row limit used by CLI search commands.
 pub const DEFAULT_LIMIT: u64 = 25;
+
+/// Help text for dynamic OSV source prefix flags such as `--osv-ghsa`.
 pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
   Any official OSV source DB prefix can be selected with repeatable --osv-{prefix} flags.
   Prefix matching is case-insensitive. Use hyphens as shown below.
@@ -52,9 +55,11 @@ const CVE_ZIP_TYPE_DELTA_HOURLY: i32 = 1;
 const CVE_ZIP_TYPE_DELTA_END_OF_DAY: i32 = 2;
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 
+/// Callback used by long-running import commands to report progress to the TUI.
 pub type IngestProgressCallback = Arc<dyn Fn(IngestProgress) + Send + Sync>;
 type ParsedCveFile = Result<(CveActiveModels, ReadJsonFileRecord), String>;
 
+/// Progress snapshot emitted by CVE import and update operations.
 #[derive(Clone, Debug)]
 pub struct IngestProgress {
     pub label: String,
@@ -88,6 +93,7 @@ struct OsvZipReadResult {
     seen_osv_ids: HashSet<String>,
 }
 
+/// CVE release archive kind accepted by download and ingest commands.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ReleaseAssetKind {
     All,
@@ -105,6 +111,7 @@ impl std::fmt::Display for ReleaseAssetKind {
     }
 }
 
+/// Normalized date filters shared by CLI search commands.
 #[derive(Debug, Default)]
 pub struct DateFilter {
     pub published_since: Option<String>,
@@ -112,6 +119,7 @@ pub struct DateFilter {
 }
 
 impl DateFilter {
+    /// Parses optional publication and update timestamps into normalized strings.
     pub fn new(published_since: Option<&str>, updated_since: Option<&str>) -> Result<Self, String> {
         Ok(Self {
             published_since: published_since.map(normalize_timestamp).transpose()?,
@@ -120,12 +128,14 @@ impl DateFilter {
     }
 }
 
+/// Connects to the configured CVE database and converts database errors for CLI output.
 pub async fn connect_db(db_url: &str) -> Result<CveDatabase, String> {
     CveDatabase::connect(db_url)
         .await
         .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))
 }
 
+/// Builds the default SQLite URL beside the `qanvuli` executable.
 pub fn default_db_connection_string() -> Result<String, String> {
     let executable = std::env::current_exe()
         .map_err(|err| format!("failed to locate qanvuli executable: {err}"))?;
@@ -141,6 +151,7 @@ pub fn default_db_connection_string() -> Result<String, String> {
     Ok(format!("sqlite:{path}?mode=rwc"))
 }
 
+/// Removes SQLite database, WAL, and SHM files before a full initialization.
 pub fn reset_sqlite_database_files(db_url: &str) -> Result<(), String> {
     let Some(path) = sqlite_file_path(db_url) else {
         return Ok(());
@@ -175,6 +186,7 @@ fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
     (!path.is_empty() && path != ":memory:").then(|| PathBuf::from(path))
 }
 
+/// Prints a value as JSON, honoring the global `--pretty` flag.
 pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
     let text = if std::env::args_os().any(|arg| arg == "--pretty") {
         simd_json::to_string_pretty(value)
@@ -186,10 +198,12 @@ pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
     Ok(())
 }
 
+/// Formats a duration for progress and maintenance logs.
 pub fn format_elapsed(duration: Duration) -> String {
     format!("{duration:.2?}")
 }
 
+/// Selects which OSV source prefixes should be imported.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OsvImportSelection {
     all: bool,
@@ -197,6 +211,7 @@ pub struct OsvImportSelection {
 }
 
 impl OsvImportSelection {
+    /// Selects all OSV records.
     pub fn all() -> Self {
         Self {
             all: true,
@@ -204,6 +219,7 @@ impl OsvImportSelection {
         }
     }
 
+    /// Builds the default OSV import selection for `init`.
     pub fn default_init(include_all: bool, prefixes: &[String]) -> Self {
         if include_all {
             return Self::all();
@@ -222,6 +238,7 @@ impl OsvImportSelection {
         }
     }
 
+    /// Builds optional OSV import additions for `update`.
     pub fn update_additions(include_all: bool, prefixes: &[String]) -> Option<Self> {
         if include_all {
             return Some(Self::all());
@@ -236,6 +253,7 @@ impl OsvImportSelection {
         })
     }
 
+    /// Returns a selection containing records selected by either side.
     pub fn merged_with(&self, other: &Self) -> Self {
         if self.all || other.all {
             return Self::all();
@@ -248,6 +266,7 @@ impl OsvImportSelection {
         }
     }
 
+    /// Restores an OSV import selection from metadata stored in the database.
     pub fn from_metadata(value: Option<&str>) -> Option<Self> {
         let value = value?.trim();
         if value.eq_ignore_ascii_case("ALL") {
@@ -265,6 +284,7 @@ impl OsvImportSelection {
         })
     }
 
+    /// Encodes this selection for storage in database metadata.
     pub fn as_metadata_value(&self) -> String {
         if self.all {
             "ALL".to_owned()
@@ -277,6 +297,7 @@ impl OsvImportSelection {
         }
     }
 
+    /// Returns whether this selection includes the given OSV advisory ID.
     pub fn matches_id(&self, id: &str) -> bool {
         let id = id.to_ascii_uppercase();
         self.all
@@ -286,6 +307,7 @@ impl OsvImportSelection {
                 .any(|prefix| id.starts_with(&format!("{prefix}-")))
     }
 
+    /// Human-readable description used in import logs.
     pub fn description(&self) -> String {
         if self.all {
             "all OSV records".to_owned()
@@ -332,6 +354,7 @@ fn normalize_osv_prefix(prefix: &str) -> String {
     prefix.trim().trim_end_matches('-').to_ascii_uppercase()
 }
 
+/// Rebuilds the identifier graph and writes a compact timing message to stderr.
 pub async fn rebuild_graph_and_report(db: &CveDatabase, label: &str) -> Result<(), String> {
     let started = Instant::now();
     let summary = db
@@ -346,6 +369,7 @@ pub async fn rebuild_graph_and_report(db: &CveDatabase, label: &str) -> Result<(
     Ok(())
 }
 
+/// Writes source synchronization status for enrichment providers to stderr.
 pub async fn report_enrichment_source_status(db: &CveDatabase, label: &str) -> Result<(), String> {
     let states = db
         .source_sync_states()

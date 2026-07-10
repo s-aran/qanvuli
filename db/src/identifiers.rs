@@ -4,6 +4,7 @@ use sea_orm::FromQueryResult;
 use serde::Serialize;
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Last-known synchronization state for an external enrichment source.
 pub struct SourceSyncState {
     pub source: String,
     pub last_attempt_at: Option<String>,
@@ -17,6 +18,7 @@ pub struct SourceSyncState {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Result of resolving one vulnerability identifier through the local alias graph.
 pub struct IdentifierResolution {
     pub queried_id: String,
     pub normalized_id: String,
@@ -29,6 +31,7 @@ pub struct IdentifierResolution {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Evidence for one alias edge between two vulnerability identifiers.
 pub struct IdentifierEdgeEvidence {
     pub from_identifier: String,
     pub to_identifier: String,

@@ -1,5 +1,6 @@
 use super::common::{connect_db, print_json};
 
+/// CLI arguments for `qanvuli query`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[command(subcommand)]
@@ -36,6 +37,7 @@ struct PackageArgs {
     enriched: bool,
 }
 
+/// Runs cross-source identifier and package enrichment queries.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
     db.initialize_schema()

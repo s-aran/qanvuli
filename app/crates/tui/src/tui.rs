@@ -15,6 +15,7 @@ use qanvuli_db::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 
+/// CLI arguments for `qanvuli tui`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[arg(value_name = "QUERY")]
@@ -23,6 +24,7 @@ pub struct Args {
     limit: u64,
 }
 
+/// Opens the interactive terminal UI for local CVE search and maintenance.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let mut db = Some(connection::connect(db_url).await?);
     let mut terminal = TerminalGuard::enter()?;

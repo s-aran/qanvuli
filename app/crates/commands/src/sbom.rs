@@ -5,6 +5,7 @@ use simd_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+/// CLI arguments for `qanvuli sbom`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[arg(long = "file", value_name = "PATH")]
@@ -37,6 +38,7 @@ impl Args {
     }
 }
 
+/// Reads an SBOM JSON file and prints local vulnerability findings as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
     db.initialize_schema()

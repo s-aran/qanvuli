@@ -5,6 +5,7 @@ use super::common::{
 };
 use std::path::PathBuf;
 
+/// CLI arguments for `qanvuli update`.
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
@@ -20,6 +21,7 @@ pub struct Args {
     osv_prefixes: Vec<String>,
 }
 
+/// Applies CVE deltas, refreshes enrichment sources, and rebuilds the graph.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
@@ -50,10 +52,12 @@ async fn run_with_progress(
     Ok(())
 }
 
+/// Runs update with default CLI arguments.
 pub async fn run_default(db_url: &str) -> Result<(), String> {
     run(db_url, Args::default()).await
 }
 
+/// Runs default update and reports progress through the callback.
 pub async fn run_default_with_progress(
     db_url: &str,
     progress: IngestProgressCallback,
@@ -61,6 +65,7 @@ pub async fn run_default_with_progress(
     run_with_progress(db_url, Args::default(), Some(progress)).await
 }
 
+/// Runs default update with progress and optional archive retention.
 pub async fn run_default_with_progress_and_keep(
     db_url: &str,
     progress: IngestProgressCallback,

@@ -57,6 +57,7 @@ const PUBLISHED_STATE: i32 = 0;
 const REJECTED_STATE: i32 = 1;
 
 impl ReadJsonFileRecord {
+    /// Creates a file-read marker by hashing the original JSON content.
     pub fn from_content(filename: impl Into<String>, content: &[u8]) -> Self {
         Self {
             filename: filename.into(),
@@ -82,6 +83,7 @@ impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
 }
 
 impl CveActiveModels {
+    /// Builds database active models from a parsed CVE JSON value.
     pub fn from_raw_json(raw_json: Value) -> Self {
         let cve_id = cve_id_from_raw_json(&raw_json).to_owned();
         let cvss_rows = cvss_active_models(&cve_id, &raw_json);
@@ -98,6 +100,7 @@ impl CveActiveModels {
         }
     }
 
+    /// Builds database active models from a raw CVE JSON string.
     pub fn from_raw_json_string(raw_json: String) -> Result<Self, DbErr> {
         let mut bytes = raw_json.as_bytes().to_vec();
         let value: BorrowedValue<'_> =
@@ -746,50 +749,61 @@ fn description_en_from_raw(descriptions: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Async database handle for CVE, CWE, OSV, KEV, EPSS, and identifier graph data.
 #[derive(Clone)]
 pub struct CveDatabase {
     db: DatabaseConnection,
 }
 
+/// Transaction-backed session for streaming a full CVE replacement import.
 pub struct CveBulkReplaceSession {
     txn: DatabaseTransaction,
 }
 
 impl CveDatabase {
+    /// Connects to the database URL and returns a `CveDatabase` handle.
     pub async fn connect(database_url: &str) -> Result<Self, DbErr> {
         let db = connect_database(database_url).await?;
         Ok(Self { db })
     }
 
+    /// Compatibility alias for `connect`.
     pub async fn new_async(database_url: &str) -> Result<Self, DbErr> {
         Self::connect(database_url).await
     }
 
+    /// Borrows the underlying SeaORM connection.
     pub fn connection(&self) -> &DatabaseConnection {
         &self.db
     }
 
+    /// Consumes this handle and returns the underlying SeaORM connection.
     pub fn into_connection(self) -> DatabaseConnection {
         self.db
     }
 
+    /// Closes the underlying database connection.
     pub async fn close(self) -> Result<(), DbErr> {
         self.db.close().await
     }
 
+    /// Applies all pending schema migrations.
     pub async fn initialize_schema(&self) -> Result<(), DbErr> {
         Migrator::up(&self.db, None).await
     }
 
+    /// Drops and recreates the schema by running migrations down and up.
     pub async fn rebuild_schema(&self) -> Result<(), DbErr> {
         Migrator::down(&self.db, None).await?;
         self.initialize_schema().await
     }
 
+    /// Inserts or updates one CVE base row.
     pub async fn upsert_cve(&self, model: cve::ActiveModel) -> Result<(), DbErr> {
         upsert_cve_on(&self.db, model).await
     }
 
+    /// Inserts or updates prepared CVE models and their detail rows in batches.
     pub async fn upsert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
         if models.is_empty() {
             return Ok(0);
@@ -815,6 +829,7 @@ impl CveDatabase {
         Ok(inserted)
     }
 
+    /// Converts parsed CVE records into database models and upserts them.
     pub async fn upsert_cve_records(
         &self,
         records: Vec<RawCveRecord<CveStatusData>>,
@@ -823,6 +838,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Parses raw CVE JSON strings and upserts the resulting records.
     pub async fn upsert_cve_raw_json_strings(&self, values: Vec<String>) -> Result<usize, DbErr> {
         self.upsert_cve_models(
             values
@@ -833,6 +849,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Replaces all CVE data with the provided prepared models.
     pub async fn replace_all_cve_models(
         &self,
         models: Vec<CveActiveModels>,
@@ -846,16 +863,19 @@ impl CveDatabase {
         Ok(inserted)
     }
 
+    /// Prepares storage and indexes for a full bulk CVE replacement.
     pub async fn prepare_bulk_replace_all(&self) -> Result<(), DbErr> {
         prepare_bulk_replace_all_on(&self.db).await
     }
 
+    /// Starts a transaction-backed full CVE replacement session.
     pub async fn begin_bulk_replace_all(&self) -> Result<CveBulkReplaceSession, DbErr> {
         prepare_bulk_replace_all_on(&self.db).await?;
         let txn = self.db.begin().await?;
         Ok(CveBulkReplaceSession { txn })
     }
 
+    /// Inserts prepared CVE models during a bulk import without clearing existing data.
     pub async fn insert_cve_models_bulk(
         &self,
         models: Vec<CveActiveModels>,
@@ -870,32 +890,39 @@ impl CveDatabase {
         Ok(inserted)
     }
 
+    /// Finishes a full bulk CVE replacement by restoring indexes and storage settings.
     pub async fn finish_bulk_replace_all(&self) -> Result<(), DbErr> {
         finish_bulk_replace_all_on(&self.db).await
     }
 
+    /// Prepares storage and indexes for a bulk OSV import.
     pub async fn prepare_bulk_osv_import(&self) -> Result<(), DbErr> {
         prepare_bulk_osv_import_on(&self.db).await
     }
 
+    /// Finishes a bulk OSV import and restores query indexes.
     pub async fn finish_bulk_osv_import(&self) -> Result<(), DbErr> {
         finish_bulk_osv_import_on(&self.db).await
     }
 
+    /// Restores storage settings after a partial OSV import without rebuilding indexes.
     pub async fn finish_bulk_osv_import_storage_only(&self) -> Result<(), DbErr> {
         finish_bulk_osv_import_storage_on(&self.db).await
     }
 
+    /// Compacts the underlying SQLite storage where supported.
     pub async fn compact_storage(&self) -> Result<(), DbErr> {
         compact_storage_on(&self.db).await
     }
 
+    /// Deletes CVE core and detail tables inside a transaction.
     pub async fn clear_cve_tables(&self) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
         clear_cve_tables_on(&txn).await?;
         txn.commit().await
     }
 
+    /// Inserts or updates the CWE catalog tree.
     pub async fn upsert_cwe_catalog(&self, catalog: &WeaknessCatalog) -> Result<usize, DbErr> {
         let txn = self.db.begin().await?;
         let count = upsert_cwe_catalog_on(&txn, catalog).await?;
@@ -903,6 +930,7 @@ impl CveDatabase {
         Ok(count)
     }
 
+    /// Inserts or updates one minimal CWE row.
     pub async fn upsert_cwe(&self, id: i32, description: Option<String>) -> Result<(), DbErr> {
         let txn = self.db.begin().await?;
         upsert_cwe_rows(
@@ -918,6 +946,7 @@ impl CveDatabase {
         txn.commit().await
     }
 
+    /// Inserts prepared CVE models without upsert conflict handling.
     pub async fn insert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
         if models.is_empty() {
             return Ok(0);
@@ -929,6 +958,7 @@ impl CveDatabase {
         Ok(inserted)
     }
 
+    /// Converts parsed CVE records and inserts them during a bulk import.
     pub async fn insert_cve_records_bulk(
         &self,
         records: Vec<RawCveRecord<CveStatusData>>,
@@ -937,6 +967,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Parses raw CVE JSON strings and inserts them during a bulk import.
     pub async fn insert_cve_raw_json_strings_bulk(
         &self,
         values: Vec<String>,
@@ -950,6 +981,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Replaces CVSS, affected-product, and CWE detail rows for one CVE.
     pub async fn replace_cve_children(
         &self,
         cve_id: &str,
@@ -993,6 +1025,7 @@ impl CveDatabase {
         txn.commit().await
     }
 
+    /// Returns all CVE base rows ordered by newest publication date.
     pub async fn get_all(&self) -> Result<Vec<cve::Model>, DbErr> {
         cve::Entity::find()
             .order_by_desc(cve::Column::PublishedAt)
@@ -1001,6 +1034,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Finds one stored CVE base row by exact CVE ID.
     pub async fn find_cve_by_id(&self, cve_id: &str) -> Result<Option<cve::Model>, DbErr> {
         cve::Entity::find()
             .filter(cve::Column::CveId.eq(cve_id))
@@ -1008,12 +1042,14 @@ impl CveDatabase {
             .await
     }
 
+    /// Finds one CVE and returns its raw JSON payload.
     pub async fn find_cve_raw_json_by_id(&self, cve_id: &str) -> Result<Option<Value>, DbErr> {
         self.find_cve_by_id(cve_id)
             .await
             .and_then(|row| row.map(|row| raw_json_value(&row.raw_json)).transpose())
     }
 
+    /// Finds one CVE and deserializes the raw JSON into the model crate type.
     pub async fn find_cve_model_by_id(
         &self,
         cve_id: &str,
@@ -1027,6 +1063,7 @@ impl CveDatabase {
             .transpose()
     }
 
+    /// Loads normalized CWE, CVSS, and affected-product detail for one CVE.
     pub async fn find_cve_detail(&self, cve_id: &str) -> Result<CveDetail, DbErr> {
         let Some(cve) = self.find_cve_by_id(cve_id).await? else {
             return Ok(CveDetail::default());
@@ -1089,6 +1126,7 @@ impl CveDatabase {
         })
     }
 
+    /// Attaches full normalized detail to each CVE summary row.
     pub async fn attach_cve_details(
         &self,
         rows: Vec<CveSummary>,
@@ -1208,6 +1246,7 @@ impl CveDatabase {
             .collect())
     }
 
+    /// Attaches lightweight detail without affected version expansion.
     pub async fn attach_cve_overview_details(
         &self,
         rows: Vec<CveSummary>,
@@ -1332,6 +1371,7 @@ impl CveDatabase {
             .collect())
     }
 
+    /// Searches published CVE base rows by CWE IDs.
     pub async fn search_cves_by_cwe(
         &self,
         cwe_ids: &[String],
@@ -1347,6 +1387,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE base rows by CWE IDs with explicit rejected-record handling.
     pub async fn search_cves_by_cwe_with_state_scope(
         &self,
         cwe_ids: &[String],
@@ -1384,6 +1425,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summary rows by CWE IDs.
     pub async fn search_cve_summaries_by_cwe(
         &self,
         cwe_ids: &[String],
@@ -1399,6 +1441,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summary rows by CWE IDs with explicit rejected-record handling.
     pub async fn search_cve_summaries_by_cwe_with_state_scope(
         &self,
         cwe_ids: &[String],
@@ -1439,11 +1482,13 @@ impl CveDatabase {
             .await
     }
 
+    /// Counts published CVE summaries matching the given CWE IDs.
     pub async fn count_cve_summaries_by_cwe(&self, cwe_ids: &[String]) -> Result<u64, DbErr> {
         self.count_cve_summaries_by_cwe_with_state_scope(cwe_ids, CveStateScope::PublishedOnly)
             .await
     }
 
+    /// Counts CVE summaries by CWE IDs with explicit rejected-record handling.
     pub async fn count_cve_summaries_by_cwe_with_state_scope(
         &self,
         cwe_ids: &[String],
@@ -1470,6 +1515,7 @@ impl CveDatabase {
         query.count(&self.db).await
     }
 
+    /// Searches published CVE base rows by affected vendor/product substring.
     pub async fn search_cves_by_vendor_product(
         &self,
         vendor: Option<&str>,
@@ -1487,6 +1533,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE base rows by affected vendor/product substring and state scope.
     pub async fn search_cves_by_vendor_product_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1507,6 +1554,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE base rows by affected vendor/product with exact and substring filters.
     pub async fn search_cves_by_vendor_product_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1534,6 +1582,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summaries by affected vendor/product substring.
     pub async fn search_cve_summaries_by_vendor_product(
         &self,
         vendor: Option<&str>,
@@ -1551,6 +1600,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected vendor/product substring and state scope.
     pub async fn search_cve_summaries_by_vendor_product_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1571,6 +1621,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected vendor/product with exact and substring filters.
     pub async fn search_cve_summaries_by_vendor_product_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1595,6 +1646,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected filters plus publication/update date bounds.
     pub async fn search_cve_summaries_by_vendor_product_exact_date_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1676,6 +1728,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Counts published CVE summaries matching affected vendor/product substrings.
     pub async fn count_cve_summaries_by_vendor_product(
         &self,
         vendor: Option<&str>,
@@ -1689,6 +1742,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts CVE summaries by affected vendor/product substring and state scope.
     pub async fn count_cve_summaries_by_vendor_product_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1705,6 +1759,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts CVE summaries by affected vendor/product with exact and substring filters.
     pub async fn count_cve_summaries_by_vendor_product_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1749,6 +1804,7 @@ impl CveDatabase {
         query.distinct().count(&self.db).await
     }
 
+    /// Searches published CVE summaries by affected component name.
     pub async fn search_cve_summaries_by_affected_component(
         &self,
         vendor: Option<&str>,
@@ -1770,6 +1826,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected component name and state scope.
     pub async fn search_cve_summaries_by_affected_component_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1794,6 +1851,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected component with exact vendor/product options.
     pub async fn search_cve_summaries_by_affected_component_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -1839,6 +1897,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE base rows by CVE ID, title, or description text.
     pub async fn search_cves_by_text(
         &self,
         query: &str,
@@ -1854,6 +1913,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE base rows by text with explicit rejected-record handling.
     pub async fn search_cves_by_text_with_state_scope(
         &self,
         query: &str,
@@ -1881,6 +1941,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summaries by text and recognized query prefixes.
     pub async fn search_cve_summaries_by_text(
         &self,
         query: &str,
@@ -1896,6 +1957,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by text and recognized query prefixes with state scope.
     pub async fn search_cve_summaries_by_text_with_state_scope(
         &self,
         query: &str,
@@ -1974,6 +2036,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summaries whose IDs start with the prefix.
     pub async fn search_cve_summaries_by_cve_id_prefix(
         &self,
         prefix: &str,
@@ -1989,6 +2052,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by ID prefix with explicit rejected-record handling.
     pub async fn search_cve_summaries_by_cve_id_prefix_with_state_scope(
         &self,
         prefix: &str,
@@ -2036,6 +2100,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts published CVE summaries whose IDs start with the prefix.
     pub async fn count_cve_summaries_by_cve_id_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
         self.count_cve_summaries_by_cve_id_prefix_with_state_scope(
             prefix,
@@ -2044,6 +2109,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts CVE summaries by ID prefix with explicit rejected-record handling.
     pub async fn count_cve_summaries_by_cve_id_prefix_with_state_scope(
         &self,
         prefix: &str,
@@ -2073,6 +2139,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches published CVE summaries by publication or update date prefix.
     pub async fn search_cve_summaries_by_date_prefix(
         &self,
         prefix: &str,
@@ -2088,6 +2155,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by date prefix with explicit rejected-record handling.
     pub async fn search_cve_summaries_by_date_prefix_with_state_scope(
         &self,
         prefix: &str,
@@ -2141,6 +2209,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts published CVE summaries matching a publication or update date prefix.
     pub async fn count_cve_summaries_by_date_prefix(&self, prefix: &str) -> Result<u64, DbErr> {
         self.count_cve_summaries_by_date_prefix_with_state_scope(
             prefix,
@@ -2149,6 +2218,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts CVE summaries by date prefix with explicit rejected-record handling.
     pub async fn count_cve_summaries_by_date_prefix_with_state_scope(
         &self,
         prefix: &str,
@@ -2185,6 +2255,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches published CVE summaries using the same broad query behavior as the CLI.
     pub async fn search_cve_summaries_free_text(
         &self,
         query: &str,
@@ -2200,6 +2271,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries using broad CLI-style matching and state scope.
     pub async fn search_cve_summaries_free_text_with_state_scope(
         &self,
         query: &str,
@@ -2352,11 +2424,13 @@ impl CveDatabase {
         Ok(cves)
     }
 
+    /// Counts published CVE summaries matching broad CLI-style text search.
     pub async fn count_cve_summaries_free_text(&self, query: &str) -> Result<u64, DbErr> {
         self.count_cve_summaries_free_text_with_state_scope(query, CveStateScope::PublishedOnly)
             .await
     }
 
+    /// Counts CVE summaries matching broad CLI-style text search and state scope.
     pub async fn count_cve_summaries_free_text_with_state_scope(
         &self,
         query: &str,
@@ -2414,6 +2488,7 @@ impl CveDatabase {
         }
     }
 
+    /// Searches published CVE summaries using a SQLite FTS query string.
     pub async fn search_cve_summaries_by_fts_text(
         &self,
         query: &str,
@@ -2429,6 +2504,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries using SQLite FTS with explicit rejected-record handling.
     pub async fn search_cve_summaries_by_fts_text_with_state_scope(
         &self,
         query: &str,
@@ -2449,11 +2525,13 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts published CVE summaries matching a SQLite FTS query string.
     pub async fn count_cve_summaries_by_fts_text(&self, query: &str) -> Result<u64, DbErr> {
         self.count_cve_summaries_by_fts_text_with_state_scope(query, CveStateScope::PublishedOnly)
             .await
     }
 
+    /// Counts CVE summaries matching SQLite FTS with explicit rejected-record handling.
     pub async fn count_cve_summaries_by_fts_text_with_state_scope(
         &self,
         query: &str,
@@ -2654,6 +2732,7 @@ impl CveDatabase {
         Ok(dedupe_summaries_by_cve_id(cves))
     }
 
+    /// Searches published CVE summaries by CVSS score, severity, and version.
     pub async fn search_cve_summaries_by_cvss(
         &self,
         min_score: Option<f64>,
@@ -2675,6 +2754,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by CVSS filters with explicit rejected-record handling.
     pub async fn search_cve_summaries_by_cvss_with_state_scope(
         &self,
         min_score: Option<f64>,
@@ -2733,6 +2813,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summaries by affected product plus CVSS risk filters.
     pub async fn search_cve_summaries_by_product_cvss(
         &self,
         vendor: Option<&str>,
@@ -2754,6 +2835,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by affected product and CVSS filters with state scope.
     pub async fn search_cve_summaries_by_product_cvss_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -2780,6 +2862,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by exact affected filters plus CVSS filters.
     pub async fn search_cve_summaries_by_product_cvss_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -2849,6 +2932,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Searches published CVE summaries by publication and update lower bounds.
     pub async fn search_cve_summaries_by_date(
         &self,
         published_since: Option<&str>,
@@ -2866,6 +2950,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE summaries by publication and update lower bounds with state scope.
     pub async fn search_cve_summaries_by_date_with_state_scope(
         &self,
         published_since: Option<&str>,
@@ -2905,6 +2990,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Executes the structured advanced search used by the TUI.
     pub async fn search_cve_summaries_advanced(
         &self,
         options: &CveAdvancedSearch,
@@ -3018,6 +3104,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Counts rows for the structured advanced search used by the TUI.
     pub async fn count_cve_summaries_advanced(
         &self,
         options: &CveAdvancedSearch,
@@ -3115,6 +3202,7 @@ impl CveDatabase {
         Ok(count.max(0) as u64)
     }
 
+    /// Marks one CVE JSON file as read for incremental import bookkeeping.
     pub async fn mark_json_file_read(&self, filename: &str, md5hash: &str) -> Result<(), DbErr> {
         self.mark_json_files_read(vec![ReadJsonFileRecord {
             filename: filename.to_owned(),
@@ -3125,6 +3213,7 @@ impl CveDatabase {
         Ok(())
     }
 
+    /// Marks multiple CVE JSON files as read for incremental import bookkeeping.
     pub async fn mark_json_files_read(
         &self,
         files: Vec<ReadJsonFileRecord>,
@@ -3132,6 +3221,7 @@ impl CveDatabase {
         mark_json_files_read_on(&self.db, files, true).await
     }
 
+    /// Finds an import bookkeeping row for a CVE JSON file and content hash.
     pub async fn find_read_json_file(
         &self,
         filename: &str,
@@ -3144,6 +3234,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Records that a CVE zip archive has been applied.
     pub async fn mark_cve_zip_file_applied(&self, record: CveZipFileRecord) -> Result<(), DbErr> {
         let now = Utc::now().to_rfc3339();
         cve_zip_file::Entity::insert(cve_zip_file::ActiveModel {
@@ -3166,6 +3257,7 @@ impl CveDatabase {
         Ok(())
     }
 
+    /// Returns the newest applied CVE zip timestamp.
     pub async fn latest_cve_zip_datetime(&self) -> Result<Option<String>, DbErr> {
         cve_zip_file::Entity::find()
             .order_by_desc(cve_zip_file::Column::ZipDatetime)
@@ -3175,6 +3267,7 @@ impl CveDatabase {
             .map(|row| row.map(|row| row.zip_datetime))
     }
 
+    /// Returns the newest `updated_at` value currently stored for CVEs.
     pub async fn latest_cve_updated_at(&self) -> Result<Option<String>, DbErr> {
         cve::Entity::find()
             .select_only()
@@ -3185,6 +3278,7 @@ impl CveDatabase {
             .map(|value| value.flatten().filter(|value| !value.is_empty()))
     }
 
+    /// Returns aggregate status for CVE, CWE, affected, CVSS, and zip data.
     pub async fn database_status(&self) -> Result<CveDatabaseStatus, DbErr> {
         CveDatabaseStatus::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
@@ -3207,6 +3301,7 @@ impl CveDatabase {
         .ok_or_else(|| DbErr::Custom("database status query returned no row".to_owned()))
     }
 
+    /// Returns aggregate status for CVE data plus enrichment tables.
     pub async fn database_status_enriched(&self) -> Result<DatabaseStatus, DbErr> {
         let cve = self.database_status().await?;
         let sources = self.db_sources().await?;
@@ -3232,6 +3327,7 @@ impl CveDatabase {
         })
     }
 
+    /// Returns synchronization state for all registered enrichment sources.
     pub async fn source_sync_states(&self) -> Result<Vec<SourceSyncState>, DbErr> {
         SourceSyncState::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
@@ -3241,6 +3337,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Returns registered enrichment source definitions.
     pub async fn db_sources(&self) -> Result<Vec<DbSource>, DbErr> {
         DbSource::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
@@ -3279,6 +3376,7 @@ impl CveDatabase {
             .collect()
     }
 
+    /// Reads one application metadata value by key.
     pub async fn metadata_value(&self, key: &str) -> Result<Option<String>, DbErr> {
         Ok(app_metadata::Entity::find_by_id(key.to_owned())
             .one(&self.db)
@@ -3286,6 +3384,7 @@ impl CveDatabase {
             .map(|row| row.value))
     }
 
+    /// Stores one application metadata value by key.
     pub async fn set_metadata_value(&self, key: &str, value: &str) -> Result<(), DbErr> {
         let model = app_metadata::ActiveModel {
             key: Set(key.to_owned()),
@@ -3303,6 +3402,7 @@ impl CveDatabase {
         Ok(())
     }
 
+    /// Imports raw OSV advisory records without an external cursor.
     pub async fn import_osv_records(
         &self,
         records: Vec<OsvRawRecord>,
@@ -3310,6 +3410,7 @@ impl CveDatabase {
         self.import_osv_records_with_cursor(records, None).await
     }
 
+    /// Imports raw OSV advisory records and stores the source cursor.
     pub async fn import_osv_records_with_cursor(
         &self,
         records: Vec<OsvRawRecord>,
@@ -3319,6 +3420,7 @@ impl CveDatabase {
             .await
     }
 
+    /// Imports raw OSV records with cursor and an optional total record count.
     pub async fn import_osv_records_with_cursor_and_count(
         &self,
         records: Vec<OsvRawRecord>,
@@ -3334,6 +3436,7 @@ impl CveDatabase {
         .map(|(summary, _timings)| summary)
     }
 
+    /// Imports raw OSV records and returns both summary and timing breakdown.
     pub async fn import_osv_records_with_cursor_count_and_timings(
         &self,
         records: Vec<OsvRawRecord>,
@@ -3349,6 +3452,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Imports OSV records in bulk-initialization mode and returns timings.
     pub async fn import_osv_records_bulk_init_with_cursor_count_and_timings(
         &self,
         records: Vec<OsvRawRecord>,
@@ -3468,6 +3572,7 @@ impl CveDatabase {
         ))
     }
 
+    /// Replaces local CISA KEV data from the official JSON catalog.
     pub async fn import_kev_json(&self, raw_json: &str) -> Result<ImportSummary, DbErr> {
         let fetched_at = Utc::now().to_rfc3339();
         let content_hash = md5_hex(raw_json.as_bytes());
@@ -3578,6 +3683,7 @@ impl CveDatabase {
         })
     }
 
+    /// Replaces local FIRST EPSS current scores from the official CSV.
     pub async fn import_epss_csv(&self, csv: &str) -> Result<ImportSummary, DbErr> {
         let parsed = EpssCurrentCsv::parse(csv)
             .map_err(|err| DbErr::Custom(format!("failed to parse EPSS CSV: {err}")))?;
@@ -3647,6 +3753,7 @@ impl CveDatabase {
         })
     }
 
+    /// Rebuilds local vulnerability identifier nodes and alias edges.
     pub async fn rebuild_identifier_graph(&self) -> Result<ImportSummary, DbErr> {
         let txn = self.db.begin().await?;
         txn.execute(Statement::from_string(
@@ -3681,6 +3788,7 @@ impl CveDatabase {
         })
     }
 
+    /// Resolves a CVE, OSV, GHSA, RUSTSEC, PYSEC, GO, or related ID through the graph.
     pub async fn resolve_identifier(&self, id: &str) -> Result<IdentifierResolution, DbErr> {
         let normalized_id = normalize_identifier(id);
         let queried_identifier_type = self.identifier_type_for_id(&normalized_id).await?;
@@ -3722,6 +3830,7 @@ impl CveDatabase {
         })
     }
 
+    /// Returns graph edges directly connected to one vulnerability identifier.
     pub async fn related_edges(&self, id: &str) -> Result<Vec<IdentifierEdgeEvidence>, DbErr> {
         let id = normalize_identifier(id);
         IdentifierEdgeEvidence::find_by_statement(Statement::from_sql_and_values(
@@ -3756,6 +3865,7 @@ impl CveDatabase {
         Ok(identifier_type(&id).to_owned())
     }
 
+    /// Returns one CVE with joined OSV, KEV, EPSS, alias, and source status data.
     pub async fn get_enriched_cve(&self, cve_id: &str) -> Result<EnrichedCve, DbErr> {
         let cve_id = normalize_identifier(cve_id);
         let cve = self.find_cve_summary_with_detail(&cve_id).await?;
@@ -3818,6 +3928,7 @@ impl CveDatabase {
         })
     }
 
+    /// Enriches a list of CVE summaries while preserving input order.
     pub async fn enrich_cve_summaries_full(
         &self,
         summaries: Vec<CveSummary>,
@@ -3940,6 +4051,7 @@ impl CveDatabase {
             .collect())
     }
 
+    /// Returns KEV entries, optionally narrowed to one CVE ID.
     pub async fn kev_entries(&self, cve_id: Option<&str>) -> Result<Vec<KevInfo>, DbErr> {
         if let Some(cve_id) = cve_id {
             return Ok(load_kev(&self.db, cve_id).await?.into_iter().collect());
@@ -3947,6 +4059,7 @@ impl CveDatabase {
         self.kev_entries_paged(i64::MAX as u64, 0).await
     }
 
+    /// Returns paged KEV entries ordered by date added.
     pub async fn kev_entries_paged(&self, limit: u64, offset: u64) -> Result<Vec<KevInfo>, DbErr> {
         KevInfo::find_by_statement(Statement::from_string(
             DbBackend::Sqlite,
@@ -3965,11 +4078,13 @@ impl CveDatabase {
         .await
     }
 
+    /// Counts locally stored KEV entries.
     pub async fn kev_entries_count(&self) -> Result<u64, DbErr> {
         self.count_by_sql("SELECT COUNT(*) AS count FROM kev_entries".to_owned())
             .await
     }
 
+    /// Returns compact enrichment rows for the requested CVE IDs.
     pub async fn enriched_cve_summaries(
         &self,
         cve_ids: &[String],
@@ -4047,6 +4162,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Returns compact risk rows for the requested CVE IDs in input order.
     pub async fn cve_risk_summaries(
         &self,
         cve_ids: &[String],
@@ -4105,6 +4221,7 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches CVE risk rows by EPSS score or percentile.
     pub async fn search_cve_risk_by_epss(
         &self,
         min_score: Option<f64>,
@@ -4172,12 +4289,14 @@ impl CveDatabase {
         .await
     }
 
+    /// Returns one OSV advisory summary by exact advisory ID.
     pub async fn get_enriched_osv(&self, osv_id: &str) -> Result<Option<OsvSummary>, DbErr> {
         load_osv_summaries(&self.db, &[normalize_identifier(osv_id)])
             .await
             .map(|mut rows| rows.pop())
     }
 
+    /// Finds OSV advisories affecting a package/version and attaches CVE risk data.
     pub async fn query_package_enriched(
         &self,
         ecosystem: &str,

@@ -1,6 +1,7 @@
 use super::common::{ReleaseAssetKind, latest_asset};
 use std::path::PathBuf;
 
+/// CLI arguments for `qanvuli download-cve`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
     #[arg(long, value_enum, default_value_t = ReleaseAssetKind::Delta)]
@@ -9,6 +10,7 @@ pub struct Args {
     output_dir: PathBuf,
 }
 
+/// Downloads the selected CVE release archive and prints its local path.
 pub async fn run(args: Args) -> Result<(), String> {
     let asset = latest_asset(args.kind).await?;
     std::fs::create_dir_all(&args.output_dir)

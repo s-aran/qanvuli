@@ -4,6 +4,7 @@ use crate::entity::{cve, cve_affected, cve_cvss, cve_cwe, cwe};
 use sea_orm::FromQueryResult;
 use serde::{Serialize, Serializer};
 
+/// Prepared SeaORM active models derived from one CVE record.
 pub struct CveActiveModels {
     pub cve_id: String,
     pub cve: cve::ActiveModel,
@@ -13,12 +14,14 @@ pub struct CveActiveModels {
     pub cwe_rows: Vec<cve_cwe::ActiveModel>,
 }
 
+/// Import bookkeeping for one JSON file read from a CVE archive.
 pub struct ReadJsonFileRecord {
     pub filename: String,
     pub md5hash: String,
 }
 
 #[derive(Clone, Debug)]
+/// Import bookkeeping for one processed CVE zip archive.
 pub struct CveZipFileRecord {
     pub zip_filename: String,
     pub zip_datetime: String,
@@ -26,6 +29,7 @@ pub struct CveZipFileRecord {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Lightweight CVE row returned by search APIs.
 pub struct CveSummary {
     pub cve_id: String,
     #[serde(serialize_with = "serialize_cve_state")]
@@ -37,12 +41,14 @@ pub struct CveSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// CVE summary plus normalized CWE, CVSS, and affected-product detail.
 pub struct CveSummaryWithDetail {
     pub summary: CveSummary,
     pub detail: CveDetail,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Aggregate counts and freshness metadata for the local CVE database.
 pub struct CveDatabaseStatus {
     pub cve_count: i64,
     pub published_count: i64,
@@ -56,6 +62,7 @@ pub struct CveDatabaseStatus {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+/// Normalized detail attached to a CVE summary.
 pub struct CveDetail {
     pub cwes: Vec<CveCweDetail>,
     pub cvss: Vec<CveCvssDetail>,
@@ -63,12 +70,14 @@ pub struct CveDetail {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// CWE classification attached to a CVE.
 pub struct CveCweDetail {
     pub id: i32,
     pub description: Option<String>,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// CVSS metric attached to a CVE.
 pub struct CveCvssDetail {
     pub version: String,
     pub base_score: Option<f64>,
@@ -78,6 +87,7 @@ pub struct CveCvssDetail {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Affected vendor, product, package, and version data attached to a CVE.
 pub struct CveAffectedDetail {
     pub vendor: Option<String>,
     pub product: Option<String>,
@@ -88,6 +98,7 @@ pub struct CveAffectedDetail {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+/// One version entry from a CVE affected product block.
 pub struct CveAffectedVersionDetail {
     pub version: Option<String>,
     pub status: Option<String>,
@@ -97,6 +108,7 @@ pub struct CveAffectedVersionDetail {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// CWE catalog entry with local tree relationship counts.
 pub struct CweEntry {
     pub id: i32,
     pub description: Option<String>,
@@ -108,6 +120,7 @@ pub struct CweEntry {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Structured search request used by the TUI and higher-level search flows.
 pub struct CveAdvancedSearch {
     pub query: Option<String>,
     pub query_mode: Option<CveAdvancedQueryMode>,
@@ -123,6 +136,7 @@ pub struct CveAdvancedSearch {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Interprets the free query text in an advanced CVE search.
 pub enum CveAdvancedQueryMode {
     FreeText,
     Product,
@@ -132,6 +146,7 @@ pub enum CveAdvancedQueryMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Controls whether rejected CVE records are visible to a query.
 pub enum CveStateScope {
     #[default]
     PublishedOnly,
@@ -145,6 +160,7 @@ impl CveStateScope {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Sort order for CVE summary search results.
 pub enum CveSummarySortOrder {
     PublishedAsc,
     #[default]
@@ -207,12 +223,14 @@ pub(crate) struct CveAffectedDetailRow {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Reference URL metadata attached to a CVE.
 pub struct CveReference {
     pub url: Option<String>,
     pub name: Option<String>,
     pub tags: Vec<String>,
 }
 
+/// Converts the stored CVE state integer into a stable API label.
 pub fn cve_state_label(state: i32) -> &'static str {
     match state {
         0 => "PUBLISHED",

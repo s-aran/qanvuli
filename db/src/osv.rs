@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::time::Duration;
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Registered enrichment source known to the local database.
 pub struct DbSource {
     pub source: String,
     pub display_name: String,
@@ -20,6 +21,7 @@ pub struct DbSource {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Combined CVE and enrichment database status.
 pub struct DatabaseStatus {
     #[serde(flatten)]
     pub cve: CveDatabaseStatus,
@@ -28,6 +30,7 @@ pub struct DatabaseStatus {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Aggregate counts for enrichment tables.
 pub struct EnrichmentDatabaseStatus {
     pub osv_record_count: i64,
     pub kev_entry_count: i64,
@@ -37,12 +40,14 @@ pub struct EnrichmentDatabaseStatus {
 }
 
 #[derive(Clone, Debug)]
+/// Raw OSV advisory JSON staged for import.
 pub struct OsvRawRecord {
     pub source_path: Option<String>,
     pub raw_json: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+/// Summary of an enrichment import run.
 pub struct ImportSummary {
     pub source: String,
     pub imported: usize,
@@ -52,6 +57,7 @@ pub struct ImportSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Timing breakdown for an enrichment import run.
 pub struct ImportTimings {
     pub hash: Duration,
     pub parse: Duration,
@@ -61,6 +67,7 @@ pub struct ImportTimings {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// CVE record with locally joined OSV, KEV, EPSS, and graph evidence.
 pub struct EnrichedCve {
     pub cve_id: String,
     pub cve: Option<CveSummaryWithDetail>,
@@ -76,6 +83,7 @@ pub struct EnrichedCve {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Compact enriched CVE row used by list and search responses.
 pub struct EnrichedCveSummary {
     pub cve_id: String,
     pub aliases: String,
@@ -93,6 +101,7 @@ pub struct EnrichedCveSummary {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Compact risk row for CVE triage.
 pub struct CveRiskSummary {
     pub cve_id: String,
     pub title: Option<String>,
@@ -113,6 +122,7 @@ pub struct CveRiskSummary {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Lightweight OSV advisory summary.
 pub struct OsvSummary {
     pub osv_id: String,
     pub schema_version: Option<String>,
@@ -124,6 +134,7 @@ pub struct OsvSummary {
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]
+/// Package affected by an OSV advisory.
 pub struct AffectedPackageSummary {
     pub osv_id: String,
     pub ecosystem: Option<String>,
@@ -133,6 +144,7 @@ pub struct AffectedPackageSummary {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Human-readable evidence showing why records were linked or matched.
 pub struct Evidence {
     pub kind: String,
     pub source: String,
@@ -144,11 +156,13 @@ pub struct Evidence {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Source freshness data attached to enriched responses.
 pub struct EnrichmentStatusSummary {
     pub source_sync: Vec<SourceSyncState>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Package/version lookup input echoed in enriched package findings.
 pub struct PackageQuery {
     pub ecosystem: String,
     pub package: String,
@@ -157,6 +171,7 @@ pub struct PackageQuery {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Vulnerability finding for one package/version lookup.
 pub struct EnrichedFinding {
     pub primary_id: String,
     pub cve_ids: Vec<String>,
@@ -170,18 +185,21 @@ pub struct EnrichedFinding {
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Affected/not-affected status and confidence for a package finding.
 pub struct AffectedStatus {
     pub status: String,
     pub confidence: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Risk enrichment attached to a package finding.
 pub struct FindingEnrichment {
     pub kev: Option<KevInfo>,
     pub epss: Option<EpssInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
+/// Derived triage signals for ordering package findings.
 pub struct PrioritySignals {
     pub known_exploited: bool,
     pub epss_percentile: Option<f64>,

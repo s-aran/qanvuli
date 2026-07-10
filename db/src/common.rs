@@ -28,6 +28,10 @@ pub(crate) fn normalize_identifier(id: &str) -> String {
     id.trim().to_ascii_uppercase()
 }
 
+/// Classifies a vulnerability identifier after trimming and uppercasing it.
+///
+/// Returns stable lowercase labels such as `cve`, `ghsa`, `rustsec`, `pysec`,
+/// `go`, `osv`, or `other`.
 pub fn detect_identifier_type(id: &str) -> &'static str {
     identifier_type(&normalize_identifier(id))
 }
