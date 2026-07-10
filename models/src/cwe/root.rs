@@ -264,9 +264,9 @@ mod tests {
         }
     }
 
-    fn validate_references<'a>(
+    fn validate_references(
         references: &Option<References>,
-        external_reference_ids: &HashSet<&'a str>,
+        external_reference_ids: &HashSet<&str>,
     ) {
         let Some(references) = references else {
             return;

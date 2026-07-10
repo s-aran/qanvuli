@@ -531,12 +531,14 @@ pub async fn sync_all_enrichment_sources_after_update(
     let summary = import_osv_zip_file_in_batches(
         db,
         &zip_path,
-        Some(&object_paths),
-        Some(&selection),
-        None,
-        cursor.as_deref(),
-        label,
-        false,
+        OsvZipImportOptions {
+            target_paths: Some(&object_paths),
+            selection: Some(&selection),
+            seen_osv_ids: None,
+            cursor: cursor.as_deref(),
+            label,
+            bulk_init: false,
+        },
     )
     .await;
     let _ = std::fs::remove_file(&zip_path);
@@ -647,12 +649,14 @@ async fn import_osv_selection_zips_from_gcs(
         let summary = import_osv_zip_file_in_batches(
             db,
             &zip_path,
-            None,
-            Some(selection),
-            None,
-            cursor,
-            label,
-            bulk_init,
+            OsvZipImportOptions {
+                target_paths: None,
+                selection: Some(selection),
+                seen_osv_ids: None,
+                cursor,
+                label,
+                bulk_init,
+            },
         )
         .await;
         let _ = std::fs::remove_file(&zip_path);
@@ -694,12 +698,14 @@ async fn import_osv_selection_zips_from_gcs(
         let summary = import_osv_zip_file_in_batches(
             db,
             &zip_path,
-            None,
-            Some(&single_selection),
-            Some(&mut imported_osv_ids),
-            cursor,
-            label,
-            bulk_init,
+            OsvZipImportOptions {
+                target_paths: None,
+                selection: Some(&single_selection),
+                seen_osv_ids: Some(&mut imported_osv_ids),
+                cursor,
+                label,
+                bulk_init,
+            },
         )
         .await;
         let _ = std::fs::remove_file(&zip_path);
@@ -777,16 +783,28 @@ async fn sync_kev_epss_snapshots(db: &CveDatabase, label: &str) -> Result<(), St
     Ok(())
 }
 
+pub(crate) struct OsvZipImportOptions<'a> {
+    target_paths: Option<&'a HashSet<String>>,
+    selection: Option<&'a OsvImportSelection>,
+    seen_osv_ids: Option<&'a mut HashSet<String>>,
+    cursor: Option<&'a str>,
+    label: &'a str,
+    bulk_init: bool,
+}
+
 pub(crate) async fn import_osv_zip_file_in_batches(
     db: &CveDatabase,
     path: &Path,
-    target_paths: Option<&HashSet<String>>,
-    selection: Option<&OsvImportSelection>,
-    seen_osv_ids: Option<&mut HashSet<String>>,
-    cursor: Option<&str>,
-    label: &str,
-    bulk_init: bool,
+    options: OsvZipImportOptions<'_>,
 ) -> Result<qanvuli_db::ImportSummary, String> {
+    let OsvZipImportOptions {
+        target_paths,
+        selection,
+        seen_osv_ids,
+        cursor,
+        label,
+        bulk_init,
+    } = options;
     let started = Instant::now();
     let file = std::fs::File::open(path)
         .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
@@ -1272,7 +1290,7 @@ fn available_storage_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize as u64))
+    Some(stats.f_bavail.saturating_mul(stats.f_frsize))
 }
 
 #[cfg(not(target_os = "linux"))]

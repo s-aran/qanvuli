@@ -139,45 +139,6 @@ impl AdvancedForm {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn exact_checkboxes_route_values_to_exact_options() {
-        let form = AdvancedForm {
-            product: "Django".to_owned(),
-            product_exact: true,
-            vendor: "Example".to_owned(),
-            vendor_exact: false,
-            ..AdvancedForm::default()
-        };
-
-        let options = form.to_search_options(CveSummarySortOrder::PublishedDesc);
-
-        assert_eq!(options.product, None);
-        assert_eq!(options.product_exact.as_deref(), Some("Django"));
-        assert_eq!(options.vendor.as_deref(), Some("Example"));
-        assert_eq!(options.vendor_exact, None);
-    }
-
-    #[test]
-    fn exact_checkbox_toggle_does_not_edit_text_fields() {
-        let mut form = AdvancedForm {
-            product: "Django".to_owned(),
-            active_field: AdvancedField::ProductExact,
-            ..AdvancedForm::default()
-        };
-
-        form.push('x');
-        assert_eq!(form.product, "Django");
-        assert!(!form.product_exact);
-
-        form.toggle_current();
-        assert!(form.product_exact);
-    }
-}
-
 impl AdvancedField {
     fn next(self) -> Self {
         match self {
@@ -253,5 +214,44 @@ fn option_string(value: &str) -> Option<String> {
         None
     } else {
         Some(value.to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_checkboxes_route_values_to_exact_options() {
+        let form = AdvancedForm {
+            product: "Django".to_owned(),
+            product_exact: true,
+            vendor: "Example".to_owned(),
+            vendor_exact: false,
+            ..AdvancedForm::default()
+        };
+
+        let options = form.to_search_options(CveSummarySortOrder::PublishedDesc);
+
+        assert_eq!(options.product, None);
+        assert_eq!(options.product_exact.as_deref(), Some("Django"));
+        assert_eq!(options.vendor.as_deref(), Some("Example"));
+        assert_eq!(options.vendor_exact, None);
+    }
+
+    #[test]
+    fn exact_checkbox_toggle_does_not_edit_text_fields() {
+        let mut form = AdvancedForm {
+            product: "Django".to_owned(),
+            active_field: AdvancedField::ProductExact,
+            ..AdvancedForm::default()
+        };
+
+        form.push('x');
+        assert_eq!(form.product, "Django");
+        assert!(!form.product_exact);
+
+        form.toggle_current();
+        assert!(form.product_exact);
     }
 }

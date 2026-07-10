@@ -21,7 +21,7 @@ pub use identifiers::*;
 pub use kev::*;
 use migration::Migrator;
 pub use osv::*;
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use qanvuli_models::{
     CveStatusData, RawCveRecord, RawCveStatusRecord, cna_affected_raw_values, cna_cvss_raw_values,
@@ -3791,25 +3791,42 @@ impl CveDatabase {
     /// Resolves a CVE, OSV, GHSA, RUSTSEC, PYSEC, GO, or related ID through the graph.
     pub async fn resolve_identifier(&self, id: &str) -> Result<IdentifierResolution, DbErr> {
         let normalized_id = normalize_identifier(id);
-        let queried_identifier_type = self.identifier_type_for_id(&normalized_id).await?;
         let edges = self.related_edges(&normalized_id).await?;
-        let mut seen = BTreeSet::new();
-        let mut queue = VecDeque::from([normalized_id.clone()]);
-        seen.insert(normalized_id.clone());
-        while let Some(current) = queue.pop_front() {
-            for edge in self.related_edges(&current).await? {
-                for id in [edge.from_identifier, edge.to_identifier] {
-                    if seen.insert(id.clone()) {
-                        queue.push_back(id);
-                    }
-                }
-            }
-        }
+        let connected = IdentifierNodeRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            WITH RECURSIVE connected(identifier) AS (
+                VALUES (?)
+                UNION
+                SELECT CASE
+                    WHEN edge.from_identifier = connected.identifier THEN edge.to_identifier
+                    ELSE edge.from_identifier
+                END
+                FROM vulnerability_identifier_edges edge
+                INNER JOIN connected
+                    ON edge.from_identifier = connected.identifier
+                    OR edge.to_identifier = connected.identifier
+            )
+            SELECT identifier FROM connected ORDER BY identifier
+            "#,
+            vec![SeaValue::from(normalized_id.clone())],
+        ))
+        .all(&self.db)
+        .await?;
+        let connected_ids = connected
+            .into_iter()
+            .map(|row| row.identifier)
+            .collect::<Vec<_>>();
+        let osv_ids = load_existing_osv_ids(&self.db, &connected_ids)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let queried_identifier_type = resolved_identifier_type(&normalized_id, &osv_ids);
         let mut related_cve_ids = Vec::new();
         let mut related_osv_ids = Vec::new();
         let mut related_aliases = Vec::new();
-        for id in seen {
-            match self.identifier_type_for_id(&id).await?.as_str() {
+        for id in connected_ids {
+            match resolved_identifier_type(&id, &osv_ids).as_str() {
                 "cve" => related_cve_ids.push(id),
                 "osv" => related_osv_ids.push(id),
                 _ => related_aliases.push(id),
@@ -3845,24 +3862,6 @@ impl CveDatabase {
         ))
         .all(&self.db)
         .await
-    }
-
-    async fn identifier_type_for_id(&self, id: &str) -> Result<String, DbErr> {
-        let id = normalize_identifier(id);
-        if identifier_type(&id) == "cve" {
-            return Ok("cve".to_owned());
-        }
-        let exists = self
-            .count_by_statement(
-                "SELECT COUNT(*) AS count FROM osv_advisories WHERE osv_id = ?",
-                vec![SeaValue::from(id.clone())],
-            )
-            .await?
-            > 0;
-        if exists {
-            return Ok("osv".to_owned());
-        }
-        Ok(identifier_type(&id).to_owned())
     }
 
     /// Returns one CVE with joined OSV, KEV, EPSS, alias, and source status data.
@@ -4323,7 +4322,11 @@ impl CveDatabase {
         .all(&self.db)
         .await?;
 
-        let mut findings = Vec::new();
+        let package_ids = package_rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let mut ranges_by_package = load_osv_ranges_many(&self.db, &package_ids).await?;
+        let mut resolution_by_osv_id: HashMap<String, IdentifierResolution> = HashMap::new();
+        let mut matches = Vec::new();
+        let mut all_cve_ids = BTreeSet::new();
         for package_row in package_rows {
             if purl.is_some()
                 && package_row.purl.as_deref().is_some()
@@ -4331,7 +4334,9 @@ impl CveDatabase {
             {
                 continue;
             }
-            let ranges = load_osv_ranges(&self.db, package_row.id).await?;
+            let ranges = ranges_by_package
+                .remove(&package_row.id)
+                .unwrap_or_default();
             let fixed_versions = fixed_versions_from_ranges(&ranges);
             let affected =
                 match_version(ecosystem, version, &ranges).unwrap_or_else(|| AffectedStatus {
@@ -4341,18 +4346,50 @@ impl CveDatabase {
             if affected.status == "not_affected" {
                 continue;
             }
-            let resolution = self.resolve_identifier(&package_row.osv_id).await?;
+            let resolution = if let Some(resolution) = resolution_by_osv_id.get(&package_row.osv_id)
+            {
+                resolution.clone()
+            } else {
+                let resolution = self.resolve_identifier(&package_row.osv_id).await?;
+                resolution_by_osv_id.insert(package_row.osv_id.clone(), resolution.clone());
+                resolution
+            };
+            all_cve_ids.extend(resolution.related_cve_ids.iter().cloned());
+            matches.push(PackageMatch {
+                package_row,
+                fixed_versions,
+                affected,
+                resolution,
+            });
+        }
+
+        let all_cve_ids = all_cve_ids.into_iter().collect::<Vec<_>>();
+        let kev_by_cve_id = load_kev_many(&self.db, &all_cve_ids)
+            .await?
+            .into_iter()
+            .map(|row| (row.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let epss_by_cve_id = load_epss_many(&self.db, &all_cve_ids)
+            .await?
+            .into_iter()
+            .map(|row| (row.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+
+        let mut findings = Vec::with_capacity(matches.len());
+        for package_match in matches {
+            let PackageMatch {
+                package_row,
+                fixed_versions,
+                affected,
+                resolution,
+            } = package_match;
             let cve_ids = resolution.related_cve_ids.clone();
-            let mut kev = None;
-            let mut epss = None;
-            for cve_id in &cve_ids {
-                if kev.is_none() {
-                    kev = load_kev(&self.db, cve_id).await?;
-                }
-                if epss.is_none() {
-                    epss = load_epss(&self.db, cve_id).await?;
-                }
-            }
+            let kev = cve_ids
+                .iter()
+                .find_map(|cve_id| kev_by_cve_id.get(cve_id).cloned());
+            let epss = cve_ids
+                .iter()
+                .find_map(|cve_id| epss_by_cve_id.get(cve_id).cloned());
             let mut evidence = vec![Evidence {
                 kind: "osv_range_match".to_owned(),
                 source: "OSV".to_owned(),
@@ -7829,14 +7866,30 @@ struct PackageOsvRow {
     purl: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct PackageMatch {
+    package_row: PackageOsvRow,
+    fixed_versions: Vec<String>,
+    affected: AffectedStatus,
+    resolution: IdentifierResolution,
+}
+
+#[derive(Clone, Debug, FromQueryResult)]
+struct IdentifierNodeRow {
+    identifier: String,
+}
+
 #[derive(Clone, Debug, FromQueryResult)]
 struct RangeEventRow {
+    affected_package_id: i64,
     range_id: i64,
     range_type: Option<String>,
     event_type: String,
     value: String,
     event_order: i64,
 }
+
+type OsvAffectedPackageInput = (usize, Option<String>, Option<String>, Option<String>);
 
 async fn execute_values<C>(db: &C, sql: &str, values: Vec<SeaValue>) -> Result<(), DbErr>
 where
@@ -8278,7 +8331,7 @@ where
 async fn insert_osv_affected_packages<C>(
     db: &C,
     osv_id: &str,
-    mut rows: Vec<(usize, Option<String>, Option<String>, Option<String>)>,
+    mut rows: Vec<OsvAffectedPackageInput>,
 ) -> Result<HashMap<usize, i64>, DbErr>
 where
     C: ConnectionTrait,
@@ -8843,6 +8896,35 @@ where
     .await
 }
 
+async fn load_existing_osv_ids<C>(db: &C, ids: &[String]) -> Result<Vec<String>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    IdentifierNodeRow::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!(
+            "SELECT osv_id AS identifier FROM osv_advisories WHERE osv_id IN ({})",
+            sql_string_list(ids)
+        ),
+    ))
+    .all(db)
+    .await
+    .map(|rows| rows.into_iter().map(|row| row.identifier).collect())
+}
+
+fn resolved_identifier_type(id: &str, osv_ids: &HashSet<String>) -> String {
+    if identifier_type(id) == "cve" {
+        "cve".to_owned()
+    } else if osv_ids.contains(id) {
+        "osv".to_owned()
+    } else {
+        identifier_type(id).to_owned()
+    }
+}
+
 fn split_concat_values(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -8851,23 +8933,44 @@ fn split_concat_values(value: &str) -> Vec<String> {
         .collect()
 }
 
-async fn load_osv_ranges<C>(db: &C, package_id: i64) -> Result<Vec<RangeEventRow>, DbErr>
+async fn load_osv_ranges_many<C>(
+    db: &C,
+    package_ids: &[i64],
+) -> Result<HashMap<i64, Vec<RangeEventRow>>, DbErr>
 where
     C: ConnectionTrait,
 {
-    RangeEventRow::find_by_statement(Statement::from_sql_and_values(
+    if package_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let package_ids = package_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = RangeEventRow::find_by_statement(Statement::from_string(
         DbBackend::Sqlite,
-        r#"
-        SELECT r.id AS range_id, r.range_type, e.event_type, e.value, e.event_order
+        format!(
+            r#"
+        SELECT r.affected_package_id, r.id AS range_id, r.range_type,
+               e.event_type, e.value, e.event_order
         FROM osv_ranges r
         INNER JOIN osv_range_events e ON e.range_id = r.id
-        WHERE r.affected_package_id = ?
-        ORDER BY r.id, e.event_order
-        "#,
-        vec![SeaValue::from(package_id)],
+        WHERE r.affected_package_id IN ({package_ids})
+        ORDER BY r.affected_package_id, r.id, e.event_order
+        "#
+        ),
     ))
     .all(db)
-    .await
+    .await?;
+    let mut by_package = HashMap::new();
+    for row in rows {
+        by_package
+            .entry(row.affected_package_id)
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    Ok(by_package)
 }
 
 fn fixed_versions_from_ranges(ranges: &[RangeEventRow]) -> Vec<String> {

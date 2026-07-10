@@ -360,7 +360,7 @@ mod tests {
                 CveState::Rejected => {
                     let _ = serde_json::from_str::<RejectedCveRoot>(&buf).unwrap();
                 }
-                CveState::Reserved => assert!(false),
+                CveState::Reserved => unreachable!("reserved CVE was present in a CVE archive"),
             }
         }
     }
