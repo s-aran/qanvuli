@@ -650,6 +650,21 @@ fn enrichment_imports_and_queries_joined_sources() {
                 source_path: Some("GHSA-TEST-0001.json".to_owned()),
                 raw_json: include_str!("../../fixtures/osv/GHSA-TEST-0001.json").to_owned(),
             },
+            OsvRawRecord {
+                source_path: Some("GHSA-xpw3-9rhw-482x.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version": "1.7.5",
+                    "id": "GHSA-xpw3-9rhw-482x",
+                    "modified": "2099-01-05T00:00:00Z",
+                    "published": "2099-01-05T00:00:00Z",
+                    "aliases": ["CVE-2099-0001"],
+                    "summary": "Primary GHSA fixture",
+                    "details": "Fixture advisory whose GHSA ID is the primary OSV ID.",
+                    "affected": [],
+                    "references": []
+                }"#
+                .to_owned(),
+            },
         ])
         .await
         .unwrap();
@@ -782,6 +797,20 @@ fn enrichment_imports_and_queries_joined_sources() {
         );
         let osv_alias_prefix_count = db.count_cve_summaries_free_text("GHSA-TEST").await.unwrap();
         assert_eq!(osv_alias_prefix_count, 1);
+        let primary_ghsa_hits = db
+            .search_cve_summaries_free_text("GHSA-xpw3-9rhw-482x", 10, 0)
+            .await
+            .unwrap();
+        assert!(
+            primary_ghsa_hits
+                .iter()
+                .any(|row| row.cve_id == "CVE-2099-0001")
+        );
+        let primary_ghsa_count = db
+            .count_cve_summaries_free_text("GHSA-xpw3-9rhw-482x")
+            .await
+            .unwrap();
+        assert_eq!(primary_ghsa_count, 1);
         let osv_text_enrichment = db
             .enriched_cve_summaries(&["CVE-2099-0001".to_owned()])
             .await

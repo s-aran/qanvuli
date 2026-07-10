@@ -78,12 +78,9 @@ impl CweTreePrefixes {
             .iter()
             .map(|cwe| (cwe.id, cwe.parent_id))
             .collect::<HashMap<_, _>>();
-        let mut sibling_max_id_by_parent = HashMap::<Option<i32>, i32>::new();
+        let mut last_sibling_id_by_parent = HashMap::<Option<i32>, i32>::new();
         for cwe in cwes {
-            sibling_max_id_by_parent
-                .entry(cwe.parent_id)
-                .and_modify(|id| *id = (*id).max(cwe.id))
-                .or_insert(cwe.id);
+            last_sibling_id_by_parent.insert(cwe.parent_id, cwe.id);
         }
 
         let by_id = cwes
@@ -92,7 +89,7 @@ impl CweTreePrefixes {
                 (
                     cwe.id,
                     CweTreePrefixEntry {
-                        prefix: Self::build_prefix(cwe, &parent_by_id, &sibling_max_id_by_parent),
+                        prefix: Self::build_prefix(cwe, &parent_by_id, &last_sibling_id_by_parent),
                     },
                 )
             })
@@ -111,7 +108,7 @@ impl CweTreePrefixes {
     fn build_prefix(
         cwe: &CweEntry,
         parent_by_id: &HashMap<i32, Option<i32>>,
-        sibling_max_id_by_parent: &HashMap<Option<i32>, i32>,
+        last_sibling_id_by_parent: &HashMap<Option<i32>, i32>,
     ) -> String {
         let ancestors = Self::ancestor_ids(cwe, parent_by_id);
         if ancestors.is_empty() {
@@ -119,17 +116,17 @@ impl CweTreePrefixes {
         }
 
         let mut prefix = String::new();
-        for ancestor_id in ancestors.iter().take(ancestors.len().saturating_sub(1)) {
+        for ancestor_id in ancestors.iter().skip(1) {
             let continues = parent_by_id.get(ancestor_id).is_some_and(|parent_id| {
-                Self::has_later_sibling(*parent_id, *ancestor_id, sibling_max_id_by_parent)
+                Self::has_later_sibling(*parent_id, *ancestor_id, last_sibling_id_by_parent)
             });
-            prefix.push_str(if continues { "|  " } else { "   " });
+            prefix.push_str(if continues { "│  " } else { "   " });
         }
         prefix.push_str(
-            if Self::has_later_sibling(cwe.parent_id, cwe.id, sibling_max_id_by_parent) {
-                "|- "
+            if Self::has_later_sibling(cwe.parent_id, cwe.id, last_sibling_id_by_parent) {
+                "├─ "
             } else {
-                "`- "
+                "└─ "
             },
         );
         prefix
@@ -156,10 +153,54 @@ impl CweTreePrefixes {
     fn has_later_sibling(
         parent_id: Option<i32>,
         id: i32,
-        sibling_max_id_by_parent: &HashMap<Option<i32>, i32>,
+        last_sibling_id_by_parent: &HashMap<Option<i32>, i32>,
     ) -> bool {
-        sibling_max_id_by_parent
+        last_sibling_id_by_parent
             .get(&parent_id)
-            .is_some_and(|max_id| id < *max_id)
+            .is_some_and(|last_id| id != *last_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_follow_visible_order_not_numeric_id_order() {
+        let cwes = vec![
+            cwe(10, None),
+            cwe(20, Some(10)),
+            cwe(30, Some(20)),
+            cwe(15, Some(10)),
+        ];
+
+        let prefixes = CweTreePrefixes::new(&cwes);
+
+        assert_eq!(prefixes.prefix(&cwes[0]), "");
+        assert_eq!(prefixes.prefix(&cwes[1]), "├─ ");
+        assert_eq!(prefixes.prefix(&cwes[2]), "│  └─ ");
+        assert_eq!(prefixes.prefix(&cwes[3]), "└─ ");
+    }
+
+    #[test]
+    fn prefixes_treat_filtered_visible_siblings_as_tree_boundaries() {
+        let cwes = vec![cwe(10, None), cwe(30, Some(10)), cwe(40, Some(30))];
+
+        let prefixes = CweTreePrefixes::new(&cwes);
+
+        assert_eq!(prefixes.prefix(&cwes[1]), "└─ ");
+        assert_eq!(prefixes.prefix(&cwes[2]), "   └─ ");
+    }
+
+    fn cwe(id: i32, parent_id: Option<i32>) -> CweEntry {
+        CweEntry {
+            id,
+            description: None,
+            status: None,
+            parent_id,
+            parent_count: usize::from(parent_id.is_some()),
+            sibling_count: 0,
+            child_count: 0,
+        }
     }
 }

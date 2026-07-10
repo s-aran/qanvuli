@@ -2528,7 +2528,10 @@ impl CveDatabase {
         ));
         let alias = normalize_identifier(raw_query);
         values.push(SeaValue::from(alias.clone()));
-        values.push(SeaValue::from(token_prefix_upper_bound(&alias)));
+        let alias_upper = token_prefix_upper_bound(&alias);
+        values.push(SeaValue::from(alias_upper.clone()));
+        values.push(SeaValue::from(alias));
+        values.push(SeaValue::from(alias_upper));
         self.count_by_statement(fts_or_osv_count_sql(state_scope), values)
             .await
     }
@@ -2539,14 +2542,18 @@ impl CveDatabase {
         state_scope: CveStateScope,
     ) -> Result<u64, DbErr> {
         let upper = token_prefix_upper_bound(token);
+        let alias = normalize_identifier(token);
+        let alias_upper = token_prefix_upper_bound(&alias);
         self.count_by_statement(
             fts_or_osv_token_count_sql(state_scope),
             vec![
                 SeaValue::from(format!("{token}*")),
                 SeaValue::from(token.to_owned()),
                 SeaValue::from(upper),
-                SeaValue::from(normalize_identifier(token)),
-                SeaValue::from(token_prefix_upper_bound(&normalize_identifier(token))),
+                SeaValue::from(alias.clone()),
+                SeaValue::from(alias_upper.clone()),
+                SeaValue::from(alias),
+                SeaValue::from(alias_upper),
             ],
         )
         .await
@@ -6653,11 +6660,19 @@ fn osv_token_summary_sql(state_scope: CveStateScope) -> &'static str {
 fn osv_alias_summary_sql(state_scope: CveStateScope) -> &'static str {
     if state_scope.includes_rejected() {
         r#"
-        WITH matches AS (
+        WITH bounds(alias, upper) AS (
+            VALUES (?, ?)
+        ),
+        matches AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s, bounds
+            WHERE s.osv_id >= bounds.alias AND s.osv_id < bounds.upper
+            UNION
             SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
-            WHERE a.alias_id >= ? AND a.alias_id < ?
+            CROSS JOIN bounds
+            WHERE a.alias_id >= bounds.alias AND a.alias_id < bounds.upper
         )
         SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
         FROM matches
@@ -6667,11 +6682,19 @@ fn osv_alias_summary_sql(state_scope: CveStateScope) -> &'static str {
         "#
     } else {
         r#"
-        WITH matches AS (
+        WITH bounds(alias, upper) AS (
+            VALUES (?, ?)
+        ),
+        matches AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s, bounds
+            WHERE s.osv_id >= bounds.alias AND s.osv_id < bounds.upper
+            UNION
             SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
-            WHERE a.alias_id >= ? AND a.alias_id < ?
+            CROSS JOIN bounds
+            WHERE a.alias_id >= bounds.alias AND a.alias_id < bounds.upper
         )
         SELECT cve.cve_id, cve.state, cve.published_at, cve.updated_at, cve.title, cve.description_en
         FROM matches
@@ -6703,6 +6726,10 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
         ),
         alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s
+            WHERE s.osv_id >= ? AND s.osv_id < ?
+            UNION
             SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
@@ -6737,6 +6764,10 @@ fn fts_or_osv_count_sql(state_scope: CveStateScope) -> &'static str {
             INNER JOIN osv_cve_search s ON s.osv_id = m.osv_id
         ),
         alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s
+            WHERE s.osv_id >= ? AND s.osv_id < ?
+            UNION
             SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
@@ -6771,6 +6802,10 @@ fn fts_or_osv_token_count_sql(state_scope: CveStateScope) -> &'static str {
         ),
         alias_cves AS (
             SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s
+            WHERE s.osv_id >= ? AND s.osv_id < ?
+            UNION
+            SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
             WHERE a.alias_id >= ? AND a.alias_id < ?
@@ -6798,6 +6833,11 @@ fn fts_or_osv_token_count_sql(state_scope: CveStateScope) -> &'static str {
             WHERE token >= ? AND token < ? AND state = 0
         ),
         alias_cves AS (
+            SELECT DISTINCT s.cve_id
+            FROM osv_cve_search s
+            INNER JOIN cve ON cve.cve_id = s.cve_id
+            WHERE s.osv_id >= ? AND s.osv_id < ? AND cve.state = 0
+            UNION
             SELECT DISTINCT s.cve_id
             FROM osv_aliases a
             INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
