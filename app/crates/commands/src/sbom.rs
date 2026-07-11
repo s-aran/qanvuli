@@ -47,8 +47,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let date_filter = args.date_filter()?;
     let packages = load_sbom_packages(args.path()?)?;
     let package_count = packages.len();
-    let mut cve_findings = BTreeMap::<String, SbomCveFinding>::new();
-    let mut osv_findings = BTreeMap::<String, SbomOsvFinding>::new();
+    let mut cve_findings = BTreeMap::<(String, String, String), SbomCveFinding>::new();
+    let mut osv_findings = BTreeMap::<(String, String, String, String), SbomOsvFinding>::new();
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
     let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
@@ -68,7 +68,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 .map_err(|err| format!("failed to search `{component}`: {err}"))?;
 
             for cve in cves {
-                let key = format!("{}:{}", package.name, cve.cve_id);
+                let key = cve_finding_key(&package, &cve.cve_id);
                 cve_findings.entry(key).or_insert_with(|| SbomCveFinding {
                     package: package.name.clone(),
                     version: package.version.clone(),
@@ -95,7 +95,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 .await
                 .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
             for finding in findings {
-                let key = format!("{}:{}", package.name, finding.primary_id);
+                let key = osv_finding_key(&package, &package_ref.purl, &finding.primary_id);
                 osv_findings.entry(key).or_insert_with(|| SbomOsvFinding {
                     package: package.name.clone(),
                     version: package.version.clone(),
@@ -120,6 +120,29 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
 
     close_db(db).await?;
     Ok(())
+}
+
+/// Builds an unambiguous key that keeps findings for distinct package versions separate.
+fn cve_finding_key(package: &SbomPackage, cve_id: &str) -> (String, String, String) {
+    (
+        package.name.clone(),
+        package.version.clone().unwrap_or_default(),
+        cve_id.to_owned(),
+    )
+}
+
+/// Builds an unambiguous key for OSV findings, including the PURL that was matched.
+fn osv_finding_key(
+    package: &SbomPackage,
+    purl: &str,
+    finding_id: &str,
+) -> (String, String, String, String) {
+    (
+        package.name.clone(),
+        package.version.clone().unwrap_or_default(),
+        purl.to_owned(),
+        finding_id.to_owned(),
+    )
 }
 
 fn load_sbom_packages(path: &Path) -> Result<Vec<SbomPackage>, String> {
@@ -260,7 +283,7 @@ fn package_ref_from_purl(purl: &str, fallback_version: Option<&str>) -> Option<P
     );
     let (purl_type, name_path) = package_path.split_once('/')?;
     let ecosystem = osv_ecosystem_from_purl_type(purl_type)?;
-    let name = percent_decode_minimal(name_path);
+    let name = percent_decode(name_path);
     if name.is_empty() {
         return None;
     }
@@ -270,7 +293,7 @@ fn package_ref_from_purl(purl: &str, fallback_version: Option<&str>) -> Option<P
         name,
         version: purl_version
             .or(fallback_version)
-            .map(percent_decode_minimal)
+            .map(percent_decode)
             .filter(|version| !version.is_empty()),
         purl: purl.to_owned(),
     })
@@ -291,8 +314,9 @@ fn osv_ecosystem_from_purl_type(purl_type: &str) -> Option<&'static str> {
     }
 }
 
-fn percent_decode_minimal(value: &str) -> String {
-    let mut decoded = String::with_capacity(value.len());
+/// Decodes percent-encoded UTF-8 while leaving malformed values unchanged.
+fn percent_decode(value: &str) -> String {
+    let mut decoded = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -301,14 +325,14 @@ fn percent_decode_minimal(value: &str) -> String {
             && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
             && let Ok(byte) = u8::from_str_radix(hex, 16)
         {
-            decoded.push(byte as char);
+            decoded.push(byte);
             index += 3;
             continue;
         }
-        decoded.push(bytes[index] as char);
+        decoded.push(bytes[index]);
         index += 1;
     }
-    decoded
+    String::from_utf8(decoded).unwrap_or_else(|_| value.to_owned())
 }
 
 #[cfg(test)]
@@ -341,6 +365,40 @@ mod tests {
                 .unwrap()
                 .name,
             "@scope/name"
+        );
+    }
+
+    #[test]
+    fn decodes_percent_encoded_utf8_purl_names() {
+        assert_eq!(
+            package_ref_from_purl("pkg:npm/%E3%81%82@1.2.3", None)
+                .unwrap()
+                .name,
+            "あ"
+        );
+        assert_eq!(percent_decode("%FF"), "%FF");
+    }
+
+    #[test]
+    fn finding_keys_keep_package_versions_separate() {
+        let v1 = SbomPackage {
+            name: "example".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            external_refs: Vec::new(),
+            package_url: None,
+        };
+        let v2 = SbomPackage {
+            version: Some("2.0.0".to_owned()),
+            ..v1.clone()
+        };
+
+        assert_ne!(
+            cve_finding_key(&v1, "CVE-2024-1"),
+            cve_finding_key(&v2, "CVE-2024-1")
+        );
+        assert_ne!(
+            osv_finding_key(&v1, "pkg:cargo/example@1.0.0", "GHSA-test"),
+            osv_finding_key(&v1, "pkg:cargo/example@2.0.0", "GHSA-test")
         );
     }
 

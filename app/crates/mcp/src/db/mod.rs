@@ -2,7 +2,8 @@
 
 use crate::{common::error::mcp_error, response};
 use qanvuli_app_commands::common::{
-    OsvImportSelection, apply_delta_updates, sync_all_enrichment_sources_after_update,
+    OsvImportSelection, apply_delta_updates, redact_database_url,
+    sync_all_enrichment_sources_after_update,
 };
 use qanvuli_db::{CveDatabase, CveStateScope, CveSummary};
 use qanvuli_models::RawCveStatusRecord;
@@ -32,7 +33,7 @@ impl DbProvider {
                 CveDatabase::connect(&self.db_url).await.map_err(|err| {
                     mcp_error(format!(
                         "failed to connect database `{}`: {err}",
-                        self.db_url
+                        redact_database_url(&self.db_url)
                     ))
                 })
             })

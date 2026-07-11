@@ -1,8 +1,9 @@
 use super::common::{
     IngestMode, IngestOptions, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
     OsvImportSelection, ReleaseAssetKind, close_db, connect_db, download_latest_asset_with_source,
-    ingest_zip_with_progress, remove_processed_zip, report_enrichment_source_status,
-    reset_sqlite_database_files, sync_all_enrichment_sources_after_init,
+    ingest_zip_with_progress, redact_database_url, remove_processed_zip,
+    report_enrichment_source_status, reset_sqlite_database_files,
+    sync_all_enrichment_sources_after_init,
 };
 use std::path::PathBuf;
 
@@ -38,7 +39,7 @@ async fn run_with_progress(
 ) -> Result<(), String> {
     if args.schema_only {
         emit_init_progress(&progress, "-", "connecting");
-        eprintln!("init: connecting database {db_url}");
+        eprintln!("init: connecting database {}", redact_database_url(db_url));
         let db = connect_db(db_url).await?;
         if args.rebuild {
             emit_init_progress(&progress, "-", "rebuilding");
@@ -55,7 +56,7 @@ async fn run_with_progress(
         }
         emit_init_progress(&progress, "-", "done");
         report_enrichment_source_status(&db, "init").await?;
-        println!("initialized schema: {db_url}");
+        println!("initialized schema: {}", redact_database_url(db_url));
         close_db(db).await?;
         return Ok(());
     }
@@ -78,7 +79,7 @@ async fn run_with_progress(
     reset_sqlite_database_files(db_url)?;
 
     emit_init_progress(&progress, &asset_path.display().to_string(), "connecting");
-    eprintln!("init: connecting database {db_url}");
+    eprintln!("init: connecting database {}", redact_database_url(db_url));
     let db = connect_db(db_url).await?;
     emit_init_progress(&progress, &asset_path.display().to_string(), "importing");
     eprintln!("init: importing all CVEs; schema will be rebuilt before insert");

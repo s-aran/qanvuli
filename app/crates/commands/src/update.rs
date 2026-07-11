@@ -1,7 +1,7 @@
 use super::common::{
     IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
     apply_delta_updates_with_progress, close_db, connect_db, rebuild_graph_and_report,
-    report_enrichment_source_status, sync_all_enrichment_sources_after_update,
+    redact_database_url, report_enrichment_source_status, sync_all_enrichment_sources_after_update,
 };
 use std::path::PathBuf;
 
@@ -31,7 +31,10 @@ async fn run_with_progress(
     args: Args,
     progress: Option<IngestProgressCallback>,
 ) -> Result<(), String> {
-    eprintln!("update: connecting database {db_url}");
+    eprintln!(
+        "update: connecting database {}",
+        redact_database_url(db_url)
+    );
     let db = connect_db(db_url).await?;
     eprintln!("update: applying schema migrations");
     db.initialize_schema()

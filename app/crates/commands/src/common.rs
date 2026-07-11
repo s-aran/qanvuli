@@ -130,9 +130,28 @@ impl DateFilter {
 
 /// Connects to the configured CVE database and converts database errors for CLI output.
 pub async fn connect_db(db_url: &str) -> Result<CveDatabase, String> {
-    CveDatabase::connect(db_url)
-        .await
-        .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))
+    CveDatabase::connect(db_url).await.map_err(|err| {
+        format!(
+            "failed to connect database `{}`: {err}",
+            redact_database_url(db_url)
+        )
+    })
+}
+
+/// Redacts database credentials before a connection string is shown to a user.
+///
+/// Command errors can be captured by CI or MCP clients, so connection URLs must
+/// not disclose an embedded username or password.
+pub fn redact_database_url(db_url: &str) -> String {
+    let Ok(mut url) = Url::parse(db_url) else {
+        return db_url.to_owned();
+    };
+
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("REDACTED");
+        let _ = url.set_password(None);
+    }
+    url.to_string()
 }
 
 /// Closes a command database connection and converts errors for CLI output.
@@ -2449,6 +2468,15 @@ mod tests {
         let executable = std::env::current_exe().unwrap();
 
         assert_eq!(db_path, executable.parent().unwrap().join("db.sqlite"));
+    }
+
+    #[test]
+    fn redact_database_url_removes_embedded_credentials() {
+        let redacted = redact_database_url("postgres://alice:super-secret@example.test/qanvuli");
+
+        assert_eq!(redacted, "postgres://REDACTED@example.test/qanvuli");
+        assert!(!redacted.contains("super-secret"));
+        assert!(!redacted.contains("alice"));
     }
 
     #[test]

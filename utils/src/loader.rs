@@ -85,6 +85,8 @@ impl<T> ReadSeek for T where T: Read + Seek + Send {}
 
 const ZIP_EXTRACTION_EXPANSION_FACTOR: u64 = 8;
 const ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CVE_JSON_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_NESTED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub struct ZipStorage {
     stream: Option<zip::ZipArchive<Box<dyn ReadSeek>>>,
@@ -168,11 +170,7 @@ impl FileStorageTrait for ZipStorage {
             .ok_or_else(|| anyhow!("zip stream is unavailable for {path}"))?
             .by_name(path.as_str())
             .with_context(|| format!("failed to find {path} in zip archive"))?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)
-            .with_context(|| format!("failed to read {path} from zip archive"))?;
-
-        Ok(buf)
+        read_zip_entry_bytes(&mut f, &path)
     }
 
     fn enum_json_list(&self) -> impl Iterator<Item = String> {
@@ -235,11 +233,7 @@ impl FileStorageTrait for ZipStorage {
                 .by_name(entry.path.as_str())
                 .with_context(|| format!("failed to find {} in zip archive", entry.path))?
         };
-        let mut buf = Vec::with_capacity(f.size() as usize);
-        f.read_to_end(&mut buf)
-            .with_context(|| format!("failed to read {} from zip archive", entry.path))?;
-
-        Ok(buf)
+        read_zip_entry_bytes(&mut f, &entry.path)
     }
 }
 
@@ -261,6 +255,11 @@ fn extract_nested_cve_zip(
         .by_index(0)
         .with_context(|| format!("failed to inspect nested zip entry {nested_name}"))?
         .size();
+    if nested_zip_size > MAX_NESTED_ARCHIVE_BYTES {
+        return Err(anyhow!(
+            "nested zip entry {nested_name} is {nested_zip_size} bytes; maximum is {MAX_NESTED_ARCHIVE_BYTES} bytes"
+        ));
+    }
     let required_bytes = nested_zip_size
         .saturating_mul(ZIP_EXTRACTION_EXPANSION_FACTOR)
         .saturating_add(ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES);
@@ -303,6 +302,20 @@ fn extract_nested_cve_zip(
     })?;
 
     Ok((temp_dir, inner))
+}
+
+fn read_zip_entry_bytes(reader: &mut impl Read, path: &str) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_CVE_JSON_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {path} from zip archive"))?;
+    if bytes.len() as u64 > MAX_CVE_JSON_ENTRY_BYTES {
+        return Err(anyhow!(
+            "zip entry {path} exceeds the {MAX_CVE_JSON_ENTRY_BYTES}-byte limit"
+        ));
+    }
+    Ok(bytes)
 }
 
 fn unique_temp_dir(required_bytes: u64) -> PathBuf {
@@ -487,6 +500,15 @@ mod tests {
         assert!(!is_cve_json_path("nested/CVE-20X4-12345.json"));
         assert!(!is_cve_json_path("nested/CVE-2024-.json"));
         assert!(!is_cve_json_path("nested/CVE-2024-12345.JSON"));
+    }
+
+    #[test]
+    fn zip_entry_reader_rejects_oversized_json() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; MAX_CVE_JSON_ENTRY_BYTES as usize + 1]);
+
+        let err = read_zip_entry_bytes(&mut reader, "CVE-2024-1.json").unwrap_err();
+
+        assert!(err.to_string().contains("exceeds"));
     }
 
     #[test]
