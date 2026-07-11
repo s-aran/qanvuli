@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[features]
-default = ["enrichment"]
-enrichment = []
-
 [dependencies]
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }

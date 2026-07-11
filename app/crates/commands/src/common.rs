@@ -154,14 +154,8 @@ impl OsvImportSelection {
         if include_all {
             return Self::all();
         }
-        let id_prefixes = if prefixes.is_empty() {
-            BTreeSet::from(["OSV".to_owned()])
-        } else {
-            prefixes
-                .iter()
-                .map(|prefix| normalize_osv_prefix(prefix))
-                .collect()
-        };
+        let mut id_prefixes = required_osv_import_prefixes();
+        id_prefixes.extend(prefixes.iter().map(|prefix| normalize_osv_prefix(prefix)));
         Self {
             all: false,
             id_prefixes,
@@ -202,12 +196,13 @@ impl OsvImportSelection {
         if value.eq_ignore_ascii_case("ALL") {
             return Some(Self::all());
         }
-        let id_prefixes = value
+        let mut id_prefixes = value
             .split(',')
             .map(str::trim)
             .filter(|prefix| !prefix.is_empty())
             .map(normalize_osv_prefix)
             .collect::<BTreeSet<_>>();
+        id_prefixes.extend(required_osv_import_prefixes());
         (!id_prefixes.is_empty()).then_some(Self {
             all: false,
             id_prefixes,
@@ -278,6 +273,21 @@ impl OsvImportSelection {
             ))
         }
     }
+}
+
+fn required_osv_import_prefixes() -> BTreeSet<String> {
+    BTreeSet::from(["GHSA".to_owned(), "OSV".to_owned()])
+}
+
+fn metadata_includes_required_osv_prefixes(value: &str) -> bool {
+    if value.trim().eq_ignore_ascii_case("ALL") {
+        return true;
+    }
+    let prefixes = value
+        .split(',')
+        .map(normalize_osv_prefix)
+        .collect::<BTreeSet<_>>();
+    required_osv_import_prefixes().is_subset(&prefixes)
 }
 
 fn normalize_osv_prefix(prefix: &str) -> String {
@@ -360,6 +370,7 @@ pub async fn sync_all_enrichment_sources_after_init(
     let started = Instant::now();
     sync_osv_selection_from_gcs_with_mode(db, label, osv_selection, true).await?;
     sync_kev_epss_snapshots(db, label).await?;
+    rebuild_graph_and_report(db, label).await?;
     eprintln!(
         "{label}: enrichment sync completed in {}",
         format_elapsed(started.elapsed())
@@ -393,15 +404,22 @@ pub async fn sync_all_enrichment_sources_after_update(
         .map_err(|err| format!("{label}: failed to read OSV import selection: {err}"))?;
     let selection = OsvImportSelection::from_metadata(selection_metadata.as_deref())
         .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
+    let selection = requested_osv_additions.map_or(selection.clone(), |additions| {
+        selection.merged_with(additions)
+    });
     selection
         .validate_known_prefixes()
         .map_err(|err| format!("{label}: {err}"))?;
-    if let Some(additions) = requested_osv_additions {
-        let selection = selection.merged_with(additions);
-        eprintln!(
-            "{label}: OSV selection expanded to {}; seeding selected records",
-            selection.description()
-        );
+    let needs_required_seed = selection_metadata
+        .as_deref()
+        .is_some_and(|metadata| !metadata_includes_required_osv_prefixes(metadata));
+    if needs_required_seed || requested_osv_additions.is_some() {
+        let reason = if needs_required_seed {
+            "seeding required OSV and GHSA records for the existing database"
+        } else {
+            "seeding additional OSV records"
+        };
+        eprintln!("{label}: {reason} ({})", selection.description(),);
         sync_osv_selection_from_gcs(db, label, &selection).await?;
         sync_kev_epss_snapshots(db, label).await?;
         eprintln!(
@@ -2441,6 +2459,21 @@ mod tests {
         );
         assert!(!database_dirs.contains_key("crates.io"));
         assert!(!database_dirs.contains_key("empty"));
+    }
+
+    #[test]
+    fn osv_and_ghsa_are_always_included_in_osv_selection() {
+        let selection = OsvImportSelection::default_init(false, &["pysec".to_owned()]);
+        assert!(selection.matches_id("OSV-2024-1"));
+        assert!(selection.matches_id("GHSA-aaaa-bbbb-cccc"));
+        assert!(selection.matches_id("PYSEC-2024-1"));
+
+        let restored = OsvImportSelection::from_metadata(Some("OSV")).unwrap();
+        assert!(restored.matches_id("GHSA-aaaa-bbbb-cccc"));
+
+        assert!(!metadata_includes_required_osv_prefixes("OSV"));
+        assert!(metadata_includes_required_osv_prefixes("OSV,GHSA"));
+        assert!(metadata_includes_required_osv_prefixes("all"));
     }
 
     #[test]

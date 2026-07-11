@@ -4544,14 +4544,24 @@ impl CveDatabase {
         &self,
         cve_id: &str,
     ) -> Result<Option<CveSummaryWithDetail>, DbErr> {
-        let Some(summary) = cve::Entity::find()
+        self.find_cve_summary_with_detail_with_state_scope(cve_id, CveStateScope::PublishedOnly)
+            .await
+    }
+
+    /// Finds a CVE summary and detail with explicit rejected-record handling.
+    pub async fn find_cve_summary_with_detail_with_state_scope(
+        &self,
+        cve_id: &str,
+        state_scope: CveStateScope,
+    ) -> Result<Option<CveSummaryWithDetail>, DbErr> {
+        let mut query = cve::Entity::find()
             .select_only()
             .columns(summary_columns())
-            .filter(cve::Column::CveId.eq(cve_id))
-            .into_model::<CveSummary>()
-            .one(&self.db)
-            .await?
-        else {
+            .filter(cve::Column::CveId.eq(cve_id));
+        if !state_scope.includes_rejected() {
+            query = query.filter(cve::Column::State.eq(PUBLISHED_STATE));
+        }
+        let Some(summary) = query.into_model::<CveSummary>().one(&self.db).await? else {
             return Ok(None);
         };
         let mut rows = self.attach_cve_details(vec![summary]).await?;

@@ -92,7 +92,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         );
         for finding in result.cve_findings {
             let key = cve_finding_key_from_finding(&finding);
-            cve_findings.entry(key).or_insert(finding);
+            merge_cve_finding(&mut cve_findings, key, finding);
         }
         for finding in result.osv_findings {
             let key = osv_finding_key_from_finding(&finding);
@@ -193,6 +193,8 @@ async fn search_package(
                 package: package.name.clone(),
                 version: package.version.clone(),
                 matched_component: component.clone(),
+                matched_purl: None,
+                version_match: CveVersionMatch::NotChecked,
                 cve,
             });
         }
@@ -215,9 +217,28 @@ async fn search_package(
             .await
             .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
         for finding in findings {
+            if finding.affected.status == "affected" {
+                for cve_id in &finding.cve_ids {
+                    let Some(cve) = db
+                        .find_cve_summary_with_detail_with_state_scope(cve_id, state_scope)
+                        .await
+                        .map_err(|err| format!("failed to load {cve_id}: {err}"))?
+                    else {
+                        continue;
+                    };
+                    cve_findings.push(SbomCveFinding {
+                        package: package.name.clone(),
+                        version: package_ref.version.clone(),
+                        matched_component: package_ref.name.clone(),
+                        matched_purl: Some(package_ref.purl.clone()),
+                        version_match: CveVersionMatch::OsvRangeMatched,
+                        cve: cve.summary,
+                    });
+                }
+            }
             osv_findings.push(SbomOsvFinding {
                 package: package.name.clone(),
-                version: package.version.clone(),
+                version: package_ref.version.clone(),
                 matched_purl: package_ref.purl.clone(),
                 finding,
             });
@@ -262,6 +283,24 @@ fn cve_finding_key_from_finding(finding: &SbomCveFinding) -> (String, String, St
         finding.version.clone().unwrap_or_default(),
         finding.cve.cve_id.clone(),
     )
+}
+
+fn merge_cve_finding(
+    findings: &mut BTreeMap<(String, String, String), SbomCveFinding>,
+    key: (String, String, String),
+    finding: SbomCveFinding,
+) {
+    match findings.entry(key) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(finding);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry)
+            if finding.version_match.is_verified() && !entry.get().version_match.is_verified() =>
+        {
+            entry.insert(finding);
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
+    }
 }
 
 fn osv_finding_key_from_finding(finding: &SbomOsvFinding) -> (String, String, String, String) {
@@ -377,7 +416,25 @@ struct SbomCveFinding {
     package: String,
     version: Option<String>,
     matched_component: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    matched_purl: Option<String>,
+    version_match: CveVersionMatch,
     cve: CveSummary,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CveVersionMatch {
+    /// The CVE is a component-name match; its version range was not evaluated.
+    NotChecked,
+    /// An OSV/GHSA affected-version range matched and aliases this CVE.
+    OsvRangeMatched,
+}
+
+impl CveVersionMatch {
+    const fn is_verified(&self) -> bool {
+        matches!(self, Self::OsvRangeMatched)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -547,6 +604,50 @@ mod tests {
             osv_finding_key(&v1, "pkg:cargo/example@1.0.0", "GHSA-test"),
             osv_finding_key(&v1, "pkg:cargo/example@2.0.0", "GHSA-test")
         );
+    }
+
+    #[test]
+    fn version_matched_cve_replaces_component_only_match() {
+        let summary = CveSummary {
+            cve_id: "CVE-2026-1".to_owned(),
+            state: 1,
+            published_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+            title: "example".to_owned(),
+            description_en: None,
+        };
+        let key = (
+            "example".to_owned(),
+            "1.0.0".to_owned(),
+            summary.cve_id.clone(),
+        );
+        let mut findings = BTreeMap::new();
+        merge_cve_finding(
+            &mut findings,
+            key.clone(),
+            SbomCveFinding {
+                package: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                matched_component: "example".to_owned(),
+                matched_purl: None,
+                version_match: CveVersionMatch::NotChecked,
+                cve: summary.clone(),
+            },
+        );
+        merge_cve_finding(
+            &mut findings,
+            key.clone(),
+            SbomCveFinding {
+                package: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                matched_component: "example".to_owned(),
+                matched_purl: Some("pkg:cargo/example@1.0.0".to_owned()),
+                version_match: CveVersionMatch::OsvRangeMatched,
+                cve: summary,
+            },
+        );
+
+        assert!(findings[&key].version_match.is_verified());
     }
 
     #[test]

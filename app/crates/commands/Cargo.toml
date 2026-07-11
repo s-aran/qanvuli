@@ -4,12 +4,8 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
-[features]
-default = ["enrichment"]
-enrichment = ["qanvuli-core/enrichment"]
-
 [dependencies]
-qanvuli-core = { version = "*", path = "../../../core", default-features = false }
+qanvuli-core = { version = "*", path = "../../../core" }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 rayon = "1.12"

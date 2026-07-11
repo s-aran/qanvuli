@@ -48,13 +48,11 @@ impl MigrationTrait for M20260616CreateCveCoreSchema {
 
         create_current_indexes(manager.get_connection()).await?;
         create_current_search_tables(manager.get_connection()).await?;
-        #[cfg(feature = "enrichment")]
         create_enrichment_tables(manager.get_connection()).await?;
         Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        #[cfg(feature = "enrichment")]
         drop_enrichment_tables(manager.get_connection()).await?;
 
         for table in [
@@ -87,7 +85,6 @@ impl MigrationTrait for M20260616CreateCveCoreSchema {
     }
 }
 
-#[cfg(feature = "enrichment")]
 async fn drop_enrichment_tables<C>(db: &C) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
@@ -118,7 +115,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "enrichment")]
 async fn create_enrichment_tables<C>(db: &C) -> Result<(), DbErr>
 where
     C: ConnectionTrait,

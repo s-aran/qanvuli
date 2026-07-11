@@ -10,12 +10,7 @@ version.workspace = true
 license.workspace = true
 
 [features]
-default = ["enrichment", "mcp", "tui"]
-enrichment = [
-    "qanvuli-app-commands/enrichment",
-    "qanvuli-app-mcp?/enrichment",
-    "qanvuli-app-tui?/enrichment",
-]
+default = ["mcp", "tui"]
 mcp = ["dep:qanvuli-app-mcp"]
 tui = ["dep:qanvuli-app-tui"]
 

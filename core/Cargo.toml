@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
-[features]
-default = ["enrichment"]
-enrichment = ["qanvuli-db/enrichment"]
-
 [dependencies]
 ahash = "0.8"
 anyhow = "1.0"
@@ -24,7 +20,7 @@ toml = { version = "1.1", features = ["fast_hash"] }
 qanvuli-models = { version = "*", path = "../models" }
 qanvuli-utils = { version = "*", path = "../utils" }
 qanvuli-collector = { version = "*", path = "../collector" }
-qanvuli-db = { version = "*", path = "../db", default-features = false }
+qanvuli-db = { version = "*", path = "../db" }
 
 [lib]
 doctest = false
