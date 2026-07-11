@@ -16,7 +16,7 @@ serde = { version = "1.0", features = ["derive", "serde_derive"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.52" }
-octocrab = { version = "0.53", default-features = false, features = [
+octocrab = { version = "0.54", default-features = false, features = [
     "default-client",
     "follow-redirect",
     "jwt-aws-lc-rs",

@@ -331,6 +331,7 @@ async fn close_db_before_maintenance(
             .map_err(|err| format!("failed to close database before {operation}: {err}"))?;
     }
     app.results.clear();
+    app.osv_results.clear();
     app.enrichment.clear();
     app.total_results = None;
     Ok(())

@@ -870,6 +870,67 @@ fn enrichment_imports_and_queries_joined_sources() {
     });
 }
 
+#[test]
+fn deferred_osv_import_rebuilds_search_once_and_bulk_finish_restores_indexes() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+
+        db.prepare_bulk_osv_import().await.unwrap();
+        let dropped_indexes = db
+            .connection()
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_source_raw_records_source_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert!(dropped_indexes.is_empty());
+        db.finish_bulk_osv_import().await.unwrap();
+        let restored_indexes = db
+            .connection()
+            .query_all(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_source_raw_records_source_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored_indexes.len(), OSV_BULK_LOAD_FINAL_INDEXES.len());
+
+        let (summary, _) = db
+            .import_osv_records_deferred_search_with_cursor_count_and_timings(
+                vec![OsvRawRecord {
+                    source_path: Some("GHSA-TEST-0001.json".to_owned()),
+                    raw_json: include_str!("../../fixtures/osv/GHSA-TEST-0001.json").to_owned(),
+                }],
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.imported, 1);
+        assert!(
+            db.search_osv_summaries_free_text("duplicate fixture", 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        db.rebuild_osv_text_search().await.unwrap();
+        assert_eq!(
+            db.search_osv_summaries_free_text("duplicate fixture", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    });
+}
+
 async fn insert_test_cwe(db: &DatabaseConnection) {
     cwe::Entity::insert(cwe::ActiveModel {
         id: Set(79),

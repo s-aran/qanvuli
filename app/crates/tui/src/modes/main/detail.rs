@@ -5,7 +5,9 @@ use crate::{
     traits::detail::DetailPanel,
     utils::datetime::format_timestamp,
 };
-use qanvuli_core::database::{CveAffectedDetail, CveSummaryWithDetail, cve_state_label};
+use qanvuli_core::database::{
+    CveAffectedDetail, CveSummaryWithDetail, OsvSummary, cve_state_label,
+};
 use ratatui::{
     layout::Rect,
     text::Line,
@@ -22,21 +24,25 @@ impl DetailPanel for MainDetailPanel {
         detail_search: &DetailSearch,
         area: Rect,
     ) {
-        let detail = app
-            .selected()
-            .map(|cve| detail_lines(cve, app.display.timezone, detail_search))
-            .unwrap_or_else(|| vec![Line::from("No results")]);
+        let detail = if let Some(cve) = app.selected() {
+            detail_lines(cve, app.display.timezone, detail_search)
+        } else if let Some(osv) = app.selected_osv() {
+            osv_detail_lines(osv, app.display.timezone, detail_search)
+        } else {
+            vec![Line::from("No results")]
+        };
         app.clamp_detail_scroll();
-        let detail_title = app
-            .selected()
-            .map(|cve| {
-                format!(
-                    "{} [{}]",
-                    cve.summary.cve_id,
-                    cve_state_label(cve.summary.state)
-                )
-            })
-            .unwrap_or_else(|| "CVE".to_owned());
+        let detail_title = if let Some(cve) = app.selected() {
+            format!(
+                "{} [{}]",
+                cve.summary.cve_id,
+                cve_state_label(cve.summary.state)
+            )
+        } else if let Some(osv) = app.selected_osv() {
+            format!("{} [OSV]", osv.osv_id)
+        } else {
+            "Result".to_owned()
+        };
         let detail = Paragraph::new(detail)
             .block(
                 Block::default()
@@ -48,6 +54,33 @@ impl DetailPanel for MainDetailPanel {
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, area);
     }
+}
+
+fn osv_detail_lines(
+    osv: &OsvSummary,
+    timezone: TimeZone,
+    detail_search: &DetailSearch,
+) -> Vec<Line<'static>> {
+    let timestamp = |label: &str, value: Option<&str>| {
+        highlighted_line(
+            &format!(
+                "{label}: {}",
+                value
+                    .map(|value| format_timestamp(value, timezone))
+                    .unwrap_or_else(|| "-".to_owned())
+            ),
+            detail_search,
+        )
+    };
+    vec![
+        timestamp("Published", osv.published_at.as_deref()),
+        timestamp("Updated", osv.modified_at.as_deref()),
+        timestamp("Withdrawn", osv.withdrawn_at.as_deref()),
+        Line::from(""),
+        highlighted_line(osv.summary.as_deref().unwrap_or_default(), detail_search),
+        Line::from(""),
+        highlighted_line(osv.details.as_deref().unwrap_or_default(), detail_search),
+    ]
 }
 
 fn detail_lines(

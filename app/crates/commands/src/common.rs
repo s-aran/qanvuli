@@ -309,6 +309,25 @@ pub async fn rebuild_graph_and_report(db: &CveDatabase, label: &str) -> Result<(
     Ok(())
 }
 
+async fn rebuild_osv_text_search_if_imported(
+    db: &CveDatabase,
+    label: &str,
+    imported: usize,
+) -> Result<(), String> {
+    if imported == 0 {
+        return Ok(());
+    }
+    let started = Instant::now();
+    db.rebuild_osv_text_search()
+        .await
+        .map_err(|err| format!("{label}: failed to rebuild OSV text search: {err}"))?;
+    eprintln!(
+        "{label}: rebuilt OSV text search in {}",
+        format_elapsed(started.elapsed())
+    );
+    Ok(())
+}
+
 /// Writes source synchronization status for enrichment providers to stderr.
 pub async fn report_enrichment_source_status(db: &CveDatabase, label: &str) -> Result<(), String> {
     let states = db
@@ -491,6 +510,7 @@ pub async fn sync_all_enrichment_sources_after_update(
     .await;
     let _ = std::fs::remove_file(&zip_path);
     let summary = summary?;
+    rebuild_osv_text_search_if_imported(db, label, summary.imported).await?;
     eprintln!(
         "{label}: upserted OSV records={} skipped={} in {}",
         summary.imported,
@@ -552,7 +572,7 @@ async fn sync_osv_selection_from_gcs_with_mode(
     let finish_result = if bulk_init {
         let finish_started = Instant::now();
         let result = db
-            .finish_bulk_osv_import_storage_only()
+            .finish_bulk_osv_import()
             .await
             .map_err(|err| format!("{label}: failed to finish OSV bulk import: {err}"));
         Some((finish_started.elapsed(), result))
@@ -560,6 +580,9 @@ async fn sync_osv_selection_from_gcs_with_mode(
         None
     };
     let summary = summary?;
+    if !bulk_init {
+        rebuild_osv_text_search_if_imported(db, label, summary.imported).await?;
+    }
     if let Some((elapsed, result)) = finish_result {
         result?;
         eprintln!(
@@ -804,7 +827,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
             )
             .await
         } else {
-            db.import_osv_records_with_cursor_count_and_timings(
+            db.import_osv_records_deferred_search_with_cursor_count_and_timings(
                 batch.records,
                 cursor,
                 Some(batch.seen),

@@ -9,8 +9,8 @@ pub mod database {
         CveActiveModels, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail, CveCvssDetail,
         CveCweDetail, CveDatabase, CveDetail, CveReference, CveStateScope, CveSummary,
         CveSummarySortOrder, CveSummaryWithDetail, CveZipFileRecord, CweEntry, EnrichedCveSummary,
-        EnrichedFinding, ImportSummary, OsvRawRecord, ReadJsonFileRecord, cve_state_label,
-        detect_identifier_type,
+        EnrichedFinding, ImportSummary, OsvRawRecord, OsvSummary, ReadJsonFileRecord,
+        cve_state_label, detect_identifier_type,
     };
 }
 

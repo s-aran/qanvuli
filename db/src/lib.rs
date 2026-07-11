@@ -901,6 +901,11 @@ impl CveDatabase {
         finish_bulk_osv_import_on(&self.db).await
     }
 
+    /// Rebuilds OSV full-text and token search tables after deferred imports.
+    pub async fn rebuild_osv_text_search(&self) -> Result<(), DbErr> {
+        rebuild_osv_text_search(&self.db).await
+    }
+
     /// Restores storage settings after a partial OSV import without rebuilding indexes.
     pub async fn finish_bulk_osv_import_storage_only(&self) -> Result<(), DbErr> {
         finish_bulk_osv_import_storage_on(&self.db).await
@@ -2367,22 +2372,28 @@ impl CveDatabase {
                         )
                         .await?,
                     );
-                }
-                let osv_cves = if let Some(token) = single_fts_token(query) {
-                    self.search_cve_summaries_by_osv_token(&token, state_scope, candidate_limit, 0)
-                        .await?
                 } else {
-                    self.search_cve_summaries_by_osv_free_text(
-                        query,
-                        state_scope,
-                        candidate_limit,
-                        0,
-                    )
-                    .await?
-                };
-                append_unique_summaries(&mut cves, osv_cves);
+                    let osv_cves = if let Some(token) = single_fts_token(query) {
+                        self.search_cve_summaries_by_osv_token(
+                            &token,
+                            state_scope,
+                            candidate_limit,
+                            0,
+                        )
+                        .await?
+                    } else {
+                        self.search_cve_summaries_by_osv_free_text(
+                            query,
+                            state_scope,
+                            candidate_limit,
+                            0,
+                        )
+                        .await?
+                    };
+                    append_unique_summaries(&mut cves, osv_cves);
+                }
             }
-            if cves.len() < candidate_limit as usize {
+            if !is_identifier_like_query(query) && cves.len() < candidate_limit as usize {
                 append_unique_summaries(
                     &mut cves,
                     self.search_cve_summaries_by_fts_text_with_state_scope(
@@ -2483,6 +2494,42 @@ impl CveDatabase {
         } else if let Some(cwe_id) = cwe_id {
             self.count_cve_summaries_by_cwe_with_state_scope(&[cwe_id.to_string()], state_scope)
                 .await
+        } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
+            && is_identifier_like_query(query)
+        {
+            let identifier = normalize_identifier(query);
+            let upper = token_prefix_upper_bound(&identifier);
+            let state_filter = if state_scope.includes_rejected() {
+                ""
+            } else {
+                " AND cve.state = 0"
+            };
+            self.count_by_statement(
+                &format!(
+                    r#"
+                    WITH matches(cve_id) AS (
+                        SELECT cve_id FROM osv_cve_search
+                        WHERE osv_id >= ? AND osv_id < ?
+                        UNION
+                        SELECT s.cve_id
+                        FROM osv_aliases a
+                        INNER JOIN osv_cve_search s ON s.osv_id = a.osv_id
+                        WHERE a.alias_id >= ? AND a.alias_id < ?
+                    )
+                    SELECT COUNT(*) AS count
+                    FROM matches
+                    INNER JOIN cve ON cve.cve_id = matches.cve_id
+                    WHERE true{state_filter}
+                    "#
+                ),
+                vec![
+                    SeaValue::from(identifier.clone()),
+                    SeaValue::from(upper.clone()),
+                    SeaValue::from(identifier),
+                    SeaValue::from(upper),
+                ],
+            )
+            .await
         } else if matches!(self.db.get_database_backend(), DbBackend::Sqlite)
             && let Some(fts_query) = fts_query(query)
         {
@@ -3481,6 +3528,24 @@ impl CveDatabase {
             last_cursor,
             record_count_override,
             false,
+            true,
+        )
+        .await
+    }
+
+    /// Imports OSV records while deferring the global text-search rebuild to the caller.
+    pub async fn import_osv_records_deferred_search_with_cursor_count_and_timings(
+        &self,
+        records: Vec<OsvRawRecord>,
+        last_cursor: Option<&str>,
+        record_count_override: Option<usize>,
+    ) -> Result<(ImportSummary, ImportTimings), DbErr> {
+        self.import_osv_records_with_cursor_count_timings_and_mode(
+            records,
+            last_cursor,
+            record_count_override,
+            false,
+            false,
         )
         .await
     }
@@ -3497,6 +3562,7 @@ impl CveDatabase {
             last_cursor,
             record_count_override,
             true,
+            false,
         )
         .await
     }
@@ -3507,6 +3573,7 @@ impl CveDatabase {
         last_cursor: Option<&str>,
         record_count_override: Option<usize>,
         bulk_init: bool,
+        rebuild_text_search: bool,
     ) -> Result<(ImportSummary, ImportTimings), DbErr> {
         let total_start = std::time::Instant::now();
         let fetched_at = Utc::now().to_rfc3339();
@@ -3584,7 +3651,7 @@ impl CveDatabase {
         .await?;
         txn.commit().await?;
         let db_write_elapsed = db_write_start.elapsed();
-        if imported > 0 && !bulk_init {
+        if imported > 0 && rebuild_text_search {
             rebuild_osv_text_search(&self.db).await?;
         }
         Ok((
@@ -4339,37 +4406,24 @@ impl CveDatabase {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let normalized = normalize_identifier(query);
-        let pattern = like_pattern(query);
+        let (sql, values) = osv_summary_search_statement(query, limit, offset, false)?;
         OsvSummary::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            r#"
-            SELECT DISTINCT o.osv_id, o.schema_version, o.published_at, o.modified_at,
-                   o.withdrawn_at, o.summary, o.details
-            FROM osv_advisories o
-            LEFT JOIN osv_aliases alias ON alias.osv_id = o.osv_id
-            LEFT JOIN osv_affected_packages package ON package.osv_id = o.osv_id
-            WHERE o.osv_id = ? OR alias.alias_id = ?
-               OR o.osv_id LIKE ? OR o.summary LIKE ? OR o.details LIKE ?
-               OR alias.alias_id LIKE ? OR package.package_name LIKE ? OR package.purl LIKE ?
-            ORDER BY o.published_at DESC, o.osv_id ASC
-            LIMIT ? OFFSET ?
-            "#,
-            vec![
-                SeaValue::from(normalized.clone()),
-                SeaValue::from(normalized),
-                SeaValue::from(pattern.clone()),
-                SeaValue::from(pattern.clone()),
-                SeaValue::from(pattern.clone()),
-                SeaValue::from(pattern.clone()),
-                SeaValue::from(pattern.clone()),
-                SeaValue::from(pattern),
-                SeaValue::from(limit as i64),
-                SeaValue::from(offset as i64),
-            ],
+            sql,
+            values,
         ))
         .all(&self.db)
         .await
+    }
+
+    /// Counts OSV advisories matching an identifier, alias, package, or text query.
+    pub async fn count_osv_summaries_free_text(&self, query: &str) -> Result<u64, DbErr> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(0);
+        }
+        let (sql, values) = osv_summary_search_statement(query, 0, 0, true)?;
+        self.count_by_statement(&sql, values).await
     }
 
     /// Finds OSV advisories affecting a package/version and attaches CVE risk data.
@@ -5403,6 +5457,7 @@ where
     for sql in OSV_BULK_LOAD_FINAL_INDEXES {
         db.execute_unprepared(sql).await?;
     }
+    rebuild_osv_text_search(db).await?;
     restore_sqlite_bulk_pragmas(db).await
 }
 
@@ -7797,6 +7852,76 @@ fn is_identifier_like_query(query: &str) -> bool {
         && query
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn osv_summary_search_statement(
+    query: &str,
+    limit: u64,
+    offset: u64,
+    count_only: bool,
+) -> Result<(String, Vec<SeaValue>), DbErr> {
+    if is_identifier_like_query(query) {
+        let identifier = normalize_identifier(query);
+        let upper = token_prefix_upper_bound(&identifier);
+        let matched = r#"
+            WITH matched(osv_id) AS (
+                SELECT osv_id FROM osv_advisories WHERE osv_id >= ? AND osv_id < ?
+                UNION
+                SELECT osv_id FROM osv_aliases WHERE alias_id >= ? AND alias_id < ?
+            )
+        "#;
+        let mut values = vec![
+            SeaValue::from(identifier.clone()),
+            SeaValue::from(upper.clone()),
+            SeaValue::from(identifier),
+            SeaValue::from(upper),
+        ];
+        let sql = if count_only {
+            format!(
+                "{matched} SELECT COUNT(*) AS count FROM matched INNER JOIN osv_advisories o ON o.osv_id = matched.osv_id"
+            )
+        } else {
+            values.push(SeaValue::from(limit as i64));
+            values.push(SeaValue::from(offset as i64));
+            format!(
+                r#"{matched}
+                SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
+                       o.withdrawn_at, o.summary, o.details
+                FROM matched
+                INNER JOIN osv_advisories o ON o.osv_id = matched.osv_id
+                ORDER BY o.published_at DESC, o.osv_id ASC
+                LIMIT ? OFFSET ?"#
+            )
+        };
+        return Ok((sql, values));
+    }
+
+    let fts_query = fts_query(query)
+        .ok_or_else(|| DbErr::Custom("OSV search query has no searchable tokens".to_owned()))?;
+    if count_only {
+        Ok((
+            "SELECT COUNT(*) AS count FROM osv_text_fts WHERE osv_text_fts MATCH ?".to_owned(),
+            vec![SeaValue::from(fts_query)],
+        ))
+    } else {
+        Ok((
+            r#"
+            SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
+                   o.withdrawn_at, o.summary, o.details
+            FROM osv_text_fts fts
+            INNER JOIN osv_advisories o ON o.osv_id = fts.osv_id
+            WHERE osv_text_fts MATCH ?
+            ORDER BY o.published_at DESC, o.osv_id ASC
+            LIMIT ? OFFSET ?
+            "#
+            .to_owned(),
+            vec![
+                SeaValue::from(fts_query),
+                SeaValue::from(limit as i64),
+                SeaValue::from(offset as i64),
+            ],
+        ))
+    }
 }
 
 fn affected_fts_query(vendor: Option<&str>, product: Option<&str>) -> Option<String> {

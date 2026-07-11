@@ -23,13 +23,23 @@ impl ResultList for CandidateList {
                     Line::from(Span::raw(cve.summary.title.clone())),
                 ])
             })
+            .chain(app.osv_results.iter().map(|osv| {
+                ListItem::new(vec![
+                    Line::from(Span::raw(osv.osv_id.clone())),
+                    Line::from(Span::raw(
+                        osv.summary
+                            .clone()
+                            .unwrap_or_else(|| "OSV advisory".to_owned()),
+                    )),
+                ])
+            }))
             .collect::<Vec<_>>();
         let list = List::new(items)
             .block(
                 Block::default()
                     .title(format!(
                         "Candidates ({}/{})",
-                        app.results.len(),
+                        app.candidate_count(),
                         app.total_results
                             .map(|total| total.to_string())
                             .unwrap_or_else(|| "-".to_owned())

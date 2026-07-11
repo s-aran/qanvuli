@@ -13,7 +13,7 @@ use super::{
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_core::database::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
-    CweEntry, EnrichedCveSummary,
+    CweEntry, EnrichedCveSummary, OsvSummary,
 };
 use ratatui::widgets::ListState;
 use std::collections::HashMap;
@@ -42,6 +42,7 @@ pub(super) struct App {
     pub(super) display: DisplaySettings,
     pub(super) limit: u64,
     pub(super) results: Vec<CveSummaryWithDetail>,
+    pub(super) osv_results: Vec<OsvSummary>,
     pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
@@ -243,6 +244,7 @@ impl App {
             display: DisplaySettings::default(),
             limit,
             results: Vec::new(),
+            osv_results: Vec::new(),
             total_results: None,
             list_state,
             focus: PaneFocus::Left,
@@ -338,13 +340,13 @@ impl App {
     }
 
     pub(super) fn start_load_more(&mut self, db: CveDatabase) {
-        if self.searching() || self.exhausted || self.results.is_empty() {
+        if self.searching() || self.exhausted || self.candidate_count() == 0 {
             return;
         }
 
         let request = self.searched_request.clone();
-        let offset = self.results.len() as u64;
-        let select_offset = self.results.len();
+        let offset = self.results.len().max(self.osv_results.len()) as u64;
+        let select_offset = self.candidate_count();
         self.start_pending_search(
             db,
             request,
@@ -392,8 +394,10 @@ impl App {
         }
         match kind {
             SearchKind::Replace => {
-                self.exhausted = result.rows.len() < self.limit as usize;
+                self.exhausted = result.rows.len() < self.limit as usize
+                    && result.osv_rows.len() < self.limit as usize;
                 self.results = result.rows;
+                self.osv_results = result.osv_rows;
                 self.clear_detail();
                 self.select_candidate(0);
                 if let Some(count) = count {
@@ -402,8 +406,10 @@ impl App {
                 }
             }
             SearchKind::Append { select_offset } => {
-                self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize;
+                self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize
+                    && result.osv_rows.len() < TUI_LOAD_MORE_LIMIT as usize;
                 self.results.extend(result.rows);
+                self.osv_results.extend(result.osv_rows);
                 self.select_candidate(select_offset);
             }
         }
@@ -627,7 +633,7 @@ impl App {
     pub(super) fn detail_status(&self) -> &'static str {
         if self.searching() {
             "searching"
-        } else if self.selected().is_none() {
+        } else if self.selected().is_none() && self.selected_osv().is_none() {
             "no selection"
         } else {
             "ready"
@@ -765,6 +771,17 @@ impl App {
         self.list_state
             .selected()
             .and_then(|index| self.results.get(index))
+    }
+
+    pub(super) fn selected_osv(&self) -> Option<&OsvSummary> {
+        self.list_state
+            .selected()
+            .and_then(|index| index.checked_sub(self.results.len()))
+            .and_then(|index| self.osv_results.get(index))
+    }
+
+    pub(super) fn candidate_count(&self) -> usize {
+        self.results.len() + self.osv_results.len()
     }
 
     pub(super) fn toggle_raw_json_mode(&mut self, db: Option<CveDatabase>) {
@@ -953,19 +970,20 @@ impl App {
     }
 
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
-        if self.results.is_empty() {
+        let candidate_count = self.candidate_count();
+        if candidate_count == 0 {
             self.list_state.select(None);
             return;
         }
         let current = self.list_state.selected().unwrap_or(0);
-        if current + 1 >= self.results.len() {
+        if current + 1 >= candidate_count {
             self.start_load_more(db);
             return;
         }
         let next = self
             .list_state
             .selected()
-            .map(|index| (index + 1).min(self.results.len() - 1))
+            .map(|index| (index + 1).min(candidate_count - 1))
             .unwrap_or(0);
         self.list_state.select(Some(next));
     }
@@ -1017,7 +1035,7 @@ impl App {
     }
 
     pub(super) fn previous(&mut self) {
-        if self.results.is_empty() {
+        if self.candidate_count() == 0 {
             self.list_state.select(None);
             return;
         }
@@ -1278,6 +1296,7 @@ impl App {
         self.advanced = AdvancedForm::default();
         self.display = DisplaySettings::default();
         self.results.clear();
+        self.osv_results.clear();
         self.enrichment.clear();
         self.total_results = None;
         self.list_state.select(Some(0));
@@ -1433,7 +1452,8 @@ impl App {
         amount: PageAmount,
         db: Option<CveDatabase>,
     ) {
-        if self.results.is_empty() {
+        let candidate_count = self.candidate_count();
+        if candidate_count == 0 {
             self.list_state.select(None);
             return;
         }
@@ -1442,11 +1462,11 @@ impl App {
         let step = self.left_step(amount);
         let next = match direction {
             PageDirection::Up => current.saturating_sub(step),
-            PageDirection::Down => current.saturating_add(step).min(self.results.len() - 1),
+            PageDirection::Down => current.saturating_add(step).min(candidate_count - 1),
         };
         self.list_state.select(Some(next));
         if matches!(direction, PageDirection::Down)
-            && next + 1 >= self.results.len()
+            && next + 1 >= candidate_count
             && let Some(db) = db
         {
             self.start_load_more(db);
@@ -1526,11 +1546,11 @@ impl App {
     }
 
     fn select_candidate(&mut self, index: usize) {
-        if self.results.is_empty() {
+        let candidate_count = self.candidate_count();
+        if candidate_count == 0 {
             self.list_state.select(None);
         } else {
-            self.list_state
-                .select(Some(index.min(self.results.len() - 1)));
+            self.list_state.select(Some(index.min(candidate_count - 1)));
         }
     }
 

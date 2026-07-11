@@ -34,7 +34,11 @@ pub(super) fn render(
         RightPaneTab::Metadata => render_lines(
             frame,
             app,
-            metadata::metadata_lines(app.selected().map(|cve| &cve.detail), detail_search),
+            if app.selected_osv().is_some() {
+                vec![Line::from("No CVE metadata for OSV-only advisory")]
+            } else {
+                metadata::metadata_lines(app.selected().map(|cve| &cve.detail), detail_search)
+            },
             rows[1],
         ),
         RightPaneTab::Enrichment => {
@@ -84,6 +88,13 @@ fn render_lines(
 }
 
 fn enrichment_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static>> {
+    if let Some(osv) = app.selected_osv() {
+        return vec![
+            highlighted_line(&format!("Identifier: {}", osv.osv_id), detail_search),
+            Line::from(""),
+            Line::from("OSV-only advisory; no related CVE enrichment"),
+        ];
+    }
     let Some(cve) = app.selected() else {
         return vec![Line::from("No result")];
     };
