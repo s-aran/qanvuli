@@ -9,9 +9,5 @@ pub(crate) fn offset(value: Option<u64>) -> u64 {
 }
 
 pub(crate) fn state_scope(include_rejected: Option<bool>) -> CveStateScope {
-    if include_rejected.unwrap_or(false) {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    }
+    CveStateScope::from_include_rejected(include_rejected.unwrap_or(false))
 }

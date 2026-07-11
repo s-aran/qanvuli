@@ -135,6 +135,13 @@ pub async fn connect_db(db_url: &str) -> Result<CveDatabase, String> {
         .map_err(|err| format!("failed to connect database `{db_url}`: {err}"))
 }
 
+/// Closes a command database connection and converts errors for CLI output.
+pub async fn close_db(db: CveDatabase) -> Result<(), String> {
+    db.close()
+        .await
+        .map_err(|err| format!("failed to close database: {err}"))
+}
+
 /// Builds the default SQLite URL beside the `qanvuli` executable.
 pub fn default_db_connection_string() -> Result<String, String> {
     let executable = std::env::current_exe()

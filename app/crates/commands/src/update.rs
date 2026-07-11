@@ -1,6 +1,6 @@
 use super::common::{
     IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
-    apply_delta_updates_with_progress, connect_db, rebuild_graph_and_report,
+    apply_delta_updates_with_progress, close_db, connect_db, rebuild_graph_and_report,
     report_enrichment_source_status, sync_all_enrichment_sources_after_update,
 };
 use std::path::PathBuf;
@@ -46,9 +46,7 @@ async fn run_with_progress(
     sync_all_enrichment_sources_after_update(&db, "update", osv_additions.as_ref()).await?;
     rebuild_graph_and_report(&db, "update").await?;
     report_enrichment_source_status(&db, "update").await?;
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }
 

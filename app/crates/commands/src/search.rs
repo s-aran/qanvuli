@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
+use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
 use qanvuli_db::{CveStateScope, detect_identifier_type};
 
 /// CLI arguments for `qanvuli search`.
@@ -155,9 +155,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             "resolution": resolution,
             "results": results,
         }))?;
-        db.close()
-            .await
-            .map_err(|err| format!("failed to close database: {err}"))?;
+        close_db(db).await?;
         return Ok(());
     }
 
@@ -176,19 +174,13 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             let cve = cve.map(|cve| cve.into_parts().1);
             print_json(&cve)?;
         }
-        db.close()
-            .await
-            .map_err(|err| format!("failed to close database: {err}"))?;
+        close_db(db).await?;
         return Ok(());
     }
 
     let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
     let offset = args.offset.unwrap_or(0);
-    let state_scope = if args.include_rejected {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    };
+    let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
     let vendor = args.vendor_like();
     let product = args.product_like();
     let component = args.component_like();
@@ -287,9 +279,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     } else {
         print_json(&summaries)?;
     }
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }
 

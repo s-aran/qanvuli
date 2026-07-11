@@ -1,4 +1,4 @@
-use super::common::{connect_db, print_json};
+use super::common::{close_db, connect_db, print_json};
 
 /// CLI arguments for `qanvuli query`.
 #[derive(Debug, clap::Args)]
@@ -71,8 +71,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             print_json(&result)?;
         }
     }
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }

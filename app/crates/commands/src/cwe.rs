@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, connect_db, print_json};
+use super::common::{DEFAULT_LIMIT, close_db, connect_db, print_json};
 use qanvuli_db::CveStateScope;
 
 /// CLI arguments for `qanvuli cwe`.
@@ -13,19 +13,13 @@ pub struct Args {
 /// Runs a CWE search and prints matching CVE summaries as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_db(db_url).await?;
-    let state_scope = if args.include_rejected {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    };
+    let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
     let cves = db
         .search_cve_summaries_by_cwe_with_state_scope(&[args.cwe], state_scope, DEFAULT_LIMIT, 0)
         .await
         .map_err(|err| format!("failed to search CWE: {err}"))?;
 
     print_json(&cves)?;
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }

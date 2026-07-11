@@ -1,6 +1,6 @@
 use super::common::{
     IngestMode, IngestOptions, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
-    OsvImportSelection, ReleaseAssetKind, connect_db, download_latest_asset_with_source,
+    OsvImportSelection, ReleaseAssetKind, close_db, connect_db, download_latest_asset_with_source,
     ingest_zip_with_progress, remove_processed_zip, report_enrichment_source_status,
     reset_sqlite_database_files, sync_all_enrichment_sources_after_init,
 };
@@ -56,9 +56,7 @@ async fn run_with_progress(
         emit_init_progress(&progress, "-", "done");
         report_enrichment_source_status(&db, "init").await?;
         println!("initialized schema: {db_url}");
-        db.close()
-            .await
-            .map_err(|err| format!("failed to close database: {err}"))?;
+        close_db(db).await?;
         return Ok(());
     }
 
@@ -103,9 +101,7 @@ async fn run_with_progress(
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
     sync_all_enrichment_sources_after_init(&db, "init", &osv_selection).await?;
     report_enrichment_source_status(&db, "init").await?;
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }
 

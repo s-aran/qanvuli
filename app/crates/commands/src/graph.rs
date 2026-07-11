@@ -1,4 +1,4 @@
-use super::common::{connect_db, print_json};
+use super::common::{close_db, connect_db, print_json};
 
 /// CLI arguments for `qanvuli graph`.
 #[derive(Debug, clap::Args)]
@@ -28,8 +28,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             print_json(&summary)?;
         }
     }
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }

@@ -154,6 +154,15 @@ pub enum CveStateScope {
 }
 
 impl CveStateScope {
+    /// Creates a scope from a caller-facing rejected-record flag.
+    pub const fn from_include_rejected(include_rejected: bool) -> Self {
+        if include_rejected {
+            Self::IncludeRejected
+        } else {
+            Self::PublishedOnly
+        }
+    }
+
     pub(crate) fn includes_rejected(self) -> bool {
         matches!(self, Self::IncludeRejected)
     }

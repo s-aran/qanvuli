@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, DateFilter, connect_db, print_json};
+use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
 use qanvuli_db::{CveStateScope, CveSummary, EnrichedFinding};
 use serde::{Deserialize, Serialize};
 use simd_json::json;
@@ -50,11 +50,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let mut cve_findings = BTreeMap::<String, SbomCveFinding>::new();
     let mut osv_findings = BTreeMap::<String, SbomOsvFinding>::new();
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
-    let state_scope = if args.include_rejected {
-        CveStateScope::IncludeRejected
-    } else {
-        CveStateScope::PublishedOnly
-    };
+    let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
     for package in packages {
         for component in package.search_names().into_iter().take(8) {
@@ -122,9 +118,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         "osv_findings": osv_findings,
     }))?;
 
-    db.close()
-        .await
-        .map_err(|err| format!("failed to close database: {err}"))?;
+    close_db(db).await?;
     Ok(())
 }
 
