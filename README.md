@@ -24,10 +24,11 @@ It imports CVE JSON archives into a local SQLite database, applies delta updates
 - Network access for downloading CVE/CWE archives during initialization and updates.
 - SQLite database path or connection URL.
 
-By default, qanvuli uses:
+By default, qanvuli stores and opens `db.sqlite` in the directory containing the
+`qanvuli` executable. For example, a Cargo-installed binary uses:
 
 ```bash
-sqlite://./db.sqlite?mode=rwc
+~/.cargo/bin/db.sqlite
 ```
 
 You can override it with `--db-url` or `QANVULI_DB_URL`.
@@ -152,50 +153,14 @@ cargo run -- mcp
 The MCP server exposes tools for:
 
 - CWE search
-- vendor/product search
+- vendor/product search with substring or exact-match arguments
 - text search
 - CVSS search
 - recent CVE search
-- identifier resolution across CVE, OSV, GHSA, RUSTSEC, PYSEC, and GO aliases
-- enriched CVE lookup with local OSV, CISA KEV, and FIRST EPSS data
-- enriched OSV package/version lookup
 - exact raw CVE JSON lookup
-- database status
+- database update
 
 Use `--db-url` or `QANVULI_DB_URL` to point the MCP server at the same database used by the CLI/TUI.
-
-## OSV, KEV, EPSS Enrichment
-
-The CVE List V5 importer and updater remain the source of CVE records. OSV, CISA KEV, and FIRST EPSS are imported as additional local enrichment sources with raw source records, provider timestamps where available, fetched timestamps, content hashes, normalized lookup tables, source sync state, and identifier graph evidence.
-
-Initialization:
-
-```bash
-cargo run -- init
-cargo run -- init --osv-pysec --osv-ghsa
-cargo run -- init --osv-rustsec --osv-go
-cargo run -- init --osv-suse-su --osv-ubuntu
-cargo run -- init --osv-all
-cargo run -- update
-cargo run -- update --osv-ghsa
-cargo run -- graph rebuild
-```
-
-Cross-source queries:
-
-```bash
-cargo run -- query resolve --id GHSA-TEST-0001
-cargo run -- query enriched-cve --id CVE-2099-0001
-cargo run -- query package --ecosystem crates.io --name foo --version 1.2.3 --enriched
-cargo run -- search --text GHSA-TEST-0001 --enriched
-cargo run -- db status
-```
-
-MCP tools include `resolve_identifier`, `get_related_identifiers`, `get_enriched_cve`, `get_enriched_osv`, `query_package_enriched`, and enriched `get_database_status`.
-
-`init` and `update` continue to use the existing CVE List V5 importer/updater, then rebuild the local identifier graph and report OSV/KEV/EPSS sync state. KEV and EPSS are refreshed as snapshots. During `init`, OSV records are imported from Google Cloud Storage by advisory ID prefix. `OSV-` (OSS-Fuzz) is included by default, `--osv-all` imports the complete OSV corpus, and any official OSV source DB prefix can be selected with repeatable `--osv-<prefix>` flags. For example, `--osv-ghsa` selects `GHSA-`, `--osv-pysec` selects `PYSEC-`, `--osv-rustsec` selects `RUSTSEC-`, and `--osv-suse-su` selects `SUSE-SU-`; these are generic prefix selections, not hard-coded source-specific modes. The selected OSV prefixes are stored locally so plain `update` applies `modified_id.csv` changes only for the configured subset, upserting changed OSV IDs. `update --osv-<prefix>` and `update --osv-all` expand the stored OSV selection and seed the expanded set before continuing with KEV/EPSS snapshots. OSV imports upsert by OSV ID and skip unchanged records by content hash.
-
-Current limits: OSV imports are streamed from disk into DB batches to reduce peak memory use, but `--osv-all` can still be slow. Package/version matching currently supports OSV SEMVER ranges for `crates.io`; unsupported ecosystems are not reported as `not_affected`. EPSS history, NVD/CVSS/CWE/CPE enrichment beyond existing CVE data, CSAF, VEX, automated remediation, and arbitrary MCP URL fetching are not implemented.
 
 ## SBOM Search
 
