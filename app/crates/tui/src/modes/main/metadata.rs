@@ -2,7 +2,7 @@ use crate::{
     common::{DetailSearch, highlighted_line},
     utils::text::normalize_spaces,
 };
-use qanvuli_db::CveDetail;
+use qanvuli_core::database::CveDetail;
 use ratatui::text::Line;
 
 pub(super) fn metadata_lines(

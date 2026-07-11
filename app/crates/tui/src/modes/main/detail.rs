@@ -5,7 +5,7 @@ use crate::{
     traits::detail::DetailPanel,
     utils::datetime::format_timestamp,
 };
-use qanvuli_db::{CveAffectedDetail, CveSummaryWithDetail, cve_state_label};
+use qanvuli_core::database::{CveAffectedDetail, CveSummaryWithDetail, cve_state_label};
 use ratatui::{
     layout::Rect,
     text::Line,

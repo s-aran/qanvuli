@@ -1,6 +1,6 @@
 use crate::{app::App, common::input::is_ctrl, utils::text::wrapped_line_count};
 use crossterm::event::{KeyCode, KeyEvent};
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 use ratatui::layout::Size;
 
 pub(crate) fn handle_key(

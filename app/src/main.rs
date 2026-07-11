@@ -11,7 +11,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    qanvuli_utils::init_tls_provider();
+    qanvuli_core::runtime::init_tls_provider();
 
     let cli = Cli::parse_from(normalize_osv_prefix_flags(std::env::args_os())?);
     if cli.version {

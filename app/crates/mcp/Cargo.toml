@@ -6,12 +6,11 @@ license.workspace = true
 
 [features]
 default = ["enrichment"]
-enrichment = ["qanvuli-app-commands/enrichment", "qanvuli-db/enrichment"]
+enrichment = ["qanvuli-app-commands/enrichment", "qanvuli-core/enrichment"]
 
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "../commands", default-features = false }
-qanvuli-db = { version = "*", path = "../../../db", default-features = false }
-qanvuli-models = { version = "*", path = "../../../models" }
+qanvuli-core = { version = "*", path = "../../../core", default-features = false }
 rmcp = { version = "2.1", features = ["server", "transport-io"] }
 serde = { version = "1.0", features = ["derive"] }
 simd-json = { version = "0.17", features = ["ahash"] }

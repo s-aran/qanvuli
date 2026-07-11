@@ -1,4 +1,4 @@
-use qanvuli_db::{CveDatabase, CweEntry};
+use qanvuli_core::database::{CveDatabase, CweEntry};
 
 const CWE_TUI_LIMIT: u64 = 2_000;
 

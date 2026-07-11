@@ -1,5 +1,5 @@
 use super::common::{DEFAULT_LIMIT, close_db, connect_db, print_json};
-use qanvuli_db::CveStateScope;
+use qanvuli_core::database::CveStateScope;
 
 /// CLI arguments for `qanvuli cwe`.
 #[derive(Debug, clap::Args)]

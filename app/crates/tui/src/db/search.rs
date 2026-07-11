@@ -1,5 +1,5 @@
 use crate::mode::SearchMode;
-use qanvuli_db::{
+use qanvuli_core::database::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary, CveSummaryWithDetail,
     EnrichedCveSummary,
 };

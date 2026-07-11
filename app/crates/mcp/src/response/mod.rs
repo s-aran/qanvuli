@@ -1,9 +1,9 @@
 use crate::common::error::mcp_error;
-use qanvuli_db::{
+use qanvuli_core::database::{
     CveAffectedDetail, CveCvssDetail, CveCweDetail, CveReference, CveSummary, CveSummaryWithDetail,
     cve_state_label,
 };
-use qanvuli_models::RawCveStatusRecord;
+use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::model::{CallToolResult, ContentBlock};
 use simd_json::{OwnedValue as Value, json};
 

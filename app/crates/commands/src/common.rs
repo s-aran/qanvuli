@@ -1,18 +1,14 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, TimeZone, Utc};
 use clap::ValueEnum;
-use qanvuli_collector::providers::{
-    cve::CveRelease,
-    cwe::CweCatalogFile,
-    epss::download_epss_current_csv,
-    kev::download_kev_json,
-    osv::{OSV_ALL_ZIP, OsvGcsSource, OsvModifiedId, parse_modified_id_csv},
+use qanvuli_core::{
+    database::{CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord},
+    ingest::{
+        CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile, JsonEntry, OSV_ALL_ZIP,
+        OsvGcsSource, OsvModifiedId, ZipStorage, download_epss_current_csv, download_kev_json,
+        parse_modified_id_csv,
+    },
+    model::{OSV_DATABASE_SOURCE_PREFIXES, is_known_osv_database_prefix, read_cwe_catalog_zip},
 };
-use qanvuli_db::{
-    CveActiveModels, CveDatabase, CveZipFileRecord, OsvRawRecord, ReadJsonFileRecord,
-};
-use qanvuli_models::cwe::read_cwe_catalog_zip;
-use qanvuli_models::osv::{OSV_DATABASE_SOURCE_PREFIXES, is_known_osv_database_prefix};
-use qanvuli_utils::loader::{self, FileStorageTrait, JsonEntry};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read;
@@ -116,7 +112,7 @@ impl std::fmt::Display for ReleaseAssetKind {
 }
 
 /// Normalized date filters shared by CLI search commands.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DateFilter {
     pub published_since: Option<String>,
     pub updated_since: Option<String>,
@@ -577,7 +573,7 @@ async fn import_osv_selection_zips_from_gcs(
     cursor: Option<&str>,
     label: &str,
     bulk_init: bool,
-) -> Result<qanvuli_db::ImportSummary, String> {
+) -> Result<qanvuli_core::database::ImportSummary, String> {
     if selection.all {
         let zip_path = download_osv_zip_to_temp(osv, OSV_ALL_ZIP, label).await?;
         let summary = import_osv_zip_file_in_batches(
@@ -597,7 +593,7 @@ async fn import_osv_selection_zips_from_gcs(
         return summary;
     }
 
-    let mut total = qanvuli_db::ImportSummary {
+    let mut total = qanvuli_core::database::ImportSummary {
         source: "OSV".to_owned(),
         imported: 0,
         skipped: 0,
@@ -730,7 +726,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
     db: &CveDatabase,
     path: &Path,
     options: OsvZipImportOptions<'_>,
-) -> Result<qanvuli_db::ImportSummary, String> {
+) -> Result<qanvuli_core::database::ImportSummary, String> {
     let OsvZipImportOptions {
         target_paths,
         selection,
@@ -872,7 +868,7 @@ pub(crate) async fn import_osv_zip_file_in_batches(
         timings.hash_lookup,
         timings.db_write
     );
-    Ok(qanvuli_db::ImportSummary {
+    Ok(qanvuli_core::database::ImportSummary {
         source: "OSV".to_owned(),
         imported,
         skipped,
@@ -1740,7 +1736,7 @@ async fn cve_zip_asset_is_not_newer(db: &CveDatabase, asset: &CveZipAsset) -> Re
 async fn update_delta_assets_since(
     since: &str,
     elapsed: ChronoDuration,
-) -> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
+) -> Result<Vec<GitHubReleaseFile>, String> {
     let mut cve = CveRelease::new();
     cve.async_get_all()
         .await
@@ -1811,9 +1807,7 @@ async fn update_delta_assets_since(
     Ok(selected)
 }
 
-pub async fn latest_asset(
-    kind: ReleaseAssetKind,
-) -> Result<qanvuli_utils::github::GitHubReleaseFile, String> {
+pub async fn latest_asset(kind: ReleaseAssetKind) -> Result<GitHubReleaseFile, String> {
     let mut cve = CveRelease::new();
     cve.async_get()
         .await
@@ -1830,8 +1824,7 @@ pub async fn latest_asset(
         .ok_or_else(|| format!("no {kind} CVE zip asset found"))
 }
 
-pub async fn delta_assets_oldest_first()
--> Result<Vec<qanvuli_utils::github::GitHubReleaseFile>, String> {
+pub async fn delta_assets_oldest_first() -> Result<Vec<GitHubReleaseFile>, String> {
     let mut cve = CveRelease::new();
     cve.async_get_all()
         .await
@@ -1885,7 +1878,7 @@ pub async fn ingest_zip_with_progress(
     } = options;
     let total_start = Instant::now();
     eprintln!("{label}: opening zip {}", asset_path.display());
-    let mut storage = loader::ZipStorage::new(asset_path.to_string_lossy().to_string())
+    let mut storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|err| format!("{label}: failed to open {}: {err}", asset_path.display()))?;
     // Preserve nested archive extraction until the database write has completed.
     storage.retain_extracted_dir();
@@ -2243,7 +2236,7 @@ fn read_and_parse_extracted_chunk(
 fn read_and_parse_zip_chunk(
     label: &str,
     chunk: &[JsonEntry],
-    storage: &mut loader::ZipStorage,
+    storage: &mut ZipStorage,
     read_failed: &mut usize,
 ) -> Result<(Vec<ParsedCveFile>, Duration, Duration), String> {
     let read_start = Instant::now();

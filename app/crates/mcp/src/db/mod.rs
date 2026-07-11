@@ -5,8 +5,8 @@ use qanvuli_app_commands::common::{
     OsvImportSelection, apply_delta_updates, redact_database_url,
     sync_all_enrichment_sources_after_update,
 };
-use qanvuli_db::{CveDatabase, CveStateScope, CveSummary};
-use qanvuli_models::RawCveStatusRecord;
+use qanvuli_core::database::{CveDatabase, CveStateScope, CveSummary};
+use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 use simd_json::{OwnedValue as Value, json};
 use std::path::PathBuf;

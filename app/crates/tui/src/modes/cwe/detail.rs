@@ -3,7 +3,7 @@ use crate::{
     common::{DetailSearch, focus_style, highlighted_line, status::detail_search_title_suffix},
     traits::detail::DetailPanel,
 };
-use qanvuli_db::CweEntry;
+use qanvuli_core::database::CweEntry;
 use ratatui::{
     layout::Rect,
     text::Line,

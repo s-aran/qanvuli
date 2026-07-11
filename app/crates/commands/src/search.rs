@@ -1,5 +1,5 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
-use qanvuli_db::{CveStateScope, detect_identifier_type};
+use qanvuli_core::database::{CveStateScope, detect_identifier_type};
 
 /// CLI arguments for `qanvuli search`.
 #[derive(Debug, Default, clap::Args)]

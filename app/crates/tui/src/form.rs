@@ -1,4 +1,6 @@
-use qanvuli_db::{CveAdvancedQueryMode, CveAdvancedSearch, CveStateScope, CveSummarySortOrder};
+use qanvuli_core::database::{
+    CveAdvancedQueryMode, CveAdvancedSearch, CveStateScope, CveSummarySortOrder,
+};
 
 use super::mode::SearchMode;
 

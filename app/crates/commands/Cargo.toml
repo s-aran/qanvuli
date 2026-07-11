@@ -6,13 +6,10 @@ license.workspace = true
 
 [features]
 default = ["enrichment"]
-enrichment = ["qanvuli-db/enrichment"]
+enrichment = ["qanvuli-core/enrichment"]
 
 [dependencies]
-qanvuli-collector = { version = "*", path = "../../../collector" }
-qanvuli-db = { version = "*", path = "../../../db", default-features = false }
-qanvuli-models = { version = "*", path = "../../../models" }
-qanvuli-utils = { version = "*", path = "../../../utils" }
+qanvuli-core = { version = "*", path = "../../../core", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.6", features = ["derive"] }
 rayon = "1.12"
@@ -21,6 +18,7 @@ serde_json = "1.0"
 simd-json = { version = "0.17", features = ["ahash"] }
 url = "2"
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+tokio = { version = "1.52", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["macros", "rt-multi-thread"] }

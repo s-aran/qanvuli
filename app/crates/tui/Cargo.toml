@@ -6,11 +6,11 @@ license.workspace = true
 
 [features]
 default = ["enrichment"]
-enrichment = ["qanvuli-app-commands/enrichment", "qanvuli-db/enrichment"]
+enrichment = ["qanvuli-app-commands/enrichment", "qanvuli-core/enrichment"]
 
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "../commands", default-features = false }
-qanvuli-db = { version = "*", path = "../../../db", default-features = false }
+qanvuli-core = { version = "*", path = "../../../core", default-features = false }
 chrono = "0.4"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = "0.29"

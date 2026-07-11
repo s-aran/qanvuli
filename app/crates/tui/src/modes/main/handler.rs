@@ -3,7 +3,7 @@ use crate::{
     common::input::is_ctrl,
 };
 use crossterm::event::{KeyCode, KeyEvent};
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 
 pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent) -> bool {
     match key.code {

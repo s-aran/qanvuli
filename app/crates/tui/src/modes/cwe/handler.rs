@@ -4,7 +4,7 @@ use crate::{
     utils::text::wrapped_line_count,
 };
 use crossterm::event::{KeyCode, KeyEvent};
-use qanvuli_db::{CveDatabase, CweEntry};
+use qanvuli_core::database::{CveDatabase, CweEntry};
 use ratatui::layout::Size;
 
 pub(crate) fn handle_key(

@@ -4,7 +4,7 @@ use crate::{
     traits::list::ResultList,
     utils::text::normalize_spaces,
 };
-use qanvuli_db::CweEntry;
+use qanvuli_core::database::CweEntry;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},

@@ -11,7 +11,7 @@ use super::{
     utils::text::{normalize_spaces, wrapped_line_count},
 };
 use qanvuli_app_commands::common::IngestProgress;
-use qanvuli_db::{
+use qanvuli_core::database::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
     CweEntry, EnrichedCveSummary,
 };

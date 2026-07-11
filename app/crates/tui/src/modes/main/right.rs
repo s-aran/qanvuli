@@ -4,7 +4,7 @@ use crate::{
     common::{DetailSearch, focus_style, highlighted_line},
     traits::detail::DetailPanel,
 };
-use qanvuli_db::EnrichedCveSummary;
+use qanvuli_core::database::EnrichedCveSummary;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},

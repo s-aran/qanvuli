@@ -1,4 +1,4 @@
-use qanvuli_db::CveSummarySortOrder;
+use qanvuli_core::database::CveSummarySortOrder;
 
 #[derive(Clone, Debug)]
 pub(super) struct DisplaySettings {

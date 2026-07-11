@@ -11,7 +11,7 @@ use super::{
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use qanvuli_app_commands::{init, update};
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 

@@ -1,9 +1,12 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
-use qanvuli_db::{CveStateScope, CveSummary, EnrichedFinding};
+use qanvuli_core::database::{CveStateScope, CveSummary, EnrichedFinding};
 use serde::{Deserialize, Serialize};
 use simd_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use tokio::task::JoinSet;
+
+const MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY: usize = 16;
 
 /// CLI arguments for `qanvuli sbom`.
 #[derive(Debug, clap::Args)]
@@ -18,6 +21,9 @@ pub struct Args {
     updated_since: Option<String>,
     #[arg(long)]
     per_package_limit: Option<u64>,
+    /// Maximum number of packages searched concurrently.
+    #[arg(short = 'j', long, value_name = "N")]
+    jobs: Option<usize>,
     #[arg(long)]
     include_rejected: bool,
 }
@@ -40,6 +46,10 @@ impl Args {
 
 /// Reads an SBOM JSON file and prints local vulnerability findings as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
+    let jobs = args.jobs.unwrap_or_else(default_search_concurrency);
+    if jobs == 0 {
+        return Err("--jobs must be at least 1".to_owned());
+    }
     let db = connect_db(db_url).await?;
     db.initialize_schema()
         .await
@@ -52,62 +62,62 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
     let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
-    for package in packages {
-        for component in package.search_names().into_iter().take(8) {
-            let cves = db
-                .search_cve_summaries_by_affected_component_with_state_scope(
-                    None,
-                    &component,
-                    date_filter.published_since.as_deref(),
-                    date_filter.updated_since.as_deref(),
-                    state_scope,
-                    per_package_limit,
-                    0,
-                )
-                .await
-                .map_err(|err| format!("failed to search `{component}`: {err}"))?;
-
-            for cve in cves {
-                let key = cve_finding_key(&package, &cve.cve_id);
-                cve_findings.entry(key).or_insert_with(|| SbomCveFinding {
-                    package: package.name.clone(),
-                    version: package.version.clone(),
-                    matched_component: component.clone(),
-                    cve,
-                });
-            }
+    eprintln!("sbom: searching {package_count} packages with up to {jobs} concurrent searches");
+    let mut pending = JoinSet::new();
+    let mut packages = packages.into_iter().enumerate();
+    let mut completed = 0usize;
+    while pending.len() < jobs {
+        let Some((index, package)) = packages.next() else {
+            break;
+        };
+        start_package_search(
+            &mut pending,
+            db.clone(),
+            package,
+            index + 1,
+            package_count,
+            date_filter.clone(),
+            state_scope,
+            per_package_limit,
+        );
+    }
+    while let Some(result) = pending.join_next().await {
+        let result = result.map_err(|err| format!("SBOM search task failed: {err}"))??;
+        completed += 1;
+        eprintln!(
+            "sbom: [{completed}/{package_count}] completed {} (CVE={}, OSV={})",
+            result.package_name,
+            result.cve_findings.len(),
+            result.osv_findings.len()
+        );
+        for finding in result.cve_findings {
+            let key = cve_finding_key_from_finding(&finding);
+            cve_findings.entry(key).or_insert(finding);
         }
-
-        for purl in package.purls() {
-            let Some(package_ref) = package_ref_from_purl(purl, package.version.as_deref()) else {
-                continue;
-            };
-            let Some(version) = package_ref.version.as_deref() else {
-                continue;
-            };
-            let findings = db
-                .query_package_enriched(
-                    &package_ref.ecosystem,
-                    &package_ref.name,
-                    version,
-                    Some(&package_ref.purl),
-                )
-                .await
-                .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
-            for finding in findings {
-                let key = osv_finding_key(&package, &package_ref.purl, &finding.primary_id);
-                osv_findings.entry(key).or_insert_with(|| SbomOsvFinding {
-                    package: package.name.clone(),
-                    version: package.version.clone(),
-                    matched_purl: package_ref.purl.clone(),
-                    finding,
-                });
-            }
+        for finding in result.osv_findings {
+            let key = osv_finding_key_from_finding(&finding);
+            osv_findings.entry(key).or_insert(finding);
+        }
+        if let Some((index, package)) = packages.next() {
+            start_package_search(
+                &mut pending,
+                db.clone(),
+                package,
+                index + 1,
+                package_count,
+                date_filter.clone(),
+                state_scope,
+                per_package_limit,
+            );
         }
     }
 
     let cve_findings = cve_findings.into_values().collect::<Vec<_>>();
     let osv_findings = osv_findings.into_values().collect::<Vec<_>>();
+    eprintln!(
+        "sbom: completed {package_count} packages; findings={}",
+        cve_findings.len() + osv_findings.len()
+    );
     print_json(&json!({
         "vulnerable": !cve_findings.is_empty() || !osv_findings.is_empty(),
         "package_count": package_count,
@@ -122,7 +132,107 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     Ok(())
 }
 
+fn default_search_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get().saturating_mul(2))
+        .unwrap_or(1)
+        .clamp(1, MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY)
+}
+
+fn start_package_search(
+    pending: &mut JoinSet<Result<PackageSearchResult, String>>,
+    db: qanvuli_core::database::CveDatabase,
+    package: SbomPackage,
+    index: usize,
+    total: usize,
+    date_filter: DateFilter,
+    state_scope: CveStateScope,
+    per_package_limit: u64,
+) {
+    eprintln!("sbom: [{index}/{total}] searching {}", package.name);
+    pending.spawn(search_package(
+        db,
+        package,
+        date_filter,
+        state_scope,
+        per_package_limit,
+    ));
+}
+
+struct PackageSearchResult {
+    package_name: String,
+    cve_findings: Vec<SbomCveFinding>,
+    osv_findings: Vec<SbomOsvFinding>,
+}
+
+async fn search_package(
+    db: qanvuli_core::database::CveDatabase,
+    package: SbomPackage,
+    date_filter: DateFilter,
+    state_scope: CveStateScope,
+    per_package_limit: u64,
+) -> Result<PackageSearchResult, String> {
+    let mut cve_findings = Vec::new();
+    let mut osv_findings = Vec::new();
+    for component in package.search_names().into_iter().take(8) {
+        let cves = db
+            .search_cve_summaries_by_affected_component_with_state_scope(
+                None,
+                &component,
+                date_filter.published_since.as_deref(),
+                date_filter.updated_since.as_deref(),
+                state_scope,
+                per_package_limit,
+                0,
+            )
+            .await
+            .map_err(|err| format!("failed to search `{component}`: {err}"))?;
+
+        for cve in cves {
+            cve_findings.push(SbomCveFinding {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                matched_component: component.clone(),
+                cve,
+            });
+        }
+    }
+
+    for purl in package.purls() {
+        let Some(package_ref) = package_ref_from_purl(purl, package.version.as_deref()) else {
+            continue;
+        };
+        let Some(version) = package_ref.version.as_deref() else {
+            continue;
+        };
+        let findings = db
+            .query_package_enriched(
+                &package_ref.ecosystem,
+                &package_ref.name,
+                version,
+                Some(&package_ref.purl),
+            )
+            .await
+            .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
+        for finding in findings {
+            osv_findings.push(SbomOsvFinding {
+                package: package.name.clone(),
+                version: package.version.clone(),
+                matched_purl: package_ref.purl.clone(),
+                finding,
+            });
+        }
+    }
+
+    Ok(PackageSearchResult {
+        package_name: package.name.clone(),
+        cve_findings,
+        osv_findings,
+    })
+}
+
 /// Builds an unambiguous key that keeps findings for distinct package versions separate.
+#[cfg(test)]
 fn cve_finding_key(package: &SbomPackage, cve_id: &str) -> (String, String, String) {
     (
         package.name.clone(),
@@ -132,6 +242,7 @@ fn cve_finding_key(package: &SbomPackage, cve_id: &str) -> (String, String, Stri
 }
 
 /// Builds an unambiguous key for OSV findings, including the PURL that was matched.
+#[cfg(test)]
 fn osv_finding_key(
     package: &SbomPackage,
     purl: &str,
@@ -142,6 +253,23 @@ fn osv_finding_key(
         package.version.clone().unwrap_or_default(),
         purl.to_owned(),
         finding_id.to_owned(),
+    )
+}
+
+fn cve_finding_key_from_finding(finding: &SbomCveFinding) -> (String, String, String) {
+    (
+        finding.package.clone(),
+        finding.version.clone().unwrap_or_default(),
+        finding.cve.cve_id.clone(),
+    )
+}
+
+fn osv_finding_key_from_finding(finding: &SbomOsvFinding) -> (String, String, String, String) {
+    (
+        finding.package.clone(),
+        finding.version.clone().unwrap_or_default(),
+        finding.matched_purl.clone(),
+        finding.finding.primary_id.clone(),
     )
 }
 
@@ -340,13 +468,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn loads_github_spdx_sbom_sample() {
-        let mut json = include_bytes!("../../../../sbom_sample.json").to_vec();
+    fn loads_minimal_spdx_sbom() {
+        let mut json = br#"{
+            "spdxVersion": "SPDX-2.3",
+            "packages": [
+                {
+                    "name": "mlua",
+                    "versionInfo": "0.11.1",
+                    "externalRefs": [{
+                        "referenceType": "purl",
+                        "referenceLocator": "pkg:cargo/mlua@0.11.1"
+                    }]
+                },
+                {"name": "serde_json", "versionInfo": "1.0.0"}
+            ]
+        }"#
+        .to_vec();
         let packages = load_sbom_packages_from_slice(&mut json).unwrap();
 
-        assert_eq!(packages.len(), 8);
+        assert_eq!(packages.len(), 2);
         assert!(packages.iter().any(|package| package.name == "mlua"));
         assert!(packages.iter().any(|package| package.name == "serde_json"));
+    }
+
+    #[test]
+    fn default_search_concurrency_is_nonzero_and_bounded() {
+        assert!((1..=MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY).contains(&default_search_concurrency()));
     }
 
     #[test]

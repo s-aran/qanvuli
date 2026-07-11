@@ -1,6 +1,6 @@
 //! Database connection, SQLite-path, and JSON-output helpers shared by commands.
 
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 use serde::Serialize;
 use std::path::PathBuf;
 use url::Url;

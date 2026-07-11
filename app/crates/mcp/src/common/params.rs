@@ -1,4 +1,4 @@
-use qanvuli_db::CveStateScope;
+use qanvuli_core::database::CveStateScope;
 
 pub(crate) fn limit(value: Option<u64>) -> u64 {
     value.unwrap_or(10).clamp(1, 30)

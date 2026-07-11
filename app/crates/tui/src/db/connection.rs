@@ -1,5 +1,5 @@
 use qanvuli_app_commands::common::connect_db;
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 
 pub(crate) async fn connect(db_url: &str) -> Result<CveDatabase, String> {
     let db = connect_db(db_url).await?;

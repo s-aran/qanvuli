@@ -2602,7 +2602,7 @@ dependencies = [
  "qanvuli-app-commands",
  "qanvuli-app-mcp",
  "qanvuli-app-tui",
- "qanvuli-utils",
+ "qanvuli-core",
  "tokio",
 ]
 
@@ -2612,10 +2612,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "qanvuli-collector",
- "qanvuli-db",
- "qanvuli-models",
- "qanvuli-utils",
+ "qanvuli-core",
  "rayon",
  "serde",
  "serde_json",
@@ -2630,8 +2627,7 @@ name = "qanvuli-app-mcp"
 version = "0.1.0"
 dependencies = [
  "qanvuli-app-commands",
- "qanvuli-db",
- "qanvuli-models",
+ "qanvuli-core",
  "rmcp",
  "serde",
  "simd-json",
@@ -2646,7 +2642,7 @@ dependencies = [
  "clap",
  "crossterm",
  "qanvuli-app-commands",
- "qanvuli-db",
+ "qanvuli-core",
  "ratatui",
  "regex",
  "serde_json",
@@ -2679,6 +2675,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "once_cell",
+ "qanvuli-collector",
  "qanvuli-db",
  "qanvuli-models",
  "qanvuli-utils",

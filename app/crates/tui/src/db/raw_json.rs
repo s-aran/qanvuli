@@ -1,4 +1,4 @@
-use qanvuli_db::CveDatabase;
+use qanvuli_core::database::CveDatabase;
 
 pub(crate) async fn load_cve_raw_json(db: CveDatabase, cve_id: String) -> Result<String, String> {
     let raw_json = db
