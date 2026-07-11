@@ -4328,6 +4328,50 @@ impl CveDatabase {
             .map(|mut rows| rows.pop())
     }
 
+    /// Searches OSV advisories independently of whether they have a CVE alias.
+    pub async fn search_osv_summaries_free_text(
+        &self,
+        query: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, DbErr> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let normalized = normalize_identifier(query);
+        let pattern = like_pattern(query);
+        OsvSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            r#"
+            SELECT DISTINCT o.osv_id, o.schema_version, o.published_at, o.modified_at,
+                   o.withdrawn_at, o.summary, o.details
+            FROM osv_advisories o
+            LEFT JOIN osv_aliases alias ON alias.osv_id = o.osv_id
+            LEFT JOIN osv_affected_packages package ON package.osv_id = o.osv_id
+            WHERE o.osv_id = ? OR alias.alias_id = ?
+               OR o.osv_id LIKE ? OR o.summary LIKE ? OR o.details LIKE ?
+               OR alias.alias_id LIKE ? OR package.package_name LIKE ? OR package.purl LIKE ?
+            ORDER BY o.published_at DESC, o.osv_id ASC
+            LIMIT ? OFFSET ?
+            "#,
+            vec![
+                SeaValue::from(normalized.clone()),
+                SeaValue::from(normalized),
+                SeaValue::from(pattern.clone()),
+                SeaValue::from(pattern.clone()),
+                SeaValue::from(pattern.clone()),
+                SeaValue::from(pattern.clone()),
+                SeaValue::from(pattern.clone()),
+                SeaValue::from(pattern),
+                SeaValue::from(limit as i64),
+                SeaValue::from(offset as i64),
+            ],
+        ))
+        .all(&self.db)
+        .await
+    }
+
     /// Finds OSV advisories affecting a package/version and attaches CVE risk data.
     pub async fn query_package_enriched(
         &self,

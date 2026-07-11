@@ -112,6 +112,19 @@ impl AdvancedForm {
         }
     }
 
+    /// Returns whether the focused field accepts text input.
+    pub(super) fn active_field_accepts_text(&self) -> bool {
+        matches!(
+            self.active_field,
+            AdvancedField::Query
+                | AdvancedField::PublishedFrom
+                | AdvancedField::PublishedTo
+                | AdvancedField::Cwe
+                | AdvancedField::Product
+                | AdvancedField::Vendor
+        )
+    }
+
     pub(super) fn to_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
         let product = option_string(&self.product);
         let vendor = option_string(&self.vendor);
@@ -253,5 +266,17 @@ mod tests {
 
         form.toggle_current();
         assert!(form.product_exact);
+    }
+
+    #[test]
+    fn text_fields_accept_spaces() {
+        let mut form = AdvancedForm {
+            active_field: AdvancedField::Product,
+            ..AdvancedForm::default()
+        };
+
+        assert!(form.active_field_accepts_text());
+        form.push(' ');
+        assert_eq!(form.product, " ");
     }
 }

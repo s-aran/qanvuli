@@ -270,6 +270,30 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .map_err(|err| format!("failed to search by date: {err}"))?
     };
 
+    if let Some(query) = args.text.as_deref() {
+        let osv_advisories = db
+            .search_osv_summaries_free_text(query, limit, offset)
+            .await
+            .map_err(|err| format!("failed to search OSV advisories: {err}"))?;
+        if args.enriched {
+            let enriched = db
+                .enrich_cve_summaries_full(summaries)
+                .await
+                .map_err(|err| format!("failed to enrich search results: {err}"))?;
+            print_json(&serde_json::json!({
+                "cves": enriched,
+                "osv_advisories": osv_advisories,
+            }))?;
+        } else {
+            print_json(&serde_json::json!({
+                "cves": summaries,
+                "osv_advisories": osv_advisories,
+            }))?;
+        }
+        close_db(db).await?;
+        return Ok(());
+    }
+
     if args.enriched {
         let enriched = db
             .enrich_cve_summaries_full(summaries)

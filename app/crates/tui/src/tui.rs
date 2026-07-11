@@ -137,6 +137,10 @@ async fn run_loop(
                     app.advanced.backspace();
                     app.sync_main_from_advanced();
                 }
+                KeyCode::Char(' ') if app.advanced.active_field_accepts_text() => {
+                    app.advanced.push(' ');
+                    app.sync_main_from_advanced();
+                }
                 KeyCode::Char(' ') => {
                     app.advanced.toggle_current();
                     app.sync_main_from_advanced();
