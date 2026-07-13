@@ -5158,12 +5158,9 @@ async fn insert_cve_rows_returning(
 ) -> Result<HashMap<String, i32>, DbErr> {
     let mut map = HashMap::with_capacity(rows.len());
     for chunk in take_chunks(rows, CVE_CHUNK_SIZE) {
-        let inserted = cve::Entity::insert_many(chunk)
-            .exec_with_returning_many(txn)
-            .await?;
-        for row in inserted {
-            map.insert(row.cve_id, row.id);
-        }
+        let cve_ids = cve_ids_from_active_models(&chunk);
+        cve::Entity::insert_many(chunk).exec(txn).await?;
+        map.extend(cve_db_ids_by_cve_ids(txn, cve_ids).await?);
     }
     Ok(map)
 }
@@ -5174,15 +5171,40 @@ async fn upsert_cve_rows_returning(
 ) -> Result<HashMap<String, i32>, DbErr> {
     let mut map = HashMap::with_capacity(rows.len());
     for chunk in take_chunks(rows, CVE_CHUNK_SIZE) {
-        let inserted = cve::Entity::insert_many(chunk)
+        let cve_ids = cve_ids_from_active_models(&chunk);
+        cve::Entity::insert_many(chunk)
             .on_conflict(cve_upsert_conflict())
-            .exec_with_returning_many(txn)
+            .exec(txn)
             .await?;
-        for row in inserted {
-            map.insert(row.cve_id, row.id);
-        }
+        map.extend(cve_db_ids_by_cve_ids(txn, cve_ids).await?);
     }
     Ok(map)
+}
+
+/// Returns only the fields needed to attach normalized rows after a bulk write.
+///
+/// `exec_with_returning_many` materializes every CVE column, including `raw_json`.
+/// Avoiding that round trip keeps large initial imports bounded by the IDs rather
+/// than by the size of their original JSON documents.
+fn cve_ids_from_active_models(rows: &[cve::ActiveModel]) -> Vec<String> {
+    rows.iter().map(|row| row.cve_id.clone().unwrap()).collect()
+}
+
+async fn cve_db_ids_by_cve_ids<C>(
+    db: &C,
+    cve_ids: Vec<String>,
+) -> Result<HashMap<String, i32>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let rows = cve::Entity::find()
+        .select_only()
+        .columns([cve::Column::Id, cve::Column::CveId])
+        .filter(cve::Column::CveId.is_in(cve_ids))
+        .into_model::<CveDbIdByCveId>()
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(|row| (row.cve_id, row.id)).collect())
 }
 
 async fn insert_cvss_rows(
