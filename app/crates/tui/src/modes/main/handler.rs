@@ -22,9 +22,15 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
                 app.move_full_page_down(db);
             }
         }
+        KeyCode::PageDown => {
+            if let Some(db) = db {
+                app.move_full_page_down(db);
+            }
+        }
         KeyCode::Char('b') if is_ctrl(key, 'b') => {
             app.move_full_page_up();
         }
+        KeyCode::PageUp => app.move_full_page_up(),
         KeyCode::F(1) => app.show_help = true,
         KeyCode::F(2) => app.next_search_mode(),
         KeyCode::F(3) => app.open_advanced_search(),

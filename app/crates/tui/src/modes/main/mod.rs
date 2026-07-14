@@ -29,9 +29,9 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
         .split(chunks[0]);
     app.set_page_sizes(
         left[1].height.saturating_sub(2) as usize,
-        chunks[1].height.saturating_sub(2) as usize,
-        chunks[1].height.saturating_sub(2) as usize,
-        chunks[1].width.saturating_sub(2) as usize,
+        chunks[1].height.saturating_sub(5) as usize,
+        chunks[1].height.saturating_sub(3) as usize,
+        chunks[1].width.saturating_sub(4) as usize,
         chunks[1].width.saturating_sub(2) as usize,
     );
 

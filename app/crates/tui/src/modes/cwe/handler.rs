@@ -48,11 +48,19 @@ pub(crate) fn handle_key(
         KeyCode::Char('f') if is_ctrl(key, 'f') && app.focus == PaneFocus::Right => {
             app.move_cwe_detail_page_down(detail_line_count, detail_page_size.saturating_mul(2))
         }
+        KeyCode::PageDown if app.focus == PaneFocus::Right => {
+            app.move_cwe_detail_page_down(detail_line_count, detail_page_size)
+        }
         KeyCode::Char('b') if is_ctrl(key, 'b') && app.focus == PaneFocus::Right => {
             app.move_cwe_detail_page_up(detail_page_size.saturating_mul(2))
         }
+        KeyCode::PageUp if app.focus == PaneFocus::Right => {
+            app.move_cwe_detail_page_up(detail_page_size)
+        }
         KeyCode::Char('f') if is_ctrl(key, 'f') => app.move_cwe_full_page_down(page_size),
         KeyCode::Char('b') if is_ctrl(key, 'b') => app.move_cwe_full_page_up(page_size),
+        KeyCode::PageDown => app.move_cwe_full_page_down(page_size),
+        KeyCode::PageUp => app.move_cwe_full_page_up(page_size),
         KeyCode::F(4) => app.open_cwe_status_popup(),
         KeyCode::Backspace => app.backspace_cwe_query(db),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_cwe_focus(),

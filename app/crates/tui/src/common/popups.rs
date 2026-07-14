@@ -34,6 +34,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Up/Down Move focused pane"),
         Line::from("Ctrl-U/D Half-page up/down focused pane"),
         Line::from("Ctrl-B/F Full-page up/down focused pane"),
+        Line::from("PageUp/Down Full-page up/down focused pane"),
         Line::from("F1     Show this help"),
         Line::from("Esc    Close this help"),
         Line::from("Ctrl-L Reset screen and popup settings"),

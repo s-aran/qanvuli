@@ -31,9 +31,11 @@ pub(crate) fn handle_key(
         KeyCode::Char('f') if is_ctrl(key, 'f') => {
             app.move_raw_page_down(line_count, page_size.saturating_mul(2))
         }
+        KeyCode::PageDown => app.move_raw_page_down(line_count, page_size),
         KeyCode::Char('b') if is_ctrl(key, 'b') => {
             app.move_raw_page_up(page_size.saturating_mul(2))
         }
+        KeyCode::PageUp => app.move_raw_page_up(page_size),
         KeyCode::Down => app.move_raw_down(line_count, page_size),
         KeyCode::Up => app.move_raw_up(),
         _ => {}

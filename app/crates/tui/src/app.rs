@@ -5,10 +5,13 @@ use super::{
         raw_json::{load_cve_raw_json, load_osv_raw_json},
         search::{SearchRequest, SearchResult, run_count_request, run_search_request},
     },
-    display::DisplaySettings,
+    display::{DisplaySettings, TimeZone},
     form::AdvancedForm,
     mode::SearchMode,
-    utils::text::{normalize_spaces, wrapped_line_count},
+    utils::{
+        datetime::format_timestamp,
+        text::{normalize_spaces, wrapped_line_count},
+    },
 };
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_core::database::{
@@ -1506,19 +1509,96 @@ impl App {
     }
 
     fn max_detail_scroll(&self) -> u16 {
-        let line_count = self
-            .selected()
-            .map(|cve| detail_line_count(cve, self.detail_content_width))
-            .unwrap_or(1);
+        let line_count = if let Some(cve) = self.selected() {
+            detail_line_count(cve, self.detail_content_width, self.display.timezone)
+        } else if let Some(osv) = self.selected_osv() {
+            osv_detail_line_count(osv, self.detail_content_width, self.display.timezone)
+        } else {
+            1
+        };
         line_count.saturating_sub(self.right_page_size) as u16
     }
 
     fn max_metadata_scroll(&self) -> u16 {
-        let line_count = self
-            .selected()
-            .map(|cve| metadata_line_count(cve, self.metadata_content_width))
-            .unwrap_or(1);
+        let line_count = match self.right_tab {
+            RightPaneTab::Cve => 1,
+            RightPaneTab::Metadata => {
+                if let Some(cve) = self.selected() {
+                    metadata_line_count(cve, self.metadata_content_width)
+                } else if let Some(osv) = self.selected_osv() {
+                    osv_metadata_line_count(osv, self.metadata_content_width)
+                } else {
+                    1
+                }
+            }
+            RightPaneTab::Enrichment => self.enrichment_line_count(),
+        };
         line_count.saturating_sub(self.metadata_page_size) as u16
+    }
+
+    fn enrichment_line_count(&self) -> usize {
+        let Some(cve) = self.selected() else {
+            return self.selected_osv().map_or(1, |_| 3);
+        };
+        let Some(enrichment) = self.enrichment.get(&cve.summary.cve_id) else {
+            return 3;
+        };
+        let width = self.metadata_content_width;
+        let mut lines = vec![
+            format!("Identifier: {}", enrichment.cve_id),
+            String::new(),
+            "Priority".to_owned(),
+        ];
+        lines.push(format!(
+            "  KEV: {}",
+            if enrichment.kev_listed {
+                "listed"
+            } else {
+                "not listed"
+            }
+        ));
+        lines.push(match (enrichment.epss, enrichment.epss_percentile) {
+            (Some(epss), Some(percentile)) => format!(
+                "  EPSS: score={epss:.5} percentile={percentile:.5} date={} model={}",
+                enrichment.epss_score_date.as_deref().unwrap_or("-"),
+                enrichment.epss_model_version.as_deref().unwrap_or("-")
+            ),
+            _ => "  EPSS: not synced".to_owned(),
+        });
+        if enrichment.kev_listed {
+            lines.push(format!(
+                "  KEV due={} ransomware={}",
+                enrichment.kev_due_date.as_deref().unwrap_or("-"),
+                enrichment
+                    .kev_known_ransomware_campaign_use
+                    .as_deref()
+                    .unwrap_or("-")
+            ));
+        }
+        let aliases = summary_values(&enrichment.aliases);
+        let osv_summaries = summary_values(&enrichment.osv_summaries);
+        let packages = summary_values(&enrichment.affected_packages);
+        append_summary_section(&mut lines, "Aliases", &aliases);
+        append_summary_section(&mut lines, "OSV Advisories", &osv_summaries);
+        append_summary_section(&mut lines, "Affected Packages", &packages);
+        lines.push(String::new());
+        lines.push("Evidence".to_owned());
+        if !aliases.is_empty() {
+            lines.push("  alias_resolution source=OSV aliases".to_owned());
+        }
+        if enrichment.kev_listed {
+            lines.push("  kev_join source=CISA KEV".to_owned());
+        }
+        if enrichment.epss.is_some() {
+            lines.push("  epss_join source=FIRST EPSS".to_owned());
+        }
+        if aliases.is_empty() && !enrichment.kev_listed && enrichment.epss.is_none() {
+            lines.push("  none".to_owned());
+        }
+        lines
+            .iter()
+            .map(|line| wrapped_line_count(line, width))
+            .sum()
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {
@@ -1614,14 +1694,111 @@ enum PageAmount {
     Full,
 }
 
-fn detail_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
-    let description_lines = cve
-        .summary
-        .description_en
-        .as_deref()
-        .map(|description| wrapped_line_count(description, width))
-        .unwrap_or(1);
-    6 + description_lines
+fn detail_line_count(cve: &CveSummaryWithDetail, width: usize, timezone: TimeZone) -> usize {
+    let summary = &cve.summary;
+    [
+        product_vendor_summary(&cve.detail.affected),
+        format!(
+            "Published: {}",
+            format_timestamp(&summary.published_at, timezone)
+        ),
+        format!(
+            "Updated: {}",
+            format_timestamp(&summary.updated_at, timezone)
+        ),
+        String::new(),
+        summary.title.clone(),
+        String::new(),
+        summary.description_en.clone().unwrap_or_default(),
+    ]
+    .iter()
+    .map(|line| wrapped_line_count(line, width))
+    .sum()
+}
+
+fn osv_detail_line_count(osv: &OsvSummary, width: usize, timezone: TimeZone) -> usize {
+    [
+        osv_timestamp_line("Published", osv.published_at.as_deref(), timezone),
+        osv_timestamp_line("Updated", osv.modified_at.as_deref(), timezone),
+        osv_timestamp_line("Withdrawn", osv.withdrawn_at.as_deref(), timezone),
+        String::new(),
+        osv.summary.clone().unwrap_or_default(),
+        String::new(),
+        osv.details.clone().unwrap_or_default(),
+    ]
+    .iter()
+    .map(|line| wrapped_line_count(line, width))
+    .sum()
+}
+
+fn osv_metadata_line_count(osv: &OsvSummary, width: usize) -> usize {
+    [
+        format!("Identifier: {}", osv.osv_id),
+        format!(
+            "Schema version: {}",
+            osv.schema_version.as_deref().unwrap_or("-")
+        ),
+        format!("Published: {}", osv.published_at.as_deref().unwrap_or("-")),
+        format!("Updated: {}", osv.modified_at.as_deref().unwrap_or("-")),
+        format!("Withdrawn: {}", osv.withdrawn_at.as_deref().unwrap_or("-")),
+    ]
+    .iter()
+    .map(|line| wrapped_line_count(line, width))
+    .sum()
+}
+
+fn osv_timestamp_line(label: &str, value: Option<&str>, timezone: TimeZone) -> String {
+    format!(
+        "{label}: {}",
+        value
+            .map(|value| format_timestamp(value, timezone))
+            .unwrap_or_else(|| "-".to_owned())
+    )
+}
+
+fn product_vendor_summary(affected: &[qanvuli_core::database::CveAffectedDetail]) -> String {
+    let mut values = Vec::new();
+    for affected in affected {
+        let value = format!(
+            "{} / {}",
+            affected.product.as_deref().unwrap_or("-"),
+            affected.vendor.as_deref().unwrap_or("-")
+        );
+        if !values.contains(&value) {
+            values.push(value);
+        }
+        if values.len() >= 3 {
+            break;
+        }
+    }
+    let suffix = if affected.len() > values.len() {
+        " ..."
+    } else {
+        ""
+    };
+    if values.is_empty() {
+        "-".to_owned()
+    } else {
+        format!("{}{suffix}", values.join(", "))
+    }
+}
+
+fn summary_values(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn append_summary_section(lines: &mut Vec<String>, title: &str, values: &[&str]) {
+    lines.push(String::new());
+    lines.push(title.to_owned());
+    if values.is_empty() {
+        lines.push("  none".to_owned());
+    } else {
+        lines.extend(values.iter().map(|value| format!("  {value}")));
+    }
 }
 
 fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
