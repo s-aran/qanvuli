@@ -2,7 +2,7 @@ use super::{
     SEARCH_TIMEOUT, TUI_LOAD_MORE_LIMIT,
     db::{
         cwe::search_cwe_entries,
-        raw_json::load_cve_raw_json,
+        raw_json::{load_cve_raw_json, load_osv_raw_json},
         search::{SearchRequest, SearchResult, run_count_request, run_search_request},
     },
     display::DisplaySettings,
@@ -791,10 +791,6 @@ impl App {
         }
         self.view_mode = ViewMode::RawJson;
         self.raw_scroll = 0;
-        let Some(cve_id) = self.selected().map(|cve| cve.summary.cve_id.clone()) else {
-            self.raw_json = Some("No CVE selected".to_owned());
-            return;
-        };
         let Some(db) = db else {
             self.raw_json = Some("Database is unavailable".to_owned());
             return;
@@ -803,7 +799,17 @@ impl App {
             task.abort();
         }
         self.raw_json = Some("Loading".to_owned());
-        self.raw_json_task = Some(tokio::spawn(load_cve_raw_json(db, cve_id)));
+        self.raw_json_task = match (
+            self.selected().map(|cve| cve.summary.cve_id.clone()),
+            self.selected_osv().map(|osv| osv.osv_id.clone()),
+        ) {
+            (Some(cve_id), _) => Some(tokio::spawn(load_cve_raw_json(db, cve_id))),
+            (_, Some(osv_id)) => Some(tokio::spawn(load_osv_raw_json(db, osv_id))),
+            (None, None) => {
+                self.raw_json = Some("No result selected".to_owned());
+                None
+            }
+        };
     }
 
     pub(super) fn toggle_cwe_list_mode(&mut self, db: Option<CveDatabase>) {

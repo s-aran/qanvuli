@@ -33,6 +33,7 @@ use common::*;
 pub use cve_types::*;
 use entity::{
     app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cve_zip_file, cwe, read_json_file,
+    source_raw_records,
 };
 pub use epss::*;
 pub use identifiers::*;
@@ -1064,6 +1065,20 @@ impl CveDatabase {
         self.find_cve_by_id(cve_id)
             .await
             .and_then(|row| row.map(|row| raw_json_value(&row.raw_json)).transpose())
+    }
+
+    /// Finds one OSV advisory and returns its raw JSON payload.
+    pub async fn find_osv_raw_json_by_id(&self, osv_id: &str) -> Result<Option<Value>, DbErr> {
+        source_raw_records::Entity::find()
+            .filter(source_raw_records::Column::Source.eq("OSV"))
+            .filter(source_raw_records::Column::SourceRecordId.eq(normalize_identifier(osv_id)))
+            .one(&self.db)
+            .await
+            .and_then(|row| {
+                row.and_then(|row| row.raw_json)
+                    .map(|raw_json| raw_json_value(&raw_json))
+                    .transpose()
+            })
     }
 
     /// Finds one CVE and deserializes the raw JSON into the model crate type.

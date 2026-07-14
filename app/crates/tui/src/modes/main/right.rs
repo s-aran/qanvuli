@@ -34,8 +34,8 @@ pub(super) fn render(
         RightPaneTab::Metadata => render_lines(
             frame,
             app,
-            if app.selected_osv().is_some() {
-                vec![Line::from("No CVE metadata for OSV-only advisory")]
+            if let Some(osv) = app.selected_osv() {
+                metadata::osv_metadata_lines(osv, detail_search)
             } else {
                 metadata::metadata_lines(app.selected().map(|cve| &cve.detail), detail_search)
             },
@@ -55,15 +55,20 @@ fn tab_title(app: &App) -> Tabs<'static> {
     ]
     .into_iter()
     .map(|tab| {
+        let title = if tab == RightPaneTab::Cve && app.selected_osv().is_some() {
+            "OSV"
+        } else {
+            tab.title()
+        };
         if app.right_tab == tab {
             Line::from(Span::styled(
-                tab.title(),
+                title,
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ))
         } else {
-            Line::from(tab.title())
+            Line::from(title)
         }
     })
     .collect::<Vec<_>>();

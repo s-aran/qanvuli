@@ -2,7 +2,7 @@ use crate::{
     common::{DetailSearch, highlighted_line},
     utils::text::normalize_spaces,
 };
-use qanvuli_core::database::CveDetail;
+use qanvuli_core::database::{CveDetail, OsvSummary};
 use ratatui::text::Line;
 
 pub(super) fn metadata_lines(
@@ -64,4 +64,20 @@ pub(super) fn metadata_lines(
         }));
     }
     lines
+}
+
+pub(super) fn osv_metadata_lines(
+    osv: &OsvSummary,
+    detail_search: &DetailSearch,
+) -> Vec<Line<'static>> {
+    let value = |label: &str, value: Option<&str>| {
+        highlighted_line(&format!("{label}: {}", value.unwrap_or("-")), detail_search)
+    };
+    vec![
+        highlighted_line(&format!("Identifier: {}", osv.osv_id), detail_search),
+        value("Schema version", osv.schema_version.as_deref()),
+        value("Published", osv.published_at.as_deref()),
+        value("Updated", osv.modified_at.as_deref()),
+        value("Withdrawn", osv.withdrawn_at.as_deref()),
+    ]
 }

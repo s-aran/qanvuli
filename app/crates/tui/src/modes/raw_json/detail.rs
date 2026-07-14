@@ -34,6 +34,7 @@ impl DetailPanel for RawJsonDetailPanel {
         let title = app
             .selected()
             .map(|cve| cve.summary.cve_id.as_str())
+            .or_else(|| app.selected_osv().map(|osv| osv.osv_id.as_str()))
             .unwrap_or("CVE");
         let paragraph = Paragraph::new(json_lines(raw_json_text(app), detail_search))
             .block(

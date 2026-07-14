@@ -27,7 +27,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("F3     Open advanced search"),
         Line::from("F4     Open display settings"),
         Line::from("F5     Open database maintenance"),
-        Line::from("F8     Toggle raw CVE JSON"),
+        Line::from("F8     Toggle raw CVE/OSV JSON"),
         Line::from("F9     Toggle CWE list"),
         Line::from("/      Search visible detail with regex"),
         Line::from("F4     Open CWE status filter in CWE mode"),

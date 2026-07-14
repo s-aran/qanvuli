@@ -729,6 +729,13 @@ fn enrichment_imports_and_queries_joined_sources() {
             }
         }
 
+        let raw_osv = db
+            .find_osv_raw_json_by_id("RUSTSEC-TEST-0001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw_osv["id"], "RUSTSEC-TEST-0001");
+
         let resolution = db.resolve_identifier("RUSTSEC-TEST-0001").await.unwrap();
         assert!(
             resolution
