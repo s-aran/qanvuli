@@ -1,13 +1,31 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod common;
+#[path = "cve/mod.rs"]
+mod cve_storage;
+use cve_storage::initialization::{
+    finish_bulk_replace_all_on, finish_bulk_replace_all_storage_on,
+    finish_bulk_replace_all_storage_with_text_search_on, prepare_bulk_replace_all_on,
+};
+use cve_storage::write::{insert_cve_models_on, upsert_cve_model_batch, upsert_cve_on};
 pub mod cve_types;
+#[path = "cwe_data/mod.rs"]
+mod cwe_storage;
 pub mod entity;
 pub mod epss;
+#[path = "epss_data/mod.rs"]
+mod epss_storage;
 pub mod identifiers;
 pub mod kev;
+#[path = "kev_data/mod.rs"]
+mod kev_storage;
 pub mod migration;
 pub mod osv;
+#[path = "osv_data/mod.rs"]
+mod osv_storage;
+mod storage;
+pub(crate) use osv_storage::initialization::OSV_BULK_LOAD_FINAL_INDEXES;
+use storage::{compact_storage_on, restore_sqlite_bulk_pragmas};
 
 use chrono::Utc;
 pub use common::detect_identifier_type;
@@ -756,10 +774,7 @@ pub struct CveDatabase {
     db: DatabaseConnection,
 }
 
-/// Transaction-backed session for streaming a full CVE replacement import.
-pub struct CveBulkReplaceSession {
-    txn: DatabaseTransaction,
-}
+pub use cve_storage::CveBulkReplaceSession;
 
 impl CveDatabase {
     /// Connects to the database URL and returns a `CveDatabase` handle.
@@ -893,12 +908,12 @@ impl CveDatabase {
 
     /// Prepares storage and indexes for a bulk OSV import.
     pub async fn prepare_bulk_osv_import(&self) -> Result<(), DbErr> {
-        prepare_bulk_osv_import_on(&self.db).await
+        osv_storage::initialization::prepare_bulk_osv_import_on(&self.db).await
     }
 
     /// Finishes a bulk OSV import and restores query indexes.
     pub async fn finish_bulk_osv_import(&self) -> Result<(), DbErr> {
-        finish_bulk_osv_import_on(&self.db).await
+        osv_storage::initialization::finish_bulk_osv_import_on(&self.db).await
     }
 
     /// Rebuilds OSV full-text and token search tables after deferred imports.
@@ -908,7 +923,7 @@ impl CveDatabase {
 
     /// Restores storage settings after a partial OSV import without rebuilding indexes.
     pub async fn finish_bulk_osv_import_storage_only(&self) -> Result<(), DbErr> {
-        finish_bulk_osv_import_storage_on(&self.db).await
+        osv_storage::initialization::finish_bulk_osv_import_storage_on(&self.db).await
     }
 
     /// Compacts the underlying SQLite storage where supported.
@@ -926,7 +941,7 @@ impl CveDatabase {
     /// Inserts or updates the CWE catalog tree.
     pub async fn upsert_cwe_catalog(&self, catalog: &WeaknessCatalog) -> Result<usize, DbErr> {
         let txn = self.db.begin().await?;
-        let count = upsert_cwe_catalog_on(&txn, catalog).await?;
+        let count = cwe_storage::catalog::upsert_cwe_catalog_on(&txn, catalog).await?;
         txn.commit().await?;
         Ok(count)
     }
@@ -3972,8 +3987,8 @@ impl CveDatabase {
         let aliases = load_aliases_for_cve(&self.db, &cve_id).await?;
         let osv_advisories = load_osv_summaries(&self.db, &osv_ids).await?;
         let affected_packages = load_affected_packages(&self.db, &osv_ids).await?;
-        let kev = load_kev(&self.db, &cve_id).await?;
-        let epss = load_epss(&self.db, &cve_id).await?;
+        let kev = kev_storage::read::load_kev(&self.db, &cve_id).await?;
+        let epss = epss_storage::read::load_epss(&self.db, &cve_id).await?;
         let mut evidence = Vec::new();
         if kev.is_some() {
             evidence.push(Evidence {
@@ -4055,8 +4070,8 @@ impl CveDatabase {
             .collect::<Vec<_>>();
         let osv_rows = load_osv_summaries(&self.db, &all_osv_ids).await?;
         let package_rows = load_affected_packages(&self.db, &all_osv_ids).await?;
-        let kev_rows = load_kev_many(&self.db, &cve_ids).await?;
-        let epss_rows = load_epss_many(&self.db, &cve_ids).await?;
+        let kev_rows = kev_storage::read::load_kev_many(&self.db, &cve_ids).await?;
+        let epss_rows = epss_storage::read::load_epss_many(&self.db, &cve_ids).await?;
         let source_sync = self.source_sync_states().await?;
 
         let mut detail_by_cve_id = details
@@ -4148,39 +4163,6 @@ impl CveDatabase {
                 }
             })
             .collect())
-    }
-
-    /// Returns KEV entries, optionally narrowed to one CVE ID.
-    pub async fn kev_entries(&self, cve_id: Option<&str>) -> Result<Vec<KevInfo>, DbErr> {
-        if let Some(cve_id) = cve_id {
-            return Ok(load_kev(&self.db, cve_id).await?.into_iter().collect());
-        }
-        self.kev_entries_paged(i64::MAX as u64, 0).await
-    }
-
-    /// Returns paged KEV entries ordered by date added.
-    pub async fn kev_entries_paged(&self, limit: u64, offset: u64) -> Result<Vec<KevInfo>, DbErr> {
-        KevInfo::find_by_statement(Statement::from_string(
-            DbBackend::Sqlite,
-            format!(
-                r#"
-            SELECT cve_id, vendor_project, product, vulnerability_name, date_added,
-                   short_description, required_action, due_date,
-                   known_ransomware_campaign_use, notes, fetched_at
-            FROM kev_entries
-            ORDER BY date_added DESC, cve_id
-            LIMIT {limit} OFFSET {offset}
-            "#
-            ),
-        ))
-        .all(&self.db)
-        .await
-    }
-
-    /// Counts locally stored KEV entries.
-    pub async fn kev_entries_count(&self) -> Result<u64, DbErr> {
-        self.count_by_sql("SELECT COUNT(*) AS count FROM kev_entries".to_owned())
-            .await
     }
 
     /// Returns compact enrichment rows for the requested CVE IDs.
@@ -4495,12 +4477,12 @@ impl CveDatabase {
         }
 
         let all_cve_ids = all_cve_ids.into_iter().collect::<Vec<_>>();
-        let kev_by_cve_id = load_kev_many(&self.db, &all_cve_ids)
+        let kev_by_cve_id = kev_storage::read::load_kev_many(&self.db, &all_cve_ids)
             .await?
             .into_iter()
             .map(|row| (row.cve_id.clone(), row))
             .collect::<HashMap<_, _>>();
-        let epss_by_cve_id = load_epss_many(&self.db, &all_cve_ids)
+        let epss_by_cve_id = epss_storage::read::load_epss_many(&self.db, &all_cve_ids)
             .await?
             .into_iter()
             .map(|row| (row.cve_id.clone(), row))
@@ -4844,56 +4826,6 @@ impl CveDatabase {
     }
 }
 
-impl CveBulkReplaceSession {
-    pub async fn insert_cve_records(
-        &self,
-        records: Vec<RawCveRecord<CveStatusData>>,
-    ) -> Result<usize, DbErr> {
-        self.insert_cve_models(records.into_iter().map(CveActiveModels::from).collect())
-            .await
-    }
-
-    pub async fn insert_cve_models(&self, models: Vec<CveActiveModels>) -> Result<usize, DbErr> {
-        if models.is_empty() {
-            return Ok(0);
-        }
-
-        insert_cve_models_on(&self.txn, models, false).await
-    }
-
-    pub async fn insert_cve_raw_json_strings(&self, values: Vec<String>) -> Result<usize, DbErr> {
-        self.insert_cve_models(
-            values
-                .into_iter()
-                .map(CveActiveModels::from_raw_json_string)
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .await
-    }
-
-    pub async fn mark_json_files_read(
-        &self,
-        files: Vec<ReadJsonFileRecord>,
-    ) -> Result<usize, DbErr> {
-        mark_json_files_read_on(&self.txn, files, false).await
-    }
-
-    pub async fn finish(self, db: &CveDatabase) -> Result<(), DbErr> {
-        self.txn.commit().await?;
-        finish_bulk_replace_all_on(&db.db).await
-    }
-
-    pub async fn finish_storage_only(self, db: &CveDatabase) -> Result<(), DbErr> {
-        self.txn.commit().await?;
-        finish_bulk_replace_all_storage_on(&db.db).await
-    }
-
-    pub async fn finish_storage_with_text_search(self, db: &CveDatabase) -> Result<(), DbErr> {
-        self.txn.commit().await?;
-        finish_bulk_replace_all_storage_with_text_search_on(&db.db).await
-    }
-}
-
 pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, DbErr> {
     let db = Database::connect(database_url).await?;
     db.execute(Statement::from_string(
@@ -4927,136 +4859,6 @@ pub async fn connect_database(database_url: &str) -> Result<DatabaseConnection, 
     ))
     .await?;
     Ok(db)
-}
-
-async fn upsert_cve_on<C>(db: &C, model: cve::ActiveModel) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    cve::Entity::insert(model)
-        .on_conflict(cve_upsert_conflict())
-        .exec(db)
-        .await?;
-
-    Ok(())
-}
-
-async fn upsert_cve_model_batch(
-    txn: &DatabaseTransaction,
-    models: Vec<CveActiveModels>,
-) -> Result<usize, DbErr> {
-    let mut cve_ids = Vec::with_capacity(models.len());
-    let mut cve_rows = Vec::with_capacity(models.len());
-
-    for model in &models {
-        cve_ids.push(model.cve_id.clone());
-        cve_rows.push(model.cve.clone());
-    }
-
-    let inserted = cve_rows.len();
-
-    let cve_db_ids = upsert_cve_rows_returning(txn, cve_rows).await?;
-    let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
-        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
-    let cve_db_id_values = cve_ids
-        .iter()
-        .filter_map(|cve_id| cve_db_ids.get(cve_id).copied())
-        .collect::<Vec<_>>();
-
-    cve_cvss::Entity::delete_many()
-        .filter(cve_cvss::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
-        .exec(txn)
-        .await?;
-    cve_affected::Entity::delete_many()
-        .filter(cve_affected::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
-        .exec(txn)
-        .await?;
-    cve_cwe::Entity::delete_many()
-        .filter(cve_cwe::Column::CveDbId.is_in(cve_db_id_values.iter().copied()))
-        .exec(txn)
-        .await?;
-
-    for chunk in take_chunks(cvss_rows, CVSS_CHUNK_SIZE) {
-        cve_cvss::Entity::insert_many(chunk).exec(txn).await?;
-    }
-    for chunk in take_chunks(affected_rows, AFFECTED_CHUNK_SIZE) {
-        cve_affected::Entity::insert_many(chunk).exec(txn).await?;
-    }
-    for chunk in take_chunks(cwe_master_rows, CWE_MASTER_CHUNK_SIZE) {
-        cwe::Entity::insert_many(chunk)
-            .on_conflict(cwe_upsert_conflict())
-            .exec(txn)
-            .await?;
-    }
-    for chunk in take_chunks(cwe_rows, CWE_CHUNK_SIZE) {
-        cve_cwe::Entity::insert_many(chunk).exec(txn).await?;
-    }
-    upsert_cve_summary_index_rows(txn, &cve_ids).await?;
-
-    Ok(inserted)
-}
-
-async fn insert_cve_models_on(
-    txn: &DatabaseTransaction,
-    models: Vec<CveActiveModels>,
-    update_search_index: bool,
-) -> Result<usize, DbErr> {
-    let mut inserted = 0usize;
-    let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
-
-    for models in models {
-        batch.push(models);
-        if batch.len() == CVE_CHUNK_SIZE {
-            inserted +=
-                insert_cve_model_batch(txn, std::mem::take(&mut batch), update_search_index)
-                    .await?;
-            batch = Vec::with_capacity(CVE_CHUNK_SIZE);
-        }
-    }
-
-    if !batch.is_empty() {
-        inserted += insert_cve_model_batch(txn, batch, update_search_index).await?;
-    }
-
-    Ok(inserted)
-}
-
-async fn insert_cve_model_batch(
-    txn: &DatabaseTransaction,
-    models: Vec<CveActiveModels>,
-    update_search_index: bool,
-) -> Result<usize, DbErr> {
-    let mut cve_rows = Vec::with_capacity(models.len());
-    let mut cve_ids = Vec::with_capacity(models.len());
-
-    for model in &models {
-        cve_ids.push(model.cve_id.clone());
-        cve_rows.push(model.cve.clone());
-    }
-
-    let inserted = cve_rows.len();
-
-    let cve_db_ids = insert_cve_rows_returning(txn, cve_rows).await?;
-    let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
-        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
-
-    for chunk in take_chunks(cvss_rows, CVSS_CHUNK_SIZE) {
-        insert_cvss_rows(txn, chunk).await?;
-    }
-    for chunk in take_chunks(affected_rows, AFFECTED_CHUNK_SIZE) {
-        insert_affected_rows(txn, chunk).await?;
-    }
-    for chunk in take_chunks(cwe_master_rows, CWE_MASTER_CHUNK_SIZE) {
-        upsert_cwe_rows(txn, chunk).await?;
-    }
-    for chunk in take_chunks(cwe_rows, CWE_CHUNK_SIZE) {
-        insert_cwe_rows(txn, chunk).await?;
-    }
-    if update_search_index {
-        upsert_cve_summary_index_rows(txn, &cve_ids).await?;
-    }
-
-    Ok(inserted)
 }
 
 type CveChildRows = (
@@ -5267,90 +5069,6 @@ async fn upsert_cwe_rows(
     Ok(())
 }
 
-async fn upsert_cwe_catalog_on(
-    txn: &DatabaseTransaction,
-    catalog: &WeaknessCatalog,
-) -> Result<usize, DbErr> {
-    let mut rows = Vec::new();
-
-    if let Some(weaknesses) = &catalog.weaknesses {
-        for weakness in &weaknesses.weakness {
-            rows.push(cwe_catalog_row(
-                weakness.id,
-                weakness.description.clone(),
-                Some(&weakness.status),
-                cwe_parent_id(&weakness.related_weaknesses)?,
-            )?);
-        }
-    }
-
-    if let Some(categories) = &catalog.categories {
-        for category in &categories.category {
-            rows.push(cwe_catalog_row(
-                category.id,
-                category.name.clone(),
-                Some(&category.status),
-                None,
-            )?);
-        }
-    }
-
-    if let Some(views) = &catalog.views {
-        for view in &views.view {
-            rows.push(cwe_catalog_row(
-                view.id,
-                view.name.clone(),
-                Some(&view.status),
-                None,
-            )?);
-        }
-    }
-
-    let count = rows.len();
-
-    for chunk in take_chunks(rows, CWE_MASTER_CHUNK_SIZE) {
-        upsert_cwe_rows(txn, chunk).await?;
-    }
-
-    Ok(count)
-}
-
-fn cwe_catalog_row(
-    id: i64,
-    description: String,
-    status: Option<&qanvuli_models::cwe::enumeration::Status>,
-    parent_id: Option<i32>,
-) -> Result<cwe::ActiveModel, DbErr> {
-    Ok(cwe::ActiveModel {
-        id: Set(i32::try_from(id)
-            .map_err(|err| DbErr::Custom(format!("CWE ID {id} does not fit in i32: {err}")))?),
-        description: Set(Some(description)),
-        status: Set(status.map(|status| status.as_ref().to_owned())),
-        parent_id: Set(parent_id),
-    })
-}
-
-fn cwe_parent_id(
-    related_weaknesses: &Option<qanvuli_models::cwe::common::RelatedWeaknesses>,
-) -> Result<Option<i32>, DbErr> {
-    let Some(related_weaknesses) = related_weaknesses else {
-        return Ok(None);
-    };
-    related_weaknesses
-        .related_weakness
-        .iter()
-        .find(|related| matches!(related.nature, RelatedNature::ChildOf))
-        .map(|related| {
-            i32::try_from(related.cwe_id).map_err(|err| {
-                DbErr::Custom(format!(
-                    "parent CWE ID {} does not fit in i32: {err}",
-                    related.cwe_id
-                ))
-            })
-        })
-        .transpose()
-}
-
 async fn insert_cwe_rows(
     txn: &DatabaseTransaction,
     rows: Vec<cve_cwe::ActiveModel>,
@@ -5358,249 +5076,6 @@ async fn insert_cwe_rows(
     cve_cwe::Entity::insert_many(rows).exec(txn).await?;
     Ok(())
 }
-
-async fn prepare_bulk_replace_all_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
-    db.execute_unprepared("PRAGMA journal_mode = MEMORY")
-        .await?;
-    db.execute_unprepared("PRAGMA synchronous = OFF").await?;
-    db.execute_unprepared("PRAGMA temp_store = MEMORY").await?;
-    db.execute_unprepared("PRAGMA cache_size = -400000").await?;
-    db.execute_unprepared("PRAGMA locking_mode = EXCLUSIVE")
-        .await?;
-    for index_name in BULK_LOAD_DROPPED_INDEXES {
-        db.execute_unprepared(&format!("DROP INDEX IF EXISTS {index_name}"))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn finish_bulk_replace_all_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    for sql in BULK_LOAD_FINAL_INDEXES {
-        db.execute_unprepared(sql).await?;
-    }
-    db.execute_unprepared("ANALYZE").await?;
-    db.execute_unprepared("PRAGMA optimize").await?;
-    rebuild_cve_summary_indexes(db).await?;
-    restore_sqlite_bulk_pragmas(db).await?;
-    Ok(())
-}
-
-async fn finish_bulk_replace_all_storage_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    restore_sqlite_bulk_pragmas(db).await
-}
-
-async fn finish_bulk_replace_all_storage_with_text_search_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    rebuild_minimal_cve_text_search(db).await?;
-    create_cve_overview_indexes(db).await?;
-    restore_sqlite_bulk_pragmas(db).await
-}
-
-async fn create_cve_overview_indexes<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-    for sql in [
-        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id_base_score ON cve_cvss (cve_db_id, base_score)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_cve_db_id ON cve_affected (vendor, cve_db_id)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
-        "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cve_db_id ON cve_cwe (cve_db_id)",
-    ] {
-        db.execute_unprepared(sql).await?;
-    }
-    Ok(())
-}
-
-async fn prepare_bulk_osv_import_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
-    db.execute_unprepared("PRAGMA journal_mode = MEMORY")
-        .await?;
-    db.execute_unprepared("PRAGMA synchronous = OFF").await?;
-    db.execute_unprepared("PRAGMA temp_store = MEMORY").await?;
-    db.execute_unprepared("PRAGMA cache_size = -400000").await?;
-    db.execute_unprepared("PRAGMA locking_mode = EXCLUSIVE")
-        .await?;
-    for index_name in OSV_BULK_LOAD_DROPPED_INDEXES {
-        db.execute_unprepared(&format!("DROP INDEX IF EXISTS {index_name}"))
-            .await?;
-    }
-    Ok(())
-}
-
-async fn finish_bulk_osv_import_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    for sql in OSV_BULK_LOAD_FINAL_INDEXES {
-        db.execute_unprepared(sql).await?;
-    }
-    rebuild_osv_text_search(db).await?;
-    restore_sqlite_bulk_pragmas(db).await
-}
-
-async fn finish_bulk_osv_import_storage_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    rebuild_osv_text_search(db).await?;
-    restore_sqlite_bulk_pragmas(db).await
-}
-
-async fn restore_sqlite_bulk_pragmas<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-    db.execute_unprepared("PRAGMA journal_mode = WAL").await?;
-    db.execute_unprepared("PRAGMA synchronous = NORMAL").await?;
-    db.execute_unprepared("PRAGMA locking_mode = NORMAL")
-        .await?;
-    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
-        .await?;
-    Ok(())
-}
-
-async fn compact_storage_on<C>(db: &C) -> Result<(), DbErr>
-where
-    C: ConnectionTrait,
-{
-    if !matches!(db.get_database_backend(), DbBackend::Sqlite) {
-        return Ok(());
-    }
-
-    db.execute_unprepared("PRAGMA wal_checkpoint(TRUNCATE)")
-        .await?;
-    db.execute_unprepared("VACUUM").await?;
-    Ok(())
-}
-
-const BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
-    "idx_read_json_file_filename",
-    "idx_cve_published_at",
-    "idx_cve_updated_at",
-    "idx_cve_reference_text",
-    "idx_cve_cvss_cve_db_id",
-    "idx_cve_cvss_version",
-    "idx_cve_cvss_base_score",
-    "idx_cve_cvss_base_severity",
-    "idx_cve_cvss_severity_score",
-    "idx_cve_cvss_version_score",
-    "idx_cve_cvss_cve_db_id_score_version",
-    "idx_cve_affected_cve_db_id",
-    "idx_cve_affected_vendor",
-    "idx_cve_affected_product",
-    "idx_cve_affected_package",
-    "idx_cve_affected_version_text",
-    "idx_cve_affected_cve_db_id_vendor_product",
-    "idx_cve_affected_vendor_cve_db_id",
-    "idx_cve_affected_product_cve_db_id",
-    "idx_cve_affected_vendor_product_cve_db_id",
-    "idx_cve_cwe_cve_id",
-    "idx_cve_cwe_cve_db_id",
-    "idx_cve_cwe_cwe_id",
-    "idx_cve_cwe_cwe_id_cve_id",
-    "idx_cve_cwe_cwe_id_cve_db_id",
-    "idx_cwe_id",
-    "idx_cve_published_at_cve_id",
-    "idx_cve_updated_at_cve_id",
-];
-
-const BULK_LOAD_FINAL_INDEXES: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file (filename)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve (published_at)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve (updated_at)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve (published_at, cve_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve (updated_at, cve_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_reference_text ON cve (reference_text)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss (cve_db_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version ON cve_cvss (version)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_score ON cve_cvss (base_score)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_base_severity ON cve_cvss (base_severity)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss (base_severity, base_score)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_version_score ON cve_cvss (version, base_score)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id_score_version ON cve_cvss (cve_db_id, base_score, version)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected (cve_db_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor ON cve_affected (vendor)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_product ON cve_affected (product)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_package ON cve_affected (package_name)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_version_text ON cve_affected (version_text)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id_vendor_product ON cve_affected (cve_db_id, vendor, product)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_cve_db_id ON cve_affected (vendor, cve_db_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_product_cve_db_id ON cve_affected (product, cve_db_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected (vendor, product, cve_db_id)",
-    "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe (cwe_id, cve_db_id)",
-];
-
-const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
-    "idx_source_raw_records_source_hash",
-    "idx_osv_aliases_alias",
-    "idx_osv_cve_search_cve_id",
-    "idx_osv_affected_packages_lookup",
-    "idx_osv_ranges_package",
-    "idx_osv_range_events_range",
-    "idx_identifier_edges_to",
-    "idx_identifier_edges_from",
-];
-
-const OSV_BULK_LOAD_FINAL_INDEXES: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases (alias_id)",
-    "CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
-    "CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
-    "CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges (affected_package_id)",
-    "CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
-    "CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges (to_identifier)",
-    "CREATE INDEX IF NOT EXISTS idx_identifier_edges_from ON vulnerability_identifier_edges (from_identifier)",
-];
 
 async fn create_cve_summary_indexes<C>(db: &C) -> Result<(), DbErr>
 where
@@ -9162,78 +8637,6 @@ where
             ORDER BY p.osv_id, p.ecosystem, p.package_name
             "#,
             sql_string_list(ids)
-        ),
-    ))
-    .all(db)
-    .await
-}
-
-async fn load_kev<C>(db: &C, cve_id: &str) -> Result<Option<KevInfo>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    KevInfo::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "SELECT cve_id, vendor_project, product, vulnerability_name, date_added, short_description, required_action, due_date, known_ransomware_campaign_use, notes, fetched_at FROM kev_entries WHERE cve_id = ?",
-        vec![SeaValue::from(normalize_identifier(cve_id))],
-    ))
-    .one(db)
-    .await
-}
-
-async fn load_kev_many<C>(db: &C, cve_ids: &[String]) -> Result<Vec<KevInfo>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    if cve_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    KevInfo::find_by_statement(Statement::from_string(
-        DbBackend::Sqlite,
-        format!(
-            r#"
-            SELECT cve_id, vendor_project, product, vulnerability_name, date_added,
-                   short_description, required_action, due_date,
-                   known_ransomware_campaign_use, notes, fetched_at
-            FROM kev_entries
-            WHERE cve_id IN ({})
-            "#,
-            sql_string_list(cve_ids)
-        ),
-    ))
-    .all(db)
-    .await
-}
-
-async fn load_epss<C>(db: &C, cve_id: &str) -> Result<Option<EpssInfo>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    EpssInfo::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "SELECT cve_id, epss, percentile, score_date, model_version, fetched_at FROM epss_current WHERE cve_id = ?",
-        vec![SeaValue::from(normalize_identifier(cve_id))],
-    ))
-    .one(db)
-    .await
-}
-
-async fn load_epss_many<C>(db: &C, cve_ids: &[String]) -> Result<Vec<EpssInfo>, DbErr>
-where
-    C: ConnectionTrait,
-{
-    if cve_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    EpssInfo::find_by_statement(Statement::from_string(
-        DbBackend::Sqlite,
-        format!(
-            r#"
-            SELECT cve_id, epss, percentile, score_date, model_version, fetched_at
-            FROM epss_current
-            WHERE cve_id IN ({})
-            "#,
-            sql_string_list(cve_ids)
         ),
     ))
     .all(db)

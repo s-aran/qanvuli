@@ -1007,3 +1007,37 @@ fn mark_json_files_read_splits_large_batches_under_sqlite_variable_limit() {
         assert_eq!(count, 20_000);
     });
 }
+
+#[test]
+fn bulk_initialization_writes_20_000_cves_within_two_seconds() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+
+        let records = (0..20_000)
+            .map(|index| CVE_JSON.replace("CVE-2024-0001", &format!("CVE-2024-{index:04}")))
+            .collect::<Vec<_>>();
+        let models = records
+            .into_iter()
+            .map(CveActiveModels::from_raw_json_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let session = db.begin_bulk_replace_all().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let inserted = session.insert_cve_models(models).await.unwrap();
+        session.finish_storage_only(&db).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(inserted, 20_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "bulk initialization wrote 20,000 CVEs in {elapsed:?}"
+        );
+    });
+}
