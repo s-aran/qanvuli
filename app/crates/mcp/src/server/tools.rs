@@ -298,8 +298,22 @@ impl CveSearchServer {
             &args.package,
             &args.version,
             args.purl.as_deref(),
+            args.status.as_deref(),
+            limit(args.limit),
+            offset(args.offset),
         )
         .await
+    }
+
+    #[tool(
+        description = "Batch-query up to 200 package/version tuples. Each input returns its own findings or error; status defaults to affected."
+    )]
+    pub(crate) async fn query_packages_enriched(
+        &self,
+        Parameters(args): Parameters<QueryPackagesEnrichedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::query_packages_enriched(db, args.packages, args.status.as_deref()).await
     }
 
     #[tool(

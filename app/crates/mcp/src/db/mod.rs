@@ -277,12 +277,77 @@ pub(crate) async fn query_package_enriched(
     package: &str,
     version: &str,
     purl: Option<&str>,
+    status: Option<&str>,
+    limit: u64,
+    offset: u64,
 ) -> Result<CallToolResult, McpError> {
+    let status = status.unwrap_or("affected");
+    if !matches!(status, "affected" | "all") {
+        return Err(mcp_error("status must be either 'affected' or 'all'"));
+    }
     let result = db
         .query_package_enriched(ecosystem, package, version, purl)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
-    response::tool_result(json!(result))
+    let confirmed_count = result
+        .iter()
+        .filter(|finding| finding.affected.status == "affected")
+        .count();
+    let mut result = result
+        .into_iter()
+        .filter(|finding| status == "all" || finding.affected.status == "affected")
+        .collect::<Vec<_>>();
+    let matching_count = result.len();
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    let limit = usize::try_from(limit).unwrap_or(30);
+    let has_more = result.len().saturating_sub(offset) > limit;
+    let findings = result
+        .drain(offset.min(matching_count)..)
+        .take(limit)
+        .collect::<Vec<_>>();
+    response::tool_result(json!({
+        "vulnerable": confirmed_count > 0,
+        "confirmed_count": confirmed_count,
+        "status": status,
+        "has_more": has_more,
+        "findings": findings,
+    }))
+}
+
+pub(crate) async fn query_packages_enriched(
+    db: &CveDatabase,
+    packages: Vec<crate::args::PackageQueryArgs>,
+    status: Option<&str>,
+) -> Result<CallToolResult, McpError> {
+    let status = status.unwrap_or("affected");
+    if !matches!(status, "affected" | "all") {
+        return Err(mcp_error("status must be either 'affected' or 'all'"));
+    }
+    let requested = packages.len();
+    let mut results = Vec::with_capacity(requested.min(200));
+    for package in packages.into_iter().take(200) {
+        match db
+            .query_package_enriched(
+                &package.ecosystem,
+                &package.package,
+                &package.version,
+                package.purl.as_deref(),
+            )
+            .await
+        {
+            Ok(findings) => {
+                let findings = findings
+                    .into_iter()
+                    .filter(|finding| status == "all" || finding.affected.status == "affected")
+                    .collect::<Vec<_>>();
+                results.push(json!({"package": package, "findings": findings}));
+            }
+            Err(error) => results.push(json!({"package": package, "error": error.to_string()})),
+        }
+    }
+    response::tool_result(
+        json!({"requested": requested, "truncated": requested > 200, "status": status, "results": results}),
+    )
 }
 
 pub(crate) async fn known_exploited(

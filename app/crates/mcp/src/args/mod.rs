@@ -1,5 +1,5 @@
 use rmcp::schemars;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CweArgs {
@@ -266,6 +266,28 @@ pub(crate) struct QueryPackageEnrichedArgs {
     pub(crate) version: String,
     /// Optional package URL to disambiguate package identity.
     pub(crate) purl: Option<String>,
+    /// Return only confirmed affected findings (default), or all evaluated findings.
+    pub(crate) status: Option<String>,
+    /// Maximum findings to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching findings to skip. Default is 0.
+    pub(crate) offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub(crate) struct PackageQueryArgs {
+    pub(crate) ecosystem: String,
+    pub(crate) package: String,
+    pub(crate) version: String,
+    pub(crate) purl: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct QueryPackagesEnrichedArgs {
+    /// Up to 200 package/version tuples.
+    pub(crate) packages: Vec<PackageQueryArgs>,
+    /// Return only confirmed affected findings (default), or all evaluated findings.
+    pub(crate) status: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
