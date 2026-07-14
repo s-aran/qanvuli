@@ -91,6 +91,7 @@ where
 {
     for table in [
         "vulnerability_identifier_edges",
+        "identifier_components",
         "vulnerability_identifiers",
         "epss_current",
         "kev_entries",
@@ -248,14 +249,17 @@ where
             PRIMARY KEY(from_identifier, to_identifier, relation_type, source)
         )
         "#,
+        "CREATE TABLE identifier_components (identifier TEXT PRIMARY KEY, component_id TEXT NOT NULL)",
         "CREATE INDEX idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
         "CREATE INDEX idx_osv_aliases_alias ON osv_aliases (alias_id)",
         "CREATE INDEX idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
-        "CREATE INDEX idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",
+        "CREATE INDEX idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem COLLATE NOCASE, package_name COLLATE NOCASE)",
+        "CREATE INDEX idx_osv_affected_packages_osv_id ON osv_affected_packages (osv_id)",
         "CREATE INDEX idx_osv_ranges_package ON osv_ranges (affected_package_id)",
         "CREATE INDEX idx_osv_range_events_range ON osv_range_events (range_id, event_order)",
         "CREATE INDEX idx_identifier_edges_to ON vulnerability_identifier_edges (to_identifier)",
         "CREATE INDEX idx_identifier_edges_from ON vulnerability_identifier_edges (from_identifier)",
+        "CREATE INDEX idx_identifier_components_component ON identifier_components (component_id)",
         "CREATE INDEX idx_kev_entries_date_added_cve_id ON kev_entries (date_added DESC, cve_id)",
         "CREATE INDEX idx_epss_current_score ON epss_current (epss DESC, percentile DESC, cve_id)",
         "CREATE INDEX idx_epss_current_percentile ON epss_current (percentile DESC, epss DESC, cve_id)",

@@ -39,7 +39,8 @@ pub use identifiers::*;
 pub use kev::*;
 use migration::Migrator;
 pub use osv::*;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::str::FromStr;
 
 use qanvuli_models::{
     CveStatusData, RawCveRecord, RawCveStatusRecord, cna_affected_raw_values, cna_cvss_raw_values,
@@ -3800,10 +3801,26 @@ impl CveDatabase {
 
     /// Replaces local FIRST EPSS current scores from the official CSV.
     pub async fn import_epss_csv(&self, csv: &str) -> Result<ImportSummary, DbErr> {
+        let content_hash = md5_hex(csv.as_bytes());
+        if self
+            .count_by_statement(
+            "SELECT COUNT(*) AS count FROM source_raw_records WHERE source='EPSS' AND content_hash=?",
+                vec![SeaValue::from(content_hash.clone())],
+            )
+            .await?
+            > 0
+        {
+            return Ok(ImportSummary {
+                source: "EPSS".to_owned(),
+                imported: 0,
+                skipped: 1,
+                record_count: 0,
+                content_hash: Some(content_hash),
+            });
+        }
         let parsed = EpssCurrentCsv::parse(csv)
             .map_err(|err| DbErr::Custom(format!("failed to parse EPSS CSV: {err}")))?;
         let fetched_at = Utc::now().to_rfc3339();
-        let content_hash = md5_hex(csv.as_bytes());
         let txn = self.db.begin().await?;
         mark_source_attempt(&txn, "EPSS", Some(&content_hash)).await?;
         let raw_record_id = upsert_raw_record(
@@ -3827,15 +3844,15 @@ impl CveDatabase {
             "DELETE FROM epss_current".to_owned(),
         ))
         .await?;
-        for row in &parsed.rows {
-            execute_values(
-                &txn,
-                r#"
-                INSERT INTO epss_current (
-                    cve_id, epss, percentile, score_date, model_version, fetched_at, raw_record_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                "#,
-                vec![
+        for rows in parsed.rows.chunks(100) {
+            let mut sql = "INSERT INTO epss_current (cve_id, epss, percentile, score_date, model_version, fetched_at, raw_record_id) VALUES ".to_owned();
+            let mut values = Vec::with_capacity(rows.len() * 7);
+            for (index, row) in rows.iter().enumerate() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push_str("(?, ?, ?, ?, ?, ?, ?)");
+                values.extend([
                     SeaValue::from(row.cve_id.clone()),
                     SeaValue::from(row.epss),
                     SeaValue::from(row.percentile),
@@ -3843,10 +3860,12 @@ impl CveDatabase {
                     text_value(parsed.model_version.clone()),
                     SeaValue::from(fetched_at.clone()),
                     SeaValue::from(raw_record_id),
-                ],
-            )
-            .await?;
-            upsert_identifier(&txn, &row.cve_id, "EPSS", &fetched_at).await?;
+                ]);
+            }
+            execute_values(&txn, &sql, values).await?;
+            for row in rows {
+                upsert_identifier(&txn, &row.cve_id, "EPSS", &fetched_at).await?;
+            }
         }
         mark_source_success(
             &txn,
@@ -3876,16 +3895,12 @@ impl CveDatabase {
             "DELETE FROM vulnerability_identifier_edges".to_owned(),
         ))
         .await?;
-        txn.execute(Statement::from_string(
-            DbBackend::Sqlite,
-            "DELETE FROM vulnerability_identifiers".to_owned(),
-        ))
-        .await?;
         refresh_identifier_nodes_for_source(&txn, "CVE").await?;
         refresh_identifier_nodes_for_source(&txn, "OSV").await?;
         refresh_identifier_nodes_for_source(&txn, "KEV").await?;
         refresh_identifier_nodes_for_source(&txn, "EPSS").await?;
         refresh_osv_alias_edges(&txn).await?;
+        rebuild_identifier_components(&txn).await?;
         txn.commit().await?;
         let edge_count = self
             .count_by_statement(
@@ -3909,25 +3924,20 @@ impl CveDatabase {
         let edges = self.related_edges(&normalized_id).await?;
         let connected = IdentifierNodeRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            r#"
-            WITH RECURSIVE connected(identifier) AS (
-                VALUES (?)
-                UNION
-                SELECT CASE
-                    WHEN edge.from_identifier = connected.identifier THEN edge.to_identifier
-                    ELSE edge.from_identifier
-                END
-                FROM vulnerability_identifier_edges edge
-                INNER JOIN connected
-                    ON edge.from_identifier = connected.identifier
-                    OR edge.to_identifier = connected.identifier
-            )
-            SELECT identifier FROM connected ORDER BY identifier
-            "#,
+            "SELECT identifier FROM identifier_components WHERE component_id=(SELECT component_id FROM identifier_components WHERE identifier=?) ORDER BY identifier",
             vec![SeaValue::from(normalized_id.clone())],
         ))
         .all(&self.db)
         .await?;
+        let connected = if connected.is_empty() {
+            IdentifierNodeRow::find_by_statement(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                r#"WITH RECURSIVE connected(identifier) AS (VALUES (?) UNION SELECT CASE WHEN edge.from_identifier=connected.identifier THEN edge.to_identifier ELSE edge.from_identifier END FROM vulnerability_identifier_edges edge INNER JOIN connected ON edge.from_identifier=connected.identifier OR edge.to_identifier=connected.identifier) SELECT identifier FROM connected ORDER BY identifier"#,
+                vec![SeaValue::from(normalized_id.clone())],
+            )).all(&self.db).await?
+        } else {
+            connected
+        };
         let connected_ids = connected
             .into_iter()
             .map(|row| row.identifier)
@@ -4422,8 +4432,8 @@ impl CveDatabase {
             SELECT p.id, p.osv_id, p.ecosystem, p.package_name, p.purl
             FROM osv_affected_packages p
             INNER JOIN osv_advisories a ON a.osv_id = p.osv_id
-            WHERE lower(p.ecosystem) = lower(?)
-              AND lower(p.package_name) = lower(?)
+            WHERE p.ecosystem = ? COLLATE NOCASE
+              AND p.package_name = ? COLLATE NOCASE
               AND a.withdrawn_at IS NULL
             ORDER BY p.osv_id
             "#,
@@ -4437,6 +4447,7 @@ impl CveDatabase {
 
         let package_ids = package_rows.iter().map(|row| row.id).collect::<Vec<_>>();
         let mut ranges_by_package = load_osv_ranges_many(&self.db, &package_ids).await?;
+        let mut versions_by_package = load_osv_versions_many(&self.db, &package_ids).await?;
         let mut resolution_by_osv_id: HashMap<String, IdentifierResolution> = HashMap::new();
         let mut matches = Vec::new();
         let mut all_cve_ids = BTreeSet::new();
@@ -4450,9 +4461,12 @@ impl CveDatabase {
             let ranges = ranges_by_package
                 .remove(&package_row.id)
                 .unwrap_or_default();
+            let explicit_versions = versions_by_package
+                .remove(&package_row.id)
+                .unwrap_or_default();
             let fixed_versions = fixed_versions_from_ranges(&ranges);
-            let affected =
-                match_version(ecosystem, version, &ranges).unwrap_or_else(|| AffectedStatus {
+            let affected = match_version(ecosystem, version, &ranges, &explicit_versions)
+                .unwrap_or_else(|| AffectedStatus {
                     status: "unknown".to_owned(),
                     confidence: "low".to_owned(),
                 });
@@ -7708,6 +7722,12 @@ struct RangeEventRow {
     event_order: i64,
 }
 
+#[derive(Clone, Debug, FromQueryResult)]
+struct ExplicitVersionRow {
+    affected_package_id: i64,
+    version: String,
+}
+
 type OsvAffectedPackageInput = (usize, Option<String>, Option<String>, Option<String>);
 
 async fn execute_values<C>(db: &C, sql: &str, values: Vec<SeaValue>) -> Result<(), DbErr>
@@ -8467,6 +8487,76 @@ where
     Ok(())
 }
 
+#[derive(Clone, Debug, FromQueryResult)]
+struct AliasEdgeRow {
+    from_identifier: String,
+    to_identifier: String,
+}
+
+async fn rebuild_identifier_components<C>(db: &C) -> Result<(), DbErr>
+where
+    C: ConnectionTrait,
+{
+    let nodes = IdentifierNodeRow::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT identifier FROM vulnerability_identifiers ORDER BY identifier".to_owned(),
+    ))
+    .all(db)
+    .await?;
+    let edges = AliasEdgeRow::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        "SELECT from_identifier, to_identifier FROM vulnerability_identifier_edges WHERE relation_type='alias'".to_owned(),
+    )).all(db).await?;
+    let mut parent = nodes
+        .iter()
+        .map(|node| (node.identifier.clone(), node.identifier.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for edge in edges {
+        let left = component_root(&mut parent, &edge.from_identifier);
+        let right = component_root(&mut parent, &edge.to_identifier);
+        if left != right {
+            let (root, child) = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            parent.insert(child, root);
+        }
+    }
+    execute_values(db, "DELETE FROM identifier_components", Vec::new()).await?;
+    let rows = nodes
+        .into_iter()
+        .map(|node| {
+            let component_id = component_root(&mut parent, &node.identifier);
+            vec![
+                SeaValue::from(node.identifier),
+                SeaValue::from(component_id),
+            ]
+        })
+        .collect();
+    execute_many_rows(
+        db,
+        "INSERT INTO identifier_components (identifier, component_id)",
+        2,
+        rows,
+        "",
+    )
+    .await
+}
+
+fn component_root(parent: &mut BTreeMap<String, String>, identifier: &str) -> String {
+    let current = parent
+        .get(identifier)
+        .cloned()
+        .unwrap_or_else(|| identifier.to_owned());
+    if current == identifier {
+        return current;
+    }
+    let root = component_root(parent, &current);
+    parent.insert(identifier.to_owned(), root.clone());
+    root
+}
+
 async fn upsert_identifier<C>(db: &C, id: &str, source: &str, now: &str) -> Result<(), DbErr>
 where
     C: ConnectionTrait,
@@ -8720,6 +8810,37 @@ where
     Ok(by_package)
 }
 
+async fn load_osv_versions_many<C>(
+    db: &C,
+    package_ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, DbErr>
+where
+    C: ConnectionTrait,
+{
+    if package_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let ids = package_ids
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let rows = ExplicitVersionRow::find_by_statement(Statement::from_string(
+        DbBackend::Sqlite,
+        format!("SELECT affected_package_id, version FROM osv_versions WHERE affected_package_id IN ({ids}) ORDER BY affected_package_id, version"),
+    ))
+    .all(db)
+    .await?;
+    let mut by_package = HashMap::new();
+    for row in rows {
+        by_package
+            .entry(row.affected_package_id)
+            .or_insert_with(Vec::new)
+            .push(row.version);
+    }
+    Ok(by_package)
+}
+
 fn fixed_versions_from_ranges(ranges: &[RangeEventRow]) -> Vec<String> {
     let mut values = ranges
         .iter()
@@ -8735,27 +8856,85 @@ fn match_version(
     ecosystem: &str,
     installed: &str,
     ranges: &[RangeEventRow],
+    explicit_versions: &[String],
 ) -> Option<AffectedStatus> {
-    if !ecosystem.eq_ignore_ascii_case("crates.io") {
+    if explicit_versions.iter().any(|value| value == installed) {
         return Some(AffectedStatus {
-            status: "unsupported_version_scheme".to_owned(),
-            confidence: "low".to_owned(),
+            status: "affected".to_owned(),
+            confidence: "high".to_owned(),
         });
     }
-    let installed = semver::Version::parse(installed).ok()?;
     if ranges.is_empty() {
         return Some(AffectedStatus {
-            status: "unknown".to_owned(),
-            confidence: "low".to_owned(),
+            status: if explicit_versions.is_empty() {
+                "unknown"
+            } else {
+                "not_affected"
+            }
+            .to_owned(),
+            confidence: if explicit_versions.is_empty() {
+                "low"
+            } else {
+                "high"
+            }
+            .to_owned(),
         });
     }
+    if ["crates.io", "npm", "go"]
+        .iter()
+        .any(|name| ecosystem.eq_ignore_ascii_case(name))
+    {
+        return match_semver_version(installed, ranges);
+    }
+    if ecosystem.eq_ignore_ascii_case("pypi") {
+        return match_pep440_version(installed, ranges);
+    }
+    Some(AffectedStatus {
+        status: "unsupported_version_scheme".to_owned(),
+        confidence: "low".to_owned(),
+    })
+}
+
+fn match_semver_version(installed: &str, ranges: &[RangeEventRow]) -> Option<AffectedStatus> {
+    let installed = semver::Version::parse(installed).ok()?;
+    match_ranges(
+        installed,
+        ranges,
+        "SEMVER",
+        semver::Version::new(0, 0, 0),
+        semver::Version::parse,
+    )
+}
+
+fn match_pep440_version(installed: &str, ranges: &[RangeEventRow]) -> Option<AffectedStatus> {
+    let installed = pep440_rs::Version::from_str(installed).ok()?;
+    match_ranges(
+        installed,
+        ranges,
+        "ECOSYSTEM",
+        pep440_rs::Version::from_str("0").ok()?,
+        pep440_rs::Version::from_str,
+    )
+}
+
+fn match_ranges<V, F, E>(
+    installed: V,
+    ranges: &[RangeEventRow],
+    range_type: &str,
+    zero: V,
+    parse: F,
+) -> Option<AffectedStatus>
+where
+    V: Ord + Clone,
+    F: Fn(&str) -> Result<V, E>,
+{
     let mut affected = false;
     let mut by_range: HashMap<i64, Vec<&RangeEventRow>> = HashMap::new();
     for row in ranges {
         if row
             .range_type
             .as_deref()
-            .is_some_and(|range_type| !range_type.eq_ignore_ascii_case("SEMVER"))
+            .is_some_and(|value| !value.eq_ignore_ascii_case(range_type))
         {
             return Some(AffectedStatus {
                 status: "unsupported_version_scheme".to_owned(),
@@ -8766,26 +8945,27 @@ fn match_version(
     }
     for events in by_range.values_mut() {
         events.sort_by_key(|row| row.event_order);
-        let mut introduced = semver::Version::new(0, 0, 0);
+        let mut introduced = zero.clone();
         let mut fixed = None;
+        let mut last_affected = None;
         for event in events.iter() {
             match event.event_type.as_str() {
                 "introduced" => {
-                    if event.value != "0"
-                        && let Ok(version) = semver::Version::parse(&event.value)
-                    {
-                        introduced = version;
+                    if event.value != "0" {
+                        introduced = parse(&event.value).ok()?;
                     }
                 }
                 "fixed" => {
-                    if let Ok(version) = semver::Version::parse(&event.value) {
-                        fixed = Some(version);
-                    }
+                    fixed = Some(parse(&event.value).ok()?);
                 }
+                "last_affected" => last_affected = Some(parse(&event.value).ok()?),
                 _ => {}
             }
         }
-        if installed >= introduced && fixed.as_ref().is_none_or(|fixed| installed < *fixed) {
+        if installed >= introduced
+            && fixed.as_ref().is_none_or(|fixed| installed < *fixed)
+            && last_affected.as_ref().is_none_or(|last| installed <= *last)
+        {
             affected = true;
         }
     }
