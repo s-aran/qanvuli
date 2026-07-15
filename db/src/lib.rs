@@ -4423,6 +4423,66 @@ impl CveDatabase {
         .await
     }
 
+    /// Returns registered OSV advisory families, derived from their identifier prefixes.
+    pub async fn osv_advisory_families(&self) -> Result<Vec<String>, DbErr> {
+        IdentifierValueRow::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT DISTINCT CASE WHEN instr(osv_id, '-') > 0 THEN substr(osv_id, 1, instr(osv_id, '-') - 1) ELSE osv_id END AS value FROM osv_advisories ORDER BY value".to_owned(),
+        ))
+        .all(&self.db)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.value).collect())
+    }
+
+    /// Returns registered OSV package ecosystems.
+    pub async fn osv_ecosystems(&self) -> Result<Vec<String>, DbErr> {
+        IdentifierValueRow::find_by_statement(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT DISTINCT ecosystem AS value FROM osv_affected_packages WHERE ecosystem IS NOT NULL AND trim(ecosystem) <> '' ORDER BY value".to_owned(),
+        ))
+        .all(&self.db)
+        .await
+        .map(|rows| rows.into_iter().map(|row| row.value).collect())
+    }
+
+    /// Searches registered OSV advisories with optional advisory-family and ecosystem filters.
+    pub async fn search_osv_summaries_scoped(
+        &self,
+        query: Option<&str>,
+        advisory_families: &[String],
+        ecosystems: Option<&[String]>,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, DbErr> {
+        let (sql, values) = osv_scoped_search_statement(
+            query,
+            advisory_families,
+            ecosystems,
+            limit,
+            offset,
+            false,
+        )?;
+        OsvSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    /// Counts registered OSV advisories matching the supplied scope.
+    pub async fn count_osv_summaries_scoped(
+        &self,
+        query: Option<&str>,
+        advisory_families: &[String],
+        ecosystems: Option<&[String]>,
+    ) -> Result<u64, DbErr> {
+        let (sql, values) =
+            osv_scoped_search_statement(query, advisory_families, ecosystems, 0, 0, true)?;
+        self.count_by_statement(&sql, values).await
+    }
+
     /// Counts OSV advisories matching an identifier, alias, package, or text query.
     pub async fn count_osv_summaries_free_text(&self, query: &str) -> Result<u64, DbErr> {
         let query = query.trim();
@@ -7446,6 +7506,71 @@ fn osv_summary_search_statement(
                 SeaValue::from(limit as i64),
                 SeaValue::from(offset as i64),
             ],
+        ))
+    }
+}
+
+fn osv_scoped_search_statement(
+    query: Option<&str>,
+    advisory_families: &[String],
+    ecosystems: Option<&[String]>,
+    limit: u64,
+    offset: u64,
+    count_only: bool,
+) -> Result<(String, Vec<SeaValue>), DbErr> {
+    let mut sql = if query.is_some_and(|query| !query.trim().is_empty()) {
+        " FROM osv_text_fts f INNER JOIN osv_advisories o ON o.osv_id = f.osv_id WHERE f MATCH ?"
+            .to_owned()
+    } else {
+        " FROM osv_advisories o WHERE 1 = 1".to_owned()
+    };
+    let mut values = Vec::new();
+    if let Some(query) = query.map(str::trim).filter(|query| !query.is_empty()) {
+        let query = fts_query(query)
+            .ok_or_else(|| DbErr::Custom("OSV search query has no searchable tokens".to_owned()))?;
+        values.push(SeaValue::from(query));
+    }
+    if !advisory_families.is_empty() {
+        sql.push_str(" AND (");
+        sql.push_str(
+            &std::iter::repeat_n("o.osv_id LIKE ?", advisory_families.len())
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        );
+        sql.push(')');
+        values.extend(
+            advisory_families
+                .iter()
+                .map(|family| SeaValue::from(format!("{family}-%"))),
+        );
+    }
+    if let Some(ecosystems) = ecosystems {
+        if ecosystems.is_empty() {
+            sql.push_str(" AND 0");
+        } else {
+            sql.push_str(" AND EXISTS (SELECT 1 FROM osv_affected_packages p WHERE p.osv_id = o.osv_id AND p.ecosystem COLLATE NOCASE IN (");
+            sql.push_str(
+                &std::iter::repeat_n("?", ecosystems.len())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            sql.push_str("))");
+            values.extend(ecosystems.iter().cloned().map(SeaValue::from));
+        }
+    }
+    if count_only {
+        Ok((
+            format!("SELECT COUNT(DISTINCT o.osv_id) AS count{sql}"),
+            values,
+        ))
+    } else {
+        values.push(SeaValue::from(limit as i64));
+        values.push(SeaValue::from(offset as i64));
+        Ok((
+            format!(
+                "SELECT DISTINCT o.osv_id, o.schema_version, o.published_at, o.modified_at, o.withdrawn_at, o.summary, o.details{sql} ORDER BY o.published_at DESC, o.osv_id ASC LIMIT ? OFFSET ?"
+            ),
+            values,
         ))
     }
 }

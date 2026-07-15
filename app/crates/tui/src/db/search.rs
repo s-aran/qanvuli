@@ -18,7 +18,12 @@ pub(crate) enum SearchRequest {
         query: String,
         state_scope: CveStateScope,
     },
-    Advanced(CveAdvancedSearch),
+    Advanced {
+        options: CveAdvancedSearch,
+        include_cve: bool,
+        osv_families: Vec<String>,
+        ecosystems: Option<Vec<String>>,
+    },
 }
 
 pub(crate) async fn run_search_request(
@@ -46,11 +51,32 @@ pub(crate) async fn run_search_request(
                 enrichment,
             })
         }
-        SearchRequest::Advanced(options) => {
-            let rows = db
-                .search_cve_summaries_advanced(&options, limit, offset)
+        SearchRequest::Advanced {
+            options,
+            include_cve,
+            osv_families,
+            ecosystems,
+        } => {
+            let rows = if include_cve {
+                db.search_cve_summaries_advanced(&options, limit, offset)
+                    .await
+                    .map_err(|err| err.to_string())?
+            } else {
+                Vec::new()
+            };
+            let osv_rows = if osv_families.is_empty() {
+                Vec::new()
+            } else {
+                db.search_osv_summaries_scoped(
+                    options.query.as_deref(),
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    limit,
+                    offset,
+                )
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| err.to_string())?
+            };
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
@@ -58,7 +84,7 @@ pub(crate) async fn run_search_request(
             let enrichment = load_enrichment_summaries(&db, &rows).await?;
             Ok(SearchResult {
                 rows,
-                osv_rows: Vec::new(),
+                osv_rows,
                 enrichment,
             })
         }
@@ -126,10 +152,32 @@ pub(crate) async fn run_count_request(
             query,
             state_scope,
         } => count_by_mode(&db, mode, &query, state_scope).await,
-        SearchRequest::Advanced(options) => db
-            .count_cve_summaries_advanced(&options)
-            .await
-            .map_err(|err| err.to_string()),
+        SearchRequest::Advanced {
+            options,
+            include_cve,
+            osv_families,
+            ecosystems,
+        } => {
+            let cve = if include_cve {
+                db.count_cve_summaries_advanced(&options)
+                    .await
+                    .map_err(|err| err.to_string())?
+            } else {
+                0
+            };
+            let osv = if osv_families.is_empty() {
+                0
+            } else {
+                db.count_osv_summaries_scoped(
+                    options.query.as_deref(),
+                    &osv_families,
+                    ecosystems.as_deref(),
+                )
+                .await
+                .map_err(|err| err.to_string())?
+            };
+            Ok(cve + osv)
+        }
     }
 }
 

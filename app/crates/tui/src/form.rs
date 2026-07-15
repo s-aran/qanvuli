@@ -17,6 +17,12 @@ pub(super) struct AdvancedForm {
     pub(super) vendor_exact: bool,
     pub(super) state_scope: CveStateScope,
     pub(super) active_field: AdvancedField,
+    pub(super) source_cve: bool,
+    pub(super) source_osv: bool,
+    pub(super) advisories: Vec<(String, bool)>,
+    pub(super) scope_cursor: usize,
+    pub(super) scope_filter: String,
+    pub(super) scope_scroll: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +52,115 @@ impl Default for AdvancedForm {
             vendor_exact: false,
             state_scope: CveStateScope::PublishedOnly,
             active_field: AdvancedField::Query,
+            source_cve: true,
+            source_osv: true,
+            advisories: Vec::new(),
+            scope_cursor: 0,
+            scope_filter: String::new(),
+            scope_scroll: 0,
         }
     }
 }
 
 impl AdvancedForm {
+    pub(super) fn next_scope(&mut self) {
+        self.scope_cursor = (self.scope_cursor + 1) % self.scope_entries().len().max(1);
+        self.scope_scroll = self.scope_cursor.saturating_sub(5);
+    }
+    pub(super) fn previous_scope(&mut self) {
+        self.scope_cursor = if self.scope_cursor == 0 {
+            self.scope_entries().len().saturating_sub(1)
+        } else {
+            self.scope_cursor - 1
+        };
+        self.scope_scroll = self.scope_cursor.saturating_sub(5);
+    }
+
+    pub(super) fn page_down_scope(&mut self) {
+        let last = self.scope_entries().len().saturating_sub(1);
+        self.scope_cursor = (self.scope_cursor + 8).min(last);
+        self.scope_scroll = self.scope_cursor.saturating_sub(5);
+    }
+
+    pub(super) fn page_up_scope(&mut self) {
+        self.scope_cursor = self.scope_cursor.saturating_sub(8);
+        self.scope_scroll = self.scope_cursor.saturating_sub(5);
+    }
+    pub(super) fn toggle_scope_current(&mut self) {
+        match self.scope_entries().get(self.scope_cursor).copied() {
+            Some(ScopeEntry::Cve) => self.source_cve = !self.source_cve,
+            Some(ScopeEntry::Osv) => self.source_osv = !self.source_osv,
+            Some(ScopeEntry::Advisory(index)) => {
+                self.advisories[index].1 = !self.advisories[index].1
+            }
+            Some(ScopeEntry::AllAdvisories) => self.select_all_scope(),
+            Some(ScopeEntry::ClearAdvisories) => self.clear_all_scope(),
+            None => {}
+        }
+        self.clamp_scope_cursor();
+    }
+
+    pub(super) fn set_scope_candidates(&mut self, advisories: Vec<String>) {
+        self.advisories = merge_candidates(&self.advisories, advisories);
+        self.scope_cursor = self
+            .scope_cursor
+            .min(self.scope_entries().len().saturating_sub(1));
+    }
+
+    pub(super) fn push_scope_filter(&mut self, ch: char) {
+        self.scope_filter.push(ch);
+        self.scope_cursor = 0;
+        self.scope_scroll = 0;
+    }
+    pub(super) fn backspace_scope_filter(&mut self) {
+        self.scope_filter.pop();
+        self.scope_cursor = 0;
+        self.scope_scroll = 0;
+    }
+    pub(super) fn scope_entries(&self) -> Vec<ScopeEntry> {
+        let mut entries = vec![ScopeEntry::Cve, ScopeEntry::Osv];
+        if self.source_osv {
+            entries.extend(
+                self.advisories
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (name, _))| fuzzy_matches(name, &self.scope_filter))
+                    .map(|(index, _)| ScopeEntry::Advisory(index)),
+            );
+        }
+        entries.extend([ScopeEntry::AllAdvisories, ScopeEntry::ClearAdvisories]);
+        entries
+    }
+
+    pub(super) fn selected_advisories(&self) -> Vec<String> {
+        self.advisories
+            .iter()
+            .filter(|(_, selected)| *selected)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    pub(super) fn select_all_scope(&mut self) {
+        self.source_osv = true;
+        self.advisories
+            .iter_mut()
+            .for_each(|(_, selected)| *selected = true);
+    }
+
+    pub(super) fn clear_all_scope(&mut self) {
+        self.source_osv = false;
+        self.advisories
+            .iter_mut()
+            .for_each(|(_, selected)| *selected = false);
+        self.clamp_scope_cursor();
+    }
+
+    fn clamp_scope_cursor(&mut self) {
+        self.scope_cursor = self
+            .scope_cursor
+            .min(self.scope_entries().len().saturating_sub(1));
+        self.scope_scroll = self.scope_scroll.min(self.scope_cursor.saturating_sub(2));
+    }
     pub(super) fn push(&mut self, ch: char) {
         if let Some(field) = self.active_text_mut() {
             field.push(ch);
@@ -152,6 +262,40 @@ impl AdvancedForm {
             self.query_mode = mode;
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum ScopeEntry {
+    Cve,
+    Osv,
+    Advisory(usize),
+    AllAdvisories,
+    ClearAdvisories,
+}
+
+fn fuzzy_matches(value: &str, query: &str) -> bool {
+    let mut query = query.chars().flat_map(char::to_lowercase);
+    let mut next = query.next();
+    for ch in value.chars().flat_map(char::to_lowercase) {
+        if next == Some(ch) {
+            next = query.next();
+        }
+    }
+    next.is_none()
+}
+
+fn merge_candidates(current: &[(String, bool)], values: Vec<String>) -> Vec<(String, bool)> {
+    values
+        .into_iter()
+        .map(|value| {
+            let selected = current
+                .iter()
+                .find(|(name, _)| *name == value)
+                .map(|(_, selected)| *selected)
+                .unwrap_or(true);
+            (value, selected)
+        })
+        .collect()
 }
 
 impl AdvancedField {
@@ -280,5 +424,51 @@ mod tests {
         assert!(form.active_field_accepts_text());
         form.push(' ');
         assert_eq!(form.product, " ");
+    }
+
+    #[test]
+    fn scope_candidates_are_filterable_and_selectable() {
+        let mut form = AdvancedForm::default();
+        form.set_scope_candidates(vec!["GHSA".to_owned(), "RUSTSEC".to_owned()]);
+
+        form.push_scope_filter('g');
+        assert!(
+            form.scope_entries()
+                .iter()
+                .any(|entry| matches!(entry, ScopeEntry::Advisory(0)))
+        );
+        assert!(
+            !form
+                .scope_entries()
+                .iter()
+                .any(|entry| matches!(entry, ScopeEntry::Advisory(1)))
+        );
+
+        form.clear_all_scope();
+        assert!(form.source_cve);
+        assert!(!form.source_osv);
+        assert!(form.selected_advisories().is_empty());
+
+        form.select_all_scope();
+        assert!(form.source_cve);
+        assert!(form.source_osv);
+        assert_eq!(form.selected_advisories(), vec!["GHSA", "RUSTSEC"]);
+    }
+
+    #[test]
+    fn disabling_osv_hides_advisories_without_losing_their_selection() {
+        let mut form = AdvancedForm::default();
+        form.set_scope_candidates(vec!["GHSA".to_owned()]);
+        form.scope_cursor = 1;
+        form.toggle_scope_current();
+
+        assert!(!form.source_osv);
+        assert!(
+            !form
+                .scope_entries()
+                .iter()
+                .any(|entry| matches!(entry, ScopeEntry::Advisory(_)))
+        );
+        assert_eq!(form.selected_advisories(), vec!["GHSA"]);
     }
 }

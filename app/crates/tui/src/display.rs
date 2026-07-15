@@ -2,10 +2,17 @@ use qanvuli_core::database::CveSummarySortOrder;
 
 #[derive(Clone, Debug)]
 pub(super) struct DisplaySettings {
+    pub(super) tab: DisplayTab,
     pub(super) sort_field: SortField,
     pub(super) sort_direction: SortDirection,
     pub(super) timezone: TimeZone,
     pub(super) active_field: DisplayField,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DisplayTab {
+    Settings,
+    Sources,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +47,7 @@ pub(super) enum TimeZone {
 impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
+            tab: DisplayTab::Settings,
             sort_field: SortField::Published,
             sort_direction: SortDirection::Desc,
             timezone: TimeZone::Utc,
@@ -49,6 +57,13 @@ impl Default for DisplaySettings {
 }
 
 impl DisplaySettings {
+    pub(super) fn next_tab(&mut self) {
+        self.tab = DisplayTab::Sources;
+    }
+
+    pub(super) fn previous_tab(&mut self) {
+        self.tab = DisplayTab::Settings;
+    }
     pub(super) fn next_field(&mut self) {
         self.active_field = self.active_field.next();
     }

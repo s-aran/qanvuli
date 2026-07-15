@@ -33,8 +33,13 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
         KeyCode::PageUp => app.move_full_page_up(),
         KeyCode::F(1) => app.show_help = true,
         KeyCode::F(2) => app.next_search_mode(),
-        KeyCode::F(3) => app.open_advanced_search(),
-        KeyCode::F(4) => app.open_display_settings(),
+        KeyCode::F(3) => {
+            app.open_advanced_search();
+        }
+        KeyCode::F(4) => {
+            app.open_display_settings();
+            app.load_scope_candidates(db);
+        }
         KeyCode::F(5) => app.open_maintenance(),
         KeyCode::F(8) => app.toggle_raw_json_mode(db),
         KeyCode::F(9) => app.toggle_cwe_list_mode(db),

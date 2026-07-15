@@ -3,6 +3,7 @@ use super::{
     app::{App, MaintenanceChoice, MaintenanceOperation, ViewMode},
     common::input::{is_ctrl, is_ctrl_quit},
     db::connection,
+    display::DisplayTab,
     form::AdvancedField,
     modes,
     terminal::TerminalGuard,
@@ -58,6 +59,7 @@ async fn run_loop(
         app.poll_raw_json().await;
         app.poll_enrichment().await;
         app.poll_cwe_search().await;
+        app.poll_scope_candidates().await;
         app.ensure_loaded_enrichment(db.as_ref().cloned());
         if app.poll_maintenance().await {
             refresh_db_after_maintenance(db_url, db, app).await;
@@ -146,28 +148,26 @@ async fn run_loop(
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                KeyCode::Char(ch) => {
-                    app.advanced.push(ch);
-                    app.sync_main_from_advanced();
-                }
-                KeyCode::Tab => app.advanced.next_field(),
-                KeyCode::BackTab => app.advanced.previous_field(),
-                KeyCode::Down => app.advanced.next_field(),
-                KeyCode::Up => app.advanced.previous_field(),
-                KeyCode::Right if app.advanced.active_field == AdvancedField::Query => {
+                KeyCode::Tab | KeyCode::Down => app.advanced.next_field(),
+                KeyCode::BackTab | KeyCode::Up => app.advanced.previous_field(),
+                KeyCode::Char(']') if app.advanced.active_field == AdvancedField::Query => {
                     app.advanced.query_mode = app.advanced.query_mode.next();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Left if app.advanced.active_field == AdvancedField::Query => {
+                KeyCode::Char('[') if app.advanced.active_field == AdvancedField::Query => {
                     app.advanced.query_mode = app.advanced.query_mode.previous();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Right => {
+                KeyCode::Char(']') => {
                     app.advanced.next_value();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Left => {
+                KeyCode::Char('[') => {
                     app.advanced.previous_value();
+                    app.sync_main_from_advanced();
+                }
+                KeyCode::Char(ch) => {
+                    app.advanced.push(ch);
                     app.sync_main_from_advanced();
                 }
                 _ => {}
@@ -176,16 +176,37 @@ async fn run_loop(
         }
 
         if app.show_display {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.show_display = false,
-                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                KeyCode::Tab => app.display.next_field(),
-                KeyCode::BackTab => app.display.previous_field(),
-                KeyCode::Down => app.display.next_field(),
-                KeyCode::Up => app.display.previous_field(),
-                KeyCode::Right => app.display.next_value(),
-                KeyCode::Left => app.display.previous_value(),
-                _ => {}
+            if app.display.tab == DisplayTab::Sources {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => app.show_display = false,
+                    KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
+                    KeyCode::Left => app.display.previous_tab(),
+                    KeyCode::Right => app.display.next_tab(),
+                    KeyCode::Backspace => app.advanced.backspace_scope_filter(),
+                    KeyCode::Char(' ') => app.advanced.toggle_scope_current(),
+                    KeyCode::Char('a') => app.advanced.select_all_scope(),
+                    KeyCode::Char('x') => app.advanced.clear_all_scope(),
+                    KeyCode::Char(ch) => app.advanced.push_scope_filter(ch),
+                    KeyCode::Tab | KeyCode::Down => app.advanced.next_scope(),
+                    KeyCode::BackTab | KeyCode::Up => app.advanced.previous_scope(),
+                    KeyCode::PageDown => app.advanced.page_down_scope(),
+                    KeyCode::PageUp => app.advanced.page_up_scope(),
+                    _ => {}
+                }
+            } else {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => app.show_display = false,
+                    KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
+                    KeyCode::Tab => app.display.next_field(),
+                    KeyCode::BackTab => app.display.previous_field(),
+                    KeyCode::Down => app.display.next_field(),
+                    KeyCode::Up => app.display.previous_field(),
+                    KeyCode::Right => app.display.next_tab(),
+                    KeyCode::Left => app.display.previous_tab(),
+                    KeyCode::Char(']') => app.display.next_value(),
+                    KeyCode::Char('[') => app.display.previous_value(),
+                    _ => {}
+                }
             }
             continue;
         }

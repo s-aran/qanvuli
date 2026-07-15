@@ -24,6 +24,7 @@ use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
 const MIN_PAGE_SIZE: usize = 1;
+const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(super) const CWE_STATUS_COUNT: usize = 6;
 const CWE_STATUS_CONTROL_COUNT: usize = CWE_STATUS_COUNT + 2;
 const CWE_STATUS_SELECT_ALL_CURSOR: usize = CWE_STATUS_COUNT;
@@ -73,6 +74,7 @@ pub(super) struct App {
     pub(super) enrichment: HashMap<String, EnrichedCveSummary>,
     enrichment_task: Option<PendingEnrichment>,
     cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
+    scope_task: Option<JoinHandle<Result<Vec<String>, String>>>,
     search_started_at: Option<Instant>,
     search_timeout_at: Option<Instant>,
     searched_request: SearchRequest,
@@ -275,6 +277,7 @@ impl App {
             count_task: None,
             raw_json_task: None,
             cwe_task: None,
+            scope_task: None,
             search_started_at: None,
             search_timeout_at: None,
             searched_request: SearchRequest::Mode {
@@ -316,7 +319,12 @@ impl App {
                 state_scope: self.state_scope,
             }
         } else {
-            SearchRequest::Advanced(self.main_search_options(sort_order))
+            SearchRequest::Advanced {
+                options: self.main_search_options(sort_order),
+                include_cve: true,
+                osv_families: Vec::new(),
+                ecosystems: None,
+            }
         };
         self.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to search");
@@ -326,8 +334,16 @@ impl App {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
         self.state_scope = self.advanced.state_scope;
-        let request =
-            SearchRequest::Advanced(self.advanced.to_search_options(self.display.sort_order()));
+        let request = SearchRequest::Advanced {
+            options: self.advanced.to_search_options(self.display.sort_order()),
+            include_cve: self.advanced.source_cve,
+            osv_families: if self.advanced.source_osv {
+                self.advanced.selected_advisories()
+            } else {
+                Vec::new()
+            },
+            ecosystems: None,
+        };
         self.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to search");
     }
@@ -338,7 +354,48 @@ impl App {
         self.show_advanced = true;
     }
 
+    pub(super) fn load_scope_candidates(&mut self, db: Option<CveDatabase>) {
+        if self.scope_task.is_some() {
+            return;
+        }
+        let Some(db) = db else {
+            return;
+        };
+        self.scope_task = Some(tokio::spawn(async move {
+            let configured_prefixes = db
+                .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
+                .await
+                .map_err(|err| err.to_string())?;
+            let advisories =
+                Self::registered_osv_advisory_families(&db, configured_prefixes.as_deref()).await?;
+            Ok(advisories)
+        }));
+    }
+
+    async fn registered_osv_advisory_families(
+        db: &CveDatabase,
+        configured_prefixes: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        let Some(configured_prefixes) = configured_prefixes else {
+            // Older databases did not persist this setting; match the default import scope.
+            return Ok(vec!["GHSA".to_owned(), "OSV".to_owned()]);
+        };
+        if configured_prefixes.trim().eq_ignore_ascii_case("ALL") {
+            return db
+                .osv_advisory_families()
+                .await
+                .map_err(|err| err.to_string());
+        }
+        Ok(configured_prefixes
+            .split(',')
+            .map(str::trim)
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| prefix.trim_end_matches('-').to_ascii_uppercase())
+            .collect())
+    }
+
     pub(super) fn open_display_settings(&mut self) {
+        self.display.tab = crate::display::DisplayTab::Settings;
         self.show_display = true;
     }
 
@@ -607,12 +664,34 @@ impl App {
         self.search.is_some()
     }
 
+    pub(super) async fn poll_scope_candidates(&mut self) {
+        let Some(task) = self.scope_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let Some(task) = self.scope_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(advisories)) => self.advanced.set_scope_candidates(advisories),
+            Ok(Err(err)) => self.status_message = Some(err),
+            Err(err) => self.status_message = Some(format!("failed to join scope task: {err}")),
+        }
+    }
+
+    pub(super) fn scope_candidates_loading(&self) -> bool {
+        self.scope_task.is_some()
+    }
+
     pub(super) fn has_background_task(&self) -> bool {
         self.search.is_some()
             || self.count_task.is_some()
             || self.raw_json_task.is_some()
             || self.enrichment_task.is_some()
             || self.cwe_task.is_some()
+            || self.scope_task.is_some()
             || self.maintenance.is_some()
     }
 

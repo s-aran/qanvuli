@@ -938,6 +938,67 @@ fn deferred_osv_import_rebuilds_search_once_and_bulk_finish_restores_indexes() {
     });
 }
 
+#[test]
+fn scoped_osv_search_uses_registered_families_and_ecosystems() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_osv_records(vec![
+            OsvRawRecord {
+                source_path: Some("GHSA-TEST-0001.json".to_owned()),
+                raw_json: include_str!("../../fixtures/osv/GHSA-TEST-0001.json").to_owned(),
+            },
+            OsvRawRecord {
+                source_path: Some("RUSTSEC-TEST-0001.json".to_owned()),
+                raw_json: include_str!("../../fixtures/osv/RUSTSEC-TEST-0001.json").to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.osv_advisory_families().await.unwrap(),
+            vec!["GHSA", "RUSTSEC"]
+        );
+        assert_eq!(db.osv_ecosystems().await.unwrap(), vec!["crates.io"]);
+
+        let ghsa = db
+            .search_osv_summaries_scoped(None, &["GHSA".to_owned()], None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(ghsa.len(), 1);
+        assert!(ghsa[0].osv_id.starts_with("GHSA-"));
+
+        assert_eq!(
+            db.count_osv_summaries_scoped(
+                None,
+                &["GHSA".to_owned(), "RUSTSEC".to_owned()],
+                Some(&[]),
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(
+            db.search_osv_summaries_scoped(
+                None,
+                &["GHSA".to_owned(), "RUSTSEC".to_owned()],
+                Some(&[]),
+                10,
+                0,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+    });
+}
+
 async fn insert_test_cwe(db: &DatabaseConnection) {
     cwe::Entity::insert(cwe::ActiveModel {
         id: Set(79),
