@@ -22,7 +22,6 @@ pub(super) struct AdvancedForm {
     pub(super) advisories: Vec<(String, bool)>,
     pub(super) scope_cursor: usize,
     pub(super) scope_filter: String,
-    pub(super) scope_scroll: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +56,6 @@ impl Default for AdvancedForm {
             advisories: Vec::new(),
             scope_cursor: 0,
             scope_filter: String::new(),
-            scope_scroll: 0,
         }
     }
 }
@@ -65,7 +63,6 @@ impl Default for AdvancedForm {
 impl AdvancedForm {
     pub(super) fn next_scope(&mut self) {
         self.scope_cursor = (self.scope_cursor + 1) % self.scope_entries().len().max(1);
-        self.scope_scroll = self.scope_cursor.saturating_sub(5);
     }
     pub(super) fn previous_scope(&mut self) {
         self.scope_cursor = if self.scope_cursor == 0 {
@@ -73,18 +70,15 @@ impl AdvancedForm {
         } else {
             self.scope_cursor - 1
         };
-        self.scope_scroll = self.scope_cursor.saturating_sub(5);
     }
 
     pub(super) fn page_down_scope(&mut self) {
         let last = self.scope_entries().len().saturating_sub(1);
         self.scope_cursor = (self.scope_cursor + 8).min(last);
-        self.scope_scroll = self.scope_cursor.saturating_sub(5);
     }
 
     pub(super) fn page_up_scope(&mut self) {
         self.scope_cursor = self.scope_cursor.saturating_sub(8);
-        self.scope_scroll = self.scope_cursor.saturating_sub(5);
     }
     pub(super) fn toggle_scope_current(&mut self) {
         match self.scope_entries().get(self.scope_cursor).copied() {
@@ -110,12 +104,10 @@ impl AdvancedForm {
     pub(super) fn push_scope_filter(&mut self, ch: char) {
         self.scope_filter.push(ch);
         self.scope_cursor = 0;
-        self.scope_scroll = 0;
     }
     pub(super) fn backspace_scope_filter(&mut self) {
         self.scope_filter.pop();
         self.scope_cursor = 0;
-        self.scope_scroll = 0;
     }
     pub(super) fn scope_entries(&self) -> Vec<ScopeEntry> {
         let mut entries = vec![ScopeEntry::Cve, ScopeEntry::Osv];
@@ -159,7 +151,6 @@ impl AdvancedForm {
         self.scope_cursor = self
             .scope_cursor
             .min(self.scope_entries().len().saturating_sub(1));
-        self.scope_scroll = self.scope_scroll.min(self.scope_cursor.saturating_sub(2));
     }
     pub(super) fn push(&mut self, ch: char) {
         if let Some(field) = self.active_text_mut() {

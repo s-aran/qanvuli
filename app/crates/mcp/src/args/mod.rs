@@ -272,6 +272,8 @@ pub(crate) struct QueryPackageEnrichedArgs {
     pub(crate) limit: Option<u64>,
     /// Number of matching findings to skip. Default is 0.
     pub(crate) offset: Option<u64>,
+    /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
+    pub(crate) include_evidence: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -288,6 +290,8 @@ pub(crate) struct QueryPackagesEnrichedArgs {
     pub(crate) packages: Vec<PackageQueryArgs>,
     /// Return only confirmed affected findings (default), or all evaluated findings.
     pub(crate) status: Option<String>,
+    /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
+    pub(crate) include_evidence: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

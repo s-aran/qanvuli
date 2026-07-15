@@ -5,10 +5,14 @@ use qanvuli_app_commands::common::{
     OsvImportSelection, apply_delta_updates, redact_database_url,
     sync_all_enrichment_sources_after_update,
 };
-use qanvuli_core::database::{CveDatabase, CveStateScope, CveSummary};
+use qanvuli_core::database::{
+    CveDatabase, CveRiskSummary, CveStateScope, CveSummary, EnrichedFinding,
+};
 use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
+use serde::Serialize;
 use simd_json::{OwnedValue as Value, json};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -280,13 +284,14 @@ pub(crate) async fn query_package_enriched(
     status: Option<&str>,
     limit: u64,
     offset: u64,
+    include_evidence: bool,
 ) -> Result<CallToolResult, McpError> {
     let status = status.unwrap_or("affected");
     if !matches!(status, "affected" | "all") {
         return Err(mcp_error("status must be either 'affected' or 'all'"));
     }
     let result = db
-        .query_package_enriched(ecosystem, package, version, purl)
+        .query_package_enriched_with_evidence(ecosystem, package, version, purl, include_evidence)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     let confirmed_count = result
@@ -305,9 +310,11 @@ pub(crate) async fn query_package_enriched(
         .drain(offset.min(matching_count)..)
         .take(limit)
         .collect::<Vec<_>>();
+    let findings = serialize_findings(&findings, include_evidence)?;
     response::tool_result(json!({
         "vulnerable": confirmed_count > 0,
         "confirmed_count": confirmed_count,
+        "coverage_notice": coverage_notice(ecosystem, confirmed_count),
         "status": status,
         "has_more": has_more,
         "findings": findings,
@@ -318,6 +325,7 @@ pub(crate) async fn query_packages_enriched(
     db: &CveDatabase,
     packages: Vec<crate::args::PackageQueryArgs>,
     status: Option<&str>,
+    include_evidence: bool,
 ) -> Result<CallToolResult, McpError> {
     let status = status.unwrap_or("affected");
     if !matches!(status, "affected" | "all") {
@@ -327,11 +335,12 @@ pub(crate) async fn query_packages_enriched(
     let mut results = Vec::with_capacity(requested.min(200));
     for package in packages.into_iter().take(200) {
         match db
-            .query_package_enriched(
+            .query_package_enriched_with_evidence(
                 &package.ecosystem,
                 &package.package,
                 &package.version,
                 package.purl.as_deref(),
+                include_evidence,
             )
             .await
         {
@@ -340,7 +349,28 @@ pub(crate) async fn query_packages_enriched(
                     .into_iter()
                     .filter(|finding| status == "all" || finding.affected.status == "affected")
                     .collect::<Vec<_>>();
-                results.push(json!({"package": package, "findings": findings}));
+                let cve_ids = findings
+                    .iter()
+                    .flat_map(|finding| finding.cve_ids.iter().cloned())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let risk = db
+                    .cve_risk_summaries(&cve_ids)
+                    .await
+                    .map_err(|err| mcp_error(err.to_string()))?;
+                let summary = batch_summary(
+                    &package,
+                    cve_ids,
+                    &risk,
+                    findings
+                        .iter()
+                        .any(|finding| finding.affected.status == "affected"),
+                );
+                let findings = serialize_findings(&findings, include_evidence)?;
+                let coverage_notice =
+                    coverage_notice(&package.ecosystem, if summary.vulnerable { 1 } else { 0 });
+                results.push(json!({"package": package, "findings": findings, "summary": summary, "coverage_notice": coverage_notice}));
             }
             Err(error) => results.push(json!({"package": package, "error": error.to_string()})),
         }
@@ -348,6 +378,68 @@ pub(crate) async fn query_packages_enriched(
     response::tool_result(
         json!({"requested": requested, "truncated": requested > 200, "status": status, "results": results}),
     )
+}
+
+fn coverage_notice(ecosystem: &str, confirmed_count: usize) -> Option<&'static str> {
+    (ecosystem.eq_ignore_ascii_case("pypi") && confirmed_count == 0).then_some(
+        "No OSV-affected finding was confirmed. OSV ranges can omit vulnerabilities left unpatched on end-of-life branches; cross-check critical EOL packages with CVE List or vendor advisories.",
+    )
+}
+
+#[derive(Serialize)]
+struct BatchPackageSummary {
+    package: String,
+    version: String,
+    vulnerable: bool,
+    cve_ids: Vec<String>,
+    max_cvss: Option<f64>,
+    max_epss: Option<f64>,
+    kev: bool,
+}
+
+fn batch_summary(
+    package: &crate::args::PackageQueryArgs,
+    cve_ids: Vec<String>,
+    risk: &[CveRiskSummary],
+    vulnerable: bool,
+) -> BatchPackageSummary {
+    BatchPackageSummary {
+        package: package.package.clone(),
+        version: package.version.clone(),
+        vulnerable,
+        cve_ids,
+        max_cvss: risk
+            .iter()
+            .filter_map(|summary| summary.max_cvss_score)
+            .max_by(f64::total_cmp),
+        max_epss: risk
+            .iter()
+            .filter_map(|summary| summary.epss)
+            .max_by(f64::total_cmp),
+        kev: risk.iter().any(|summary| summary.kev_listed),
+    }
+}
+
+fn serialize_findings(
+    findings: &[EnrichedFinding],
+    include_evidence: bool,
+) -> Result<Value, McpError> {
+    let mut value = simd_json::serde::to_owned_value(findings)
+        .map_err(|err| mcp_error(format!("failed to encode package findings: {err}")))?;
+    if include_evidence {
+        return Ok(value);
+    }
+
+    let Value::Array(values) = &mut value else {
+        return Err(mcp_error("package findings did not serialize to an array"));
+    };
+    for finding in values.iter_mut() {
+        let Value::Object(object) = finding else {
+            return Err(mcp_error("package finding did not serialize to an object"));
+        };
+        object.remove("evidence");
+    }
+    Ok(value)
 }
 
 pub(crate) async fn known_exploited(
@@ -577,5 +669,65 @@ mod tests {
         let result = database_status(&db).await.unwrap();
 
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[test]
+    fn batch_summary_aggregates_all_related_cves() {
+        let package = crate::args::PackageQueryArgs {
+            ecosystem: "PyPI".to_owned(),
+            package: "pillow-heif".to_owned(),
+            version: "1.1.1".to_owned(),
+            purl: None,
+        };
+        let risk = vec![
+            CveRiskSummary {
+                cve_id: "CVE-2099-0001".to_owned(),
+                title: None,
+                published_at: None,
+                updated_at: None,
+                state: None,
+                kev_listed: false,
+                kev_date_added: None,
+                kev_due_date: None,
+                kev_known_ransomware_campaign_use: None,
+                epss: Some(0.12),
+                epss_percentile: None,
+                epss_score_date: None,
+                epss_model_version: None,
+                max_cvss_score: Some(7.5),
+                max_cvss_severity: None,
+                max_cvss_version: None,
+            },
+            CveRiskSummary {
+                cve_id: "CVE-2099-0002".to_owned(),
+                title: None,
+                published_at: None,
+                updated_at: None,
+                state: None,
+                kev_listed: true,
+                kev_date_added: None,
+                kev_due_date: None,
+                kev_known_ransomware_campaign_use: None,
+                epss: Some(0.91),
+                epss_percentile: None,
+                epss_score_date: None,
+                epss_model_version: None,
+                max_cvss_score: Some(9.8),
+                max_cvss_severity: None,
+                max_cvss_version: None,
+            },
+        ];
+
+        let summary = batch_summary(
+            &package,
+            vec!["CVE-2099-0001".to_owned(), "CVE-2099-0002".to_owned()],
+            &risk,
+            true,
+        );
+
+        assert!(summary.vulnerable);
+        assert!(summary.kev);
+        assert_eq!(summary.max_cvss, Some(9.8));
+        assert_eq!(summary.max_epss, Some(0.91));
     }
 }

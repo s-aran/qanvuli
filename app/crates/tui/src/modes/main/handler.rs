@@ -34,7 +34,7 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
         KeyCode::F(1) => app.show_help = true,
         KeyCode::F(2) => app.next_search_mode(),
         KeyCode::F(3) => {
-            app.open_advanced_search();
+            app.open_advanced_search(db);
         }
         KeyCode::F(4) => {
             app.open_display_settings();

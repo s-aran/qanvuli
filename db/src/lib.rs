@@ -55,7 +55,7 @@ use qanvuli_models::{
     parse_value_with_raw,
 };
 use rayon::prelude::*;
-use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::sea_query::{Expr, Func, OnConflict};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction,
     DbBackend, DbErr, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
@@ -1071,7 +1071,7 @@ impl CveDatabase {
     pub async fn find_osv_raw_json_by_id(&self, osv_id: &str) -> Result<Option<Value>, DbErr> {
         source_raw_records::Entity::find()
             .filter(source_raw_records::Column::Source.eq("OSV"))
-            .filter(source_raw_records::Column::SourceRecordId.eq(normalize_identifier(osv_id)))
+            .filter(source_raw_records::Column::SourceRecordId.eq(osv_id.trim()))
             .one(&self.db)
             .await
             .and_then(|row| {
@@ -4527,6 +4527,20 @@ impl CveDatabase {
         version: &str,
         purl: Option<&str>,
     ) -> Result<Vec<EnrichedFinding>, DbErr> {
+        self.query_package_enriched_with_evidence(ecosystem, package, version, purl, true)
+            .await
+    }
+
+    /// Equivalent to [`Self::query_package_enriched`], optionally omitting verbose evidence.
+    pub async fn query_package_enriched_with_evidence(
+        &self,
+        ecosystem: &str,
+        package: &str,
+        version: &str,
+        purl: Option<&str>,
+        include_evidence: bool,
+    ) -> Result<Vec<EnrichedFinding>, DbErr> {
+        let package = canonical_package_name(ecosystem, package);
         let package_rows = PackageOsvRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
@@ -4540,7 +4554,7 @@ impl CveDatabase {
             "#,
             vec![
                 SeaValue::from(ecosystem.to_owned()),
-                SeaValue::from(package.to_owned()),
+                SeaValue::from(package.clone()),
             ],
         ))
         .all(&self.db)
@@ -4618,53 +4632,58 @@ impl CveDatabase {
             let epss = cve_ids
                 .iter()
                 .find_map(|cve_id| epss_by_cve_id.get(cve_id).cloned());
-            let mut evidence = vec![Evidence {
-                kind: "osv_range_match".to_owned(),
-                source: "OSV".to_owned(),
-                from: None,
-                to: None,
-                cve_id: None,
-                osv_id: Some(package_row.osv_id.clone()),
-                detail: Some(format!(
-                    "{} {} {}",
-                    affected.status,
-                    package_row.ecosystem.unwrap_or_default(),
-                    package_row.package_name.unwrap_or_default()
-                )),
-            }];
-            evidence.extend(resolution.edges.iter().map(|edge| Evidence {
-                kind: "alias_resolution".to_owned(),
-                source: edge.source.clone(),
-                from: Some(edge.from_identifier.clone()),
-                to: Some(edge.to_identifier.clone()),
-                cve_id: None,
-                osv_id: None,
-                detail: Some(edge.evidence_json.clone()),
-            }));
-            for cve_id in &cve_ids {
-                if kev.is_some() {
-                    evidence.push(Evidence {
-                        kind: "kev_join".to_owned(),
-                        source: "CISA KEV".to_owned(),
+            let evidence = include_evidence
+                .then(|| {
+                    let mut evidence = vec![Evidence {
+                        kind: "osv_range_match".to_owned(),
+                        source: "OSV".to_owned(),
                         from: None,
                         to: None,
-                        cve_id: Some(cve_id.clone()),
+                        cve_id: None,
+                        osv_id: Some(package_row.osv_id.clone()),
+                        detail: Some(format!(
+                            "{} {} {}",
+                            affected.status,
+                            package_row.ecosystem.unwrap_or_default(),
+                            package_row.package_name.unwrap_or_default()
+                        )),
+                    }];
+                    evidence.extend(resolution.edges.iter().map(|edge| Evidence {
+                        kind: "alias_resolution".to_owned(),
+                        source: edge.source.clone(),
+                        from: Some(edge.from_identifier.clone()),
+                        to: Some(edge.to_identifier.clone()),
+                        cve_id: None,
                         osv_id: None,
-                        detail: None,
-                    });
-                }
-                if epss.is_some() {
-                    evidence.push(Evidence {
-                        kind: "epss_join".to_owned(),
-                        source: "FIRST EPSS".to_owned(),
-                        from: None,
-                        to: None,
-                        cve_id: Some(cve_id.clone()),
-                        osv_id: None,
-                        detail: None,
-                    });
-                }
-            }
+                        detail: Some(edge.evidence_json.clone()),
+                    }));
+                    for cve_id in &cve_ids {
+                        if kev.is_some() {
+                            evidence.push(Evidence {
+                                kind: "kev_join".to_owned(),
+                                source: "CISA KEV".to_owned(),
+                                from: None,
+                                to: None,
+                                cve_id: Some(cve_id.clone()),
+                                osv_id: None,
+                                detail: None,
+                            });
+                        }
+                        if epss.is_some() {
+                            evidence.push(Evidence {
+                                kind: "epss_join".to_owned(),
+                                source: "FIRST EPSS".to_owned(),
+                                from: None,
+                                to: None,
+                                cve_id: Some(cve_id.clone()),
+                                osv_id: None,
+                                detail: None,
+                            });
+                        }
+                    }
+                    evidence
+                })
+                .unwrap_or_default();
             let priority_signals = priority_signals(
                 kev.as_ref(),
                 epss.as_ref(),
@@ -4677,7 +4696,7 @@ impl CveDatabase {
                 aliases: resolution.related_aliases,
                 package: PackageQuery {
                     ecosystem: ecosystem.to_owned(),
-                    package: package.to_owned(),
+                    package: package.clone(),
                     version: version.to_owned(),
                     purl: purl.map(ToOwned::to_owned),
                 },
@@ -7012,13 +7031,13 @@ fn affected_exact_where_clause(
     }
     if let Some(vendor_exact) = option_text(vendor_exact) {
         conditions.push(format!(
-            "cve_affected.vendor = {}",
+            "cve_affected.vendor = {} COLLATE NOCASE",
             sql_string_literal(vendor_exact)
         ));
     }
     if let Some(product_exact) = option_text(product_exact) {
         conditions.push(format!(
-            "cve_affected.product = {}",
+            "cve_affected.product = {} COLLATE NOCASE",
             sql_string_literal(product_exact)
         ));
     }
@@ -7133,10 +7152,16 @@ fn apply_affected_filters(
         query = query.filter(cve_affected::Column::Product.like(like_pattern(product)));
     }
     if let Some(vendor_exact) = option_text(vendor_exact) {
-        query = query.filter(cve_affected::Column::Vendor.eq(vendor_exact.to_owned()));
+        query = query.filter(
+            Expr::expr(Func::lower(Expr::col(cve_affected::Column::Vendor)))
+                .eq(vendor_exact.to_lowercase()),
+        );
     }
     if let Some(product_exact) = option_text(product_exact) {
-        query = query.filter(cve_affected::Column::Product.eq(product_exact.to_owned()));
+        query = query.filter(
+            Expr::expr(Func::lower(Expr::col(cve_affected::Column::Product)))
+                .eq(product_exact.to_lowercase()),
+        );
     }
     query
 }
@@ -7197,13 +7222,13 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     }
     if let Some(vendor_exact) = option_text(options.vendor_exact.as_deref()) {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor = {})",
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.vendor = {} COLLATE NOCASE)",
             sql_string_literal(vendor_exact)
         ));
     }
     if let Some(product_exact) = option_text(options.product_exact.as_deref()) {
         conditions.push(format!(
-            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product = {})",
+            "EXISTS (SELECT 1 FROM cve_affected WHERE cve_affected.cve_db_id = cve.id AND cve_affected.product = {} COLLATE NOCASE)",
             sql_string_literal(product_exact)
         ));
     }
@@ -7586,8 +7611,7 @@ fn osv_scoped_search_statement(
     count_only: bool,
 ) -> Result<(String, Vec<SeaValue>), DbErr> {
     let mut sql = if query.is_some_and(|query| !query.trim().is_empty()) {
-        " FROM osv_text_fts f INNER JOIN osv_advisories o ON o.osv_id = f.osv_id WHERE f MATCH ?"
-            .to_owned()
+        " FROM osv_text_fts INNER JOIN osv_advisories o ON o.osv_id = osv_text_fts.osv_id WHERE osv_text_fts MATCH ?".to_owned()
     } else {
         " FROM osv_advisories o WHERE 1 = 1".to_owned()
     };
@@ -9052,11 +9076,40 @@ fn fixed_versions_from_ranges(ranges: &[RangeEventRow]) -> Vec<String> {
     let mut values = ranges
         .iter()
         .filter(|row| row.event_type == "fixed")
+        .filter(|row| !is_git_commit_hash(&row.value))
         .map(|row| row.value.clone())
         .collect::<Vec<_>>();
     values.sort();
     values.dedup();
     values
+}
+
+fn canonical_package_name(ecosystem: &str, package: &str) -> String {
+    if !ecosystem.eq_ignore_ascii_case("PyPI") {
+        return package.to_owned();
+    }
+
+    let mut canonical = String::with_capacity(package.len());
+    let mut previous_was_separator = false;
+    for character in package.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            if !previous_was_separator {
+                canonical.push('-');
+                previous_was_separator = true;
+            }
+        } else {
+            canonical.extend(character.to_lowercase());
+            previous_was_separator = false;
+        }
+    }
+    canonical
+}
+
+fn is_git_commit_hash(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn match_version(

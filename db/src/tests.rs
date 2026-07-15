@@ -555,6 +555,33 @@ fn upsert_cve_models_writes_parent_and_children() {
             .unwrap();
         assert_eq!(by_exact_product.len(), 1);
 
+        let exact_cve_product_case_insensitive = cve_db
+            .search_cves_by_vendor_product_exact_with_state_scope(
+                None,
+                None,
+                None,
+                Some("example product"),
+                CveStateScope::PublishedOnly,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_cve_product_case_insensitive.len(), 1);
+
+        let exact_product_case_insensitive = cve_db
+            .search_cve_summaries_advanced(
+                &CveAdvancedSearch {
+                    product_exact: Some("example product".to_owned()),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_product_case_insensitive.len(), 1);
+
         let by_partial_as_exact = cve_db
             .search_cve_summaries_by_vendor_product_exact_with_state_scope(
                 None,
@@ -674,6 +701,28 @@ fn enrichment_imports_and_queries_joined_sources() {
                 .to_owned(),
             },
         ])
+        .await
+        .unwrap();
+        db.import_osv_records(vec![OsvRawRecord {
+            source_path: Some("PYSEC-TEST-0001.json".to_owned()),
+            raw_json: r#"{
+                "schema_version": "1.7.5",
+                "id": "PYSEC-TEST-0001",
+                "modified": "2099-01-05T00:00:00Z",
+                "published": "2099-01-05T00:00:00Z",
+                "aliases": ["CVE-2099-0001"],
+                "summary": "PyPI canonical-name fixture",
+                "details": "Fixture advisory for PyPI normalization.",
+                "affected": [{
+                    "package": {"ecosystem": "PyPI", "name": "pillow-heif"},
+                    "ranges": [{"type": "ECOSYSTEM", "events": [
+                        {"introduced": "0"}, {"fixed": "1.2.0"}
+                    ]}]
+                }],
+                "references": []
+            }"#
+            .to_owned(),
+        }])
         .await
         .unwrap();
         let unchanged = db
@@ -869,11 +918,33 @@ fn enrichment_imports_and_queries_joined_sources() {
         assert!(finding.evidence.iter().any(|e| e.kind == "kev_join"));
         assert!(finding.evidence.iter().any(|e| e.kind == "epss_join"));
 
+        let canonical_pypi = db
+            .query_package_enriched("PyPI", "pillow-heif", "1.1.1", None)
+            .await
+            .unwrap();
+        assert_eq!(canonical_pypi.len(), 1);
+        for package in ["pillow_heif", "Pillow_Heif", "pillow.heif"] {
+            let findings = db
+                .query_package_enriched("PyPI", package, "1.1.1", None)
+                .await
+                .unwrap();
+            assert_eq!(findings.len(), canonical_pypi.len(), "{package}");
+            assert_eq!(findings[0].cve_ids, canonical_pypi[0].cve_ids, "{package}");
+        }
+
         let unsupported = db
             .query_package_enriched("npm", "foo", "1.2.3", None)
             .await
             .unwrap();
         assert!(unsupported.is_empty());
+
+        assert!(is_git_commit_hash(
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+        assert!(!is_git_commit_hash(
+            "0123456789ABCDEF0123456789ABCDEF01234567"
+        ));
+        assert!(!is_git_commit_hash("1.2.3"));
     });
 }
 
@@ -973,6 +1044,13 @@ fn scoped_osv_search_uses_registered_families_and_ecosystems() {
             .unwrap();
         assert_eq!(ghsa.len(), 1);
         assert!(ghsa[0].osv_id.starts_with("GHSA-"));
+
+        let searched_ghsa = db
+            .search_osv_summaries_scoped(Some("duplicate"), &["GHSA".to_owned()], None, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(searched_ghsa.len(), 1);
+        assert!(searched_ghsa[0].osv_id.starts_with("GHSA-"));
 
         assert_eq!(
             db.count_osv_summaries_scoped(

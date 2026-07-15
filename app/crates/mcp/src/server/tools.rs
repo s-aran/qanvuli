@@ -285,7 +285,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Query local OSV records for an ecosystem/package/version, then attach CVE aliases, CISA KEV, FIRST EPSS, priority signals, and evidence. This does not fetch URLs or run commands."
+        description = "Query local OSV records for an ecosystem/package/version, then attach CVE aliases, CISA KEV, FIRST EPSS, and priority signals. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence. This does not fetch URLs or run commands."
     )]
     pub(crate) async fn query_package_enriched(
         &self,
@@ -301,19 +301,26 @@ impl CveSearchServer {
             args.status.as_deref(),
             limit(args.limit),
             offset(args.offset),
+            args.include_evidence.unwrap_or(false),
         )
         .await
     }
 
     #[tool(
-        description = "Batch-query up to 200 package/version tuples. Each input returns its own findings or error; status defaults to affected."
+        description = "Batch-query up to 200 package/version tuples. Each input returns findings plus a compact CVE/KEV/EPSS/CVSS summary; status defaults to affected. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence."
     )]
     pub(crate) async fn query_packages_enriched(
         &self,
         Parameters(args): Parameters<QueryPackagesEnrichedArgs>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
-        db::query_packages_enriched(db, args.packages, args.status.as_deref()).await
+        db::query_packages_enriched(
+            db,
+            args.packages,
+            args.status.as_deref(),
+            args.include_evidence.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(

@@ -4,7 +4,7 @@ use crate::{
         centered_rect,
         components::{ActionButton, ButtonRow, Checkbox, RadioOption, SelectableField},
     },
-    display::{DisplayField, DisplaySettings, DisplayTab},
+    display::{DisplayField, DisplaySettings},
     form::{AdvancedField, AdvancedForm, StateScopeUi},
     traits::component::LineComponent,
     utils::text::progress_ratio,
@@ -15,7 +15,7 @@ use ratatui::{
     text::Line,
     widgets::{
         Block, Borders, Clear, Gauge, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-        Tabs, Wrap,
+        Wrap,
     },
 };
 
@@ -152,99 +152,45 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
-        .split(inner);
-    frame.render_widget(
-        Tabs::new([Line::from("Display"), Line::from("DB Sources")]).select(
-            if display.tab == DisplayTab::Settings {
-                0
-            } else {
-                1
-            },
-        ),
-        rows[0],
-    );
-
-    if display.tab == DisplayTab::Settings {
-        let lines = vec![
-            display_line(
-                display,
-                DisplayField::SortField,
-                "Sort item",
-                display.sort_field.label(),
-            ),
-            display_line(
-                display,
-                DisplayField::SortDirection,
-                "Sort direction",
-                display.sort_direction.label(),
-            ),
-            display_line(
-                display,
-                DisplayField::TimeZone,
-                "Timezone",
-                display.timezone.label(),
-            ),
-            display_line(
-                display,
-                DisplayField::KevOnly,
-                "KEV listed only",
-                if display.kev_only { "on" } else { "off" },
-            ),
-            Line::from(""),
-            Line::from(
-                "Enter/Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right tab  [/] change",
-            ),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), rows[1]);
-        return;
-    }
-
-    draw_source_settings(frame, app, rows[1]);
-}
-
-fn draw_source_settings(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui::layout::Rect) {
     let form = &app.advanced;
     let entries = form.scope_entries();
-    let active = |entry| entries.get(form.scope_cursor).copied() == Some(entry);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(3),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let sources = Line::from(
-        vec![
-            Checkbox {
-                label: "CVE".to_owned(),
-                checked: form.source_cve,
-                active: active(crate::form::ScopeEntry::Cve),
-                active_color: Color::Cyan,
-            }
-            .line()
-            .spans,
-            Line::from("  ").spans,
-            Checkbox {
-                label: "OSV".to_owned(),
-                checked: form.source_osv,
-                active: active(crate::form::ScopeEntry::Osv),
-                active_color: Color::Cyan,
-            }
-            .line()
-            .spans,
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>(),
-    );
-    frame.render_widget(Paragraph::new(sources), rows[0]);
-    let filter = if form.source_osv {
+    let active =
+        |entry| display.source_focus && entries.get(form.scope_cursor).copied() == Some(entry);
+    let mut lines = vec![
+        display_line(
+            display,
+            DisplayField::SortField,
+            "Sort item",
+            display.sort_field.label(),
+        ),
+        display_line(
+            display,
+            DisplayField::SortDirection,
+            "Sort direction",
+            display.sort_direction.label(),
+        ),
+        display_line(
+            display,
+            DisplayField::TimeZone,
+            "Timezone",
+            display.timezone.label(),
+        ),
+        display_line(
+            display,
+            DisplayField::KevOnly,
+            "KEV listed only",
+            if display.kev_only { "on" } else { "off" },
+        ),
+        Line::from(""),
+        Line::from("DB Sources"),
+    ];
+    lines.extend(entries.iter().filter_map(|entry| match entry {
+        crate::form::ScopeEntry::Cve | crate::form::ScopeEntry::Osv => {
+            Some(scope_entry_line(form, *entry, active(*entry)))
+        }
+        _ => None,
+    }));
+    lines.push(Line::from(if form.source_osv {
         if app.scope_candidates_loading() {
             format!("Advisory filter (loading): {}", form.scope_filter)
         } else {
@@ -252,50 +198,41 @@ fn draw_source_settings(frame: &mut ratatui::Frame<'_>, app: &App, area: ratatui
         }
     } else {
         "Enable OSV to choose registered advisories".to_owned()
-    };
-    frame.render_widget(Paragraph::new(filter), rows[1]);
-    let advisory_lines = entries
-        .iter()
-        .enumerate()
-        .filter_map(|(cursor, entry)| {
-            matches!(entry, crate::form::ScopeEntry::Advisory(_))
-                .then(|| scope_entry_line(form, *entry, cursor == form.scope_cursor))
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(advisory_lines).scroll((form.scope_scroll as u16, 0)),
-        rows[2],
+    }));
+    lines.extend(entries.iter().filter_map(|entry| {
+        matches!(entry, crate::form::ScopeEntry::Advisory(_))
+            .then(|| scope_entry_line(form, *entry, active(*entry)))
+    }));
+    lines.push(
+        ButtonRow {
+            buttons: vec![
+                ActionButton {
+                    label: "Select All (A)",
+                    active: active(crate::form::ScopeEntry::AllAdvisories),
+                },
+                ActionButton {
+                    label: "Clear All (X)",
+                    active: active(crate::form::ScopeEntry::ClearAdvisories),
+                },
+            ],
+        }
+        .line(),
     );
-    let buttons = ButtonRow {
-        buttons: vec![
-            ActionButton {
-                label: "Select All (A)",
-                active: active(crate::form::ScopeEntry::AllAdvisories),
-            },
-            ActionButton {
-                label: "Clear All (X)",
-                active: active(crate::form::ScopeEntry::ClearAdvisories),
-            },
-        ],
-    }
-    .line();
-    frame.render_widget(Paragraph::new(buttons), rows[3]);
+    lines.push(Line::from(
+        "Enter/Esc close  Tab/Up/Down focus  Left/Right change  Space toggle  A/X all OSV  PgUp/PgDn scroll",
+    ));
     frame.render_widget(
-        Paragraph::new("Space toggle  Type filter  PgUp/PgDn scroll  Left/Right tab"),
-        rows[4],
+        Paragraph::new(lines.clone())
+            .scroll((display.scroll as u16, 0))
+            .wrap(Wrap { trim: true }),
+        inner,
     );
-    if form.source_osv {
-        let count = entries
-            .iter()
-            .filter(|entry| matches!(entry, crate::form::ScopeEntry::Advisory(_)))
-            .count();
-        let mut state = ScrollbarState::new(count).position(form.scope_scroll);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            rows[2],
-            &mut state,
-        );
-    }
+    let mut state = ScrollbarState::new(lines.len()).position(display.scroll);
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight),
+        inner,
+        &mut state,
+    );
 }
 
 pub(crate) fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
@@ -455,7 +392,7 @@ fn display_line(
     SelectableField {
         label,
         value: value.to_owned(),
-        active: display.active_field == field,
+        active: !display.source_focus && display.active_field == field,
         active_color: Color::Cyan,
     }
     .line()

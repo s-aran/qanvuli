@@ -7,10 +7,10 @@
 pub mod database {
     pub use qanvuli_db::{
         CveActiveModels, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail, CveCvssDetail,
-        CveCweDetail, CveDatabase, CveDetail, CveReference, CveStateScope, CveSummary,
-        CveSummarySortOrder, CveSummaryWithDetail, CveZipFileRecord, CweEntry, EnrichedCveSummary,
-        EnrichedFinding, ImportSummary, OsvRawRecord, OsvSummary, ReadJsonFileRecord,
-        cve_state_label, detect_identifier_type,
+        CveCweDetail, CveDatabase, CveDetail, CveReference, CveRiskSummary, CveStateScope,
+        CveSummary, CveSummarySortOrder, CveSummaryWithDetail, CveZipFileRecord, CweEntry,
+        EnrichedCveSummary, EnrichedFinding, ImportSummary, OsvRawRecord, OsvSummary,
+        ReadJsonFileRecord, cve_state_label, detect_identifier_type,
     };
 }
 

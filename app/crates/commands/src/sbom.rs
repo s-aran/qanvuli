@@ -26,6 +26,9 @@ pub struct Args {
     jobs: Option<usize>,
     #[arg(long)]
     include_rejected: bool,
+    /// Include unverified text-name matches. These never affect vulnerability counts.
+    #[arg(long)]
+    include_name_matches: bool,
 }
 
 impl Args {
@@ -59,6 +62,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let package_count = packages.len();
     let mut cve_findings = BTreeMap::<(String, String, String), SbomCveFinding>::new();
     let mut osv_findings = BTreeMap::<(String, String, String, String), SbomOsvFinding>::new();
+    let mut unverified_name_matches = BTreeMap::<(String, String, String), SbomCveFinding>::new();
+    let mut unresolved_versions = BTreeSet::new();
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
     let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
@@ -79,6 +84,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             date_filter.clone(),
             state_scope,
             per_package_limit,
+            args.include_name_matches,
         );
     }
     while let Some(result) = pending.join_next().await {
@@ -98,6 +104,11 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             let key = osv_finding_key_from_finding(&finding);
             osv_findings.entry(key).or_insert(finding);
         }
+        for finding in result.unverified_name_matches {
+            let key = cve_finding_key_from_finding(&finding);
+            merge_cve_finding(&mut unverified_name_matches, key, finding);
+        }
+        unresolved_versions.extend(result.unresolved_versions);
         if let Some((index, package)) = packages.next() {
             start_package_search(
                 &mut pending,
@@ -108,12 +119,14 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 date_filter.clone(),
                 state_scope,
                 per_package_limit,
+                args.include_name_matches,
             );
         }
     }
 
     let cve_findings = cve_findings.into_values().collect::<Vec<_>>();
     let osv_findings = osv_findings.into_values().collect::<Vec<_>>();
+    let unverified_name_matches = unverified_name_matches.into_values().collect::<Vec<_>>();
     eprintln!(
         "sbom: completed {package_count} packages; findings={}",
         cve_findings.len() + osv_findings.len()
@@ -126,6 +139,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         "osv_count": osv_findings.len(),
         "findings": cve_findings,
         "osv_findings": osv_findings,
+        "unverified_name_matches": if args.include_name_matches { Some(unverified_name_matches) } else { None },
+        "unresolved_versions": unresolved_versions,
     }))?;
 
     close_db(db).await?;
@@ -148,6 +163,7 @@ fn start_package_search(
     date_filter: DateFilter,
     state_scope: CveStateScope,
     per_package_limit: u64,
+    include_name_matches: bool,
 ) {
     eprintln!("sbom: [{index}/{total}] searching {}", package.name);
     pending.spawn(search_package(
@@ -156,6 +172,7 @@ fn start_package_search(
         date_filter,
         state_scope,
         per_package_limit,
+        include_name_matches,
     ));
 }
 
@@ -163,6 +180,8 @@ struct PackageSearchResult {
     package_name: String,
     cve_findings: Vec<SbomCveFinding>,
     osv_findings: Vec<SbomOsvFinding>,
+    unverified_name_matches: Vec<SbomCveFinding>,
+    unresolved_versions: Vec<UnresolvedVersion>,
 }
 
 async fn search_package(
@@ -171,32 +190,37 @@ async fn search_package(
     date_filter: DateFilter,
     state_scope: CveStateScope,
     per_package_limit: u64,
+    include_name_matches: bool,
 ) -> Result<PackageSearchResult, String> {
     let mut cve_findings = Vec::new();
     let mut osv_findings = Vec::new();
-    for component in package.search_names().into_iter().take(8) {
-        let cves = db
-            .search_cve_summaries_by_affected_component_with_state_scope(
-                None,
-                &component,
-                date_filter.published_since.as_deref(),
-                date_filter.updated_since.as_deref(),
-                state_scope,
-                per_package_limit,
-                0,
-            )
-            .await
-            .map_err(|err| format!("failed to search `{component}`: {err}"))?;
+    let mut unverified_name_matches = Vec::new();
+    let mut unresolved_versions = Vec::new();
+    if include_name_matches && package.purls().is_empty() {
+        for component in package.search_names().into_iter().take(8) {
+            let cves = db
+                .search_cve_summaries_by_affected_component_with_state_scope(
+                    None,
+                    &component,
+                    date_filter.published_since.as_deref(),
+                    date_filter.updated_since.as_deref(),
+                    state_scope,
+                    per_package_limit,
+                    0,
+                )
+                .await
+                .map_err(|err| format!("failed to search `{component}`: {err}"))?;
 
-        for cve in cves {
-            cve_findings.push(SbomCveFinding {
-                package: package.name.clone(),
-                version: package.version.clone(),
-                matched_component: component.clone(),
-                matched_purl: None,
-                version_match: CveVersionMatch::NotChecked,
-                cve,
-            });
+            for cve in cves {
+                unverified_name_matches.push(SbomCveFinding {
+                    package: package.name.clone(),
+                    version: package.version.clone(),
+                    matched_component: component.clone(),
+                    matched_purl: None,
+                    version_match: CveVersionMatch::NotChecked,
+                    cve,
+                });
+            }
         }
     }
 
@@ -207,6 +231,15 @@ async fn search_package(
         let Some(version) = package_ref.version.as_deref() else {
             continue;
         };
+        if !is_concrete_version(version) {
+            unresolved_versions.push(UnresolvedVersion {
+                package: package.name.clone(),
+                version: version.to_owned(),
+                matched_purl: package_ref.purl.clone(),
+                reason: "version constraint is not a concrete version".to_owned(),
+            });
+            continue;
+        }
         let findings = db
             .query_package_enriched(
                 &package_ref.ecosystem,
@@ -236,12 +269,14 @@ async fn search_package(
                     });
                 }
             }
-            osv_findings.push(SbomOsvFinding {
-                package: package.name.clone(),
-                version: package_ref.version.clone(),
-                matched_purl: package_ref.purl.clone(),
-                finding,
-            });
+            if finding.affected.status == "affected" {
+                osv_findings.push(SbomOsvFinding {
+                    package: package.name.clone(),
+                    version: package_ref.version.clone(),
+                    matched_purl: package_ref.purl.clone(),
+                    finding,
+                });
+            }
         }
     }
 
@@ -249,6 +284,8 @@ async fn search_package(
         package_name: package.name.clone(),
         cve_findings,
         osv_findings,
+        unverified_name_matches,
+        unresolved_versions,
     })
 }
 
@@ -445,6 +482,26 @@ struct SbomOsvFinding {
     finding: EnrichedFinding,
 }
 
+#[derive(Debug, Serialize, Ord, PartialOrd, Eq, PartialEq)]
+struct UnresolvedVersion {
+    package: String,
+    version: String,
+    matched_purl: String,
+    reason: String,
+}
+
+/// Constraints such as `>= 2.2.1,< 3` are not installed versions and must not
+/// be sent through the exact-version OSV matcher.
+fn is_concrete_version(version: &str) -> bool {
+    !version.is_empty()
+        && !version.chars().any(|character| {
+            matches!(
+                character,
+                '<' | '>' | '=' | '!' | '~' | '^' | '*' | ',' | ' ' | '|'
+            )
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PackageRef {
     ecosystem: String,
@@ -581,6 +638,14 @@ mod tests {
             "あ"
         );
         assert_eq!(percent_decode("%FF"), "%FF");
+    }
+
+    #[test]
+    fn distinguishes_concrete_versions_from_constraints() {
+        assert!(is_concrete_version("2.10"));
+        assert!(is_concrete_version("7.25.9"));
+        assert!(!is_concrete_version(">= 2.2.1,< 3"));
+        assert!(!is_concrete_version(">= 0.9.1"));
     }
 
     #[test]

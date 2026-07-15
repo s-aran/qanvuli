@@ -22,6 +22,7 @@ pub(crate) enum SearchRequest {
     Advanced {
         options: CveAdvancedSearch,
         include_cve: bool,
+        include_osv: bool,
         osv_families: Vec<String>,
         ecosystems: Option<Vec<String>>,
     },
@@ -72,9 +73,11 @@ pub(crate) async fn run_search_request(
         SearchRequest::Advanced {
             options,
             include_cve,
+            include_osv,
             osv_families,
             ecosystems,
         } => {
+            let osv_query = advanced_osv_query(&options);
             let rows = if include_cve {
                 db.search_cve_summaries_advanced(&options, limit, offset)
                     .await
@@ -82,11 +85,11 @@ pub(crate) async fn run_search_request(
             } else {
                 Vec::new()
             };
-            let osv_rows = if osv_families.is_empty() {
+            let osv_rows = if !include_osv || has_cve_only_advanced_filters(&options) {
                 Vec::new()
             } else {
                 db.search_osv_summaries_scoped(
-                    options.query.as_deref(),
+                    osv_query.as_deref(),
                     &osv_families,
                     ecosystems.as_deref(),
                     limit,
@@ -198,9 +201,11 @@ pub(crate) async fn run_count_request(
         SearchRequest::Advanced {
             options,
             include_cve,
+            include_osv,
             osv_families,
             ecosystems,
         } => {
+            let osv_query = advanced_osv_query(&options);
             let cve = if include_cve {
                 db.count_cve_summaries_advanced(&options)
                     .await
@@ -208,11 +213,11 @@ pub(crate) async fn run_count_request(
             } else {
                 0
             };
-            let osv = if osv_families.is_empty() {
+            let osv = if !include_osv || has_cve_only_advanced_filters(&options) {
                 0
             } else {
                 db.count_osv_summaries_scoped(
-                    options.query.as_deref(),
+                    osv_query.as_deref(),
                     &osv_families,
                     ecosystems.as_deref(),
                 )
@@ -222,6 +227,32 @@ pub(crate) async fn run_count_request(
             Ok(cve + osv)
         }
     }
+}
+
+fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
+    [
+        options.published_from.as_deref(),
+        options.published_to.as_deref(),
+        options.cwe.as_deref(),
+    ]
+    .into_iter()
+    .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
+        || options.kev_only
+}
+
+fn advanced_osv_query(options: &CveAdvancedSearch) -> Option<String> {
+    let query = [
+        options.query.as_deref(),
+        options.product.as_deref(),
+        options.product_exact.as_deref(),
+        options.vendor.as_deref(),
+        options.vendor_exact.as_deref(),
+    ]
+    .into_iter()
+    .filter_map(|value| value.map(str::trim).filter(|value| !value.is_empty()))
+    .collect::<Vec<_>>()
+    .join(" ");
+    (!query.is_empty()).then_some(query)
 }
 
 async fn search_by_mode(
@@ -389,6 +420,31 @@ mod tests {
     use qanvuli_core::database::OsvRawRecord;
 
     #[test]
+    fn advanced_osv_search_excludes_cve_only_filters() {
+        assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch::default()));
+        assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch {
+            vendor: Some("Example".to_owned()),
+            ..Default::default()
+        }));
+        assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch {
+            product_exact: Some("Django".to_owned()),
+            ..Default::default()
+        }));
+        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
+            published_from: Some("2026-01-01".to_owned()),
+            ..Default::default()
+        }));
+        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
+            cwe: Some("CWE-79".to_owned()),
+            ..Default::default()
+        }));
+        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
+            kev_only: true,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
     fn identifier_and_free_text_modes_return_osv_only_aliases() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -433,6 +489,19 @@ mod tests {
                 assert_eq!(result.osv_rows.len(), 1);
                 assert_eq!(result.osv_rows[0].osv_id, "MAL-2099-1");
             }
+
+            let request = SearchRequest::Mode {
+                mode: SearchMode::FreeText,
+                query: "GHSA-test-alias-only".to_owned(),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: true,
+            };
+            let result = run_search_request(db.clone(), request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert!(result.rows.is_empty());
+            assert_eq!(result.osv_rows.len(), 1);
+            assert_eq!(run_count_request(db, request).await.unwrap(), 1);
         });
     }
 
@@ -495,6 +564,56 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(count, 1);
+            }
+
+            let request = SearchRequest::Advanced {
+                options: CveAdvancedSearch {
+                    product: Some("example-product".to_owned()),
+                    ..Default::default()
+                },
+                include_cve: false,
+                include_osv: true,
+                osv_families: vec!["GHSA".to_owned()],
+                ecosystems: None,
+            };
+            let result = run_search_request(db.clone(), request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(result.osv_rows.len(), 1);
+            assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 1);
+
+            for (name, options) in [
+                (
+                    "published_from",
+                    CveAdvancedSearch {
+                        published_from: Some("2099-01-01".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "cwe",
+                    CveAdvancedSearch {
+                        cwe: Some("CWE-79".to_owned()),
+                        ..Default::default()
+                    },
+                ),
+            ] {
+                let request = SearchRequest::Advanced {
+                    options,
+                    include_cve: false,
+                    include_osv: true,
+                    osv_families: vec!["GHSA".to_owned()],
+                    ecosystems: None,
+                };
+                let result = run_search_request(db.clone(), request.clone(), 10, 0)
+                    .await
+                    .unwrap();
+                assert!(result.osv_rows.is_empty(), "{name}");
+                assert_eq!(
+                    run_count_request(db.clone(), request).await.unwrap(),
+                    0,
+                    "{name}"
+                );
             }
         });
     }

@@ -160,6 +160,15 @@ The MCP server exposes tools for:
 - exact raw CVE JSON lookup
 - database update
 
+Package enrichment queries normalize PyPI package names according to PEP 503, so `pillow_heif`,
+`Pillow_Heif`, and `pillow.heif` match `pillow-heif`. The batch package query returns compact
+per-package summaries by default; pass `include_evidence: true` only when detailed OSV/alias
+match evidence is needed.
+
+OSV package ranges do not necessarily model vulnerabilities left unpatched on end-of-life
+branches, and some CVEs may be absent from OSV. For important packages on EOL branches, also
+cross-check the CVE List or the vendor's security advisories.
+
 Use `--db-url` or `QANVULI_DB_URL` to point the MCP server at the same database used by the CLI/TUI.
 
 ## SBOM Search

@@ -3,7 +3,6 @@ use super::{
     app::{App, MaintenanceChoice, MaintenanceOperation, ViewMode},
     common::input::{is_ctrl, is_ctrl_quit},
     db::connection,
-    display::DisplayTab,
     form::AdvancedField,
     modes,
     terminal::TerminalGuard,
@@ -176,37 +175,67 @@ async fn run_loop(
         }
 
         if app.show_display {
-            if app.display.tab == DisplayTab::Sources {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => app.show_display = false,
-                    KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                    KeyCode::Left => app.display.previous_tab(),
-                    KeyCode::Right => app.display.next_tab(),
-                    KeyCode::Backspace => app.advanced.backspace_scope_filter(),
-                    KeyCode::Char(' ') => app.advanced.toggle_scope_current(),
-                    KeyCode::Char('a') => app.advanced.select_all_scope(),
-                    KeyCode::Char('x') => app.advanced.clear_all_scope(),
-                    KeyCode::Char(ch) => app.advanced.push_scope_filter(ch),
-                    KeyCode::Tab | KeyCode::Down => app.advanced.next_scope(),
-                    KeyCode::BackTab | KeyCode::Up => app.advanced.previous_scope(),
-                    KeyCode::PageDown => app.advanced.page_down_scope(),
-                    KeyCode::PageUp => app.advanced.page_up_scope(),
-                    _ => {}
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => app.show_display = false,
+                KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
+                KeyCode::PageDown => app.display.scroll = app.display.scroll.saturating_add(8),
+                KeyCode::PageUp => app.display.scroll = app.display.scroll.saturating_sub(8),
+                KeyCode::Tab | KeyCode::Down => {
+                    if app.display.source_focus {
+                        if app.advanced.scope_cursor + 1 >= app.advanced.scope_entries().len() {
+                            app.display.source_focus = false;
+                            app.display.active_field = crate::display::DisplayField::SortField;
+                            app.display.scroll = 0;
+                        } else {
+                            app.advanced.next_scope();
+                            app.display.scroll = app.advanced.scope_cursor.saturating_add(5);
+                        }
+                    } else if app.display.active_field == crate::display::DisplayField::KevOnly {
+                        app.display.source_focus = true;
+                        app.advanced.scope_cursor = 0;
+                        app.display.scroll = 5;
+                    } else {
+                        app.display.next_field();
+                    }
                 }
-            } else {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter => app.show_display = false,
-                    KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                    KeyCode::Tab => app.display.next_field(),
-                    KeyCode::BackTab => app.display.previous_field(),
-                    KeyCode::Down => app.display.next_field(),
-                    KeyCode::Up => app.display.previous_field(),
-                    KeyCode::Right => app.display.next_tab(),
-                    KeyCode::Left => app.display.previous_tab(),
-                    KeyCode::Char(']') => app.display.next_value(),
-                    KeyCode::Char('[') => app.display.previous_value(),
-                    _ => {}
+                KeyCode::BackTab | KeyCode::Up => {
+                    if app.display.source_focus {
+                        if app.advanced.scope_cursor == 0 {
+                            app.display.source_focus = false;
+                            app.display.active_field = crate::display::DisplayField::KevOnly;
+                            app.display.scroll = 0;
+                        } else {
+                            app.advanced.previous_scope();
+                            app.display.scroll = app.advanced.scope_cursor.saturating_add(5);
+                        }
+                    } else {
+                        app.display.previous_field();
+                    }
                 }
+                KeyCode::Left | KeyCode::Char('[') => {
+                    if app.display.source_focus {
+                        app.advanced.toggle_scope_current();
+                    } else {
+                        app.display.previous_value();
+                    }
+                }
+                KeyCode::Right | KeyCode::Char(']') => {
+                    if app.display.source_focus {
+                        app.advanced.toggle_scope_current();
+                    } else {
+                        app.display.next_value();
+                    }
+                }
+                KeyCode::Backspace if app.display.source_focus => {
+                    app.advanced.backspace_scope_filter()
+                }
+                KeyCode::Char(' ') if app.display.source_focus => {
+                    app.advanced.toggle_scope_current()
+                }
+                KeyCode::Char('a') if app.display.source_focus => app.advanced.select_all_scope(),
+                KeyCode::Char('x') if app.display.source_focus => app.advanced.clear_all_scope(),
+                KeyCode::Char(ch) if app.display.source_focus => app.advanced.push_scope_filter(ch),
+                _ => {}
             }
             continue;
         }

@@ -324,6 +324,7 @@ impl App {
             SearchRequest::Advanced {
                 options: self.main_search_options(sort_order),
                 include_cve: true,
+                include_osv: true,
                 osv_families: Vec::new(),
                 ecosystems: None,
             }
@@ -341,6 +342,7 @@ impl App {
         let request = SearchRequest::Advanced {
             options,
             include_cve: self.advanced.source_cve,
+            include_osv: self.advanced.source_osv,
             osv_families: if self.advanced.source_osv {
                 self.advanced.selected_advisories()
             } else {
@@ -352,9 +354,10 @@ impl App {
         self.start_replace_search(db, request, "failed to search");
     }
 
-    pub(super) fn open_advanced_search(&mut self) {
+    pub(super) fn open_advanced_search(&mut self, db: Option<CveDatabase>) {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
+        self.load_scope_candidates(db);
         self.show_advanced = true;
     }
 
@@ -399,7 +402,8 @@ impl App {
     }
 
     pub(super) fn open_display_settings(&mut self) {
-        self.display.tab = crate::display::DisplayTab::Settings;
+        self.display.source_focus = false;
+        self.display.scroll = 0;
         self.show_display = true;
     }
 
