@@ -187,6 +187,12 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
                 "Timezone",
                 display.timezone.label(),
             ),
+            display_line(
+                display,
+                DisplayField::KevOnly,
+                "KEV listed only",
+                if display.kev_only { "on" } else { "off" },
+            ),
             Line::from(""),
             Line::from(
                 "Enter/Esc close  Tab/Down next  Shift+Tab/Up previous  Left/Right tab  [/] change",

@@ -6,6 +6,7 @@ pub(super) struct DisplaySettings {
     pub(super) sort_field: SortField,
     pub(super) sort_direction: SortDirection,
     pub(super) timezone: TimeZone,
+    pub(super) kev_only: bool,
     pub(super) active_field: DisplayField,
 }
 
@@ -20,6 +21,7 @@ pub(super) enum DisplayField {
     SortField,
     SortDirection,
     TimeZone,
+    KevOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -51,6 +53,7 @@ impl Default for DisplaySettings {
             sort_field: SortField::Published,
             sort_direction: SortDirection::Desc,
             timezone: TimeZone::Utc,
+            kev_only: false,
             active_field: DisplayField::SortField,
         }
     }
@@ -77,6 +80,7 @@ impl DisplaySettings {
             DisplayField::SortField => self.sort_field = self.sort_field.next(),
             DisplayField::SortDirection => self.sort_direction = self.sort_direction.next(),
             DisplayField::TimeZone => self.timezone = self.timezone.next(),
+            DisplayField::KevOnly => self.kev_only = !self.kev_only,
         }
     }
 
@@ -85,6 +89,7 @@ impl DisplaySettings {
             DisplayField::SortField => self.sort_field = self.sort_field.previous(),
             DisplayField::SortDirection => self.sort_direction = self.sort_direction.previous(),
             DisplayField::TimeZone => self.timezone = self.timezone.previous(),
+            DisplayField::KevOnly => self.kev_only = !self.kev_only,
         }
     }
 
@@ -109,15 +114,17 @@ impl DisplayField {
         match self {
             Self::SortField => Self::SortDirection,
             Self::SortDirection => Self::TimeZone,
-            Self::TimeZone => Self::SortField,
+            Self::TimeZone => Self::KevOnly,
+            Self::KevOnly => Self::SortField,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::SortField => Self::TimeZone,
+            Self::SortField => Self::KevOnly,
             Self::SortDirection => Self::SortField,
             Self::TimeZone => Self::SortDirection,
+            Self::KevOnly => Self::TimeZone,
         }
     }
 }

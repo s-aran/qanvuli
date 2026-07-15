@@ -131,6 +131,7 @@ pub struct CveAdvancedSearch {
     pub product_exact: Option<String>,
     pub vendor: Option<String>,
     pub vendor_exact: Option<String>,
+    pub kev_only: bool,
     pub state_scope: CveStateScope,
     pub sort_order: CveSummarySortOrder,
 }

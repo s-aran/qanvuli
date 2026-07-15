@@ -250,6 +250,7 @@ impl AdvancedForm {
             product_exact: self.product_exact.then_some(product).flatten(),
             vendor: (!self.vendor_exact).then(|| vendor.clone()).flatten(),
             vendor_exact: self.vendor_exact.then_some(vendor).flatten(),
+            kev_only: false,
             state_scope: self.state_scope,
             sort_order,
         }

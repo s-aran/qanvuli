@@ -284,6 +284,7 @@ impl App {
                 mode: search_mode,
                 query: String::new(),
                 state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
             },
             exhausted: false,
             left_page_size: 10,
@@ -317,6 +318,7 @@ impl App {
                 mode: self.search_mode,
                 query: self.query.clone(),
                 state_scope: self.state_scope,
+                kev_only: self.display.kev_only,
             }
         } else {
             SearchRequest::Advanced {
@@ -334,8 +336,10 @@ impl App {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
         self.state_scope = self.advanced.state_scope;
+        let mut options = self.advanced.to_search_options(self.display.sort_order());
+        options.kev_only = self.display.kev_only;
         let request = SearchRequest::Advanced {
-            options: self.advanced.to_search_options(self.display.sort_order()),
+            options,
             include_cve: self.advanced.source_cve,
             osv_families: if self.advanced.source_osv {
                 self.advanced.selected_advisories()
@@ -1410,6 +1414,7 @@ impl App {
             mode: SearchMode::FreeText,
             query: String::new(),
             state_scope: CveStateScope::PublishedOnly,
+            kev_only: false,
         };
         self.exhausted = false;
         self.show_help = false;
@@ -1440,6 +1445,7 @@ impl App {
             product_exact: None,
             vendor: None,
             vendor_exact: None,
+            kev_only: self.display.kev_only,
             state_scope: self.state_scope,
             sort_order,
         }

@@ -3124,8 +3124,9 @@ impl CveDatabase {
         }
 
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
-            if (option_text(options.vendor_exact.as_deref()).is_some()
-                || option_text(options.product_exact.as_deref()).is_some())
+            if !options.kev_only
+                && (option_text(options.vendor_exact.as_deref()).is_some()
+                    || option_text(options.product_exact.as_deref()).is_some())
                 && option_text(options.query.as_deref()).is_none()
                 && option_text(options.cwe.as_deref()).is_none()
             {
@@ -3236,8 +3237,9 @@ impl CveDatabase {
         }
 
         if matches!(self.db.get_database_backend(), DbBackend::Sqlite) {
-            if (option_text(options.vendor_exact.as_deref()).is_some()
-                || option_text(options.product_exact.as_deref()).is_some())
+            if !options.kev_only
+                && (option_text(options.vendor_exact.as_deref()).is_some()
+                    || option_text(options.product_exact.as_deref()).is_some())
                 && option_text(options.query.as_deref()).is_none()
                 && option_text(options.cwe.as_deref()).is_none()
             {
@@ -4423,6 +4425,24 @@ impl CveDatabase {
         .await
     }
 
+    /// Searches OSV advisories by affected package name.
+    pub async fn search_osv_summaries_by_package(
+        &self,
+        query: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, DbErr> {
+        let (sql, values) =
+            osv_summary_column_search_statement(query, "packages", limit, offset, false)?;
+        OsvSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .all(&self.db)
+        .await
+    }
+
     /// Returns registered OSV advisory families, derived from their identifier prefixes.
     pub async fn osv_advisory_families(&self) -> Result<Vec<String>, DbErr> {
         IdentifierValueRow::find_by_statement(Statement::from_string(
@@ -4490,6 +4510,12 @@ impl CveDatabase {
             return Ok(0);
         }
         let (sql, values) = osv_summary_search_statement(query, 0, 0, true)?;
+        self.count_by_statement(&sql, values).await
+    }
+
+    /// Counts OSV advisories matching an affected package name.
+    pub async fn count_osv_summaries_by_package(&self, query: &str) -> Result<u64, DbErr> {
+        let (sql, values) = osv_summary_column_search_statement(query, "packages", 0, 0, true)?;
         self.count_by_statement(&sql, values).await
     }
 
@@ -4784,6 +4810,7 @@ impl CveDatabase {
             product: None,
             vendor_exact: None,
             product_exact: None,
+            kev_only: false,
             published_from: published_from.map(ToOwned::to_owned),
             published_to: published_to.map(ToOwned::to_owned),
             state_scope,
@@ -7120,6 +7147,11 @@ fn advanced_where_clause(options: &CveAdvancedSearch) -> String {
     if !options.state_scope.includes_rejected() {
         conditions.push("cve.state = 0".to_owned());
     }
+    if options.kev_only {
+        conditions.push(
+            "EXISTS (SELECT 1 FROM kev_entries WHERE kev_entries.cve_id = cve.cve_id)".to_owned(),
+        );
+    }
     if let Some(query) = option_text(options.query.as_deref()) {
         advanced_query_conditions(options.query_mode, query, &mut conditions);
     }
@@ -7503,6 +7535,41 @@ fn osv_summary_search_statement(
             .to_owned(),
             vec![
                 SeaValue::from(fts_query),
+                SeaValue::from(limit as i64),
+                SeaValue::from(offset as i64),
+            ],
+        ))
+    }
+}
+
+fn osv_summary_column_search_statement(
+    query: &str,
+    column: &str,
+    limit: u64,
+    offset: u64,
+    count_only: bool,
+) -> Result<(String, Vec<SeaValue>), DbErr> {
+    let query = fts_column_query(column, query)
+        .ok_or_else(|| DbErr::Custom("OSV search query has no searchable tokens".to_owned()))?;
+    if count_only {
+        Ok((
+            "SELECT COUNT(*) AS count FROM osv_text_fts WHERE osv_text_fts MATCH ?".to_owned(),
+            vec![SeaValue::from(query)],
+        ))
+    } else {
+        Ok((
+            r#"
+            SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
+                   o.withdrawn_at, o.summary, o.details
+            FROM osv_text_fts fts
+            INNER JOIN osv_advisories o ON o.osv_id = fts.osv_id
+            WHERE osv_text_fts MATCH ?
+            ORDER BY o.published_at DESC, o.osv_id ASC
+            LIMIT ? OFFSET ?
+            "#
+            .to_owned(),
+            vec![
+                SeaValue::from(query),
                 SeaValue::from(limit as i64),
                 SeaValue::from(offset as i64),
             ],
