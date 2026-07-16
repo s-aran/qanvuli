@@ -18,18 +18,12 @@ pub(crate) async fn upsert_cve_model_batch(
     txn: &DatabaseTransaction,
     models: Vec<CveActiveModels>,
 ) -> Result<usize, DbErr> {
-    let mut cve_ids = Vec::with_capacity(models.len());
-    let mut cve_rows = Vec::with_capacity(models.len());
-
-    for model in &models {
-        cve_ids.push(model.cve_id.clone());
-        cve_rows.push(model.cve.clone());
-    }
+    let (cve_ids, cve_rows, children) = split_cve_models(models);
 
     let inserted = cve_rows.len();
     let cve_db_ids = upsert_cve_rows_returning(txn, cve_rows).await?;
     let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
-        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
+        child_rows_with_cve_db_ids(children, &cve_db_ids)?;
     let cve_db_id_values = cve_ids
         .iter()
         .filter_map(|cve_id| cve_db_ids.get(cve_id).copied())
@@ -74,19 +68,12 @@ pub(crate) async fn insert_cve_models_on(
     update_search_index: bool,
 ) -> Result<usize, DbErr> {
     let mut inserted = 0usize;
-    let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
-
-    for models in models {
-        batch.push(models);
-        if batch.len() == CVE_CHUNK_SIZE {
-            inserted +=
-                insert_cve_model_batch(txn, std::mem::take(&mut batch), update_search_index)
-                    .await?;
-            batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+    let mut models = models.into_iter();
+    loop {
+        let batch = models.by_ref().take(CVE_CHUNK_SIZE).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
         }
-    }
-
-    if !batch.is_empty() {
         inserted += insert_cve_model_batch(txn, batch, update_search_index).await?;
     }
 
@@ -98,18 +85,12 @@ async fn insert_cve_model_batch(
     models: Vec<CveActiveModels>,
     update_search_index: bool,
 ) -> Result<usize, DbErr> {
-    let mut cve_rows = Vec::with_capacity(models.len());
-    let mut cve_ids = Vec::with_capacity(models.len());
-
-    for model in &models {
-        cve_ids.push(model.cve_id.clone());
-        cve_rows.push(model.cve.clone());
-    }
+    let (cve_ids, cve_rows, children) = split_cve_models(models);
 
     let inserted = cve_rows.len();
     let cve_db_ids = insert_cve_rows_returning(txn, cve_rows).await?;
     let (cvss_rows, affected_rows, cwe_master_rows, cwe_rows) =
-        child_rows_with_cve_db_ids(models, &cve_db_ids)?;
+        child_rows_with_cve_db_ids(children, &cve_db_ids)?;
 
     for chunk in take_chunks(cvss_rows, CVSS_CHUNK_SIZE) {
         insert_cvss_rows(txn, chunk).await?;

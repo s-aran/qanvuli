@@ -24,6 +24,7 @@ pub mod osv;
 #[path = "osv_data/mod.rs"]
 mod osv_storage;
 mod storage;
+#[cfg(test)]
 pub(crate) use osv_storage::initialization::OSV_BULK_LOAD_FINAL_INDEXES;
 use storage::{compact_storage_on, restore_sqlite_bulk_pragmas};
 
@@ -89,16 +90,19 @@ impl ReadJsonFileRecord {
 
 impl From<RawCveRecord<CveStatusData>> for CveActiveModels {
     fn from(value: RawCveRecord<CveStatusData>) -> Self {
-        let raw_json = value.raw_json().clone();
+        let (content, raw_json) = value.into_parts();
         let cve_id = cve_id_from_raw_json(&raw_json).to_owned();
+        let cvss_rows = cvss_active_models(&cve_id, &raw_json);
+        let affected_rows = affected_active_models(&cve_id, &raw_json);
+        let cwe_rows = cwe_active_models(&cve_id, &raw_json);
 
         Self {
             cve_id: cve_id.clone(),
-            cve: cve::ActiveModel::from(value),
-            cvss_rows: cvss_active_models(&cve_id, &raw_json),
-            affected_rows: affected_active_models(&cve_id, &raw_json),
+            cve: cve_active_model_from_content(content, raw_json),
+            cvss_rows,
+            affected_rows,
             cwe_master_rows: Vec::new(),
-            cwe_rows: cwe_active_models(&cve_id, &raw_json),
+            cwe_rows,
         }
     }
 }
@@ -123,76 +127,70 @@ impl CveActiveModels {
 
     /// Builds database active models from a raw CVE JSON string.
     pub fn from_raw_json_string(raw_json: String) -> Result<Self, DbErr> {
-        let mut bytes = raw_json.as_bytes().to_vec();
-        let value: BorrowedValue<'_> =
-            simd_json::to_borrowed_value(&mut bytes).map_err(json_parse_db_err)?;
-        let compact_raw_json = compact_json_str(&raw_json)?;
-        let cve_id = borrowed_cve_id(&value).unwrap_or_default().to_owned();
-        let cvss_rows = borrowed_cvss_active_models(&value)?;
-        let affected_rows = borrowed_affected_active_models(&value)?;
-        let cwe_rows = borrowed_cwe_active_models(&value);
+        Self::from_raw_json_bytes(raw_json.into_bytes())
+    }
 
-        Ok(Self {
-            cve_id: cve_id.clone(),
-            cve: borrowed_cve_active_model(compact_raw_json, &value, &cve_id),
-            cvss_rows,
-            affected_rows,
-            cwe_master_rows: Vec::new(),
-            cwe_rows,
-        })
+    /// Builds database active models from owned raw CVE JSON bytes.
+    pub fn from_raw_json_bytes(mut bytes: Vec<u8>) -> Result<Self, DbErr> {
+        let raw_json: Value = simd_json::from_slice(&mut bytes).map_err(json_parse_db_err)?;
+        Ok(Self::from_raw_json(raw_json))
     }
 }
 
 impl From<RawCveRecord<CveStatusData>> for cve::ActiveModel {
     fn from(value: RawCveRecord<CveStatusData>) -> Self {
         let (content, raw_json) = value.into_parts();
-        let raw_json_string = raw_json.to_string();
+        cve_active_model_from_content(content, raw_json)
+    }
+}
 
-        match content {
-            CveStatusData::Published(cve) => {
-                let metadata = cve.cve_metadata;
-                let cna = cve.containers.cna;
-                let cve_id = metadata.cve_id;
-                let title = cna.title.unwrap_or_else(|| cve_id.clone());
+fn cve_active_model_from_content(content: CveStatusData, raw_json: Value) -> cve::ActiveModel {
+    let raw_json_string = raw_json.to_string();
 
-                Self {
-                    id: Default::default(),
-                    cve_id: Set(cve_id),
-                    state: Set(cve_state_to_int(&metadata.state)),
-                    published_at: Set(metadata
-                        .date_published
-                        .map_or_else(String::new, |d| d.to_rfc3339())),
-                    updated_at: Set(metadata
-                        .date_updated
-                        .map_or_else(String::new, |d| d.to_rfc3339())),
-                    serial: Set(metadata.serial.unwrap_or_default() as i32),
-                    title: Set(title),
-                    description_en: Set(description_en(&cna.descriptions)),
-                    reference_text: Set(reference_text_from_raw_json(&raw_json)),
-                    raw_json: Set(raw_json_string),
-                }
+    match content {
+        CveStatusData::Published(cve) => {
+            let metadata = cve.cve_metadata;
+            let cna = cve.containers.cna;
+            let cve_id = metadata.cve_id;
+            let title = cna.title.unwrap_or_else(|| cve_id.clone());
+
+            cve::ActiveModel {
+                id: Default::default(),
+                cve_id: Set(cve_id),
+                state: Set(cve_state_to_int(&metadata.state)),
+                published_at: Set(metadata
+                    .date_published
+                    .map_or_else(String::new, |d| d.to_rfc3339())),
+                updated_at: Set(metadata
+                    .date_updated
+                    .map_or_else(String::new, |d| d.to_rfc3339())),
+                serial: Set(metadata.serial.unwrap_or_default() as i32),
+                title: Set(title),
+                description_en: Set(description_en(&cna.descriptions)),
+                reference_text: Set(reference_text_from_raw_json(&raw_json)),
+                raw_json: Set(raw_json_string),
             }
-            CveStatusData::Rejected(cve) => {
-                let metadata = cve.cve_metadata;
-                let cna = cve.containers.cna;
-                let cve_id = metadata.cve_id;
+        }
+        CveStatusData::Rejected(cve) => {
+            let metadata = cve.cve_metadata;
+            let cna = cve.containers.cna;
+            let cve_id = metadata.cve_id;
 
-                Self {
-                    id: Default::default(),
-                    cve_id: Set(cve_id.clone()),
-                    state: Set(cve_state_to_int(&metadata.state)),
-                    published_at: Set(metadata
-                        .date_published
-                        .map_or_else(String::new, |d| d.to_rfc3339())),
-                    updated_at: Set(metadata
-                        .date_updated
-                        .map_or_else(String::new, |d| d.to_rfc3339())),
-                    serial: Set(metadata.serial.unwrap_or_default() as i32),
-                    title: Set(cve_id),
-                    description_en: Set(description_en(&cna.rejected_reasons)),
-                    reference_text: Set(reference_text_from_raw_json(&raw_json)),
-                    raw_json: Set(raw_json_string),
-                }
+            cve::ActiveModel {
+                id: Default::default(),
+                cve_id: Set(cve_id.clone()),
+                state: Set(cve_state_to_int(&metadata.state)),
+                published_at: Set(metadata
+                    .date_published
+                    .map_or_else(String::new, |d| d.to_rfc3339())),
+                updated_at: Set(metadata
+                    .date_updated
+                    .map_or_else(String::new, |d| d.to_rfc3339())),
+                serial: Set(metadata.serial.unwrap_or_default() as i32),
+                title: Set(cve_id),
+                description_en: Set(description_en(&cna.rejected_reasons)),
+                reference_text: Set(reference_text_from_raw_json(&raw_json)),
+                raw_json: Set(raw_json_string),
             }
         }
     }
@@ -252,292 +250,6 @@ fn cve_id_from_raw_json(raw_json: &Value) -> &str {
         .and_then(|metadata| metadata.get("cveId"))
         .and_then(Value::as_str)
         .unwrap_or_default()
-}
-
-fn borrowed_cve_active_model(
-    raw_json: String,
-    value: &BorrowedValue<'_>,
-    cve_id: &str,
-) -> cve::ActiveModel {
-    let metadata = borrowed_metadata(value);
-    let state = metadata
-        .and_then(|metadata| metadata.get("state"))
-        .and_then(BorrowedValue::as_str)
-        .unwrap_or("PUBLISHED");
-    let cna = borrowed_cna(value);
-    let title = cna
-        .and_then(|cna| cna.get("title"))
-        .and_then(BorrowedValue::as_str)
-        .unwrap_or(cve_id)
-        .to_owned();
-    let description_en = if state == "REJECTED" {
-        borrowed_description_en(cna.and_then(|cna| cna.get("rejectedReasons")))
-    } else {
-        borrowed_description_en(cna.and_then(|cna| cna.get("descriptions")))
-    };
-
-    cve::ActiveModel {
-        id: Default::default(),
-        cve_id: Set(cve_id.to_owned()),
-        state: Set(cve_state_str_to_int(state)),
-        published_at: Set(metadata
-            .and_then(|metadata| metadata.get("datePublished"))
-            .and_then(BorrowedValue::as_str)
-            .unwrap_or_default()
-            .to_owned()),
-        updated_at: Set(metadata
-            .and_then(|metadata| metadata.get("dateUpdated"))
-            .and_then(BorrowedValue::as_str)
-            .unwrap_or_default()
-            .to_owned()),
-        serial: Set(metadata
-            .and_then(|metadata| metadata.get("serial"))
-            .and_then(BorrowedValue::as_i64)
-            .and_then(|serial| i32::try_from(serial).ok())
-            .unwrap_or_default()),
-        title: Set(title),
-        description_en: Set(description_en),
-        reference_text: Set(borrowed_reference_text(value)),
-        raw_json: Set(raw_json),
-    }
-}
-
-fn borrowed_cvss_active_models(
-    value: &BorrowedValue<'_>,
-) -> Result<Vec<cve_cvss::ActiveModel>, DbErr> {
-    let Some(metrics) = borrowed_cna(value)
-        .and_then(|cna| cna.get("metrics"))
-        .and_then(BorrowedValue::as_array)
-    else {
-        return Ok(Vec::new());
-    };
-
-    let mut rows = Vec::new();
-    for metric in metrics {
-        for cvss_key in ["cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"] {
-            let Some(cvss) = metric.get(cvss_key) else {
-                continue;
-            };
-            rows.push(cve_cvss::ActiveModel {
-                cve_db_id: Set(0),
-                version: Set(
-                    borrowed_string(cvss, "version").unwrap_or_else(|| cvss_key.to_owned())
-                ),
-                base_score: Set(cvss.get("baseScore").and_then(BorrowedValue::as_f64)),
-                base_severity: Set(borrowed_string(cvss, "baseSeverity")),
-                vector_string: Set(borrowed_string(cvss, "vectorString")),
-                source: Set(Some("cna".to_owned())),
-                raw_json: Set(borrowed_json_string(cvss)?),
-                ..Default::default()
-            });
-        }
-    }
-    Ok(rows)
-}
-
-fn borrowed_affected_active_models(
-    value: &BorrowedValue<'_>,
-) -> Result<Vec<cve_affected::ActiveModel>, DbErr> {
-    let Some(affected) = borrowed_cna(value)
-        .and_then(|cna| cna.get("affected"))
-        .and_then(BorrowedValue::as_array)
-    else {
-        return Ok(Vec::new());
-    };
-
-    affected
-        .iter()
-        .map(|affected| {
-            Ok(cve_affected::ActiveModel {
-                cve_db_id: Set(0),
-                vendor: Set(borrowed_string(affected, "vendor")),
-                product: Set(borrowed_string_or_json(affected, "product")?),
-                package_name: Set(borrowed_string(affected, "packageName")),
-                collection_url: Set(borrowed_string(affected, "collectionURL")),
-                default_status: Set(borrowed_string(affected, "defaultStatus")),
-                version_text: Set(borrowed_affected_version_text(affected)),
-                raw_json: Set(borrowed_json_string(affected)?),
-                ..Default::default()
-            })
-        })
-        .collect()
-}
-
-fn borrowed_cwe_active_models(value: &BorrowedValue<'_>) -> Vec<cve_cwe::ActiveModel> {
-    let mut seen = HashSet::new();
-    let Some(problem_types) = borrowed_cna(value)
-        .and_then(|cna| cna.get("problemTypes"))
-        .and_then(BorrowedValue::as_array)
-    else {
-        return Vec::new();
-    };
-
-    problem_types
-        .iter()
-        .flat_map(|problem_type| {
-            problem_type
-                .get("descriptions")
-                .and_then(BorrowedValue::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .filter_map(|description| {
-            let cwe_id = cwe_number(borrowed_string(description, "cweId")?.as_str())?;
-            if !seen.insert(cwe_id) {
-                return None;
-            }
-            Some(cve_cwe::ActiveModel {
-                cve_db_id: Set(0),
-                cwe_id: Set(cwe_id),
-            })
-        })
-        .collect()
-}
-
-fn borrowed_metadata<'a>(value: &'a BorrowedValue<'a>) -> Option<&'a BorrowedValue<'a>> {
-    value.get("cveMetadata")
-}
-
-fn borrowed_cna<'a>(value: &'a BorrowedValue<'a>) -> Option<&'a BorrowedValue<'a>> {
-    value
-        .get("containers")
-        .and_then(|containers| containers.get("cna"))
-}
-
-fn borrowed_cve_id<'a>(value: &'a BorrowedValue<'a>) -> Option<&'a str> {
-    borrowed_metadata(value)
-        .and_then(|metadata| metadata.get("cveId"))
-        .and_then(BorrowedValue::as_str)
-}
-
-fn borrowed_description_en(descriptions: Option<&BorrowedValue<'_>>) -> Option<String> {
-    descriptions?.as_array()?.iter().find_map(|description| {
-        let lang = description
-            .get("lang")
-            .and_then(BorrowedValue::as_str)
-            .unwrap_or_default();
-        if lang.eq_ignore_ascii_case("en") {
-            description
-                .get("value")
-                .and_then(BorrowedValue::as_str)
-                .map(ToOwned::to_owned)
-        } else {
-            None
-        }
-    })
-}
-
-fn borrowed_reference_text(value: &BorrowedValue<'_>) -> String {
-    let mut parts = Vec::new();
-    collect_borrowed_reference_text(
-        borrowed_cna(value).and_then(|cna| cna.get("references")),
-        &mut parts,
-    );
-    if let Some(adps) = value
-        .get("containers")
-        .and_then(|containers| containers.get("adp"))
-        .and_then(BorrowedValue::as_array)
-    {
-        for adp in adps {
-            collect_borrowed_reference_text(adp.get("references"), &mut parts);
-        }
-    }
-    parts.join(" ")
-}
-
-fn collect_borrowed_reference_text(value: Option<&BorrowedValue<'_>>, parts: &mut Vec<String>) {
-    let Some(references) = value.and_then(BorrowedValue::as_array) else {
-        return;
-    };
-    for reference in references {
-        push_borrowed_string(reference, "url", parts);
-        push_borrowed_string(reference, "name", parts);
-        if let Some(tags) = reference.get("tags").and_then(BorrowedValue::as_array) {
-            for tag in tags {
-                if let Some(tag) = tag.as_str() {
-                    parts.push(tag.to_owned());
-                }
-            }
-        }
-    }
-}
-
-fn borrowed_affected_version_text(affected: &BorrowedValue<'_>) -> String {
-    let Some(versions) = affected.get("versions").and_then(BorrowedValue::as_array) else {
-        return String::new();
-    };
-    let mut parts = Vec::new();
-    for version in versions {
-        push_borrowed_string(version, "version", &mut parts);
-        push_borrowed_string(version, "status", &mut parts);
-        push_borrowed_string(version, "versionType", &mut parts);
-        push_borrowed_string(version, "lessThan", &mut parts);
-        push_borrowed_string(version, "lessThanOrEqual", &mut parts);
-    }
-    parts.join(" ")
-}
-
-fn push_borrowed_string(value: &BorrowedValue<'_>, key: &str, parts: &mut Vec<String>) {
-    if let Some(text) = value.get(key).and_then(BorrowedValue::as_str)
-        && !text.is_empty()
-    {
-        parts.push(text.to_owned());
-    }
-}
-
-fn borrowed_string(value: &BorrowedValue<'_>, key: &str) -> Option<String> {
-    value
-        .get(key)
-        .and_then(BorrowedValue::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn borrowed_string_or_json(value: &BorrowedValue<'_>, key: &str) -> Result<Option<String>, DbErr> {
-    let Some(value) = value.get(key) else {
-        return Ok(None);
-    };
-    if let Some(s) = value.as_str() {
-        return Ok(Some(s.to_owned()));
-    }
-    Ok(Some(borrowed_json_string(value)?))
-}
-
-fn borrowed_json_string(value: &BorrowedValue<'_>) -> Result<String, DbErr> {
-    simd_json::to_string(value).map_err(json_parse_db_err)
-}
-
-fn compact_json_str(value: &str) -> Result<String, DbErr> {
-    let mut compact = String::with_capacity(value.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for ch in value.chars() {
-        if in_string {
-            compact.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-        } else if ch == '"' {
-            in_string = true;
-            compact.push(ch);
-        } else if !ch.is_whitespace() {
-            compact.push(ch);
-        }
-    }
-    if escaped || in_string {
-        return Err(DbErr::Custom(
-            "failed to compact JSON: unterminated string literal".to_owned(),
-        ));
-    }
-    if compact.is_empty() {
-        return Err(DbErr::Custom(
-            "failed to compact JSON: empty JSON payload".to_owned(),
-        ));
-    }
-    Ok(compact)
 }
 
 fn json_parse_db_err(err: simd_json::Error) -> DbErr {
@@ -709,6 +421,13 @@ fn affected_versions(raw_json: &str) -> Vec<CveAffectedVersionDetail> {
         .unwrap_or_default()
 }
 
+fn borrowed_string(value: &BorrowedValue<'_>, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(BorrowedValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
 fn cwe_numbers(cwe_ids: &[String]) -> Vec<i32> {
     let mut seen = HashSet::new();
     cwe_ids
@@ -824,17 +543,12 @@ impl CveDatabase {
 
         let txn = self.db.begin().await?;
         let mut inserted = 0usize;
-        let mut batch = Vec::with_capacity(CVE_CHUNK_SIZE);
-
-        for model in models {
-            batch.push(model);
-            if batch.len() == CVE_CHUNK_SIZE {
-                inserted += upsert_cve_model_batch(&txn, std::mem::take(&mut batch)).await?;
-                batch = Vec::with_capacity(CVE_CHUNK_SIZE);
+        let mut models = models.into_iter();
+        loop {
+            let batch = models.by_ref().take(CVE_CHUNK_SIZE).collect::<Vec<_>>();
+            if batch.is_empty() {
+                break;
             }
-        }
-
-        if !batch.is_empty() {
             inserted += upsert_cve_model_batch(&txn, batch).await?;
         }
 
@@ -4399,9 +4113,23 @@ impl CveDatabase {
 
     /// Returns one OSV advisory summary by exact advisory ID.
     pub async fn get_enriched_osv(&self, osv_id: &str) -> Result<Option<OsvSummary>, DbErr> {
-        load_osv_summaries(&self.db, &[normalize_identifier(osv_id)])
+        self.get_enriched_osv_many(&[normalize_identifier(osv_id)])
             .await
             .map(|mut rows| rows.pop())
+    }
+
+    /// Returns OSV advisory summaries in the requested identifier order.
+    /// Missing advisories are omitted. SQLite's parameter limit is respected by
+    /// bounded batches rather than issuing one query per advisory.
+    pub async fn get_enriched_osv_many(
+        &self,
+        osv_ids: &[String],
+    ) -> Result<Vec<OsvSummary>, DbErr> {
+        let normalized_ids = osv_ids
+            .iter()
+            .map(|id| normalize_identifier(id))
+            .collect::<Vec<_>>();
+        load_osv_summaries(&self.db, &normalized_ids).await
     }
 
     /// Searches OSV advisories independently of whether they have a CVE alias.
@@ -5003,8 +4731,46 @@ type CveChildRows = (
     Vec<cve_cwe::ActiveModel>,
 );
 
-fn child_rows_with_cve_db_ids(
+struct PendingCveChildren {
+    cve_id: String,
+    cvss_rows: Vec<cve_cvss::ActiveModel>,
+    affected_rows: Vec<cve_affected::ActiveModel>,
+    cwe_master_rows: Vec<cwe::ActiveModel>,
+    cwe_rows: Vec<cve_cwe::ActiveModel>,
+}
+
+fn split_cve_models(
     models: Vec<CveActiveModels>,
+) -> (Vec<String>, Vec<cve::ActiveModel>, Vec<PendingCveChildren>) {
+    let mut cve_ids = Vec::with_capacity(models.len());
+    let mut cve_rows = Vec::with_capacity(models.len());
+    let mut children = Vec::with_capacity(models.len());
+
+    for CveActiveModels {
+        cve_id,
+        cve,
+        cvss_rows,
+        affected_rows,
+        cwe_master_rows,
+        cwe_rows,
+    } in models
+    {
+        cve_ids.push(cve_id.clone());
+        cve_rows.push(cve);
+        children.push(PendingCveChildren {
+            cve_id,
+            cvss_rows,
+            affected_rows,
+            cwe_master_rows,
+            cwe_rows,
+        });
+    }
+
+    (cve_ids, cve_rows, children)
+}
+
+fn child_rows_with_cve_db_ids(
+    models: Vec<PendingCveChildren>,
     cve_db_ids: &HashMap<String, i32>,
 ) -> Result<CveChildRows, DbErr> {
     let mut cvss_rows = Vec::new();
@@ -8114,12 +7880,14 @@ fn raw_record_content_values(
     if input.content_type != "application/json" {
         return Ok((input.raw_content.to_owned(), None));
     }
-    let compact = compact_json_str(input.raw_content).map_err(|err| {
-        DbErr::Custom(format!(
-            "failed to store raw JSON for {} {}: {err}",
-            input.source, input.source_record_id
-        ))
-    })?;
+    let compact = serde_json::from_str::<Value>(input.raw_content)
+        .map(|value| value.to_string())
+        .map_err(|err| {
+            DbErr::Custom(format!(
+                "failed to store raw JSON for {} {}: {err}",
+                input.source, input.source_record_id
+            ))
+        })?;
     Ok((compact.clone(), Some(compact)))
 }
 
@@ -8869,15 +8637,34 @@ where
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    OsvSummary::find_by_statement(Statement::from_string(
-        DbBackend::Sqlite,
-        format!(
-            "SELECT osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details FROM osv_advisories WHERE osv_id IN ({}) ORDER BY osv_id",
-            sql_string_list(ids)
-        ),
-    ))
-    .all(db)
-    .await
+
+    // SQLite defaults to 999 bind parameters. Keep headroom for future query
+    // predicates while retaining constant query count for normal requests.
+    const SQLITE_ID_QUERY_CHUNK: usize = 900;
+    let mut rows_by_id = HashMap::with_capacity(ids.len());
+    for ids in ids.chunks(SQLITE_ID_QUERY_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = OsvSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!(
+                "SELECT osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details FROM osv_advisories WHERE osv_id IN ({placeholders})"
+            ),
+            ids.iter()
+                .cloned()
+                .map(SeaValue::from)
+                .collect::<Vec<_>>(),
+        ))
+        .all(db)
+        .await?;
+        rows_by_id.extend(rows.into_iter().map(|row| (row.osv_id.clone(), row)));
+    }
+
+    Ok(ids
+        .iter()
+        .filter_map(|id| rows_by_id.get(id).cloned())
+        .collect())
 }
 
 #[derive(Debug, FromQueryResult)]

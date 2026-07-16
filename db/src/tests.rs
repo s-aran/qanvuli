@@ -115,10 +115,11 @@ fn raw_cve_json_string_storage_is_compact() {
 }
 
 #[test]
-fn compact_json_str_rejects_unterminated_string() {
-    let err = compact_json_str(r#"{"id":"CVE-2099-0001}"#).unwrap_err();
+fn raw_cve_json_string_rejects_malformed_json() {
+    let err =
+        CveActiveModels::from_raw_json_string(r#"{"id":"CVE-2099-0001}"#.to_owned()).unwrap_err();
     assert!(
-        err.to_string().contains("unterminated string literal"),
+        err.to_string().contains("failed to parse CVE JSON"),
         "{err}"
     );
 }

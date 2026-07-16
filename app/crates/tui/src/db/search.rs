@@ -58,7 +58,11 @@ pub(crate) async fn run_search_request(
             } else {
                 search_by_mode(&db, mode, &query, state_scope, limit, offset).await?
             };
-            let osv_rows = search_osv_by_mode(&db, mode, &query, limit, offset).await?;
+            let osv_rows = if kev_only {
+                Vec::new()
+            } else {
+                search_osv_by_mode(&db, mode, &query, limit, offset).await?
+            };
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
@@ -85,19 +89,20 @@ pub(crate) async fn run_search_request(
             } else {
                 Vec::new()
             };
-            let osv_rows = if !include_osv || has_cve_only_advanced_filters(&options) {
-                Vec::new()
-            } else {
-                db.search_osv_summaries_scoped(
-                    osv_query.as_deref(),
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            };
+            let osv_rows =
+                if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options) {
+                    Vec::new()
+                } else {
+                    db.search_osv_summaries_scoped(
+                        osv_query.as_deref(),
+                        &osv_families,
+                        ecosystems.as_deref(),
+                        limit,
+                        offset,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?
+                };
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
@@ -129,22 +134,15 @@ async fn search_osv_by_mode(
                 .resolve_identifier(query)
                 .await
                 .map_err(|err| err.to_string())?;
-            let mut rows = Vec::new();
-            for osv_id in resolution
+            let osv_ids = resolution
                 .related_osv_ids
                 .into_iter()
                 .skip(offset as usize)
                 .take(limit as usize)
-            {
-                if let Some(row) = db
-                    .get_enriched_osv(&osv_id)
-                    .await
-                    .map_err(|err| err.to_string())?
-                {
-                    rows.push(row);
-                }
-            }
-            Ok(rows)
+                .collect::<Vec<_>>();
+            db.get_enriched_osv_many(&osv_ids)
+                .await
+                .map_err(|err| err.to_string())
         }
         SearchMode::Product => db
             .search_osv_summaries_by_package(query, limit, offset)
@@ -193,7 +191,7 @@ pub(crate) async fn run_count_request(
                     })
                     .await
                     .map_err(|err| err.to_string())?;
-                Ok(cve + count_osv_by_mode(&db, mode, &query).await?)
+                Ok(cve)
             } else {
                 count_by_mode(&db, mode, &query, state_scope).await
             }
@@ -213,7 +211,8 @@ pub(crate) async fn run_count_request(
             } else {
                 0
             };
-            let osv = if !include_osv || has_cve_only_advanced_filters(&options) {
+            let osv = if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options)
+            {
                 0
             } else {
                 db.count_osv_summaries_scoped(
@@ -393,25 +392,6 @@ async fn count_by_mode(
         }),
     }
     .map_err(|err| err.to_string())
-}
-
-async fn count_osv_by_mode(db: &CveDatabase, mode: SearchMode, query: &str) -> Result<u64, String> {
-    match mode {
-        SearchMode::FreeText | SearchMode::Vendor => db
-            .count_osv_summaries_free_text(query)
-            .await
-            .map_err(|err| err.to_string()),
-        SearchMode::Product => db
-            .count_osv_summaries_by_package(query)
-            .await
-            .map_err(|err| err.to_string()),
-        SearchMode::Identifier => db
-            .resolve_identifier(query)
-            .await
-            .map(|resolution| resolution.related_osv_ids.len() as u64)
-            .map_err(|err| err.to_string()),
-        SearchMode::Cwe | SearchMode::Cve => Ok(0),
-    }
 }
 
 #[cfg(test)]
