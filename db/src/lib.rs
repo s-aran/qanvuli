@@ -34,7 +34,6 @@ use common::*;
 pub use cve_types::*;
 use entity::{
     app_metadata, cve, cve_affected, cve_cvss, cve_cwe, cve_zip_file, cwe, read_json_file,
-    source_raw_records,
 };
 pub use epss::*;
 pub use identifiers::*;
@@ -783,9 +782,11 @@ impl CveDatabase {
 
     /// Finds one OSV advisory and returns its raw JSON payload.
     pub async fn find_osv_raw_json_by_id(&self, osv_id: &str) -> Result<Option<Value>, DbErr> {
-        source_raw_records::Entity::find()
-            .filter(source_raw_records::Column::Source.eq("OSV"))
-            .filter(source_raw_records::Column::SourceRecordId.eq(osv_id.trim()))
+        RawJsonValueRow::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT raw.raw_json FROM osv_advisories advisory INNER JOIN osv_raw_records raw ON raw.id = advisory.raw_record_id WHERE advisory.osv_id = ?".to_owned(),
+            vec![SeaValue::from(normalize_identifier(osv_id))],
+        ))
             .one(&self.db)
             .await
             .and_then(|row| {
@@ -3176,7 +3177,7 @@ impl CveDatabase {
 
     async fn raw_record_hashes(
         &self,
-        source: &str,
+        _source: &str,
         source_record_ids: &[String],
     ) -> Result<HashMap<String, String>, DbErr> {
         if source_record_ids.is_empty() {
@@ -3187,8 +3188,7 @@ impl CveDatabase {
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
                 format!(
-                    "SELECT source_record_id, content_hash FROM source_raw_records WHERE source = {} AND source_record_id IN ({})",
-                    sql_string_literal(source),
+                    "SELECT osv_id AS source_record_id, content_hash FROM osv_raw_records WHERE osv_id IN ({})",
                     sql_string_list(source_record_ids)
                 ),
             ))
@@ -3373,7 +3373,6 @@ impl CveDatabase {
                 fetched_at: &fetched_at,
                 content_hash: &record.content_hash,
                 raw_content: &record.raw_json,
-                content_type: "application/json",
             };
             let raw_record_id = if bulk_init {
                 insert_raw_record(&txn, input).await?
@@ -3442,7 +3441,6 @@ impl CveDatabase {
                 fetched_at: &fetched_at,
                 content_hash: &content_hash,
                 raw_content: raw_json,
-                content_type: "application/json",
             },
         )
         .await?;
@@ -3467,7 +3465,6 @@ impl CveDatabase {
                     fetched_at: &fetched_at,
                     content_hash: &md5_hex(entry_raw.as_bytes()),
                     raw_content: &entry_raw,
-                    content_type: "application/json",
                 },
             )
             .await?;
@@ -3535,7 +3532,7 @@ impl CveDatabase {
         let content_hash = md5_hex(csv.as_bytes());
         if self
             .count_by_statement(
-            "SELECT COUNT(*) AS count FROM source_raw_records WHERE source='EPSS' AND content_hash=?",
+                "SELECT COUNT(*) AS count FROM epss_raw_records WHERE content_hash=?",
                 vec![SeaValue::from(content_hash.clone())],
             )
             .await?
@@ -3566,7 +3563,6 @@ impl CveDatabase {
                 fetched_at: &fetched_at,
                 content_hash: &content_hash,
                 raw_content: csv,
-                content_type: "text/csv",
             },
         )
         .await?;
@@ -4206,6 +4202,35 @@ impl CveDatabase {
             query,
             advisory_families,
             ecosystems,
+            None,
+            limit,
+            offset,
+            false,
+        )?;
+        OsvSummary::find_by_statement(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .all(&self.db)
+        .await
+    }
+
+    /// Searches scoped OSV advisories with an exact, case-insensitive package name.
+    pub async fn search_osv_summaries_scoped_by_exact_package(
+        &self,
+        query: Option<&str>,
+        advisory_families: &[String],
+        ecosystems: Option<&[String]>,
+        package_name: &str,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, DbErr> {
+        let (sql, values) = osv_scoped_search_statement(
+            query,
+            advisory_families,
+            ecosystems,
+            Some(package_name),
             limit,
             offset,
             false,
@@ -4227,7 +4252,27 @@ impl CveDatabase {
         ecosystems: Option<&[String]>,
     ) -> Result<u64, DbErr> {
         let (sql, values) =
-            osv_scoped_search_statement(query, advisory_families, ecosystems, 0, 0, true)?;
+            osv_scoped_search_statement(query, advisory_families, ecosystems, None, 0, 0, true)?;
+        self.count_by_statement(&sql, values).await
+    }
+
+    /// Counts scoped OSV advisories with an exact, case-insensitive package name.
+    pub async fn count_osv_summaries_scoped_by_exact_package(
+        &self,
+        query: Option<&str>,
+        advisory_families: &[String],
+        ecosystems: Option<&[String]>,
+        package_name: &str,
+    ) -> Result<u64, DbErr> {
+        let (sql, values) = osv_scoped_search_statement(
+            query,
+            advisory_families,
+            ecosystems,
+            Some(package_name),
+            0,
+            0,
+            true,
+        )?;
         self.count_by_statement(&sql, values).await
     }
 
@@ -7273,13 +7318,21 @@ fn osv_summary_search_statement(
         let identifier = normalize_identifier(query);
         let upper = token_prefix_upper_bound(&identifier);
         let matched = r#"
-            WITH matched(osv_id) AS (
-                SELECT osv_id FROM osv_advisories WHERE osv_id >= ? AND osv_id < ?
-                UNION
-                SELECT osv_id FROM osv_aliases WHERE alias_id >= ? AND alias_id < ?
+            WITH matched(osv_id, match_rank) AS (
+                SELECT osv_id, 0 FROM osv_advisories WHERE osv_id = ?
+                UNION ALL
+                SELECT osv_id, 0 FROM osv_aliases WHERE alias_id = ?
+                UNION ALL
+                SELECT osv_id, 1 FROM osv_advisories WHERE osv_id >= ? AND osv_id < ?
+                UNION ALL
+                SELECT osv_id, 1 FROM osv_aliases WHERE alias_id >= ? AND alias_id < ?
+            ), ranked(osv_id, match_rank) AS (
+                SELECT osv_id, MIN(match_rank) FROM matched GROUP BY osv_id
             )
         "#;
         let mut values = vec![
+            SeaValue::from(identifier.clone()),
+            SeaValue::from(identifier.clone()),
             SeaValue::from(identifier.clone()),
             SeaValue::from(upper.clone()),
             SeaValue::from(identifier),
@@ -7287,7 +7340,7 @@ fn osv_summary_search_statement(
         ];
         let sql = if count_only {
             format!(
-                "{matched} SELECT COUNT(*) AS count FROM matched INNER JOIN osv_advisories o ON o.osv_id = matched.osv_id"
+                "{matched} SELECT COUNT(*) AS count FROM ranked INNER JOIN osv_advisories o ON o.osv_id = ranked.osv_id"
             )
         } else {
             values.push(SeaValue::from(limit as i64));
@@ -7295,10 +7348,11 @@ fn osv_summary_search_statement(
             format!(
                 r#"{matched}
                 SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
-                       o.withdrawn_at, o.summary, o.details
-                FROM matched
-                INNER JOIN osv_advisories o ON o.osv_id = matched.osv_id
-                ORDER BY o.published_at DESC, o.osv_id ASC
+                       o.withdrawn_at, o.summary, o.details,
+                       (SELECT group_concat(package_name, ', ') FROM osv_affected_packages p WHERE p.osv_id = o.osv_id) AS package_summary
+                FROM ranked
+                INNER JOIN osv_advisories o ON o.osv_id = ranked.osv_id
+                ORDER BY ranked.match_rank ASC, o.published_at DESC, o.osv_id ASC
                 LIMIT ? OFFSET ?"#
             )
         };
@@ -7316,7 +7370,8 @@ fn osv_summary_search_statement(
         Ok((
             r#"
             SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
-                   o.withdrawn_at, o.summary, o.details
+                   o.withdrawn_at, o.summary, o.details,
+                   (SELECT group_concat(package_name, ', ') FROM osv_affected_packages p WHERE p.osv_id = o.osv_id) AS package_summary
             FROM osv_text_fts fts
             INNER JOIN osv_advisories o ON o.osv_id = fts.osv_id
             WHERE osv_text_fts MATCH ?
@@ -7351,7 +7406,8 @@ fn osv_summary_column_search_statement(
         Ok((
             r#"
             SELECT o.osv_id, o.schema_version, o.published_at, o.modified_at,
-                   o.withdrawn_at, o.summary, o.details
+                   o.withdrawn_at, o.summary, o.details,
+                   (SELECT group_concat(package_name, ', ') FROM osv_affected_packages p WHERE p.osv_id = o.osv_id) AS package_summary
             FROM osv_text_fts fts
             INNER JOIN osv_advisories o ON o.osv_id = fts.osv_id
             WHERE osv_text_fts MATCH ?
@@ -7372,6 +7428,7 @@ fn osv_scoped_search_statement(
     query: Option<&str>,
     advisory_families: &[String],
     ecosystems: Option<&[String]>,
+    exact_package_name: Option<&str>,
     limit: u64,
     offset: u64,
     count_only: bool,
@@ -7415,6 +7472,13 @@ fn osv_scoped_search_statement(
             values.extend(ecosystems.iter().cloned().map(SeaValue::from));
         }
     }
+    if let Some(package_name) = exact_package_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        sql.push_str(" AND EXISTS (SELECT 1 FROM osv_affected_packages p WHERE p.osv_id = o.osv_id AND p.package_name COLLATE NOCASE = ?)");
+        values.push(SeaValue::from(package_name.to_owned()));
+    }
     if count_only {
         Ok((
             format!("SELECT COUNT(DISTINCT o.osv_id) AS count{sql}"),
@@ -7425,7 +7489,7 @@ fn osv_scoped_search_statement(
         values.push(SeaValue::from(offset as i64));
         Ok((
             format!(
-                "SELECT DISTINCT o.osv_id, o.schema_version, o.published_at, o.modified_at, o.withdrawn_at, o.summary, o.details{sql} ORDER BY o.published_at DESC, o.osv_id ASC LIMIT ? OFFSET ?"
+                "SELECT DISTINCT o.osv_id, o.schema_version, o.published_at, o.modified_at, o.withdrawn_at, o.summary, o.details, (SELECT group_concat(package_name, ', ') FROM osv_affected_packages p WHERE p.osv_id = o.osv_id) AS package_summary{sql} ORDER BY o.published_at DESC, o.osv_id ASC LIMIT ? OFFSET ?"
             ),
             values,
         ))
@@ -7526,7 +7590,6 @@ struct RawRecordInput<'a> {
     fetched_at: &'a str,
     content_hash: &'a str,
     raw_content: &'a str,
-    content_type: &'a str,
 }
 
 struct ParsedOsvRawRecord {
@@ -7791,104 +7854,98 @@ async fn upsert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, 
 where
     C: ConnectionTrait,
 {
-    let (stored_raw_content, raw_json) = raw_record_content_values(&input)?;
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            r#"
-        INSERT INTO source_raw_records (
-            source, source_record_id, source_path, provider_published_at,
-            provider_modified_at, score_date, fetched_at, content_hash,
-            raw_content, raw_json, raw_csv, content_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(source, source_record_id) DO UPDATE SET
-            source_path = excluded.source_path,
-            provider_published_at = excluded.provider_published_at,
-            provider_modified_at = excluded.provider_modified_at,
-            score_date = excluded.score_date,
-            fetched_at = excluded.fetched_at,
-            content_hash = excluded.content_hash,
-            raw_content = excluded.raw_content,
-            raw_json = excluded.raw_json,
-            raw_csv = excluded.raw_csv,
-            content_type = excluded.content_type
-        RETURNING id
-        "#,
-            vec![
-                SeaValue::from(input.source.to_owned()),
-                SeaValue::from(input.source_record_id.to_owned()),
-                SeaValue::from(input.source_path.map(ToOwned::to_owned)),
-                SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
-                SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
-                SeaValue::from(input.score_date.map(ToOwned::to_owned)),
-                SeaValue::from(input.fetched_at.to_owned()),
-                SeaValue::from(input.content_hash.to_owned()),
-                SeaValue::from(stored_raw_content),
-                SeaValue::from(raw_json),
-                SeaValue::from(
-                    (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
-                ),
-                SeaValue::from(input.content_type.to_owned()),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("raw record upsert did not return a row".to_owned()))?;
-    row.try_get::<i64>("", "id")
+    write_raw_record(db, input, true).await
 }
 
 async fn insert_raw_record<C>(db: &C, input: RawRecordInput<'_>) -> Result<i64, DbErr>
 where
     C: ConnectionTrait,
 {
-    let (stored_raw_content, raw_json) = raw_record_content_values(&input)?;
-    let row = db
-        .query_one(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            r#"
-        INSERT INTO source_raw_records (
-            source, source_record_id, source_path, provider_published_at,
-            provider_modified_at, score_date, fetched_at, content_hash,
-            raw_content, raw_json, raw_csv, content_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        RETURNING id
-        "#,
-            vec![
-                SeaValue::from(input.source.to_owned()),
-                SeaValue::from(input.source_record_id.to_owned()),
-                SeaValue::from(input.source_path.map(ToOwned::to_owned)),
-                SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
-                SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
-                SeaValue::from(input.score_date.map(ToOwned::to_owned)),
-                SeaValue::from(input.fetched_at.to_owned()),
-                SeaValue::from(input.content_hash.to_owned()),
-                SeaValue::from(stored_raw_content),
-                SeaValue::from(raw_json),
-                SeaValue::from(
-                    (input.content_type == "text/csv").then(|| input.raw_content.to_owned()),
-                ),
-                SeaValue::from(input.content_type.to_owned()),
-            ],
-        ))
-        .await?
-        .ok_or_else(|| DbErr::Custom("raw record insert did not return a row".to_owned()))?;
-    row.try_get::<i64>("", "id")
+    write_raw_record(db, input, false).await
 }
 
-fn raw_record_content_values(
-    input: &RawRecordInput<'_>,
-) -> Result<(String, Option<String>), DbErr> {
-    if input.content_type != "application/json" {
-        return Ok((input.raw_content.to_owned(), None));
-    }
-    let compact = serde_json::from_str::<Value>(input.raw_content)
+async fn write_raw_record<C>(db: &C, input: RawRecordInput<'_>, upsert: bool) -> Result<i64, DbErr>
+where
+    C: ConnectionTrait,
+{
+    let (sql, values) = match input.source {
+        "OSV" => {
+            let raw_json = canonical_json(input.raw_content, input.source_record_id)?;
+            (
+                format!(
+                    "INSERT INTO osv_raw_records (osv_id, source_path, provider_published_at, provider_modified_at, fetched_at, content_hash, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?) {} RETURNING id",
+                    conflict_clause(
+                        upsert,
+                        "ON CONFLICT(osv_id) DO UPDATE SET source_path=excluded.source_path, provider_published_at=excluded.provider_published_at, provider_modified_at=excluded.provider_modified_at, fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_json=excluded.raw_json"
+                    )
+                ),
+                vec![
+                    SeaValue::from(input.source_record_id.to_owned()),
+                    SeaValue::from(input.source_path.map(ToOwned::to_owned)),
+                    SeaValue::from(input.provider_published_at.map(ToOwned::to_owned)),
+                    SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
+                    SeaValue::from(input.fetched_at.to_owned()),
+                    SeaValue::from(input.content_hash.to_owned()),
+                    SeaValue::from(raw_json),
+                ],
+            )
+        }
+        "KEV" => {
+            let raw_json = canonical_json(input.raw_content, input.source_record_id)?;
+            (
+                format!(
+                    "INSERT INTO kev_raw_records (record_id, source_path, provider_modified_at, score_date, fetched_at, content_hash, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?) {} RETURNING id",
+                    conflict_clause(
+                        upsert,
+                        "ON CONFLICT(record_id) DO UPDATE SET source_path=excluded.source_path, provider_modified_at=excluded.provider_modified_at, score_date=excluded.score_date, fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_json=excluded.raw_json"
+                    )
+                ),
+                vec![
+                    SeaValue::from(input.source_record_id.to_owned()),
+                    SeaValue::from(input.source_path.map(ToOwned::to_owned)),
+                    SeaValue::from(input.provider_modified_at.map(ToOwned::to_owned)),
+                    SeaValue::from(input.score_date.map(ToOwned::to_owned)),
+                    SeaValue::from(input.fetched_at.to_owned()),
+                    SeaValue::from(input.content_hash.to_owned()),
+                    SeaValue::from(raw_json),
+                ],
+            )
+        }
+        "EPSS" => (
+            format!(
+                "INSERT INTO epss_raw_records (score_date, fetched_at, content_hash, raw_csv) VALUES (?, ?, ?, ?) {} RETURNING id",
+                conflict_clause(
+                    upsert,
+                    "ON CONFLICT(score_date) DO UPDATE SET fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_csv=excluded.raw_csv"
+                )
+            ),
+            vec![
+                SeaValue::from(input.source_record_id.to_owned()),
+                SeaValue::from(input.fetched_at.to_owned()),
+                SeaValue::from(input.content_hash.to_owned()),
+                SeaValue::from(input.raw_content.to_owned()),
+            ],
+        ),
+        source => return Err(DbErr::Custom(format!("unsupported raw source: {source}"))),
+    };
+    db.query_one(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .ok_or_else(|| DbErr::Custom("raw record write did not return a row".to_owned()))?
+    .try_get::<i64>("", "id")
+}
+
+fn conflict_clause(upsert: bool, clause: &'static str) -> &'static str {
+    if upsert { clause } else { "" }
+}
+
+fn canonical_json(raw_json: &str, record_id: &str) -> Result<String, DbErr> {
+    serde_json::from_str::<Value>(raw_json)
         .map(|value| value.to_string())
-        .map_err(|err| {
-            DbErr::Custom(format!(
-                "failed to store raw JSON for {} {}: {err}",
-                input.source, input.source_record_id
-            ))
-        })?;
-    Ok((compact.clone(), Some(compact)))
+        .map_err(|err| DbErr::Custom(format!("failed to store raw JSON for {record_id}: {err}")))
 }
 
 async fn insert_osv_normalized<C>(
@@ -8649,7 +8706,7 @@ where
         let rows = OsvSummary::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             format!(
-                "SELECT osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details FROM osv_advisories WHERE osv_id IN ({placeholders})"
+                "SELECT osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details, (SELECT group_concat(package_name, ', ') FROM osv_affected_packages p WHERE p.osv_id = osv_advisories.osv_id) AS package_summary FROM osv_advisories WHERE osv_id IN ({placeholders})"
             ),
             ids.iter()
                 .cloned()
@@ -8670,6 +8727,11 @@ where
 #[derive(Debug, FromQueryResult)]
 struct IdentifierValueRow {
     value: String,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct RawJsonValueRow {
+    raw_json: Option<String>,
 }
 
 #[derive(Debug, FromQueryResult)]

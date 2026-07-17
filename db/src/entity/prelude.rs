@@ -18,7 +18,6 @@ pub use super::osv_ranges::Entity as OsvRanges;
 pub use super::osv_references::Entity as OsvReferences;
 pub use super::osv_versions::Entity as OsvVersions;
 pub use super::read_json_file::Entity as ReadJsonFile;
-pub use super::source_raw_records::Entity as SourceRawRecords;
 pub use super::source_sync_state::Entity as SourceSyncState;
 pub use super::vulnerability_identifier_edges::Entity as VulnerabilityIdentifierEdges;
 pub use super::vulnerability_identifiers::Entity as VulnerabilityIdentifiers;

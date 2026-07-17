@@ -3,7 +3,7 @@
 use super::super::*;
 
 pub(crate) const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
-    "idx_source_raw_records_source_hash",
+    "idx_osv_raw_records_content_hash",
     "idx_osv_aliases_alias",
     "idx_osv_cve_search_cve_id",
     "idx_osv_affected_packages_lookup",
@@ -14,7 +14,7 @@ pub(crate) const OSV_BULK_LOAD_DROPPED_INDEXES: &[&str] = &[
 ];
 
 pub(crate) const OSV_BULK_LOAD_FINAL_INDEXES: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_osv_raw_records_content_hash ON osv_raw_records (content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases (alias_id)",
     "CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
     "CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem, package_name)",

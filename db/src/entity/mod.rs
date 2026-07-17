@@ -20,7 +20,6 @@ pub mod osv_ranges;
 pub mod osv_references;
 pub mod osv_versions;
 pub mod read_json_file;
-pub mod source_raw_records;
 pub mod source_sync_state;
 pub mod vulnerability_identifier_edges;
 pub mod vulnerability_identifiers;

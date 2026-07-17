@@ -92,6 +92,22 @@ pub(crate) async fn run_search_request(
             let osv_rows =
                 if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options) {
                     Vec::new()
+                } else if let Some(package_name) = options
+                    .product_exact
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    db.search_osv_summaries_scoped_by_exact_package(
+                        osv_query.as_deref(),
+                        &osv_families,
+                        ecosystems.as_deref(),
+                        package_name,
+                        limit,
+                        offset,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?
                 } else {
                     db.search_osv_summaries_scoped(
                         osv_query.as_deref(),
@@ -214,6 +230,20 @@ pub(crate) async fn run_count_request(
             let osv = if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options)
             {
                 0
+            } else if let Some(package_name) = options
+                .product_exact
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                db.count_osv_summaries_scoped_by_exact_package(
+                    osv_query.as_deref(),
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    package_name,
+                )
+                .await
+                .map_err(|err| err.to_string())?
             } else {
                 db.count_osv_summaries_scoped(
                     osv_query.as_deref(),
@@ -243,7 +273,6 @@ fn advanced_osv_query(options: &CveAdvancedSearch) -> Option<String> {
     let query = [
         options.query.as_deref(),
         options.product.as_deref(),
-        options.product_exact.as_deref(),
         options.vendor.as_deref(),
         options.vendor_exact.as_deref(),
     ]

@@ -106,7 +106,9 @@ where
         "osv_cve_search",
         "osv_aliases",
         "osv_advisories",
-        "source_raw_records",
+        "epss_raw_records",
+        "kev_raw_records",
+        "osv_raw_records",
         "source_sync_state",
         "db_sources",
     ] {
@@ -144,21 +146,36 @@ where
         )
         "#,
         r#"
-        CREATE TABLE source_raw_records (
+        CREATE TABLE osv_raw_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            source TEXT NOT NULL,
-            source_record_id TEXT NOT NULL,
+            osv_id TEXT NOT NULL UNIQUE,
             source_path TEXT,
             provider_published_at TEXT,
+            provider_modified_at TEXT,
+            fetched_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            raw_json TEXT NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE kev_raw_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            record_id TEXT NOT NULL UNIQUE,
+            source_path TEXT,
             provider_modified_at TEXT,
             score_date TEXT,
             fetched_at TEXT NOT NULL,
             content_hash TEXT NOT NULL,
-            raw_content TEXT NOT NULL,
-            raw_json TEXT,
-            raw_csv TEXT,
-            content_type TEXT NOT NULL,
-            UNIQUE(source, source_record_id)
+            raw_json TEXT NOT NULL
+        )
+        "#,
+        r#"
+        CREATE TABLE epss_raw_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            score_date TEXT NOT NULL UNIQUE,
+            fetched_at TEXT NOT NULL,
+            content_hash TEXT NOT NULL UNIQUE,
+            raw_csv TEXT NOT NULL
         )
         "#,
         r#"
@@ -171,7 +188,7 @@ where
             summary TEXT,
             details TEXT,
             raw_record_id INTEGER NOT NULL,
-            FOREIGN KEY(raw_record_id) REFERENCES source_raw_records(id)
+            FOREIGN KEY(raw_record_id) REFERENCES osv_raw_records(id)
         )
         "#,
         "CREATE TABLE osv_aliases (osv_id TEXT NOT NULL, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id))",
@@ -214,7 +231,8 @@ where
             known_ransomware_campaign_use TEXT,
             notes TEXT,
             fetched_at TEXT NOT NULL,
-            raw_record_id INTEGER NOT NULL
+            raw_record_id INTEGER NOT NULL,
+            FOREIGN KEY(raw_record_id) REFERENCES kev_raw_records(id)
         )
         "#,
         r#"
@@ -225,7 +243,8 @@ where
             score_date TEXT,
             model_version TEXT,
             fetched_at TEXT NOT NULL,
-            raw_record_id INTEGER
+            raw_record_id INTEGER NOT NULL,
+            FOREIGN KEY(raw_record_id) REFERENCES epss_raw_records(id)
         )
         "#,
         r#"
@@ -250,7 +269,8 @@ where
         )
         "#,
         "CREATE TABLE identifier_components (identifier TEXT PRIMARY KEY, component_id TEXT NOT NULL)",
-        "CREATE INDEX idx_source_raw_records_source_hash ON source_raw_records (source, content_hash)",
+        "CREATE INDEX idx_osv_raw_records_content_hash ON osv_raw_records (content_hash)",
+        "CREATE INDEX idx_kev_raw_records_content_hash ON kev_raw_records (content_hash)",
         "CREATE INDEX idx_osv_aliases_alias ON osv_aliases (alias_id)",
         "CREATE INDEX idx_osv_cve_search_cve_id ON osv_cve_search (cve_id)",
         "CREATE INDEX idx_osv_affected_packages_lookup ON osv_affected_packages (ecosystem COLLATE NOCASE, package_name COLLATE NOCASE)",

@@ -50,7 +50,7 @@ mod tests {
             .await
             .unwrap();
 
-            let raw = load_osv_raw_json(db, "GHSA-raw-json-test".to_owned())
+            let raw = load_osv_raw_json(db, "GHSA-RAW-JSON-TEST".to_owned())
                 .await
                 .unwrap();
             assert_eq!(

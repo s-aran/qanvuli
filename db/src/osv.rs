@@ -131,6 +131,7 @@ pub struct OsvSummary {
     pub withdrawn_at: Option<String>,
     pub summary: Option<String>,
     pub details: Option<String>,
+    pub package_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, FromQueryResult, Serialize)]

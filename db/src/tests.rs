@@ -116,8 +116,10 @@ fn raw_cve_json_string_storage_is_compact() {
 
 #[test]
 fn raw_cve_json_string_rejects_malformed_json() {
-    let err =
-        CveActiveModels::from_raw_json_string(r#"{"id":"CVE-2099-0001}"#.to_owned()).unwrap_err();
+    let Err(err) = CveActiveModels::from_raw_json_string(r#"{"id":"CVE-2099-0001}"#.to_owned())
+    else {
+        panic!("malformed JSON must fail to parse");
+    };
     assert!(
         err.to_string().contains("failed to parse CVE JSON"),
         "{err}"
@@ -742,42 +744,29 @@ fn enrichment_imports_and_queries_joined_sources() {
             .await
             .unwrap();
 
-        let raw_rows = db
-            .connection()
-            .query_all(Statement::from_string(
-                DbBackend::Sqlite,
-                r#"
-                SELECT source, source_record_id, raw_content, raw_json, raw_csv, content_type
-                FROM source_raw_records
-                ORDER BY source, source_record_id
-                "#
+        let raw_rows = db.connection().query_all(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT raw_json FROM osv_raw_records UNION ALL SELECT raw_json FROM kev_raw_records"
                 .to_owned(),
-            ))
-            .await
-            .unwrap();
+        )).await.unwrap();
         assert!(!raw_rows.is_empty());
         for row in raw_rows {
-            let source = row.try_get::<String>("", "source").unwrap();
-            let content_type = row.try_get::<String>("", "content_type").unwrap();
-            let raw_content = row.try_get::<String>("", "raw_content").unwrap();
-            if content_type == "application/json" {
-                let raw_json = row
-                    .try_get::<Option<String>>("", "raw_json")
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(raw_content, raw_json, "{source} JSON raw columns differ");
-                assert!(!raw_json.contains('\n'), "{source} raw_json is pretty");
-                assert!(!raw_json.contains("  "), "{source} raw_json is pretty");
-                raw_json_value(&raw_json).unwrap();
-            } else if source == "EPSS" {
-                let raw_csv = row
-                    .try_get::<Option<String>>("", "raw_csv")
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(raw_content, raw_csv);
-                assert!(raw_csv.starts_with("#model_version:"));
-            }
+            let raw_json = row.try_get::<String>("", "raw_json").unwrap();
+            assert!(!raw_json.contains('\n'));
+            raw_json_value(&raw_json).unwrap();
         }
+        let epss_raw = db
+            .connection()
+            .query_one(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT raw_csv FROM epss_raw_records".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "raw_csv")
+            .unwrap();
+        assert!(epss_raw.starts_with("#model_version:"));
 
         let raw_osv = db
             .find_osv_raw_json_by_id("RUSTSEC-TEST-0001")
@@ -965,7 +954,7 @@ fn deferred_osv_import_rebuilds_search_once_and_bulk_finish_restores_indexes() {
             .connection()
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_source_raw_records_source_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_osv_raw_records_content_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
             ))
             .await
             .unwrap();
@@ -975,7 +964,7 @@ fn deferred_osv_import_rebuilds_search_once_and_bulk_finish_restores_indexes() {
             .connection()
             .query_all(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_source_raw_records_source_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_osv_raw_records_content_hash', 'idx_osv_aliases_alias', 'idx_osv_cve_search_cve_id', 'idx_osv_affected_packages_lookup', 'idx_osv_ranges_package', 'idx_osv_range_events_range', 'idx_identifier_edges_to', 'idx_identifier_edges_from')".to_owned(),
             ))
             .await
             .unwrap();
@@ -1074,6 +1063,100 @@ fn scoped_osv_search_uses_registered_families_and_ecosystems() {
             .await
             .unwrap()
             .is_empty()
+        );
+    });
+}
+
+#[test]
+fn osv_identifier_search_prioritizes_an_exact_advisory_id() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_osv_records(vec![
+            OsvRawRecord {
+                source_path: Some("GHSA-EXACT-0001.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-EXACT-0001",
+                    "published":"2099-01-01T00:00:00Z",
+                    "modified":"2099-01-01T00:00:00Z",
+                    "summary":"exact"
+                }"#
+                .to_owned(),
+            },
+            OsvRawRecord {
+                source_path: Some("GHSA-EXACT-0001-NEWER.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-EXACT-0001-NEWER",
+                    "published":"2099-02-01T00:00:00Z",
+                    "modified":"2099-02-01T00:00:00Z",
+                    "summary":"prefix"
+                }"#
+                .to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let rows = db
+            .search_osv_summaries_free_text("ghsa-exact-0001", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].osv_id, "GHSA-EXACT-0001");
+    });
+}
+
+#[test]
+fn scoped_osv_exact_package_search_does_not_use_fts_prefix_matching() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    runtime.block_on(async {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_osv_records(vec![
+            OsvRawRecord {
+                source_path: Some("PYSEC-DJANGO.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5", "id":"PYSEC-DJANGO",
+                    "published":"2099-01-01T00:00:00Z", "modified":"2099-01-01T00:00:00Z",
+                    "affected":[{"package":{"ecosystem":"PyPI","name":"Django"}}]
+                }"#
+                .to_owned(),
+            },
+            OsvRawRecord {
+                source_path: Some("PYSEC-KOLIBRI.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5", "id":"PYSEC-KOLIBRI",
+                    "published":"2099-02-01T00:00:00Z", "modified":"2099-02-01T00:00:00Z",
+                    "affected":[{"package":{"ecosystem":"PyPI","name":"pypi/kolibri"}}]
+                }"#
+                .to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+        let rows = db
+            .search_osv_summaries_scoped_by_exact_package(None, &[], None, "django", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].osv_id, "PYSEC-DJANGO");
+        assert_eq!(
+            db.count_osv_summaries_scoped_by_exact_package(None, &[], None, "Django")
+                .await
+                .unwrap(),
+            1
         );
     });
 }

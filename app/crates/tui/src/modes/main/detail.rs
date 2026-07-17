@@ -73,6 +73,10 @@ fn osv_detail_lines(
         )
     };
     vec![
+        highlighted_line(
+            &format!("Product: {}", osv.package_summary.as_deref().unwrap_or("-")),
+            detail_search,
+        ),
         timestamp("Published", osv.published_at.as_deref()),
         timestamp("Updated", osv.modified_at.as_deref()),
         timestamp("Withdrawn", osv.withdrawn_at.as_deref()),
@@ -89,8 +93,10 @@ fn detail_lines(
     detail_search: &DetailSearch,
 ) -> Vec<Line<'static>> {
     let summary = &cve.summary;
+    let (products, vendors) = product_vendor_summaries(&cve.detail.affected);
     vec![
-        highlighted_line(&product_vendor_summary(&cve.detail.affected), detail_search),
+        highlighted_line(&format!("Product: {products}"), detail_search),
+        highlighted_line(&format!("Vendor: {vendors}"), detail_search),
         highlighted_line(
             &format!(
                 "Published: {}",
@@ -115,27 +121,36 @@ fn detail_lines(
     ]
 }
 
-fn product_vendor_summary(affected: &[CveAffectedDetail]) -> String {
-    let mut values = Vec::new();
+fn product_vendor_summaries(affected: &[CveAffectedDetail]) -> (String, String) {
+    let mut products = Vec::new();
+    let mut vendors = Vec::new();
     for affected in affected {
         let vendor = affected.vendor.as_deref().unwrap_or("-");
         let product = affected.product.as_deref().unwrap_or("-");
-        let value = format!("{product} / {vendor}");
-        if !values.contains(&value) {
-            values.push(value);
+        if !products.iter().any(|value| *value == product) {
+            products.push(product);
         }
-        if values.len() >= 3 {
+        if !vendors.iter().any(|value| *value == vendor) {
+            vendors.push(vendor);
+        }
+        if products.len() >= 3 && vendors.len() >= 3 {
             break;
         }
     }
+    (
+        summary_values(products, affected.len()),
+        summary_values(vendors, affected.len()),
+    )
+}
+
+fn summary_values(values: Vec<&str>, affected_count: usize) -> String {
     if values.is_empty() {
-        "-".to_owned()
-    } else {
-        let suffix = if affected.len() > values.len() {
-            " ..."
-        } else {
-            ""
-        };
-        format!("{}{suffix}", values.join(", "))
+        return "-".to_owned();
     }
+    let suffix = if affected_count > values.len() {
+        " ..."
+    } else {
+        ""
+    };
+    format!("{}{suffix}", values.join(", "))
 }
