@@ -6,11 +6,10 @@ use crate::{
     identifiers::SourceSyncState,
     kev::KevInfo,
 };
-use sea_orm::FromQueryResult;
 use serde::Serialize;
 use std::time::Duration;
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Registered enrichment source known to the local database.
 pub struct DbSource {
     pub source: String,
@@ -29,7 +28,7 @@ pub struct DatabaseStatus {
     pub enrichment: EnrichmentDatabaseStatus,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Aggregate counts for enrichment tables.
 pub struct EnrichmentDatabaseStatus {
     pub osv_record_count: i64,
@@ -82,7 +81,7 @@ pub struct EnrichedCve {
     pub database_status: EnrichmentStatusSummary,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Compact enriched CVE row used by list and search responses.
 pub struct EnrichedCveSummary {
     pub cve_id: String,
@@ -100,7 +99,7 @@ pub struct EnrichedCveSummary {
     pub epss_model_version: Option<String>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Compact risk row for CVE triage.
 pub struct CveRiskSummary {
     pub cve_id: String,
@@ -121,7 +120,7 @@ pub struct CveRiskSummary {
     pub max_cvss_version: Option<String>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Lightweight OSV advisory summary.
 pub struct OsvSummary {
     pub osv_id: String,
@@ -134,7 +133,7 @@ pub struct OsvSummary {
     pub package_summary: Option<String>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Package affected by an OSV advisory.
 pub struct AffectedPackageSummary {
     pub osv_id: String,

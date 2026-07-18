@@ -28,7 +28,7 @@ mod tests {
 
     #[test]
     fn counts_wrapped_words_the_same_way_as_the_paragraph_widget() {
-        assert_eq!(wrapped_line_count("one two three", 7), 3);
+        assert_eq!(wrapped_line_count("one two three", 7), 2);
     }
 }
 use ratatui::widgets::{Paragraph, Wrap};

@@ -1,9 +1,8 @@
 //! CISA KEV database DTOs.
 
-use sea_orm::FromQueryResult;
 use serde::Serialize;
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct KevInfo {
     pub cve_id: String,
     pub vendor_project: Option<String>,

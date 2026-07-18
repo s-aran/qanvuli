@@ -1,4 +1,4 @@
-use super::common::{close_db, connect_db, print_json};
+use super::common::{connect_sqlx_db, print_json};
 
 /// CLI arguments for `qanvuli query`.
 #[derive(Debug, clap::Args)]
@@ -39,38 +39,85 @@ struct PackageArgs {
 
 /// Runs cross-source identifier and package enrichment queries.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_db(db_url).await?;
-    db.initialize_schema()
-        .await
-        .map_err(|err| format!("failed to initialize schema: {err}"))?;
     match args.command {
         Command::Resolve(args) => {
+            let db = connect_sqlx_db(db_url).await?;
+            db.check()
+                .await
+                .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
             let result = db
                 .resolve_identifier(&args.id)
                 .await
-                .map_err(|err| format!("failed to resolve identifier: {err}"))?;
+                .map_err(|error| format!("failed to resolve identifier: {error}"))?;
             print_json(&result)?;
+            db.close()
+                .await
+                .map_err(|error| format!("failed to close database: {error}"))?;
         }
         Command::EnrichedCve(args) => {
-            let result = db
-                .get_enriched_cve(&args.id)
+            let db = connect_sqlx_db(db_url).await?;
+            db.check()
                 .await
-                .map_err(|err| format!("failed to enrich CVE: {err}"))?;
-            print_json(&result)?;
+                .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
+            let summary = db
+                .find_cve_summary(&args.id)
+                .await
+                .map_err(|error| format!("failed to find CVE: {error}"))?;
+            let detail = db
+                .cve_detail(&args.id)
+                .await
+                .map_err(|error| format!("failed to enrich CVE: {error}"))?;
+            print_json(&serde_json::json!({"summary": summary, "detail": detail}))?;
+            db.close()
+                .await
+                .map_err(|error| format!("failed to close database: {error}"))?;
         }
         Command::Package(args) => {
-            let result = db
-                .query_package_enriched(
+            let db = connect_sqlx_db(db_url).await?;
+            db.check()
+                .await
+                .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
+            let findings = db
+                .query_osv_package_with_purl(
                     &args.ecosystem,
                     &args.name,
                     &args.version,
                     args.purl.as_deref(),
                 )
                 .await
-                .map_err(|err| format!("failed to query package: {err}"))?;
-            print_json(&result)?;
+                .map_err(|error| format!("failed to query package: {error}"))?;
+            let confirmed_cve_ids = findings
+                .iter()
+                .filter(|finding| finding.status == "affected")
+                .flat_map(|finding| finding.cve_ids.iter().cloned())
+                .collect::<std::collections::BTreeSet<_>>();
+            let enrichment = if args.enriched {
+                let mut rows = Vec::with_capacity(confirmed_cve_ids.len());
+                for cve_id in &confirmed_cve_ids {
+                    rows.push(serde_json::json!({
+                        "summary": db.find_cve_summary(cve_id).await.map_err(|error| format!("failed to load {cve_id}: {error}"))?,
+                        "detail": db.cve_detail(cve_id).await.map_err(|error| format!("failed to enrich {cve_id}: {error}"))?,
+                    }));
+                }
+                Some(rows)
+            } else {
+                None
+            };
+            let confirmed_count = findings
+                .iter()
+                .filter(|finding| finding.status == "affected")
+                .count();
+            print_json(&serde_json::json!({
+                "vulnerable": confirmed_count > 0,
+                "confirmed_count": confirmed_count,
+                "candidate_count": findings.len() - confirmed_count,
+                "findings": findings,
+                "enrichment": enrichment,
+            }))?;
+            db.close()
+                .await
+                .map_err(|error| format!("failed to close database: {error}"))?;
         }
     }
-    close_db(db).await?;
     Ok(())
 }

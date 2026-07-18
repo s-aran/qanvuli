@@ -113,6 +113,41 @@ cargo run -- update
 cargo run -- update --zip ./path/to/delta.zip
 ```
 
+Verify database storage and rebuild derived search indexes:
+
+```bash
+cargo run -- db check
+cargo run -- db rebuild-search
+```
+
+### Database rebuild policy
+
+The SQLite file is derived from source feeds and is intentionally rebuildable. A full `init`
+builds and validates a candidate database in the same directory, closes its connections, and only
+then installs it over the active file. A failed download, parse, import, index build, or integrity
+check leaves the previous file untouched.
+
+The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
+foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each
+such physical connection. `db check` runs SQLite integrity and foreign-key checks plus FTS5 and
+search-content validation; `db rebuild-search` rebuilds the derived CVE and OSV FTS structures
+with stable integer content rowids.
+
+Normalized CVE affected-product rows retain provider version conditions (`version`, `status`,
+`versionType`, `lessThan`, and `lessThanOrEqual`) under integer foreign keys, while the original
+CVE JSON remains available for provider-specific fields.
+
+See [database architecture](docs/database-architecture.md) for schema ownership, replacement,
+identifier graph, FTS, and source-cursor details.
+
+OSV aliases, upstream identifiers, and related identifiers are stored as distinct relationship
+types. OSV synchronization advances its cursor only after every selected record, derived index,
+and integrity check succeeds; a failed run keeps the prior cursor so the records are retried.
+
+`init` builds a new SQLx-backed database from CVE, CWE, OSV, KEV, and EPSS sources. `update --zip`
+imports a local CVE archive through the same schema without network access; a normal `update`
+refreshes the latest CVE snapshot and enrichment sources before its final integrity check.
+
 Download a CVE archive without modifying the database:
 
 ```bash
@@ -121,6 +156,9 @@ cargo run -- download-cve --kind all --output-dir ./data
 ```
 
 ## TUI
+
+The TUI and MCP server use the SQLx database API. They expose public CVE/OSV identifiers rather
+than internal SQLite keys, and neither surface silently creates or alters a database.
 
 Start the terminal UI with an optional initial query:
 
@@ -179,6 +217,10 @@ Search CVEs for packages in a GitHub SBOM JSON file:
 cargo run -- sbom ./sbom.json
 cargo run -- sbom --file ./sbom.json --per-package-limit 5
 ```
+
+SBOM results distinguish confirmed findings from name-only candidates. A package is marked
+`vulnerable` only when range/version evaluation confirms it is affected; candidates remain
+explicitly reviewable and do not make the package definitely vulnerable.
 
 ## Workspace Layout
 

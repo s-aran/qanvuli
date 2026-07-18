@@ -1,42 +1,7 @@
-//! Common DB helpers shared by CVE, OSV, KEV, EPSS, and identifier graph code.
+//! Identifier normalization shared by SQLx ingestion and graph queries.
 
-use md5::{Digest, Md5};
-
-pub(crate) fn md5_hex(bytes: &[u8]) -> String {
-    let mut hasher = Md5::new();
-    hasher.update(bytes);
-    md5_hasher_hex(hasher)
-}
-
-pub(crate) fn md5_hex_concat<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> String {
-    let mut hasher = Md5::new();
-    for chunk in chunks {
-        hasher.update(chunk);
-    }
-    md5_hasher_hex(hasher)
-}
-
-fn md5_hasher_hex(hasher: Md5) -> String {
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-pub(crate) fn normalize_identifier(id: &str) -> String {
-    id.trim().to_ascii_uppercase()
-}
-
-/// Classifies a vulnerability identifier after trimming and uppercasing it.
-///
-/// Returns stable lowercase labels such as `cve`, `ghsa`, `rustsec`, `pysec`,
-/// `go`, `osv`, or `other`.
 pub fn detect_identifier_type(id: &str) -> &'static str {
-    identifier_type(&normalize_identifier(id))
-}
-
-pub(crate) fn identifier_type(id: &str) -> &'static str {
+    let id = id.trim().to_ascii_uppercase();
     if id.starts_with("CVE-") {
         "cve"
     } else if id.starts_with("GHSA-") {
@@ -52,25 +17,4 @@ pub(crate) fn identifier_type(id: &str) -> &'static str {
     } else {
         "other"
     }
-}
-
-pub(crate) fn sql_string_literal(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
-
-pub(crate) fn sql_string_list(values: &[String]) -> String {
-    values
-        .iter()
-        .map(|value| sql_string_literal(value))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-pub(crate) fn sql_values_list(values: &[String]) -> String {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| format!("({}, {})", sql_string_literal(value), index))
-        .collect::<Vec<_>>()
-        .join(",")
 }

@@ -5,12 +5,19 @@
 
 /// Database connection, query, and synchronization API.
 pub mod database {
+    pub use qanvuli_db::database::replacement::install_closed_database;
     pub use qanvuli_db::{
-        CveActiveModels, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail, CveCvssDetail,
-        CveCweDetail, CveDatabase, CveDetail, CveReference, CveRiskSummary, CveStateScope,
-        CveSummary, CveSummarySortOrder, CveSummaryWithDetail, CveZipFileRecord, CweEntry,
-        EnrichedCveSummary, EnrichedFinding, ImportSummary, OsvRawRecord, OsvSummary,
-        ReadJsonFileRecord, cve_state_label, detect_identifier_type,
+        AffectedStatus, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
+        CveAffectedVersionDetail, CveCvssDetail, CveCweDetail, CveDatabase, CveDetail,
+        CveReference, CveRiskSummary, CveStateScope, CveSummary, CveSummarySortOrder,
+        CveSummaryWithDetail, CweEntry, EnrichedCveSummary, EnrichedFinding, Evidence,
+        FindingEnrichment, ImportSummary, OsvRawRecord, OsvSummary, PackageQuery, PrioritySignals,
+        SqlxAffected, SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary,
+        SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase,
+        SqlxDatabaseStatus, SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution,
+        SqlxKev, SqlxKevEntry, SqlxOsvRange, SqlxOsvSummary, SqlxPackageFinding,
+        SqlxSourceSyncState, SqlxVersionMatch, cve_state_label, detect_identifier_type,
+        evaluate_sqlx_osv_version,
     };
 }
 

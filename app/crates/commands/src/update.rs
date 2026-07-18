@@ -1,7 +1,7 @@
 use super::common::{
-    IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
-    apply_delta_updates_with_progress, close_db, connect_db, rebuild_graph_and_report,
-    redact_database_url, report_enrichment_source_status, sync_all_enrichment_sources_after_update,
+    IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, connect_sqlx_db,
+    download_latest_asset_with_source, ingest_zip_sqlx, sync_cwe_catalog_sqlx,
+    sync_kev_epss_snapshots_sqlx, sync_osv_selection_from_gcs_sqlx,
 };
 use std::path::PathBuf;
 
@@ -26,31 +26,112 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
 
+/// SQLx-only entry point for integrations that already own their argument parsing.
+///
+/// This deliberately does not reuse a caller-held database handle: update closes its dedicated
+/// writer before any file replacement or cleanup can occur.
+pub async fn run_sqlx_update(
+    db_url: &str,
+    zip: Option<PathBuf>,
+    max_chunks: Option<usize>,
+    keep: bool,
+    osv_all: bool,
+    osv_prefixes: Vec<String>,
+) -> Result<(), String> {
+    run(
+        db_url,
+        Args {
+            zip,
+            max_chunks,
+            keep,
+            osv_all,
+            osv_prefixes,
+        },
+    )
+    .await
+}
+
 async fn run_with_progress(
     db_url: &str,
     args: Args,
-    progress: Option<IngestProgressCallback>,
+    _progress: Option<IngestProgressCallback>,
 ) -> Result<(), String> {
-    eprintln!(
-        "update: connecting database {}",
-        redact_database_url(db_url)
-    );
-    let db = connect_db(db_url).await?;
-    eprintln!("update: applying schema migrations");
-    db.initialize_schema()
+    if let Some(zip) = args.zip {
+        eprintln!("update: applying local SQLx delta {}", zip.display());
+        let db = connect_sqlx_db(db_url).await?;
+        db.check()
+            .await
+            .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
+        let imported = ingest_zip_sqlx(db.clone(), "update", &zip, args.max_chunks).await?;
+        db.mark_cve_asset_applied(
+            zip.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("local-cve.zip"),
+            "local",
+        )
         .await
-        .map_err(|err| format!("failed to initialize schema: {err}"))?;
-
-    let applied =
-        apply_delta_updates_with_progress(&db, args.zip, args.max_chunks, args.keep, progress)
-            .await?;
-    eprintln!("update: applied {} delta archive(s)", applied.len());
-    let osv_additions = OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes);
-    sync_all_enrichment_sources_after_update(&db, "update", osv_additions.as_ref()).await?;
-    rebuild_graph_and_report(&db, "update").await?;
-    report_enrichment_source_status(&db, "update").await?;
-    close_db(db).await?;
-    Ok(())
+        .map_err(|error| format!("failed to record local delta asset: {error}"))?;
+        db.check()
+            .await
+            .map_err(|error| format!("post-update database check failed: {error}"))?;
+        db.close()
+            .await
+            .map_err(|error| format!("failed to close database: {error}"))?;
+        eprintln!(
+            "update: imported {imported} CVE record(s) from {}",
+            zip.display()
+        );
+        return Ok(());
+    }
+    let sqlx_db = connect_sqlx_db(db_url).await?;
+    if sqlx_db.check().await.is_ok() {
+        eprintln!("update: refreshing SQLx database from the latest full CVE archive");
+        let asset = download_latest_asset_with_source(super::common::ReleaseAssetKind::All).await?;
+        ingest_zip_sqlx(sqlx_db.clone(), "update", &asset.path, args.max_chunks).await?;
+        sync_cwe_catalog_sqlx(sqlx_db.clone()).await?;
+        let saved_selection = sqlx_db
+            .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
+            .await
+            .map_err(|error| format!("failed to read OSV selection: {error}"))?;
+        let selection = OsvImportSelection::from_metadata(saved_selection.as_deref())
+            .unwrap_or_else(|| OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes));
+        let additions = OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes);
+        let selection = additions.map_or(selection.clone(), |additions| {
+            selection.merged_with(&additions)
+        });
+        sync_osv_selection_from_gcs_sqlx(sqlx_db.clone(), "update", selection).await?;
+        sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update").await?;
+        sqlx_db
+            .mark_cve_asset_applied(
+                asset
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("latest-cve.zip"),
+                if asset.downloaded {
+                    "downloaded"
+                } else {
+                    "local"
+                },
+            )
+            .await
+            .map_err(|error| format!("failed to record CVE asset: {error}"))?;
+        sqlx_db
+            .check()
+            .await
+            .map_err(|error| format!("post-update database check failed: {error}"))?;
+        sqlx_db
+            .close()
+            .await
+            .map_err(|error| format!("failed to close database: {error}"))?;
+        if !args.keep {
+            super::common::remove_processed_zip(&asset.path)?;
+        }
+        return Ok(());
+    }
+    let error = sqlx_db.check().await.unwrap_err();
+    let _ = sqlx_db.close().await;
+    Err(format!("database rebuild required before update: {error}"))
 }
 
 /// Runs update with default CLI arguments.
@@ -81,4 +162,75 @@ pub async fn run_default_with_progress_and_keep(
         Some(progress),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qanvuli_core::database::SqlxDatabase;
+    use sqlx::Connection;
+    use std::io::Write;
+
+    #[tokio::test]
+    async fn local_zip_update_uses_sqlx_schema_without_network() {
+        let directory = std::env::temp_dir().join(format!(
+            "qanvuli-sqlx-update-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("database.sqlite");
+        let zip_path = directory.join("delta.zip");
+        let url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        database.initialize().await.unwrap();
+        database.close().await.unwrap();
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "CVE-2099-0002.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(br#"{"cveMetadata":{"cveId":"CVE-2099-0002","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"delta fixture"}}}"#).unwrap();
+        zip.finish().unwrap();
+        run(
+            &url,
+            Args {
+                zip: Some(zip_path.clone()),
+                ..Args::default()
+            },
+        )
+        .await
+        .unwrap();
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        assert!(
+            database
+                .find_cve_summary("CVE-2099-0002")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        database.close().await.unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn old_schema_update_requires_rebuild_before_network_work() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-old-update-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        sqlx::query("CREATE TABLE cve (id INTEGER PRIMARY KEY, cve_id TEXT) STRICT")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let error = run(&url, Args::default()).await.unwrap_err();
+        assert!(error.contains("database rebuild required"));
+        let _ = std::fs::remove_file(path);
+    }
 }

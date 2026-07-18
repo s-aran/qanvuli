@@ -450,7 +450,7 @@ pub(crate) async fn known_exploited(
 ) -> Result<CallToolResult, McpError> {
     let (count, entries) = if cve_id.is_some() {
         let entries = db
-            .kev_entries(cve_id)
+            .kev_entries(cve_id, 1, 0)
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
         (entries.len() as u64, entries)
@@ -460,7 +460,7 @@ pub(crate) async fn known_exploited(
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
         let entries = db
-            .kev_entries_paged(limit, offset)
+            .kev_entries(None, limit as i64, offset as i64)
             .await
             .map_err(|err| mcp_error(err.to_string()))?;
         (count, entries)

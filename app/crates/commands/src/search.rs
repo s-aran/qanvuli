@@ -1,5 +1,5 @@
-use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
-use qanvuli_core::database::{CveStateScope, detect_identifier_type};
+use super::common::{DEFAULT_LIMIT, DateFilter, connect_sqlx_db, print_json};
+use qanvuli_core::database::{SqlxCveSearch, SqlxCvssSearch};
 
 /// CLI arguments for `qanvuli search`.
 #[derive(Debug, Default, clap::Args)]
@@ -45,35 +45,6 @@ pub struct Args {
 }
 
 impl Args {
-    fn has_cvss_filter(&self) -> bool {
-        self.min_score.is_some()
-            || self.max_score.is_some()
-            || self.severity.is_some()
-            || self.cvss_version.is_some()
-    }
-
-    fn has_affected_filter(&self) -> bool {
-        self.vendor
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-            || self
-                .product
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            || self
-                .vendor_exact
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            || self
-                .product_exact
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-            || self
-                .component
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-    }
-
     fn vendor_like(&self) -> Option<&str> {
         let vendor = option_text(self.vendor.as_deref());
         if self.exact && vendor.is_some() {
@@ -132,178 +103,81 @@ impl Args {
 
 /// Runs a CVE search and prints raw, summary, or enriched JSON results.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_db(db_url).await?;
     let date_filter = args.date_filter()?;
-
-    if args.enriched
-        && let Some(query) = args.text.as_deref()
-        && detect_identifier_type(query) != "other"
-    {
-        let resolution = db
-            .resolve_identifier(query)
-            .await
-            .map_err(|err| format!("failed to resolve {query}: {err}"))?;
-        let mut results = Vec::with_capacity(resolution.related_cve_ids.len());
-        for cve_id in &resolution.related_cve_ids {
-            results.push(
-                db.get_enriched_cve(cve_id)
-                    .await
-                    .map_err(|err| format!("failed to enrich {cve_id}: {err}"))?,
-            );
-        }
-        print_json(&serde_json::json!({
-            "resolution": resolution,
-            "results": results,
-        }))?;
-        close_db(db).await?;
-        return Ok(());
-    }
-
-    if let Some(cve_id) = args.cve_id.as_deref() {
-        if args.enriched {
-            let cve = db
-                .get_enriched_cve(cve_id)
-                .await
-                .map_err(|err| format!("failed to fetch enriched {cve_id}: {err}"))?;
-            print_json(&cve)?;
-        } else {
-            let cve = db
-                .find_cve_model_by_id(cve_id)
-                .await
-                .map_err(|err| format!("failed to fetch {cve_id}: {err}"))?;
-            let cve = cve.map(|cve| cve.into_parts().1);
-            print_json(&cve)?;
-        }
-        close_db(db).await?;
-        return Ok(());
-    }
-
-    let limit = args.limit.unwrap_or(DEFAULT_LIMIT);
-    let offset = args.offset.unwrap_or(0);
-    let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
-    let vendor = args.vendor_like();
-    let product = args.product_like();
-    let component = args.component_like();
-    let vendor_exact = args.vendor_exact();
-    let product_exact = args.product_exact();
-    let summaries = if let Some(query) = args.text.as_deref() {
-        db.search_cve_summaries_free_text_with_state_scope(query, state_scope, limit, offset)
-            .await
-            .map_err(|err| format!("failed to search free text: {err}"))?
-    } else if !args.cwe_ids.is_empty() {
-        db.search_cve_summaries_by_cwe_with_state_scope(&args.cwe_ids, state_scope, limit, offset)
-            .await
-            .map_err(|err| format!("failed to search CWE: {err}"))?
-    } else if args.has_cvss_filter() {
-        if args.has_affected_filter() {
-            db.search_cve_summaries_by_product_cvss_exact_with_state_scope(
-                vendor,
-                product.or(component),
-                vendor_exact,
-                product_exact,
-                args.min_score,
-                args.max_score,
-                args.severity.as_deref(),
-                args.cvss_version.as_deref(),
-                state_scope,
-                limit,
-                offset,
-            )
-            .await
-            .map_err(|err| format!("failed to search affected CVSS: {err}"))?
-        } else {
-            db.search_cve_summaries_by_cvss_with_state_scope(
-                args.min_score,
-                args.max_score,
-                args.severity.as_deref(),
-                args.cvss_version.as_deref(),
-                state_scope,
-                limit,
-                offset,
-            )
-            .await
-            .map_err(|err| format!("failed to search CVSS: {err}"))?
-        }
-    } else if args.has_affected_filter() {
-        if let Some(component) = args
-            .component_like()
-            .filter(|value| !value.is_empty())
-            .or(product_exact)
-        {
-            db.search_cve_summaries_by_affected_component_exact_with_state_scope(
-                vendor,
-                component,
-                vendor_exact,
-                product_exact,
-                date_filter.published_since.as_deref(),
-                date_filter.updated_since.as_deref(),
-                state_scope,
-                limit,
-                offset,
-            )
-            .await
-            .map_err(|err| format!("failed to search affected component: {err}"))?
-        } else {
-            db.search_cve_summaries_by_vendor_product_exact_date_with_state_scope(
-                vendor,
-                product,
-                vendor_exact,
-                product_exact,
-                date_filter.published_since.as_deref(),
-                date_filter.updated_since.as_deref(),
-                state_scope,
-                limit,
-                offset,
-            )
-            .await
-            .map_err(|err| format!("failed to search affected vendor/product: {err}"))?
-        }
-    } else {
-        db.search_cve_summaries_by_date_with_state_scope(
-            date_filter.published_since.as_deref(),
-            date_filter.updated_since.as_deref(),
-            state_scope,
-            limit,
-            offset,
-        )
+    let db = connect_sqlx_db(db_url).await?;
+    db.check()
         .await
-        .map_err(|err| format!("failed to search by date: {err}"))?
-    };
-
-    if let Some(query) = args.text.as_deref() {
-        let osv_advisories = db
-            .search_osv_summaries_free_text(query, limit, offset)
+        .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
+    if let Some(cve_id) = args.cve_id.as_deref() {
+        let summary = db
+            .find_cve_summary(cve_id)
             .await
-            .map_err(|err| format!("failed to search OSV advisories: {err}"))?;
-        if args.enriched {
-            let enriched = db
-                .enrich_cve_summaries_full(summaries)
-                .await
-                .map_err(|err| format!("failed to enrich search results: {err}"))?;
-            print_json(&serde_json::json!({
-                "cves": enriched,
-                "osv_advisories": osv_advisories,
-            }))?;
+            .map_err(|error| format!("failed to fetch CVE: {error}"))?;
+        let output = if args.enriched {
+            serde_json::json!({"summary": summary, "detail": db.cve_detail(cve_id).await.map_err(|error| format!("failed to fetch CVE detail: {error}"))?})
         } else {
-            print_json(&serde_json::json!({
-                "cves": summaries,
-                "osv_advisories": osv_advisories,
-            }))?;
-        }
-        close_db(db).await?;
+            serde_json::to_value(summary)
+                .map_err(|error| format!("failed to encode CVE: {error}"))?
+        };
+        print_json(&output)?;
+        db.close()
+            .await
+            .map_err(|error| format!("failed to close database: {error}"))?;
         return Ok(());
     }
-
+    let limit = i64::try_from(args.limit.unwrap_or(DEFAULT_LIMIT)).unwrap_or(i64::MAX);
+    let offset = i64::try_from(args.offset.unwrap_or_default()).unwrap_or(i64::MAX);
+    let filters = SqlxCveSearch {
+        text: args.text.clone(),
+        cwe_ids: args.cwe_ids.clone(),
+        vendor_like: args.vendor_like().map(|value| format!("%{value}%")),
+        product_like: args
+            .product_like()
+            .or(args.component_like())
+            .map(|value| format!("%{value}%")),
+        vendor_exact: args.vendor_exact().map(ToOwned::to_owned),
+        product_exact: args.product_exact().map(ToOwned::to_owned),
+        cvss: SqlxCvssSearch {
+            min_score: args.min_score,
+            max_score: args.max_score,
+            severity: args.severity.clone(),
+            version: args.cvss_version.clone(),
+        },
+        published_since: date_filter.published_since,
+        published_until: None,
+        updated_since: date_filter.updated_since,
+        updated_until: None,
+    };
+    let cves = db
+        .search_cves_advanced(filters, args.include_rejected, limit, offset)
+        .await
+        .map_err(|error| format!("failed to search CVEs: {error}"))?;
+    let osv_advisories = match args.text.as_deref() {
+        Some(query) => Some(
+            db.search_osv(query, limit)
+                .await
+                .map_err(|error| format!("failed to search OSV advisories: {error}"))?,
+        ),
+        None => None,
+    };
     if args.enriched {
-        let enriched = db
-            .enrich_cve_summaries_full(summaries)
-            .await
-            .map_err(|err| format!("failed to enrich search results: {err}"))?;
-        print_json(&enriched)?;
+        let mut enriched = Vec::with_capacity(cves.len());
+        for summary in cves {
+            let detail = db
+                .cve_detail(&summary.cve_id)
+                .await
+                .map_err(|error| format!("failed to fetch {} detail: {error}", summary.cve_id))?;
+            enriched.push(serde_json::json!({"summary": summary, "detail": detail}));
+        }
+        print_json(&serde_json::json!({"cves": enriched, "osv_advisories": osv_advisories}))?;
+    } else if let Some(osv_advisories) = osv_advisories {
+        print_json(&serde_json::json!({"cves": cves, "osv_advisories": osv_advisories}))?;
     } else {
-        print_json(&summaries)?;
+        print_json(&cves)?;
     }
-    close_db(db).await?;
+    db.close()
+        .await
+        .map_err(|error| format!("failed to close database: {error}"))?;
     Ok(())
 }
 
@@ -323,7 +197,6 @@ mod tests {
             exact: true,
             ..Args::default()
         };
-
         assert_eq!(args.vendor_like(), None);
         assert_eq!(args.product_like(), None);
         assert_eq!(args.vendor_exact(), Some("Example Vendor"));
@@ -337,7 +210,6 @@ mod tests {
             exact: true,
             ..Args::default()
         };
-
         assert_eq!(args.component_like(), None);
         assert_eq!(args.product_exact(), Some("django"));
     }
@@ -350,7 +222,6 @@ mod tests {
             exact: true,
             ..Args::default()
         };
-
         assert_eq!(args.vendor_like(), None);
         assert_eq!(args.vendor_exact(), Some("exact"));
     }

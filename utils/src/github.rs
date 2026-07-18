@@ -1,12 +1,20 @@
 use chrono::{DateTime, Utc};
 use octocrab::models::repos::{Asset, Release};
+use reqwest::{StatusCode, header};
 use std::{
-    io::{self, Write},
+    io::{self, SeekFrom, Write},
     path::{Component, Path},
+};
+use tokio::{
+    io::{AsyncSeekExt, AsyncWriteExt},
+    task::JoinSet,
 };
 
 pub const GITHUB_OWNER: &str = "CVEProject";
 pub const GITHUB_REPO: &str = "cvelistV5";
+
+const RANGE_DOWNLOAD_MIN_BYTES: u64 = 32 * 1024 * 1024;
+const RANGE_DOWNLOAD_MAX_CONNECTIONS: u64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct GitHubReleaseFile {
@@ -46,6 +54,10 @@ impl GitHubReleaseFile {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = path.as_ref();
+        if self.size >= RANGE_DOWNLOAD_MIN_BYTES && self.parallel_range_download(path).await? {
+            return Ok(());
+        }
         let mut response = reqwest::Client::new()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
@@ -58,6 +70,94 @@ impl GitHubReleaseFile {
         }
         file.flush()?;
         Ok(())
+    }
+
+    /// Downloads a large immutable release asset through independent HTTP/1.1 range requests.
+    ///
+    /// A `206` probe is required before creating the output file. Servers that ignore ranges,
+    /// change the object mid-download, or report inconsistent ranges safely fall back or fail
+    /// without presenting a completed partial file as success.
+    async fn parallel_range_download(
+        &self,
+        path: &Path,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let probe_client = reqwest::Client::builder().http1_only().build()?;
+        let probe = probe_client
+            .get(&self.url)
+            .header(header::USER_AGENT, "qanvuli")
+            .header(header::ACCEPT_ENCODING, "identity")
+            .header(header::RANGE, "bytes=0-0")
+            .send()
+            .await?;
+        if probe.status() != StatusCode::PARTIAL_CONTENT {
+            return Ok(false);
+        }
+        let content_range = probe
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_content_range)
+            .filter(|range| range.start == 0 && range.end == 0)
+            .ok_or_else(|| "invalid Content-Range in release asset range response".to_owned())?;
+        if self.size != 0 && content_range.total != self.size {
+            return Err(format!(
+                "release asset size changed during download: metadata={}, range={}",
+                self.size, content_range.total
+            )
+            .into());
+        }
+        let validator = probe
+            .headers()
+            .get(header::ETAG)
+            .or_else(|| probe.headers().get(header::LAST_MODIFIED))
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        if probe.bytes().await?.len() != 1 || content_range.total < RANGE_DOWNLOAD_MIN_BYTES {
+            return Ok(false);
+        }
+        let connection_count = content_range
+            .total
+            .div_ceil(RANGE_DOWNLOAD_MIN_BYTES)
+            .clamp(2, RANGE_DOWNLOAD_MAX_CONNECTIONS);
+        let chunk_size = content_range.total.div_ceil(connection_count);
+        let file = std::fs::File::create(path)?;
+        file.set_len(content_range.total)?;
+        drop(file);
+
+        let mut tasks = JoinSet::new();
+        for index in 0..connection_count {
+            let start = index * chunk_size;
+            if start >= content_range.total {
+                break;
+            }
+            let end = (start + chunk_size - 1).min(content_range.total - 1);
+            tasks.spawn(download_range(
+                self.url.clone(),
+                path.to_path_buf(),
+                start,
+                end,
+                content_range.total,
+                validator.clone(),
+            ));
+        }
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    let _ = std::fs::remove_file(path);
+                    return Err(error.into());
+                }
+                Err(error) => {
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    let _ = std::fs::remove_file(path);
+                    return Err(format!("release asset range task failed: {error}").into());
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn download_as(
@@ -96,6 +196,89 @@ impl GitHubReleaseFile {
         }
         self.download_as(filename)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = total.parse().ok()?;
+    (start <= end && end < total).then_some(ContentRange { start, end, total })
+}
+
+async fn download_range(
+    url: String,
+    path: std::path::PathBuf,
+    start: u64,
+    end: u64,
+    total: u64,
+    validator: Option<String>,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .http1_only()
+        .build()
+        .map_err(|error| format!("failed to create range download client: {error}"))?;
+    let mut request = client
+        .get(url)
+        .header(header::USER_AGENT, "qanvuli")
+        .header(header::ACCEPT_ENCODING, "identity")
+        .header(header::RANGE, format!("bytes={start}-{end}"));
+    if let Some(validator) = validator {
+        request = request.header(header::IF_RANGE, validator);
+    }
+    let mut response = request
+        .send()
+        .await
+        .map_err(|error| format!("range request {start}-{end} failed: {error}"))?;
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(format!(
+            "range request {start}-{end} returned {}, expected 206",
+            response.status()
+        ));
+    }
+    let actual = response
+        .headers()
+        .get(header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range)
+        .filter(|actual| actual.start == start && actual.end == end && actual.total == total)
+        .ok_or_else(|| {
+            format!("range request {start}-{end} returned an inconsistent Content-Range")
+        })?;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|error| format!("failed to open range output: {error}"))?;
+    file.seek(SeekFrom::Start(actual.start))
+        .await
+        .map_err(|error| format!("failed to seek range output: {error}"))?;
+    let mut written = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to receive range {start}-{end}: {error}"))?
+    {
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("failed to write range {start}-{end}: {error}"))?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("failed to flush range {start}-{end}: {error}"))?;
+    (written == actual.end - actual.start + 1)
+        .then_some(())
+        .ok_or_else(|| format!("range {start}-{end} was truncated: received {written} bytes"))
 }
 
 fn safe_file_name(value: &str) -> Result<&str, io::Error> {
@@ -229,4 +412,28 @@ fn release_items_to_sorted_releases(
     });
 
     Ok(releases)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_valid_byte_content_ranges() {
+        assert_eq!(
+            parse_content_range("bytes 0-1023/4096"),
+            Some(ContentRange {
+                start: 0,
+                end: 1023,
+                total: 4096,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_byte_content_ranges() {
+        for value in ["bytes 1024-0/4096", "bytes 0-4096/4096", "items 0-1/2"] {
+            assert_eq!(parse_content_range(value), None, "{value}");
+        }
+    }
 }

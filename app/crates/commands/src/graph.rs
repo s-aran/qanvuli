@@ -1,4 +1,4 @@
-use super::common::{close_db, connect_db, print_json};
+use super::common::{connect_sqlx_db, print_json};
 
 /// CLI arguments for `qanvuli graph`.
 #[derive(Debug, clap::Args)]
@@ -9,25 +9,26 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Rebuild identifier nodes and alias edges from local CVE/OSV/KEV/EPSS tables.
+    /// Rebuild derived typed identifier edges from normalized OSV relations.
     Rebuild,
 }
 
 /// Runs an identifier graph maintenance subcommand.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_db(db_url).await?;
-    db.initialize_schema()
+    let db = connect_sqlx_db(db_url).await?;
+    db.check()
         .await
-        .map_err(|err| format!("failed to initialize schema: {err}"))?;
+        .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
     match args.command {
         Command::Rebuild => {
-            let summary = db
-                .rebuild_identifier_graph()
+            db.rebuild_identifier_graph()
                 .await
-                .map_err(|err| format!("failed to rebuild graph: {err}"))?;
-            print_json(&summary)?;
+                .map_err(|error| format!("failed to rebuild graph: {error}"))?;
+            print_json(&serde_json::json!({"ok": true}))?;
         }
     }
-    close_db(db).await?;
+    db.close()
+        .await
+        .map_err(|error| format!("failed to close database: {error}"))?;
     Ok(())
 }

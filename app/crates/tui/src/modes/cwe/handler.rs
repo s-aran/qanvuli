@@ -4,12 +4,12 @@ use crate::{
     utils::text::wrapped_line_count,
 };
 use crossterm::event::{KeyCode, KeyEvent};
-use qanvuli_core::database::{CveDatabase, CweEntry};
+use qanvuli_core::database::{CweEntry, SqlxDatabase};
 use ratatui::layout::Size;
 
 pub(crate) fn handle_key(
     app: &mut App,
-    db: Option<CveDatabase>,
+    db: Option<SqlxDatabase>,
     key: &KeyEvent,
     area: Option<Size>,
 ) -> bool {

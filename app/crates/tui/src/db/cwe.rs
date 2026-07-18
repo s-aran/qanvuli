@@ -1,9 +1,9 @@
-use qanvuli_core::database::{CveDatabase, CweEntry};
+use qanvuli_core::database::{CweEntry, SqlxDatabase};
 
 const CWE_TUI_LIMIT: u64 = 2_000;
 
 pub(crate) async fn search_cwe_entries(
-    db: CveDatabase,
+    db: SqlxDatabase,
     query: String,
     statuses: Vec<String>,
 ) -> Result<Vec<CweEntry>, String> {

@@ -1,9 +1,8 @@
 //! Cross-source vulnerability identifier graph DTOs.
 
-use sea_orm::FromQueryResult;
 use serde::Serialize;
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Last-known synchronization state for an external enrichment source.
 pub struct SourceSyncState {
     pub source: String,
@@ -30,7 +29,7 @@ pub struct IdentifierResolution {
     pub source_sync: Vec<SourceSyncState>,
 }
 
-#[derive(Clone, Debug, FromQueryResult, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 /// Evidence for one alias edge between two vulnerability identifiers.
 pub struct IdentifierEdgeEvidence {
     pub from_identifier: String,

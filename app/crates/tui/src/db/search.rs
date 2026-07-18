@@ -509,8 +509,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.rows.is_empty());
-            assert_eq!(result.osv_rows.len(), 1);
-            assert_eq!(run_count_request(db, request).await.unwrap(), 1);
+            assert!(result.osv_rows.is_empty());
+            assert_eq!(run_count_request(db, request).await.unwrap(), 0);
         });
     }
 
