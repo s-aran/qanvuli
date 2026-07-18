@@ -72,14 +72,6 @@ impl AdvancedForm {
         };
     }
 
-    pub(super) fn page_down_scope(&mut self) {
-        let last = self.scope_entries().len().saturating_sub(1);
-        self.scope_cursor = (self.scope_cursor + 8).min(last);
-    }
-
-    pub(super) fn page_up_scope(&mut self) {
-        self.scope_cursor = self.scope_cursor.saturating_sub(8);
-    }
     pub(super) fn toggle_scope_current(&mut self) {
         match self.scope_entries().get(self.scope_cursor).copied() {
             Some(ScopeEntry::Cve) => self.source_cve = !self.source_cve,

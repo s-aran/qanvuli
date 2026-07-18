@@ -11,10 +11,24 @@ pub(crate) fn progress_ratio(written: usize, total: usize) -> f64 {
 }
 
 pub(crate) fn wrapped_line_count(value: &str, width: usize) -> usize {
-    let width = width.max(1);
-    value
-        .lines()
-        .map(|line| line.chars().count().max(1).div_ceil(width))
-        .sum::<usize>()
+    Paragraph::new(value)
+        .wrap(Wrap { trim: false })
+        .line_count(width.clamp(1, u16::MAX as usize) as u16)
         .max(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::wrapped_line_count;
+
+    #[test]
+    fn counts_terminal_cells_instead_of_unicode_scalar_values() {
+        assert_eq!(wrapped_line_count("あいうえお", 4), 3);
+    }
+
+    #[test]
+    fn counts_wrapped_words_the_same_way_as_the_paragraph_widget() {
+        assert_eq!(wrapped_line_count("one two three", 7), 3);
+    }
+}
+use ratatui::widgets::{Paragraph, Wrap};

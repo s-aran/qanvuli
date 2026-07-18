@@ -5,20 +5,17 @@ use super::{
         raw_json::{load_cve_raw_json, load_osv_raw_json},
         search::{SearchRequest, SearchResult, run_count_request, run_search_request},
     },
-    display::{DisplaySettings, TimeZone},
+    display::DisplaySettings,
     form::AdvancedForm,
     mode::SearchMode,
-    utils::{
-        datetime::format_timestamp,
-        text::{normalize_spaces, wrapped_line_count},
-    },
+    utils::text::{normalize_spaces, wrapped_line_count},
 };
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_core::database::{
     CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
     CweEntry, EnrichedCveSummary, OsvSummary,
 };
-use ratatui::widgets::ListState;
+use ratatui::widgets::{ListState, Paragraph, Wrap};
 use std::collections::HashMap;
 use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
@@ -1599,9 +1596,21 @@ impl App {
 
     fn max_detail_scroll(&self) -> u16 {
         let line_count = if let Some(cve) = self.selected() {
-            detail_line_count(cve, self.detail_content_width, self.display.timezone)
+            Paragraph::new(crate::modes::main::detail::detail_lines(
+                cve,
+                self.display.timezone,
+                &crate::common::DetailSearch::new(""),
+            ))
+            .wrap(Wrap { trim: false })
+            .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
         } else if let Some(osv) = self.selected_osv() {
-            osv_detail_line_count(osv, self.detail_content_width, self.display.timezone)
+            Paragraph::new(crate::modes::main::detail::osv_detail_lines(
+                osv,
+                self.display.timezone,
+                &crate::common::DetailSearch::new(""),
+            ))
+            .wrap(Wrap { trim: false })
+            .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
         } else {
             1
         };
@@ -1783,43 +1792,6 @@ enum PageAmount {
     Full,
 }
 
-fn detail_line_count(cve: &CveSummaryWithDetail, width: usize, timezone: TimeZone) -> usize {
-    let summary = &cve.summary;
-    [
-        product_vendor_summary(&cve.detail.affected),
-        format!(
-            "Published: {}",
-            format_timestamp(&summary.published_at, timezone)
-        ),
-        format!(
-            "Updated: {}",
-            format_timestamp(&summary.updated_at, timezone)
-        ),
-        String::new(),
-        summary.title.clone(),
-        String::new(),
-        summary.description_en.clone().unwrap_or_default(),
-    ]
-    .iter()
-    .map(|line| wrapped_line_count(line, width))
-    .sum()
-}
-
-fn osv_detail_line_count(osv: &OsvSummary, width: usize, timezone: TimeZone) -> usize {
-    [
-        osv_timestamp_line("Published", osv.published_at.as_deref(), timezone),
-        osv_timestamp_line("Updated", osv.modified_at.as_deref(), timezone),
-        osv_timestamp_line("Withdrawn", osv.withdrawn_at.as_deref(), timezone),
-        String::new(),
-        osv.summary.clone().unwrap_or_default(),
-        String::new(),
-        osv.details.clone().unwrap_or_default(),
-    ]
-    .iter()
-    .map(|line| wrapped_line_count(line, width))
-    .sum()
-}
-
 fn osv_metadata_line_count(osv: &OsvSummary, width: usize) -> usize {
     [
         format!("Identifier: {}", osv.osv_id),
@@ -1834,42 +1806,6 @@ fn osv_metadata_line_count(osv: &OsvSummary, width: usize) -> usize {
     .iter()
     .map(|line| wrapped_line_count(line, width))
     .sum()
-}
-
-fn osv_timestamp_line(label: &str, value: Option<&str>, timezone: TimeZone) -> String {
-    format!(
-        "{label}: {}",
-        value
-            .map(|value| format_timestamp(value, timezone))
-            .unwrap_or_else(|| "-".to_owned())
-    )
-}
-
-fn product_vendor_summary(affected: &[qanvuli_core::database::CveAffectedDetail]) -> String {
-    let mut values = Vec::new();
-    for affected in affected {
-        let value = format!(
-            "{} / {}",
-            affected.product.as_deref().unwrap_or("-"),
-            affected.vendor.as_deref().unwrap_or("-")
-        );
-        if !values.contains(&value) {
-            values.push(value);
-        }
-        if values.len() >= 3 {
-            break;
-        }
-    }
-    let suffix = if affected.len() > values.len() {
-        " ..."
-    } else {
-        ""
-    };
-    if values.is_empty() {
-        "-".to_owned()
-    } else {
-        format!("{}{suffix}", values.join(", "))
-    }
 }
 
 fn summary_values(value: &str) -> Vec<&str> {

@@ -1,5 +1,5 @@
 mod candidates;
-mod detail;
+pub(crate) mod detail;
 pub(crate) mod handler;
 mod keyword;
 mod metadata;

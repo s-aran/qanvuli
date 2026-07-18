@@ -56,7 +56,7 @@ impl DetailPanel for MainDetailPanel {
     }
 }
 
-fn osv_detail_lines(
+pub(crate) fn osv_detail_lines(
     osv: &OsvSummary,
     timezone: TimeZone,
     detail_search: &DetailSearch,
@@ -87,7 +87,7 @@ fn osv_detail_lines(
     ]
 }
 
-fn detail_lines(
+pub(crate) fn detail_lines(
     cve: &CveSummaryWithDetail,
     timezone: TimeZone,
     detail_search: &DetailSearch,
