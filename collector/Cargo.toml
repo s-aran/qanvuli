@@ -16,7 +16,7 @@ reqwest = { version = "0.13", features = [
     "rustls",
     "stream",
 ], default-features = false }
-tokio = { version = "1.52", features = ["fs", "io-util"] }
+tokio = { version = "1.53", features = ["fs", "io-util"] }
 url = "2"
 qanvuli-models = { version = "*", path = "../models" }
 qanvuli-utils = { version = "*", path = "../utils" }
