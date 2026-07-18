@@ -48,8 +48,8 @@ Examples:
   qanvuli update --osv-rustsec --osv-go
 "#;
 
-const INGEST_CHUNK_SIZE: usize = 10000;
-const OSV_IMPORT_BATCH_SIZE: usize = 5000;
+const INGEST_CHUNK_SIZE: usize = 30000;
+const OSV_IMPORT_BATCH_SIZE: usize = 6000;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
