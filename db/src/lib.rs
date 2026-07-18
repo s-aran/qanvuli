@@ -4340,9 +4340,8 @@ impl CveDatabase {
         let mut matches = Vec::new();
         let mut all_cve_ids = BTreeSet::new();
         for package_row in package_rows {
-            if purl.is_some()
-                && package_row.purl.as_deref().is_some()
-                && package_row.purl.as_deref() != purl
+            if let (Some(requested_purl), Some(row_purl)) = (purl, package_row.purl.as_deref())
+                && base_purl(row_purl) != base_purl(requested_purl)
             {
                 continue;
             }
@@ -8952,6 +8951,21 @@ fn canonical_package_name(ecosystem: &str, package: &str) -> String {
         }
     }
     canonical
+}
+
+/// Removes a package URL's version, qualifiers, and subpath for identity comparison.
+fn base_purl(purl: &str) -> &str {
+    let without_qualifiers = purl.split(['?', '#']).next().unwrap_or(purl);
+    let version_separator = without_qualifiers.rfind('@');
+    let final_path_separator = without_qualifiers.rfind('/');
+    match (version_separator, final_path_separator) {
+        (Some(version_separator), Some(final_path_separator))
+            if version_separator > final_path_separator =>
+        {
+            &without_qualifiers[..version_separator]
+        }
+        _ => without_qualifiers,
+    }
 }
 
 fn is_git_commit_hash(value: &str) -> bool {

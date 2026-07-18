@@ -102,6 +102,15 @@ fn raw_cve_record_converts_to_cve_active_model() {
 }
 
 #[test]
+fn base_purl_removes_versions_and_qualifiers_without_altering_scoped_names() {
+    assert_eq!(
+        base_purl("pkg:pypi/django@1.5.8?repository_url=https://example.invalid#src"),
+        "pkg:pypi/django"
+    );
+    assert_eq!(base_purl("pkg:npm/@scope/name"), "pkg:npm/@scope/name");
+}
+
+#[test]
 fn raw_cve_json_string_storage_is_compact() {
     let models = CveActiveModels::from_raw_json_string(CVE_JSON.to_owned()).unwrap();
     let raw_json = models.cve.raw_json.unwrap();
@@ -907,6 +916,17 @@ fn enrichment_imports_and_queries_joined_sources() {
         );
         assert!(finding.evidence.iter().any(|e| e.kind == "kev_join"));
         assert!(finding.evidence.iter().any(|e| e.kind == "epss_join"));
+
+        let findings_with_versioned_purl = db
+            .query_package_enriched(
+                "crates.io",
+                "foo",
+                "1.2.3",
+                Some("pkg:cargo/foo@1.2.3?repository_url=https://example.invalid#src/lib.rs"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(findings_with_versioned_purl.len(), 1);
 
         let canonical_pypi = db
             .query_package_enriched("PyPI", "pillow-heif", "1.1.1", None)
