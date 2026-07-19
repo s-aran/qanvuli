@@ -2,7 +2,7 @@ use super::common::{
     CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
     OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
     download_latest_asset_with_source, download_osv_selection_from_gcs,
-    import_downloaded_osv_selection, ingest_zip_sqlx_bulk, redact_database_url,
+    import_downloaded_osv_selection, ingest_zip_sqlx_bulk_with_index_signal, redact_database_url,
     remove_processed_zip, remove_sqlite_database_files, replacement_sqlite_database_url,
     sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
 };
@@ -117,13 +117,21 @@ async fn run_with_progress(
             .initialize()
             .await
             .map_err(|error| format!("failed to initialize replacement schema: {error}"))?;
-        let osv_download_task =
-            tokio::spawn(download_osv_selection_from_gcs("init", osv_selection));
-        let cve_result = ingest_zip_sqlx_bulk(
+        let (index_started_tx, index_started_rx) = tokio::sync::oneshot::channel();
+        let osv_download_task = tokio::spawn(async move {
+            index_started_rx.await.map_err(|_| {
+                "CVE import ended before index construction; OSV download was not started"
+                    .to_owned()
+            })?;
+            eprintln!("init: CVE index construction started; beginning OSV prefetch");
+            download_osv_selection_from_gcs("init", osv_selection).await
+        });
+        let cve_result = ingest_zip_sqlx_bulk_with_index_signal(
             db_for_build.clone(),
             "all",
             &asset_for_build,
             args.max_chunks,
+            index_started_tx,
         )
         .await;
         let zip_removal_result = if cve_result.is_ok() && !args.keep {

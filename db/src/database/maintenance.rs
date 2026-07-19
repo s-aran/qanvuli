@@ -40,6 +40,13 @@ pub(crate) async fn prepare_cve_bulk_load(
 pub(crate) async fn finish_cve_bulk_load(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
+    finish_cve_bulk_load_with_index_signal(connection, None).await
+}
+
+pub(crate) async fn finish_cve_bulk_load_with_index_signal(
+    connection: &mut SqliteConnection,
+    index_started: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(r#"
         CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file(filename);
         CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve(published_at);
@@ -54,6 +61,9 @@ pub(crate) async fn finish_cve_bulk_load(
         "#)
     .execute(&mut *connection)
     .await?;
+    if let Some(index_started) = index_started {
+        let _ = index_started.send(());
+    }
     rebuild_cve_search(connection).await?;
     sqlx::raw_sql(r#"
         CREATE INDEX IF NOT EXISTS idx_cve_summary_state_published ON cve_summary_index(state, published_at DESC, cve_id);

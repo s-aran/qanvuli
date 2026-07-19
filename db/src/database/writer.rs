@@ -5,8 +5,8 @@
 
 use super::maintenance::{
     check_required_schema, check_search_integrity, check_sqlite_integrity, finish_cve_bulk_load,
-    finish_osv_bulk_load, prepare_cve_bulk_load, prepare_osv_bulk_load, rebuild_cve_search,
-    rebuild_osv_search, rebuild_search,
+    finish_cve_bulk_load_with_index_signal, finish_osv_bulk_load, prepare_cve_bulk_load,
+    prepare_osv_bulk_load, rebuild_cve_search, rebuild_osv_search, rebuild_search,
 };
 use super::schema;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
@@ -93,6 +93,14 @@ impl SqliteWriter {
     pub(crate) async fn finish_cve_bulk_load(&self) -> Result<(), sqlx::Error> {
         let mut connection = self.connection.lock().await;
         finish_cve_bulk_load(&mut connection).await
+    }
+
+    pub(crate) async fn finish_cve_bulk_load_with_index_signal(
+        &self,
+        index_started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        finish_cve_bulk_load_with_index_signal(&mut connection, Some(index_started)).await
     }
 
     pub(crate) async fn prepare_osv_bulk_load(&self) -> Result<(), sqlx::Error> {

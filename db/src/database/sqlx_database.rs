@@ -471,6 +471,15 @@ impl SqlxDatabase {
         self.writer.finish_cve_bulk_load().await
     }
 
+    pub async fn finish_cve_bulk_load_with_index_signal(
+        &self,
+        index_started: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), sqlx::Error> {
+        self.writer
+            .finish_cve_bulk_load_with_index_signal(index_started)
+            .await
+    }
+
     pub async fn prepare_osv_bulk_load(&self) -> Result<(), sqlx::Error> {
         self.writer.prepare_osv_bulk_load().await
     }

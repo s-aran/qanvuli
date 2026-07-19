@@ -17,7 +17,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub mod database;
 pub use database::{
@@ -1185,7 +1185,7 @@ pub async fn ingest_zip_sqlx(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, true).await
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, true, None).await
 }
 
 async fn ingest_zip_sqlx_deferred_search(
@@ -1194,7 +1194,7 @@ async fn ingest_zip_sqlx_deferred_search(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, false).await
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, false, None).await
 }
 
 /// Imports a full replacement archive with devel's deferred-index bulk-load policy.
@@ -1204,7 +1204,26 @@ pub async fn ingest_zip_sqlx_bulk(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, true, true).await
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, true, true, None).await
+}
+
+pub(crate) async fn ingest_zip_sqlx_bulk_with_index_signal(
+    db: SqlxDatabase,
+    label: &str,
+    asset_path: &Path,
+    max_chunks: Option<usize>,
+    index_started: oneshot::Sender<()>,
+) -> Result<usize, String> {
+    ingest_zip_sqlx_with_mode(
+        db,
+        label,
+        asset_path,
+        max_chunks,
+        true,
+        true,
+        Some(index_started),
+    )
+    .await
 }
 
 async fn ingest_zip_sqlx_with_mode(
@@ -1214,6 +1233,7 @@ async fn ingest_zip_sqlx_with_mode(
     max_chunks: Option<usize>,
     bulk_replace: bool,
     rebuild_after: bool,
+    index_started: Option<oneshot::Sender<()>>,
 ) -> Result<usize, String> {
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
@@ -1270,9 +1290,13 @@ async fn ingest_zip_sqlx_with_mode(
     let fts_started = Instant::now();
     eprintln!("{label}: rebuilding CVE search indexes");
     if bulk_replace {
-        db.finish_cve_bulk_load()
-            .await
-            .map_err(|error| format!("{label}: failed to finish CVE bulk load: {error}"))?;
+        let result = if let Some(index_started) = index_started {
+            db.finish_cve_bulk_load_with_index_signal(index_started)
+                .await
+        } else {
+            db.finish_cve_bulk_load().await
+        };
+        result.map_err(|error| format!("{label}: failed to finish CVE bulk load: {error}"))?;
     } else {
         db.rebuild_cve_search()
             .await
