@@ -1,6 +1,32 @@
 //! SQLite maintenance and integrity checks for SQLx-owned connections.
 
 use sqlx::{Connection, Row, SqliteConnection};
+use std::time::Instant;
+
+async fn run_timed_stage(
+    connection: &mut SqliteConnection,
+    label: &str,
+    sql: &'static str,
+) -> Result<(), sqlx::Error> {
+    qanvuli_utils::logging::stderr(format_args!("cve maintenance: {label} started"));
+    let started = Instant::now();
+    match sqlx::raw_sql(sql).execute(&mut *connection).await {
+        Ok(_) => {
+            qanvuli_utils::logging::stderr(format_args!(
+                "cve maintenance: {label} completed in {:?}",
+                started.elapsed()
+            ));
+            Ok(())
+        }
+        Err(error) => {
+            qanvuli_utils::logging::stderr(format_args!(
+                "cve maintenance: {label} failed after {:?}: {error}",
+                started.elapsed()
+            ));
+            Err(error)
+        }
+    }
+}
 
 /// Applies the same SQLite bulk-load policy used by devel's full replacement import.
 pub(crate) async fn prepare_cve_bulk_load(
@@ -47,43 +73,75 @@ pub(crate) async fn finish_cve_bulk_load_with_index_signal(
     connection: &mut SqliteConnection,
     index_started: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::raw_sql(r#"
-        CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file(filename);
-        CREATE INDEX IF NOT EXISTS idx_cve_published_at ON cve(published_at);
-        CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve(updated_at);
-        CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve(published_at, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve(updated_at, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss(cve_db_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss(base_severity, base_score);
-        CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected(cve_db_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected(vendor, product, cve_db_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe(cwe_id, cve_db_id);
-        "#)
-    .execute(&mut *connection)
-    .await?;
     if let Some(index_started) = index_started {
         let _ = index_started.send(());
     }
+    for (label, sql) in [
+        (
+            "source-file index",
+            "CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file(filename)",
+        ),
+        (
+            "CVE published ordering index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve(published_at, cve_id)",
+        ),
+        (
+            "CVE updated ordering index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve(updated_at, cve_id)",
+        ),
+        (
+            "CVSS CVE lookup index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss(cve_db_id)",
+        ),
+        (
+            "CVSS severity index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss(base_severity, base_score)",
+        ),
+        (
+            "affected CVE lookup index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected(cve_db_id)",
+        ),
+        (
+            "affected package lookup index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected(vendor, product, cve_db_id)",
+        ),
+        (
+            "CWE lookup index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe(cwe_id, cve_db_id)",
+        ),
+    ] {
+        run_timed_stage(connection, label, sql).await?;
+    }
     rebuild_cve_search(connection).await?;
-    sqlx::raw_sql(r#"
-        CREATE INDEX IF NOT EXISTS idx_cve_summary_state_published ON cve_summary_index(state, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_summary_updated ON cve_summary_index(updated_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cwe_search_sort ON cve_cwe_search(cwe_id, state, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cvss_search_score ON cve_cvss_search(state, max_cvss_score DESC, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_affected_search_sort ON cve_affected_search(state, published_at DESC, cve_id);
-        DROP INDEX IF EXISTS idx_cve_reference_text;
-        "#)
-    .execute(&mut *connection)
-    .await?;
-    sqlx::query("ANALYZE").execute(&mut *connection).await?;
-    sqlx::query("PRAGMA optimize")
-        .execute(&mut *connection)
-        .await?;
-    sqlx::raw_sql(
-        "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA locking_mode=NORMAL; PRAGMA wal_checkpoint(TRUNCATE);",
-    )
-    .execute(&mut *connection)
-    .await?;
+    for (label, sql) in [
+        (
+            "summary ordering indexes",
+            "CREATE INDEX IF NOT EXISTS idx_cve_summary_state_published ON cve_summary_index(state, published_at DESC, cve_id); CREATE INDEX IF NOT EXISTS idx_cve_summary_updated ON cve_summary_index(updated_at DESC, cve_id)",
+        ),
+        (
+            "CWE search ordering index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_cwe_search_sort ON cve_cwe_search(cwe_id, state, published_at DESC, cve_id)",
+        ),
+        (
+            "CVSS search ordering index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_cvss_search_score ON cve_cvss_search(state, max_cvss_score DESC, published_at DESC, cve_id)",
+        ),
+        (
+            "affected search ordering index",
+            "CREATE INDEX IF NOT EXISTS idx_cve_affected_search_sort ON cve_affected_search(state, published_at DESC, cve_id)",
+        ),
+        (
+            "legacy index cleanup",
+            "DROP INDEX IF EXISTS idx_cve_reference_text",
+        ),
+        ("planner statistics", "ANALYZE; PRAGMA optimize"),
+        (
+            "durability restore",
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA locking_mode=NORMAL; PRAGMA wal_checkpoint(TRUNCATE)",
+        ),
+    ] {
+        run_timed_stage(connection, label, sql).await?;
+    }
     Ok(())
 }
 
@@ -218,13 +276,20 @@ pub(crate) async fn rebuild_osv_search(
 pub(crate) async fn rebuild_cve_search(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
-    sqlx::raw_sql(
+    run_timed_stage(
+        connection,
+        "clear CVE summary projection",
+        "DELETE FROM cve_summary_index",
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "build CVE summary projection",
         r#"
-        DELETE FROM cve_summary_index;
         INSERT INTO cve_summary_index(cve_db_id, cve_id, state, published_at, updated_at, title, description_en, max_cvss_score, max_cvss_severity, cwe_ids, affected_text, vendor_text, product_text, reference_text)
         WITH
         cvss_agg AS (
-            SELECT cve_db_id, MAX(base_score) AS max_score
+            SELECT cve_db_id, MAX(base_score) AS max_score, base_severity AS max_severity
             FROM cve_cvss GROUP BY cve_db_id
         ),
         cwe_agg AS (
@@ -240,24 +305,64 @@ pub(crate) async fn rebuild_cve_search(
         )
         SELECT c.id, c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en,
                cvss.max_score,
-               (SELECT base_severity FROM cve_cvss severity
-                WHERE severity.cve_db_id=c.id ORDER BY base_score DESC LIMIT 1),
+               cvss.max_severity,
                COALESCE(cwe.cwe_ids, ''),
                COALESCE(affected.affected_text, ''), COALESCE(affected.vendor_text, ''),
                COALESCE(affected.product_text, ''), c.reference_text
         FROM cve c
         LEFT JOIN cvss_agg cvss ON cvss.cve_db_id=c.id
         LEFT JOIN cwe_agg cwe ON cwe.cve_db_id=c.id
-        LEFT JOIN affected_agg affected ON affected.cve_db_id=c.id;
-        DELETE FROM cve_summary_fts;
+        LEFT JOIN affected_agg affected ON affected.cve_db_id=c.id
+        "#,
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "clear CVE summary FTS",
+        "DELETE FROM cve_summary_fts",
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "build CVE summary FTS",
+        r#"
         INSERT INTO cve_summary_fts(cve_id, title, description_en, affected_text, reference_text)
-        SELECT cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index;
-        DELETE FROM cve_affected_summary_fts;
+        SELECT cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index
+        "#,
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "clear affected FTS",
+        "DELETE FROM cve_affected_summary_fts",
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "build affected FTS",
+        r#"
         INSERT INTO cve_affected_summary_fts(cve_id, vendor_text, product_text, affected_text)
-        SELECT cve_id, vendor_text, product_text, affected_text FROM cve_summary_index;
-        DELETE FROM cve_cwe_search;
-        INSERT INTO cve_cwe_search SELECT link.cwe_id, c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve_cwe link JOIN cve c ON c.id=link.cve_db_id;
-        DELETE FROM cve_cvss_search;
+        SELECT cve_id, vendor_text, product_text, affected_text FROM cve_summary_index
+        "#,
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "clear CWE projection",
+        "DELETE FROM cve_cwe_search",
+    )
+    .await?;
+    run_timed_stage(connection, "build CWE projection", "INSERT INTO cve_cwe_search SELECT link.cwe_id, c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve_cwe link JOIN cve c ON c.id=link.cve_db_id").await?;
+    run_timed_stage(
+        connection,
+        "clear CVSS projection",
+        "DELETE FROM cve_cvss_search",
+    )
+    .await?;
+    run_timed_stage(
+        connection,
+        "build CVSS projection",
+        r#"
         INSERT INTO cve_cvss_search
         SELECT summary.cve_id, summary.state, summary.published_at, summary.updated_at,
                summary.title, summary.description_en, summary.max_cvss_score,
@@ -266,13 +371,17 @@ pub(crate) async fn rebuild_cve_search(
         LEFT JOIN (
             SELECT cve_db_id, group_concat(DISTINCT version) AS cvss_versions
             FROM cve_cvss GROUP BY cve_db_id
-        ) versions ON versions.cve_db_id=summary.cve_db_id;
-        DELETE FROM cve_affected_search;
-        INSERT INTO cve_affected_search SELECT cve_id, state, published_at, updated_at, title, description_en, vendor_text, product_text, affected_text FROM cve_summary_index;
+        ) versions ON versions.cve_db_id=summary.cve_db_id
         "#,
     )
-    .execute(&mut *connection)
     .await?;
+    run_timed_stage(
+        connection,
+        "clear affected projection",
+        "DELETE FROM cve_affected_search",
+    )
+    .await?;
+    run_timed_stage(connection, "build affected projection", "INSERT INTO cve_affected_search SELECT cve_id, state, published_at, updated_at, title, description_en, vendor_text, product_text, affected_text FROM cve_summary_index").await?;
     Ok(())
 }
 
@@ -322,8 +431,8 @@ pub(crate) async fn check_required_schema(
         "idx_cve_cvss_search_score",
         "idx_cve_affected_search_sort",
         "idx_read_json_file_filename",
-        "idx_cve_published_at",
-        "idx_cve_updated_at",
+        "idx_cve_published_at_cve_id",
+        "idx_cve_updated_at_cve_id",
         "idx_cve_cvss_cve_db_id",
         "idx_cve_affected_cve_db_id",
         "idx_cve_cwe_cwe_id_cve_db_id",

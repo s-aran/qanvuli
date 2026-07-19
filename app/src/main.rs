@@ -4,8 +4,9 @@ use std::ffi::OsString;
 use std::io::IsTerminal;
 
 fn main() {
+    qanvuli_utils::logging::init();
     if let Err(err) = run() {
-        eprintln!("{err}");
+        qanvuli_utils::logging::stderr(format_args!("{err}"));
         std::process::exit(1);
     }
 }
@@ -125,22 +126,24 @@ enum Command {
 
 fn print_help() -> Result<(), String> {
     let mut command = Cli::command();
-    command
-        .print_help()
-        .map_err(|err| format!("failed to print help: {err}"))?;
-    println!();
+    let help = command.render_help();
+    qanvuli_utils::logging::stdout(format_args!("{}", help.to_string().trim_end()));
     Ok(())
 }
 
 fn print_version() {
     if can_show_emoji() {
-        println!(
+        qanvuli_utils::logging::stdout(format_args!(
             "🐟 {} 🍣️ v{}",
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION")
-        );
+        ));
     } else {
-        println!("{} v{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        qanvuli_utils::logging::stdout(format_args!(
+            "{} v{}",
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_PKG_VERSION")
+        ));
     }
 }
 

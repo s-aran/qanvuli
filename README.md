@@ -83,6 +83,7 @@ Search from the CLI:
 
 ```bash
 cargo run -- search --text openssl --limit 20
+cargo run -- search --source osv --text openssl --limit 20 --offset 0
 cargo run -- search --cwe CWE-79
 cargo run -- search --vendor microsoft --product windows
 cargo run -- search --min-score 9.0 --severity CRITICAL
@@ -96,12 +97,10 @@ cargo run -- search --cve CVE-2024-12345
 
 ## Database Commands
 
-Create or rebuild the database schema and import CVE data:
+Build and install a complete replacement database:
 
 ```bash
 cargo run -- init
-cargo run -- init --schema-only
-cargo run -- init --rebuild
 cargo run -- init --zip ./path/to/cve.zip
 ```
 
@@ -109,6 +108,7 @@ Apply updates:
 
 ```bash
 cargo run -- update
+cargo run -- update --osv-full-snapshot
 cargo run -- update --zip ./path/to/delta.zip
 ```
 
@@ -116,6 +116,7 @@ Verify database storage and rebuild derived search indexes:
 
 ```bash
 cargo run -- db check
+cargo run -- db check --scan
 cargo run -- db check --full
 cargo run -- db rebuild-search
 ```
@@ -129,14 +130,15 @@ check leaves the previous file untouched.
 
 The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
 foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each
-such physical connection. `db check` is a bounded routine check using `quick_check(1)`, schema
-shape validation, and identifier-based search correspondence checks. `db check --full` additionally
+such physical connection. `db check` is a low-latency schema and fixed-sentinel check; it does not
+run `quick_check`, `integrity_check`, full counts, or OFFSET sampling. `db check --scan` adds
+`quick_check(1)` and broader correspondence scans. `db check --full` additionally
 runs the potentially long SQLite integrity, foreign-key, and native FTS scans, reporting each stage
 and elapsed time on stderr while keeping JSON on stdout. `db rebuild-search` rebuilds and directly
 verifies the derived CVE and OSV search structures without running the full SQLite scan.
 
-Existing incompatible schemas are never stamped as current or patched in place; run `init --rebuild`
-to replace them safely.
+Existing incompatible schemas are never stamped as current or patched in place; run `init` to
+build and install a complete validated replacement.
 
 Normalized CVE affected-product rows retain provider version conditions (`version`, `status`,
 `versionType`, `lessThan`, and `lessThanOrEqual`) under integer foreign keys, while the original
@@ -148,6 +150,9 @@ identifier graph, FTS, and source-cursor details.
 OSV aliases, upstream identifiers, and related identifiers are stored as distinct relationship
 types. OSV synchronization advances its cursor only after every selected record, derived index,
 and integrity check succeeds; a failed run keeps the prior cursor so the records are retried.
+OSV exports retain withdrawn records, including their `withdrawn` timestamp. The incremental feed
+lists new or modified records; `update --osv-full-snapshot` explicitly ignores the cursor and
+downloads complete selected snapshots. It does not delete local IDs absent from those snapshots.
 
 `init` builds a new SQLx-backed database from CVE, CWE, OSV, KEV, and EPSS sources. `update --zip`
 imports a local CVE archive through the same schema without network access; a normal `update`
@@ -236,6 +241,8 @@ provider timestamps for OSV findings. `--per-package-limit` limits each final so
 independently. `--include-rejected` applies to linked CVEs because OSV has no CVE rejection state.
 Package findings include explicit `*_status` fields for aliases, fixed versions, KEV, EPSS,
 priority, and evidence. A placeholder value is reported as `not_queried`, not as source absence.
+Package processing is deterministic and sequential because all SQLite work uses one physical
+mutex-protected connection; there is intentionally no public `--jobs` tuning option.
 
 ## Workspace Layout
 

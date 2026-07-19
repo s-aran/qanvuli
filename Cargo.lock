@@ -2211,6 +2211,7 @@ dependencies = [
  "qanvuli-app-mcp",
  "qanvuli-app-tui",
  "qanvuli-core",
+ "qanvuli-utils",
  "tokio",
 ]
 
@@ -2222,6 +2223,7 @@ dependencies = [
  "chrono",
  "clap",
  "qanvuli-core",
+ "qanvuli-utils",
  "rayon",
  "serde",
  "serde_json",
@@ -2348,6 +2350,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "glob",
+ "log",
  "octocrab",
  "once_cell",
  "regex",

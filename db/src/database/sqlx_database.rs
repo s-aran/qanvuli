@@ -2982,7 +2982,7 @@ mod tests {
                     let foreign_keys = sqlx::query_scalar("PRAGMA foreign_keys")
                         .fetch_one(&mut *connection)
                         .await?;
-                    let index_exists = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cve_updated_at'")
+                    let index_exists = sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_cve_updated_at_cve_id'")
                         .fetch_one(&mut *connection)
                         .await?;
                     Ok((foreign_keys, index_exists))

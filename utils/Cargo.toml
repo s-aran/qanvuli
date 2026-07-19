@@ -38,3 +38,4 @@ rustls = { version = "0.23", default-features = false, features = [
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
 regex = "1.13"
 glob = "0.3"
+log = "0.4"
