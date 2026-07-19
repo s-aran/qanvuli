@@ -1,7 +1,58 @@
+use chrono::{DateTime, Utc};
 use qanvuli_utils::github::{self, GitHubRelease, GitHubReleaseFile};
 
 pub struct CveRelease {
     releases: Vec<GitHubRelease>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(published_at: &str, asset_name: &str) -> GitHubRelease {
+        GitHubRelease {
+            version: published_at.to_owned(),
+            url: String::new(),
+            published_at: Some(
+                DateTime::parse_from_rfc3339(published_at)
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            files: vec![GitHubReleaseFile {
+                name: asset_name.to_owned(),
+                url: String::new(),
+                size: 1,
+            }],
+        }
+    }
+
+    #[test]
+    fn delta_cursor_filters_old_releases_and_keeps_chronological_order() {
+        let provider = CveRelease {
+            releases: vec![
+                release("2026-07-19T02:00:00Z", "2026-07-19_delta_0200.zip"),
+                release("2026-07-19T01:00:00Z", "2026-07-19_delta_0100.zip"),
+                release("2026-07-19T00:00:00Z", "2026-07-19_delta_0000.zip"),
+            ],
+        };
+        let cursor = DateTime::parse_from_rfc3339("2026-07-19T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let names = provider
+            .get_delta_files_published_after(cursor)
+            .into_iter()
+            .map(|(_, asset)| asset.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "2026-07-19_delta_0100.zip".to_owned(),
+                "2026-07-19_delta_0200.zip".to_owned(),
+            ]
+        );
+    }
 }
 
 impl Default for CveRelease {
@@ -95,6 +146,14 @@ impl CveRelease {
         Self::get_latest_file(releases, Self::is_all_zip)
     }
 
+    pub fn get_latest_all_file_with_published_at(
+        &self,
+    ) -> Option<(&GitHubReleaseFile, Option<DateTime<Utc>>)> {
+        let release = self.get_hourly_release().into_iter().next()?;
+        let file = release.files.iter().find(|file| Self::is_all_zip(file))?;
+        Some((file, release.published_at))
+    }
+
     pub fn get_latest_delta_file(&self) -> Option<&GitHubReleaseFile> {
         let releases = self.get_hourly_release();
         Self::get_latest_file(releases, Self::is_delta_zip)
@@ -112,6 +171,34 @@ impl CveRelease {
             .into_iter()
             .flat_map(|release| release.files.iter().filter(|file| Self::is_delta_zip(file)))
             .cloned()
+            .collect()
+    }
+
+    pub fn get_delta_files_published_after(
+        &self,
+        cursor: DateTime<Utc>,
+    ) -> Vec<(DateTime<Utc>, GitHubReleaseFile)> {
+        let mut releases = self
+            .get_hourly_release()
+            .into_iter()
+            .filter_map(|release| {
+                release
+                    .published_at
+                    .map(|published_at| (published_at, release))
+            })
+            .filter(|(published_at, _)| *published_at > cursor)
+            .collect::<Vec<_>>();
+        releases.sort_by_key(|(published_at, _)| *published_at);
+        releases
+            .into_iter()
+            .flat_map(|(published_at, release)| {
+                release
+                    .files
+                    .iter()
+                    .filter(|file| Self::is_delta_zip(file))
+                    .cloned()
+                    .map(move |file| (published_at, file))
+            })
             .collect()
     }
 

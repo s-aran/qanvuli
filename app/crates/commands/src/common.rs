@@ -1,5 +1,5 @@
 use ahash::AHashSet;
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use clap::ValueEnum;
 use qanvuli_core::ingest::OsvModifiedId;
 use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
@@ -56,6 +56,18 @@ const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
 const CWE_STORAGE_VERSION: &str = "2";
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
+pub(crate) const CVE_DELTA_CURSOR_METADATA_KEY: &str = "cve_delta_cursor";
+
+pub(crate) fn cve_full_asset_cursor(path: &Path) -> Option<DateTime<Utc>> {
+    let filename = path.file_name()?.to_str()?;
+    if !filename.contains("_all_") {
+        return None;
+    }
+    NaiveDate::parse_from_str(filename.get(..10)?, "%Y-%m-%d")
+        .ok()?
+        .and_hms_opt(0, 0, 0)
+        .map(|value| value.and_utc())
+}
 
 /// Callback used by long-running import commands to report progress to the TUI.
 pub type IngestProgressCallback = Arc<dyn Fn(IngestProgress) + Send + Sync>;
@@ -322,16 +334,31 @@ pub async fn sync_kev_epss_snapshots_sqlx(db: SqlxDatabase, label: &str) -> Resu
         .map_err(|error| format!("{label}: enrichment database check failed: {error}"))
 }
 
-/// Downloads the selected public OSV snapshot and imports it through the SQLx writer.
-pub async fn sync_osv_selection_from_gcs_sqlx(
-    db: SqlxDatabase,
+pub(crate) struct DownloadedOsvSelection {
+    label: String,
+    selection: OsvImportSelection,
+    cursor: String,
+    zip_paths: Vec<PathBuf>,
+    started: Instant,
+}
+
+impl Drop for DownloadedOsvSelection {
+    fn drop(&mut self) {
+        for path in &self.zip_paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Downloads the selected public OSV snapshot without touching SQLite.
+pub(crate) async fn download_osv_selection_from_gcs(
     label: &str,
     selection: OsvImportSelection,
-) -> Result<usize, String> {
+) -> Result<DownloadedOsvSelection, String> {
     let label = label.to_owned();
     let started = Instant::now();
     eprintln!(
-        "{label}: syncing OSV records from Google Cloud Storage ({})",
+        "{label}: prefetching OSV records from Google Cloud Storage ({})",
         selection.description()
     );
     selection
@@ -392,33 +419,55 @@ pub async fn sync_osv_selection_from_gcs_sqlx(
             }
         }
     }
+    Ok(DownloadedOsvSelection {
+        label,
+        selection,
+        cursor,
+        zip_paths,
+        started,
+    })
+}
+
+/// Imports a previously downloaded OSV selection and removes its temporary ZIPs on return.
+pub(crate) async fn import_downloaded_osv_selection(
+    db: SqlxDatabase,
+    download: DownloadedOsvSelection,
+) -> Result<usize, String> {
     let result = import_osv_zip_files_sqlx_with_mode(
         db.clone(),
-        &zip_paths,
-        Some(&selection),
-        &cursor,
+        &download.zip_paths,
+        Some(&download.selection),
+        &download.cursor,
         true,
     )
     .await;
-    for path in zip_paths {
-        let _ = std::fs::remove_file(path);
-    }
     let imported = result?;
     db.set_metadata_value(
         OSV_IMPORT_ID_PREFIXES_METADATA_KEY,
-        &selection.as_metadata_value(),
+        &download.selection.as_metadata_value(),
     )
     .await
-    .map_err(|error| format!("{label}: failed to save OSV selection: {error}"))?;
+    .map_err(|error| format!("{}: failed to save OSV selection: {error}", download.label))?;
     eprintln!(
-        "{label}: imported {imported} OSV records in {:?}",
-        started.elapsed()
+        "{}: imported {imported} OSV records in {:?}",
+        download.label,
+        download.started.elapsed()
     );
     Ok(imported)
 }
 
+/// Downloads the selected public OSV snapshot and imports it through the SQLx writer.
+pub async fn sync_osv_selection_from_gcs_sqlx(
+    db: SqlxDatabase,
+    label: &str,
+    selection: OsvImportSelection,
+) -> Result<usize, String> {
+    let download = download_osv_selection_from_gcs(label, selection).await?;
+    import_downloaded_osv_selection(db, download).await
+}
+
 /// Imports an OSV ZIP through the SQLx writer and advances the cursor only after every batch,
-/// FTS rebuild, and integrity check has succeeded.
+/// FTS rebuild, and schema validation has succeeded.
 pub async fn import_osv_zip_file_sqlx(
     db: SqlxDatabase,
     path: &Path,
@@ -776,13 +825,14 @@ pub async fn download_latest_asset(kind: ReleaseAssetKind) -> Result<PathBuf, St
 pub struct DownloadedAsset {
     pub path: PathBuf,
     pub downloaded: bool,
+    pub published_at: Option<DateTime<Utc>>,
 }
 
 pub async fn download_latest_asset_with_source(
     kind: ReleaseAssetKind,
 ) -> Result<DownloadedAsset, String> {
     eprintln!("{kind}: fetching GitHub release metadata");
-    let asset = match latest_asset(kind).await {
+    let (asset, published_at) = match latest_asset_with_published_at(kind).await {
         Ok(asset) => asset,
         Err(err) => {
             if let Some(path) = latest_local_asset(kind) {
@@ -793,6 +843,7 @@ pub async fn download_latest_asset_with_source(
                 return Ok(DownloadedAsset {
                     path,
                     downloaded: false,
+                    published_at: None,
                 });
             }
             return Err(err);
@@ -814,6 +865,7 @@ pub async fn download_latest_asset_with_source(
     Ok(DownloadedAsset {
         path: output_path,
         downloaded: true,
+        published_at,
     })
 }
 
@@ -989,19 +1041,31 @@ fn local_test_cwe_catalog_path() -> Option<PathBuf> {
 }
 
 pub async fn latest_asset(kind: ReleaseAssetKind) -> Result<GitHubReleaseFile, String> {
+    latest_asset_with_published_at(kind)
+        .await
+        .map(|(asset, _)| asset)
+}
+
+async fn latest_asset_with_published_at(
+    kind: ReleaseAssetKind,
+) -> Result<(GitHubReleaseFile, Option<DateTime<Utc>>), String> {
     let mut cve = CveRelease::new();
     cve.async_get()
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
 
     let asset = match kind {
-        ReleaseAssetKind::All => cve.get_latest_all_file(),
-        ReleaseAssetKind::Delta => cve.get_latest_delta_file(),
-        ReleaseAssetKind::DeltaMidnight => cve.get_latest_delta_midnight_file(),
+        ReleaseAssetKind::All => cve
+            .get_latest_all_file_with_published_at()
+            .map(|(asset, published_at)| (asset, published_at)),
+        ReleaseAssetKind::Delta => cve.get_latest_delta_file().map(|asset| (asset, None)),
+        ReleaseAssetKind::DeltaMidnight => cve
+            .get_latest_delta_midnight_file()
+            .map(|asset| (asset, None)),
     };
 
     asset
-        .cloned()
+        .map(|(asset, published_at)| (asset.clone(), published_at))
         .ok_or_else(|| format!("no {kind} CVE zip asset found"))
 }
 
@@ -1013,32 +1077,85 @@ pub async fn delta_assets_oldest_first() -> Result<Vec<GitHubReleaseFile>, Strin
     Ok(cve.get_delta_files_oldest_first())
 }
 
+pub async fn delta_assets_published_after(
+    cursor: DateTime<Utc>,
+) -> Result<Vec<(DateTime<Utc>, GitHubReleaseFile)>, String> {
+    let mut cve = CveRelease::new();
+    cve.async_get_all()
+        .await
+        .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
+    Ok(cve.get_delta_files_published_after(cursor))
+}
+
 /// Applies local or downloaded CVE delta archives through the SQLx writer.
 pub async fn apply_delta_updates(
     db: &SqlxDatabase,
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
-    let paths = if let Some(path) = zip {
-        vec![path]
-    } else {
-        let mut paths = Vec::new();
-        for asset in delta_assets_oldest_first().await? {
+    if let Some(path) = zip {
+        ingest_zip_sqlx(db.clone(), "update", &path, max_chunks).await?;
+        return Ok(vec![path]);
+    }
+
+    let cursor = db
+        .metadata_value(CVE_DELTA_CURSOR_METADATA_KEY)
+        .await
+        .map_err(|error| format!("failed to read CVE delta cursor: {error}"))?
+        .ok_or_else(|| {
+            "CVE delta cursor is missing; run init to rebuild the database".to_owned()
+        })?;
+    let cursor = DateTime::parse_from_rfc3339(&cursor)
+        .map_err(|error| format!("invalid CVE delta cursor; run init: {error}"))?
+        .with_timezone(&Utc);
+    let assets = delta_assets_published_after(cursor).await?;
+    let mut paths = Vec::with_capacity(assets.len());
+    let mut completed_cursor = cursor;
+    let mut database_changed = false;
+    let apply_result = async {
+        for (published_at, asset) in assets {
             let filename = asset
                 .safe_file_name()
                 .map_err(|error| format!("unsafe asset name {}: {error}", asset.name))?;
             let path = temporary_zip_file_path(filename, Some(asset.size))
                 .map_err(|error| format!("failed to prepare delta archive {filename}: {error}"))?;
+            paths.push(path.clone());
             asset
                 .async_download_as(&path)
                 .await
                 .map_err(|error| format!("failed to download {}: {error}", asset.name))?;
-            paths.push(path);
+            database_changed = true;
+            ingest_zip_sqlx_deferred_search(db.clone(), "update", &path, max_chunks).await?;
+            db.mark_cve_asset_applied(&asset.name, &asset.url)
+                .await
+                .map_err(|error| format!("failed to record CVE delta {}: {error}", asset.name))?;
+            completed_cursor = completed_cursor.max(published_at);
         }
-        paths
+        Ok::<(), String>(())
+    }
+    .await;
+    let rebuild_result = if database_changed {
+        db.rebuild_cve_search()
+            .await
+            .map_err(|error| format!("failed to rebuild CVE search data: {error}"))
+    } else {
+        Ok(())
     };
-    for path in &paths {
-        ingest_zip_sqlx(db.clone(), "update", path, max_chunks).await?;
+    if let Err(error) = apply_result.and(rebuild_result) {
+        for path in &paths {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    if database_changed {
+        if max_chunks.is_none() {
+            db.set_metadata_value(
+                CVE_DELTA_CURSOR_METADATA_KEY,
+                &completed_cursor.to_rfc3339(),
+            )
+            .await
+            .map_err(|error| format!("failed to advance CVE delta cursor: {error}"))?;
+        }
     }
     Ok(paths)
 }
@@ -1058,10 +1175,7 @@ pub async fn sync_all_enrichment_sources_after_update(
     let selection =
         requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
     sync_osv_selection_from_gcs_sqlx(db.clone(), label, selection).await?;
-    sync_kev_epss_snapshots_sqlx(db.clone(), label).await?;
-    db.rebuild_identifier_graph()
-        .await
-        .map_err(|error| format!("{label}: failed to rebuild identifier graph: {error}"))
+    sync_kev_epss_snapshots_sqlx(db.clone(), label).await
 }
 
 /// Imports raw CVE JSON into the SQLx schema.
@@ -1071,7 +1185,16 @@ pub async fn ingest_zip_sqlx(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false).await
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, true).await
+}
+
+async fn ingest_zip_sqlx_deferred_search(
+    db: SqlxDatabase,
+    label: &str,
+    asset_path: &Path,
+    max_chunks: Option<usize>,
+) -> Result<usize, String> {
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, false).await
 }
 
 /// Imports a full replacement archive with devel's deferred-index bulk-load policy.
@@ -1081,7 +1204,7 @@ pub async fn ingest_zip_sqlx_bulk(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, true).await
+    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, true, true).await
 }
 
 async fn ingest_zip_sqlx_with_mode(
@@ -1090,6 +1213,7 @@ async fn ingest_zip_sqlx_with_mode(
     asset_path: &Path,
     max_chunks: Option<usize>,
     bulk_replace: bool,
+    rebuild_after: bool,
 ) -> Result<usize, String> {
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
@@ -1140,16 +1264,19 @@ async fn ingest_zip_sqlx_with_mode(
             write_started.elapsed()
         );
     }
+    if !rebuild_after {
+        return Ok(imported);
+    }
     let fts_started = Instant::now();
-    eprintln!("{label}: rebuilding CVE/OSV search indexes");
+    eprintln!("{label}: rebuilding CVE search indexes");
     if bulk_replace {
         db.finish_cve_bulk_load()
             .await
             .map_err(|error| format!("{label}: failed to finish CVE bulk load: {error}"))?;
     } else {
-        db.rebuild_search()
+        db.rebuild_cve_search()
             .await
-            .map_err(|error| format!("{label}: failed to rebuild FTS: {error}"))?;
+            .map_err(|error| format!("{label}: failed to rebuild CVE search data: {error}"))?;
     }
     eprintln!(
         "{label}: rebuilt search indexes in {:?}",
@@ -1195,6 +1322,50 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_cve_filename_provides_a_safe_delta_cursor() {
+        assert_eq!(
+            cve_full_asset_cursor(Path::new("2026-07-18_all_CVEs_at_midnight.zip.zip"))
+                .unwrap()
+                .to_rfc3339(),
+            "2026-07-18T00:00:00+00:00"
+        );
+        assert!(cve_full_asset_cursor(Path::new("delta.zip")).is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_delta_update_requires_a_cursor_from_full_init() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+
+        let error = apply_delta_updates(&database, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("CVE delta cursor is missing"));
+    }
+
+    #[test]
+    fn downloaded_osv_selection_removes_temporary_zips_when_dropped() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-osv-prefetch-{}-{}.zip",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, b"temporary").unwrap();
+        let download = DownloadedOsvSelection {
+            label: "test".to_owned(),
+            selection: OsvImportSelection::default_init(false, &[]),
+            cursor: Utc::now().to_rfc3339(),
+            zip_paths: vec![path.clone()],
+            started: Instant::now(),
+        };
+
+        drop(download);
+
+        assert!(!path.exists());
+    }
 
     #[test]
     fn default_database_is_beside_executable() {

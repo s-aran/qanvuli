@@ -448,6 +448,10 @@ impl SqlxDatabase {
         self.writer.rebuild_search().await
     }
 
+    pub async fn rebuild_cve_search(&self) -> Result<(), sqlx::Error> {
+        self.writer.rebuild_cve_search().await
+    }
+
     pub async fn rebuild_osv_search(&self) -> Result<(), sqlx::Error> {
         self.writer.rebuild_osv_search().await
     }
@@ -1291,7 +1295,7 @@ impl SqlxDatabase {
                     sqlx::query("DELETE FROM osv_ranges WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id=?)").bind(&advisory.id).execute(&mut *transaction).await?;
                     sqlx::query("DELETE FROM osv_versions WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id=?)").bind(&advisory.id).execute(&mut *transaction).await?;
                     sqlx::query("DELETE FROM osv_affected_packages WHERE osv_id=?").bind(&advisory.id).execute(&mut *transaction).await?;
-                    sqlx::query("DELETE FROM vulnerability_identifier_edges WHERE from_identifier=? AND source='OSV'").bind(&advisory.id).execute(&mut *transaction).await?;
+                    delete_osv_identifier_edges(&mut transaction, &advisory.id).await?;
                     for (relation_type, identifiers) in [("alias", &advisory.aliases), ("upstream", &advisory.upstream), ("related", &advisory.related)] {
                         for identifier in identifiers {
                             let identifier_type = if identifier.starts_with("CVE-") { "cve" } else if identifier.starts_with("GHSA-") { "ghsa" } else { "other" };
@@ -1503,6 +1507,7 @@ impl SqlxDatabase {
             .execute(&mut **transaction)
             .await?;
         if !bulk_init {
+            delete_osv_identifier_edges(transaction, &advisory.id).await?;
             for sql in [
                 "DELETE FROM osv_aliases WHERE osv_id=?",
                 "DELETE FROM osv_references WHERE osv_id=?",
@@ -1510,7 +1515,6 @@ impl SqlxDatabase {
                 "DELETE FROM osv_ranges WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id=?)",
                 "DELETE FROM osv_versions WHERE affected_package_id IN (SELECT id FROM osv_affected_packages WHERE osv_id=?)",
                 "DELETE FROM osv_affected_packages WHERE osv_id=?",
-                "DELETE FROM vulnerability_identifier_edges WHERE from_identifier=? AND source='OSV'",
             ] {
                 sqlx::query(sql)
                     .bind(&advisory.id)
@@ -2180,6 +2184,31 @@ impl SqlxDatabase {
     }
 }
 
+async fn delete_osv_identifier_edges(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    osv_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"DELETE FROM vulnerability_identifier_edges
+           WHERE source='OSV' AND (
+               from_identifier=? OR (
+                   to_identifier=? AND relation_type IN ('alias', 'related')
+                   AND from_identifier IN (
+                       SELECT to_identifier FROM vulnerability_identifier_edges
+                       WHERE from_identifier=? AND source='OSV'
+                         AND relation_type IN ('alias', 'related')
+                   )
+               )
+           )"#,
+    )
+    .bind(osv_id)
+    .bind(osv_id)
+    .bind(osv_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 fn cve_references(cna: Option<&Value>, adp: Option<&Value>) -> Vec<SqlxCveReference> {
     let mut rows: BTreeMap<String, (Option<String>, BTreeSet<String>)> = BTreeMap::new();
     let containers = cna.into_iter().chain(adp.into_iter().flat_map(|value| {
@@ -2689,19 +2718,24 @@ mod tests {
     async fn repeated_osv_import_rebuilds_derived_edges_without_stale_duplicates() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        database.import_osv_record(OsvRawRecord {
+        database.import_osv_records_deferred_search(vec![OsvRawRecord {
             source_path: None,
             raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-edge","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-old"]}"#.to_owned(),
-        }).await.unwrap();
-        database.import_osv_record(OsvRawRecord {
+        }]).await.unwrap();
+        database.import_osv_records_deferred_search(vec![OsvRawRecord {
             source_path: None,
             raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-edge","modified":"2099-01-02T00:00:00Z","aliases":["CVE-2099-new"]}"#.to_owned(),
-        }).await.unwrap();
+        }]).await.unwrap();
         let edges: Vec<String> = database.writer.with_connection(|connection| Box::pin(async move {
             sqlx::query_scalar("SELECT to_identifier FROM vulnerability_identifier_edges WHERE source='OSV' AND from_identifier='GHSA-2099-edge' ORDER BY to_identifier")
                 .fetch_all(connection).await
         })).await.unwrap();
         assert_eq!(edges, vec!["CVE-2099-new".to_owned()]);
+        let stale_reverse_edges: i64 = database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query_scalar("SELECT COUNT(*) FROM vulnerability_identifier_edges WHERE source='OSV' AND from_identifier='CVE-2099-old' AND to_identifier='GHSA-2099-edge'")
+                .fetch_one(connection).await
+        })).await.unwrap();
+        assert_eq!(stale_reverse_edges, 0);
     }
 
     #[tokio::test]

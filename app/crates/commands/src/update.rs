@@ -1,7 +1,7 @@
 use super::common::{
-    IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, connect_sqlx_db,
-    download_latest_asset_with_source, ingest_zip_sqlx, sync_cwe_catalog_sqlx,
-    sync_kev_epss_snapshots_sqlx, sync_osv_selection_from_gcs_sqlx,
+    IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, apply_delta_updates,
+    connect_sqlx_db, ingest_zip_sqlx, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
+    sync_osv_selection_from_gcs_sqlx,
 };
 use std::path::PathBuf;
 
@@ -71,6 +71,18 @@ async fn run_with_progress(
         )
         .await
         .map_err(|error| format!("failed to record local delta asset: {error}"))?;
+        if let Some(additions) =
+            OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes)
+        {
+            let stored = db
+                .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
+                .await
+                .map_err(|error| format!("failed to read OSV selection: {error}"))?;
+            let current = OsvImportSelection::from_metadata(stored.as_deref())
+                .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
+            sync_osv_selection_from_gcs_sqlx(db.clone(), "update", current.merged_with(&additions))
+                .await?;
+        }
         db.check_schema()
             .await
             .map_err(|error| format!("post-update database check failed: {error}"))?;
@@ -85,9 +97,8 @@ async fn run_with_progress(
     }
     let sqlx_db = connect_sqlx_db(db_url).await?;
     if sqlx_db.check_schema().await.is_ok() {
-        eprintln!("update: refreshing SQLx database from the latest full CVE archive");
-        let asset = download_latest_asset_with_source(super::common::ReleaseAssetKind::All).await?;
-        ingest_zip_sqlx(sqlx_db.clone(), "update", &asset.path, args.max_chunks).await?;
+        eprintln!("update: applying CVE delta archives");
+        let applied_paths = apply_delta_updates(&sqlx_db, None, args.max_chunks).await?;
         sync_cwe_catalog_sqlx(sqlx_db.clone()).await?;
         let saved_selection = sqlx_db
             .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
@@ -102,21 +113,6 @@ async fn run_with_progress(
         sync_osv_selection_from_gcs_sqlx(sqlx_db.clone(), "update", selection).await?;
         sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update").await?;
         sqlx_db
-            .mark_cve_asset_applied(
-                asset
-                    .path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("latest-cve.zip"),
-                if asset.downloaded {
-                    "downloaded"
-                } else {
-                    "local"
-                },
-            )
-            .await
-            .map_err(|error| format!("failed to record CVE asset: {error}"))?;
-        sqlx_db
             .check_schema()
             .await
             .map_err(|error| format!("post-update database check failed: {error}"))?;
@@ -125,7 +121,9 @@ async fn run_with_progress(
             .await
             .map_err(|error| format!("failed to close database: {error}"))?;
         if !args.keep {
-            super::common::remove_processed_zip(&asset.path)?;
+            for path in applied_paths {
+                super::common::remove_processed_zip(&path)?;
+            }
         }
         return Ok(());
     }

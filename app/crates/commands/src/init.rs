@@ -1,9 +1,10 @@
 use super::common::{
-    IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
-    ReleaseAssetKind, connect_sqlx_db, download_latest_asset_with_source, ingest_zip_sqlx_bulk,
-    redact_database_url, remove_processed_zip, remove_sqlite_database_files,
-    replacement_sqlite_database_url, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
-    sync_osv_selection_from_gcs_sqlx,
+    CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
+    OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
+    download_latest_asset_with_source, download_osv_selection_from_gcs,
+    import_downloaded_osv_selection, ingest_zip_sqlx_bulk, redact_database_url,
+    remove_processed_zip, remove_sqlite_database_files, replacement_sqlite_database_url,
+    sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
 };
 use qanvuli_core::database::install_closed_database;
 use std::path::PathBuf;
@@ -78,14 +79,17 @@ async fn run_with_progress(
         return Ok(());
     }
 
-    let asset_path = if let Some(zip) = args.zip {
+    let (asset_path, cve_delta_cursor) = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
-        zip
+        let cursor = cve_full_asset_cursor(&zip);
+        (zip, cursor)
     } else {
         emit_init_progress(&progress, "-", "downloading");
-        download_latest_asset_with_source(ReleaseAssetKind::All)
-            .await?
-            .path
+        let asset = download_latest_asset_with_source(ReleaseAssetKind::All).await?;
+        let cursor = asset
+            .published_at
+            .or_else(|| cve_full_asset_cursor(&asset.path));
+        (asset.path, cursor)
     };
 
     let (candidate_path, candidate_url) = replacement_sqlite_database_url(db_url)?;
@@ -113,15 +117,40 @@ async fn run_with_progress(
             .initialize()
             .await
             .map_err(|error| format!("failed to initialize replacement schema: {error}"))?;
-        ingest_zip_sqlx_bulk(
+        let osv_download_task =
+            tokio::spawn(download_osv_selection_from_gcs("init", osv_selection));
+        let cve_result = ingest_zip_sqlx_bulk(
             db_for_build.clone(),
             "all",
             &asset_for_build,
             args.max_chunks,
         )
-        .await?;
+        .await;
+        let zip_removal_result = if cve_result.is_ok() && !args.keep {
+            remove_processed_zip(&asset_for_build)
+        } else {
+            Ok(())
+        };
+        let osv_download_result = osv_download_task
+            .await
+            .map_err(|error| format!("OSV download task failed: {error}"))?;
+        cve_result?;
+        zip_removal_result?;
+        if args.max_chunks.is_none() {
+            let cve_delta_cursor = cve_delta_cursor.ok_or_else(|| {
+                "cannot determine the full CVE archive timestamp from its release or filename"
+                    .to_owned()
+            })?;
+            db_for_build
+                .set_metadata_value(
+                    CVE_DELTA_CURSOR_METADATA_KEY,
+                    &cve_delta_cursor.to_rfc3339(),
+                )
+                .await
+                .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
+        }
         sync_cwe_catalog_sqlx(db_for_build.clone()).await?;
-        sync_osv_selection_from_gcs_sqlx(db_for_build.clone(), "init", osv_selection).await?;
+        import_downloaded_osv_selection(db_for_build.clone(), osv_download_result?).await?;
         sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init").await?;
         db_for_build
             .check_schema()
@@ -147,9 +176,6 @@ async fn run_with_progress(
     })?;
     install_closed_database(&candidate_path, &target)
         .map_err(|error| format!("failed to install validated replacement database: {error}"))?;
-    if !args.keep {
-        remove_processed_zip(&asset_path)?;
-    }
     Ok(())
 }
 
