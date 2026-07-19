@@ -284,10 +284,55 @@ pub(crate) async fn check_required_schema(
         "schema_meta",
         "app_metadata",
         "cve",
+        "cwe",
+        "cve_cvss",
+        "cve_affected",
+        "cve_cwe",
+        "read_json_file",
+        "cve_zip_file",
+        "db_sources",
+        "source_sync_state",
+        "osv_raw_records",
         "osv_advisories",
+        "osv_aliases",
+        "osv_cve_search",
+        "osv_token_cve_search",
+        "osv_affected_packages",
+        "osv_ranges",
+        "osv_range_events",
+        "osv_versions",
+        "osv_references",
+        "kev_raw_records",
+        "kev_entries",
+        "epss_raw_records",
+        "epss_current",
         "vulnerability_identifiers",
+        "vulnerability_identifier_edges",
+        "identifier_components",
+        "cve_summary_index",
         "cve_summary_fts",
+        "cve_affected_summary_fts",
+        "cve_cwe_search",
+        "cve_cvss_search",
+        "cve_affected_search",
         "osv_text_fts",
+        "idx_cve_summary_state_published",
+        "idx_cve_summary_updated",
+        "idx_cve_cwe_search_sort",
+        "idx_cve_cvss_search_score",
+        "idx_cve_affected_search_sort",
+        "idx_read_json_file_filename",
+        "idx_cve_published_at",
+        "idx_cve_updated_at",
+        "idx_cve_cvss_cve_db_id",
+        "idx_cve_affected_cve_db_id",
+        "idx_cve_cwe_cwe_id_cve_db_id",
+        "idx_osv_affected_packages_lookup",
+        "idx_osv_aliases_alias",
+        "idx_osv_ranges_package",
+        "idx_osv_range_events_range",
+        "idx_identifier_edges_to",
+        "idx_identifier_edges_from",
     ] {
         let found: Option<String> =
             sqlx::query_scalar("SELECT name FROM sqlite_master WHERE name = ? LIMIT 1")
@@ -308,31 +353,75 @@ pub(crate) async fn check_required_schema(
             "unsupported schema version {schema_version:?}; database rebuild required"
         )));
     }
+    for (table, columns, pragma) in [
+        (
+            "cve",
+            &[
+                "id",
+                "cve_id",
+                "state",
+                "published_at",
+                "updated_at",
+                "serial",
+                "title",
+                "description_en",
+                "reference_text",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('cve')",
+        ),
+        (
+            "cve_summary_index",
+            &[
+                "cve_db_id",
+                "cve_id",
+                "state",
+                "published_at",
+                "updated_at",
+                "title",
+                "description_en",
+                "max_cvss_score",
+                "max_cvss_severity",
+                "cwe_ids",
+                "affected_text",
+                "vendor_text",
+                "product_text",
+                "reference_text",
+            ][..],
+            "SELECT name FROM pragma_table_info('cve_summary_index')",
+        ),
+        (
+            "osv_advisories",
+            &[
+                "osv_id",
+                "schema_version",
+                "published_at",
+                "modified_at",
+                "withdrawn_at",
+                "summary",
+                "details",
+                "raw_record_id",
+            ][..],
+            "SELECT name FROM pragma_table_info('osv_advisories')",
+        ),
+    ] {
+        let actual: Vec<String> = sqlx::query_scalar(pragma)
+            .fetch_all(&mut *connection)
+            .await?;
+        for column in columns {
+            if !actual.iter().any(|actual| actual == column) {
+                return Err(sqlx::Error::Protocol(format!(
+                    "required column is missing: {table}.{column}; database rebuild required"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
-/// Validates SQLite storage and referential integrity on one physical connection.
-pub(crate) async fn check_sqlite_integrity(
+pub(crate) async fn check_foreign_keys_enabled(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
-    let row = sqlx::query("PRAGMA integrity_check")
-        .fetch_one(&mut *connection)
-        .await?;
-    let result: String = row.try_get(0)?;
-    if result != "ok" {
-        return Err(sqlx::Error::Protocol(format!(
-            "SQLite integrity_check failed: {result}"
-        )));
-    }
-    let violations = sqlx::query("PRAGMA foreign_key_check")
-        .fetch_all(&mut *connection)
-        .await?;
-    if !violations.is_empty() {
-        return Err(sqlx::Error::Protocol(format!(
-            "SQLite foreign_key_check found {} violation(s)",
-            violations.len()
-        )));
-    }
     let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
         .fetch_one(&mut *connection)
         .await?;
@@ -344,14 +433,62 @@ pub(crate) async fn check_sqlite_integrity(
     Ok(())
 }
 
-/// Checks an external-content FTS5 index against its content table.
-#[cfg(test)]
+pub(crate) async fn check_sqlite_quick(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    check_foreign_keys_enabled(connection).await?;
+    let result: String = sqlx::query_scalar("PRAGMA quick_check(1)")
+        .fetch_one(&mut *connection)
+        .await?;
+    if result != "ok" {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite quick_check failed: {result}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn check_sqlite_integrity(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let result: String = sqlx::query_scalar("PRAGMA integrity_check")
+        .fetch_one(&mut *connection)
+        .await?;
+    if result != "ok" {
+        return Err(sqlx::Error::Protocol(format!(
+            "SQLite integrity_check failed: {result}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn check_foreign_key_integrity(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let violation = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_optional(&mut *connection)
+        .await?;
+    if violation.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "SQLite foreign_key_check found a violation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks an FTS5 index using SQLite's native integrity command.
 pub(crate) async fn check_fts5_integrity(
     connection: &mut SqliteConnection,
     table: &str,
 ) -> Result<(), sqlx::Error> {
-    // FTS table names are internal constants, never user input.
     let integrity_sql = match table {
+        "cve_summary_fts" => {
+            "INSERT INTO cve_summary_fts(cve_summary_fts) VALUES('integrity-check')"
+        }
+        "cve_affected_summary_fts" => {
+            "INSERT INTO cve_affected_summary_fts(cve_affected_summary_fts) VALUES('integrity-check')"
+        }
+        "osv_text_fts" => "INSERT INTO osv_text_fts(osv_text_fts) VALUES('integrity-check')",
         "cve_search_fts" => {
             "INSERT INTO cve_search_fts(cve_search_fts, rank) VALUES('integrity-check', 1)"
         }
@@ -364,11 +501,182 @@ pub(crate) async fn check_fts5_integrity(
     Ok(())
 }
 
-/// Runs FTS5's integrity command and verifies stable external-content row correspondence.
-pub(crate) async fn check_search_integrity(
-    _connection: &mut SqliteConnection,
+async fn require_no_mismatch(
+    connection: &mut SqliteConnection,
+    label: &str,
+    query: &'static str,
 ) -> Result<(), sqlx::Error> {
+    if sqlx::query_scalar::<_, i64>(query)
+        .fetch_optional(&mut *connection)
+        .await?
+        .is_some()
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "search projection mismatch: {label}"
+        )));
+    }
     Ok(())
+}
+
+async fn check_projection_samples(
+    connection: &mut SqliteConnection,
+    label: &str,
+    expected_count_sql: &'static str,
+    actual_count_sql: &'static str,
+    expected_id_sql: &'static str,
+    actual_id_sql: &'static str,
+) -> Result<(), sqlx::Error> {
+    let expected: i64 = sqlx::query_scalar(expected_count_sql)
+        .fetch_one(&mut *connection)
+        .await?;
+    let actual: i64 = sqlx::query_scalar(actual_count_sql)
+        .fetch_one(&mut *connection)
+        .await?;
+    if expected != actual {
+        return Err(sqlx::Error::Protocol(format!(
+            "search projection mismatch: {label} row count (expected {expected}, found {actual})"
+        )));
+    }
+    if expected == 0 {
+        return Ok(());
+    }
+    let mut offsets = [0, expected / 2, expected - 1];
+    offsets.sort_unstable();
+    for (index, &offset) in offsets.iter().enumerate() {
+        if index > 0 && offsets[index - 1] == offset {
+            continue;
+        }
+        let expected_id: String = sqlx::query_scalar(expected_id_sql)
+            .bind(offset)
+            .fetch_one(&mut *connection)
+            .await?;
+        let actual_id: String = sqlx::query_scalar(actual_id_sql)
+            .bind(offset)
+            .fetch_one(&mut *connection)
+            .await?;
+        if expected_id != actual_id {
+            return Err(sqlx::Error::Protocol(format!(
+                "search projection mismatch: {label} sample at offset {offset}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Performs bounded correspondence checks suitable for routine health checks.
+pub(crate) async fn check_search_integrity(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    for (label, query) in [
+        (
+            "cve missing summary",
+            "SELECT 1 FROM cve c LEFT JOIN cve_summary_index s ON s.cve_db_id=c.id WHERE s.cve_db_id IS NULL LIMIT 1",
+        ),
+        (
+            "extra CVE summary",
+            "SELECT 1 FROM cve_summary_index s LEFT JOIN cve c ON c.id=s.cve_db_id WHERE c.id IS NULL LIMIT 1",
+        ),
+        (
+            "CVE summary missing CVSS projection",
+            "SELECT 1 FROM cve_summary_index s LEFT JOIN cve_cvss_search d ON d.cve_id=s.cve_id WHERE d.cve_id IS NULL LIMIT 1",
+        ),
+        (
+            "extra CVSS projection",
+            "SELECT 1 FROM cve_cvss_search d LEFT JOIN cve_summary_index s ON s.cve_id=d.cve_id WHERE s.cve_id IS NULL LIMIT 1",
+        ),
+        (
+            "CVE summary missing affected projection",
+            "SELECT 1 FROM cve_summary_index s LEFT JOIN cve_affected_search d ON d.cve_id=s.cve_id WHERE d.cve_id IS NULL LIMIT 1",
+        ),
+        (
+            "extra affected projection",
+            "SELECT 1 FROM cve_affected_search d LEFT JOIN cve_summary_index s ON s.cve_id=d.cve_id WHERE s.cve_id IS NULL LIMIT 1",
+        ),
+        (
+            "CWE link missing projection",
+            "SELECT 1 FROM cve_cwe x JOIN cve c ON c.id=x.cve_db_id LEFT JOIN cve_cwe_search d ON d.cve_id=c.cve_id AND d.cwe_id=x.cwe_id WHERE d.cve_id IS NULL LIMIT 1",
+        ),
+        (
+            "extra CWE projection",
+            "SELECT 1 FROM cve_cwe_search d LEFT JOIN cve c ON c.cve_id=d.cve_id LEFT JOIN cve_cwe x ON x.cve_db_id=c.id AND x.cwe_id=d.cwe_id WHERE x.cve_db_id IS NULL LIMIT 1",
+        ),
+    ] {
+        require_no_mismatch(connection, label, query).await?;
+    }
+    check_projection_samples(
+        connection,
+        "CVE summary FTS",
+        "SELECT COUNT(*) FROM cve_summary_index",
+        "SELECT COUNT(*) FROM cve_summary_fts",
+        "SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1 OFFSET ?",
+        "SELECT cve_id FROM cve_summary_fts ORDER BY rowid LIMIT 1 OFFSET ?",
+    )
+    .await?;
+    check_projection_samples(
+        connection,
+        "CVE affected FTS",
+        "SELECT COUNT(*) FROM cve_summary_index",
+        "SELECT COUNT(*) FROM cve_affected_summary_fts",
+        "SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1 OFFSET ?",
+        "SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid LIMIT 1 OFFSET ?",
+    )
+    .await?;
+    check_projection_samples(
+        connection,
+        "OSV text FTS",
+        "SELECT COUNT(*) FROM osv_advisories",
+        "SELECT COUNT(*) FROM osv_text_fts",
+        "SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1 OFFSET ?",
+        "SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1 OFFSET ?",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn check_complete_fts_correspondence(
+    connection: &mut SqliteConnection,
+    label: &str,
+    missing_sql: &'static str,
+    extra_sql: &'static str,
+) -> Result<(), sqlx::Error> {
+    require_no_mismatch(connection, &format!("{label} missing row"), missing_sql).await?;
+    require_no_mismatch(connection, &format!("{label} extra row"), extra_sql).await
+}
+
+pub(crate) async fn check_cve_search_full(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    check_fts5_integrity(connection, "cve_summary_fts").await?;
+    check_fts5_integrity(connection, "cve_affected_summary_fts").await?;
+    check_search_integrity(connection).await?;
+    check_complete_fts_correspondence(
+        connection,
+        "CVE summary FTS",
+        "SELECT cve_id FROM cve_summary_index EXCEPT SELECT cve_id FROM cve_summary_fts LIMIT 1",
+        "SELECT cve_id FROM cve_summary_fts EXCEPT SELECT cve_id FROM cve_summary_index LIMIT 1",
+    )
+    .await?;
+    check_complete_fts_correspondence(
+        connection,
+        "CVE affected FTS",
+        "SELECT cve_id FROM cve_summary_index EXCEPT SELECT cve_id FROM cve_affected_summary_fts LIMIT 1",
+        "SELECT cve_id FROM cve_affected_summary_fts EXCEPT SELECT cve_id FROM cve_summary_index LIMIT 1",
+    )
+    .await
+}
+
+pub(crate) async fn check_osv_search_full(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    check_fts5_integrity(connection, "osv_text_fts").await?;
+    check_search_integrity(connection).await?;
+    check_complete_fts_correspondence(
+        connection,
+        "OSV text FTS",
+        "SELECT osv_id FROM osv_advisories EXCEPT SELECT osv_id FROM osv_text_fts LIMIT 1",
+        "SELECT osv_id FROM osv_text_fts EXCEPT SELECT osv_id FROM osv_advisories LIMIT 1",
+    )
+    .await
 }
 
 #[cfg(test)]

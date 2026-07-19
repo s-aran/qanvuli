@@ -15,15 +15,19 @@ pub struct Args {
     file: Option<PathBuf>,
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
+    /// Filter CVEs by CVE publication time and OSV findings by OSV publication time.
     #[arg(long)]
     published_since: Option<String>,
+    /// Filter CVEs by CVE update time and OSV findings by OSV modification time.
     #[arg(long, alias = "since")]
     updated_since: Option<String>,
+    /// Limit final findings per package and source (CVE, OSV, and optional name matches).
     #[arg(long)]
     per_package_limit: Option<u64>,
     /// Maximum number of packages searched concurrently.
     #[arg(short = 'j', long, value_name = "N")]
     jobs: Option<usize>,
+    /// Include rejected linked CVEs; OSV advisories have no CVE rejection state.
     #[arg(long)]
     include_rejected: bool,
     /// Include unverified text-name matches. These never affect vulnerability counts.
@@ -251,26 +255,55 @@ async fn search_package(
             .await
             .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
         for finding in findings {
-            if finding.affected.status == "affected" {
-                for cve_id in &finding.cve_ids {
-                    let Some(cve) = db
-                        .find_cve_summary_with_detail_with_state_scope(cve_id, state_scope)
-                        .await
-                        .map_err(|err| format!("failed to load {cve_id}: {err}"))?
-                    else {
-                        continue;
-                    };
-                    cve_findings.push(SbomCveFinding {
+            let osv_dates = db
+                .osv_advisory_dates(&finding.primary_id)
+                .await
+                .map_err(|err| format!("failed to load {} dates: {err}", finding.primary_id))?;
+            let osv_matches_dates = osv_dates.as_ref().is_some_and(|(published, modified)| {
+                matches_since(published.as_deref(), date_filter.published_since.as_deref())
+                    && matches_since(modified.as_deref(), date_filter.updated_since.as_deref())
+            });
+            if finding.affected.status != "affected" {
+                if osv_matches_dates {
+                    unresolved_versions.push(UnresolvedVersion {
                         package: package.name.clone(),
-                        version: package_ref.version.clone(),
-                        matched_component: package_ref.name.clone(),
-                        matched_purl: Some(package_ref.purl.clone()),
-                        version_match: CveVersionMatch::OsvRangeMatched,
-                        cve: cve.summary,
+                        version: version.to_owned(),
+                        matched_purl: package_ref.purl.clone(),
+                        reason: format!(
+                            "advisory {} found but version evaluation returned {}",
+                            finding.primary_id, finding.affected.status
+                        ),
                     });
                 }
+                continue;
             }
-            if finding.affected.status == "affected" {
+            for cve_id in &finding.cve_ids {
+                let Some(cve) = db
+                    .find_cve_summary_with_detail_with_state_scope(cve_id, state_scope)
+                    .await
+                    .map_err(|err| format!("failed to load {cve_id}: {err}"))?
+                else {
+                    continue;
+                };
+                if !matches_since(
+                    Some(&cve.summary.published_at),
+                    date_filter.published_since.as_deref(),
+                ) || !matches_since(
+                    Some(&cve.summary.updated_at),
+                    date_filter.updated_since.as_deref(),
+                ) {
+                    continue;
+                }
+                cve_findings.push(SbomCveFinding {
+                    package: package.name.clone(),
+                    version: package_ref.version.clone(),
+                    matched_component: package_ref.name.clone(),
+                    matched_purl: Some(package_ref.purl.clone()),
+                    version_match: CveVersionMatch::OsvRangeMatched,
+                    cve: cve.summary,
+                });
+            }
+            if osv_matches_dates {
                 osv_findings.push(SbomOsvFinding {
                     package: package.name.clone(),
                     version: package_ref.version.clone(),
@@ -281,6 +314,11 @@ async fn search_package(
         }
     }
 
+    let limit = usize::try_from(per_package_limit).unwrap_or(usize::MAX);
+    cve_findings.truncate(limit);
+    osv_findings.truncate(limit);
+    unverified_name_matches.truncate(limit);
+
     Ok(PackageSearchResult {
         package_name: package.name.clone(),
         cve_findings,
@@ -288,6 +326,10 @@ async fn search_package(
         unverified_name_matches,
         unresolved_versions,
     })
+}
+
+fn matches_since(value: Option<&str>, since: Option<&str>) -> bool {
+    since.is_none_or(|since| value.is_some_and(|value| value >= since))
 }
 
 /// Builds an unambiguous key that keeps findings for distinct package versions separate.
@@ -631,6 +673,23 @@ mod tests {
     }
 
     #[test]
+    fn maps_every_advertised_purl_ecosystem() {
+        for (purl_type, ecosystem) in [
+            ("cargo", "crates.io"),
+            ("gem", "RubyGems"),
+            ("github", "GitHub Actions"),
+            ("golang", "Go"),
+            ("maven", "Maven"),
+            ("npm", "npm"),
+            ("nuget", "NuGet"),
+            ("pypi", "PyPI"),
+            ("pub", "Pub"),
+        ] {
+            assert_eq!(osv_ecosystem_from_purl_type(purl_type), Some(ecosystem));
+        }
+    }
+
+    #[test]
     fn decodes_percent_encoded_utf8_purl_names() {
         assert_eq!(
             package_ref_from_purl("pkg:npm/%E3%81%82@1.2.3", None)
@@ -647,6 +706,71 @@ mod tests {
         assert!(is_concrete_version("7.25.9"));
         assert!(!is_concrete_version(">= 2.2.1,< 3"));
         assert!(!is_concrete_version(">= 0.9.1"));
+    }
+
+    #[test]
+    fn source_dates_are_filtered_inclusive_of_the_boundary() {
+        assert!(matches_since(
+            Some("2026-01-02T00:00:00Z"),
+            Some("2026-01-02T00:00:00Z")
+        ));
+        assert!(!matches_since(
+            Some("2026-01-01T00:00:00Z"),
+            Some("2026-01-02T00:00:00Z")
+        ));
+        assert!(!matches_since(None, Some("2026-01-02T00:00:00Z")));
+    }
+
+    #[tokio::test]
+    async fn verified_findings_honor_source_date_filters_and_final_limit() {
+        use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons_bulk_init(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-7001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"SBOM filter fixture"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-filter","published":"2099-01-01T00:00:00Z","modified":"2099-01-02T00:00:00Z","aliases":["CVE-2099-7001"],"affected":[{"package":{"ecosystem":"crates.io","name":"fixture"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        let package = SbomPackage {
+            name: "fixture".to_owned(),
+            version: Some("1.5.0".to_owned()),
+            external_refs: Vec::new(),
+            package_url: Some("pkg:cargo/fixture@1.5.0".to_owned()),
+        };
+        let included = search_package(
+            database.clone(),
+            package.clone(),
+            DateFilter::new(Some("2099-01-01T00:00:00Z"), Some("2099-01-02T00:00:00Z")).unwrap(),
+            CveStateScope::PublishedOnly,
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(included.cve_findings.len(), 1);
+        assert_eq!(included.osv_findings.len(), 1);
+
+        let excluded = search_package(
+            database,
+            package,
+            DateFilter::new(Some("2099-01-03T00:00:00Z"), None).unwrap(),
+            CveStateScope::PublishedOnly,
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(excluded.cve_findings.is_empty());
+        assert!(excluded.osv_findings.is_empty());
     }
 
     #[test]

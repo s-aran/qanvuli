@@ -437,6 +437,7 @@ impl SqlxDatabase {
                     primary_id: finding.osv_id,
                     cve_ids: finding.cve_ids,
                     aliases: Vec::new(),
+                    aliases_status: "not_queried".to_owned(),
                     package: PackageQuery {
                         ecosystem: ecosystem.to_owned(),
                         package: package.to_owned(),
@@ -445,9 +446,12 @@ impl SqlxDatabase {
                     },
                     affected: affected.clone(),
                     fixed_versions: Vec::new(),
+                    fixed_versions_status: "not_queried".to_owned(),
                     enrichment: FindingEnrichment {
                         kev: None,
+                        kev_status: "not_queried".to_owned(),
                         epss: None,
+                        epss_status: "not_queried".to_owned(),
                     },
                     priority_signals: PrioritySignals {
                         known_exploited: false,
@@ -456,8 +460,10 @@ impl SqlxDatabase {
                         affected_confidence: affected.confidence,
                         suggested_priority: "unknown".to_owned(),
                         reasons: Vec::new(),
+                        enrichment_status: "not_queried".to_owned(),
                     },
                     evidence: Vec::new(),
+                    evidence_status: "not_queried".to_owned(),
                 }
             })
             .collect())
@@ -494,6 +500,11 @@ impl SqlxDatabase {
     /// Verifies the required schema objects and version without scanning the full database.
     pub async fn check_schema(&self) -> Result<(), sqlx::Error> {
         self.writer.check_schema().await
+    }
+
+    /// Verifies schema shape/version without requiring derived search data to be healthy.
+    pub async fn check_required_schema(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_required_schema().await
     }
 
     /// Prepares a replacement database for devel-compatible full CVE bulk loading.
@@ -541,8 +552,27 @@ impl SqlxDatabase {
     }
 
     pub async fn check(&self) -> Result<(), sqlx::Error> {
-        self.writer.check_schema().await?;
+        self.writer.check_quick().await
+    }
+
+    /// Runs the expensive SQLite file-integrity stage used by `db check --full`.
+    pub async fn check_full_sqlite(&self) -> Result<(), sqlx::Error> {
         self.writer.check_integrity().await
+    }
+
+    /// Runs the complete foreign-key scan used by `db check --full`.
+    pub async fn check_full_foreign_keys(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_foreign_key_integrity().await
+    }
+
+    /// Runs native FTS and complete CVE projection checks.
+    pub async fn check_full_cve_search(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_cve_search_full().await
+    }
+
+    /// Runs native FTS and complete OSV projection checks.
+    pub async fn check_full_osv_search(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_osv_search_full().await
     }
 
     pub const fn schema_version() -> i64 {
@@ -1277,6 +1307,26 @@ impl SqlxDatabase {
                         .bind(osv_id)
                         .fetch_optional(connection)
                         .await
+                })
+            })
+            .await
+    }
+
+    /// Returns provider publication/modification timestamps for source-specific filtering.
+    pub async fn osv_advisory_dates(
+        &self,
+        osv_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, sqlx::Error> {
+        let osv_id = osv_id.to_owned();
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT published_at, modified_at FROM osv_advisories WHERE osv_id=?",
+                    )
+                    .bind(osv_id)
+                    .fetch_optional(connection)
+                    .await
                 })
             })
             .await
@@ -2339,18 +2389,38 @@ impl SqlxDatabase {
     /// Keeping KEV entries dependent on imported CVEs gives the foreign key a real ownership
     /// meaning and makes retrying feed imports idempotent.
     pub async fn import_kev_json(&self, raw_json: String) -> Result<usize, sqlx::Error> {
+        Ok(self.import_kev_json_with_status(raw_json, true).await?.0)
+    }
+
+    /// Imports KEV data and reports whether the snapshot changed.
+    pub async fn import_kev_json_with_status(
+        &self,
+        raw_json: String,
+        force: bool,
+    ) -> Result<(usize, bool), sqlx::Error> {
         let catalog = KevCatalog::parse_json(raw_json.as_bytes())
             .map_err(|error| sqlx::Error::Protocol(format!("invalid KEV JSON: {error}")))?;
         catalog
             .validate_schema_shape()
             .map_err(|error| sqlx::Error::Protocol(format!("invalid KEV catalog: {error}")))?;
         let count = catalog.vulnerabilities.len();
+        let hash = Md5::digest(raw_json.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         self.writer.with_connection(|connection| Box::pin(async move {
+            let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM kev_raw_records WHERE content_hash=? AND raw_json=?)")
+                .bind(&hash)
+                .bind(&raw_json)
+                .fetch_one(&mut *connection)
+                .await?;
+            if unchanged && !force {
+                return Ok(false);
+            }
             let mut transaction = connection.begin().await?;
             sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('KEV', 'CISA KEV', 'enrichment', 'known_exploited_vulnerabilities.json', 'json')")
                 .execute(&mut *transaction).await?;
             let now = chrono::Utc::now().to_rfc3339();
-            let hash = Md5::digest(raw_json.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
             sqlx::query("INSERT INTO kev_raw_records (record_id, source_path, provider_modified_at, score_date, fetched_at, content_hash, raw_json) VALUES (?, NULL, NULL, NULL, ?, ?, ?) ON CONFLICT(record_id) DO UPDATE SET fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_json=excluded.raw_json")
                 .bind(&catalog.catalog_version).bind(&now).bind(hash).bind(&raw_json)
                 .execute(&mut *transaction).await?;
@@ -2372,17 +2442,38 @@ impl SqlxDatabase {
                     .bind(entry.cve_id)
                     .execute(&mut *transaction).await?;
             }
-            transaction.commit().await
-        })).await?;
-        Ok(count)
+            transaction.commit().await?;
+            Ok(true)
+        })).await.map(|changed| (count, changed))
     }
 
     /// Imports one EPSS current CSV snapshot without exposing internal CVE IDs.
     pub async fn import_epss_csv(&self, csv: String) -> Result<usize, sqlx::Error> {
+        Ok(self.import_epss_csv_with_status(csv, true).await?.0)
+    }
+
+    /// Imports EPSS data and reports whether the snapshot changed.
+    pub async fn import_epss_csv_with_status(
+        &self,
+        csv: String,
+        force: bool,
+    ) -> Result<(usize, bool), sqlx::Error> {
         let parsed = EpssCurrentCsv::parse(&csv)
             .map_err(|error| sqlx::Error::Protocol(format!("invalid EPSS CSV: {error}")))?;
         let count = parsed.rows.len();
+        let hash = Md5::digest(csv.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         self.writer.with_connection(|connection| Box::pin(async move {
+            let unchanged: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM epss_raw_records WHERE content_hash=? AND raw_csv=?)")
+                .bind(&hash)
+                .bind(&csv)
+                .fetch_one(&mut *connection)
+                .await?;
+            if unchanged && !force {
+                return Ok(false);
+            }
             let mut transaction = connection.begin().await?;
             sqlx::query("CREATE TEMP TABLE IF NOT EXISTS epss_import_stage (cve_id TEXT PRIMARY KEY, epss REAL NOT NULL, percentile REAL NOT NULL, input_order INTEGER NOT NULL) WITHOUT ROWID")
                 .execute(&mut *transaction).await?;
@@ -2405,7 +2496,6 @@ impl SqlxDatabase {
             sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('EPSS', 'FIRST EPSS', 'enrichment', 'epss_scores-current.csv', 'csv')")
                 .execute(&mut *transaction).await?;
             let now = chrono::Utc::now().to_rfc3339();
-            let hash = Md5::digest(csv.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
             sqlx::query("INSERT INTO epss_raw_records (score_date, fetched_at, content_hash, raw_csv) VALUES (?, ?, ?, ?) ON CONFLICT(score_date) DO UPDATE SET fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_csv=excluded.raw_csv")
                 .bind(&parsed.score_date).bind(&now).bind(hash).bind(&csv).execute(&mut *transaction).await?;
             let raw_record_id: i64 = sqlx::query_scalar("SELECT id FROM epss_raw_records WHERE score_date=?")
@@ -2420,9 +2510,9 @@ impl SqlxDatabase {
                 .bind(&parsed.model_version)
                 .bind(&now)
                 .execute(&mut *transaction).await?;
-            transaction.commit().await
-        })).await?;
-        Ok(count)
+            transaction.commit().await?;
+            Ok(true)
+        })).await.map(|changed| (count, changed))
     }
 }
 
@@ -2534,7 +2624,168 @@ mod tests {
         database.check_schema().await.unwrap();
         database.rebuild_search().await.unwrap();
         database.check().await.unwrap();
+        database.check_full_sqlite().await.unwrap();
+        database.check_full_foreign_keys().await.unwrap();
+        database.check_full_cve_search().await.unwrap();
+        database.check_full_osv_search().await.unwrap();
         assert_eq!(SqlxDatabase::schema_version(), 7);
+    }
+
+    #[tokio::test]
+    async fn repeated_initialization_is_idempotent() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database.initialize().await.unwrap();
+        database.check().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialization_rejects_an_incompatible_existing_schema_without_stamping_it() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::raw_sql(
+                        "CREATE TABLE schema_meta(version INTEGER NOT NULL); INSERT INTO schema_meta VALUES(6); CREATE TABLE cve(id INTEGER PRIMARY KEY);",
+                    )
+                    .execute(connection)
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        assert!(database.initialize().await.is_err());
+        let version: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT version FROM schema_meta")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(version, 6);
+    }
+
+    #[tokio::test]
+    async fn quick_check_detects_disabled_foreign_keys() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA foreign_keys=OFF")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            database
+                .check()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_check_detects_and_rebuild_repairs_missing_fts_rows() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons_bulk_init(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-9901","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"integrity fixture"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        database.rebuild_search().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("DELETE FROM cve_summary_fts WHERE cve_id='CVE-2099-9901'")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(database.check().await.is_err());
+        database.rebuild_search().await.unwrap();
+        database.check().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_check_detects_extra_osv_fts_rows() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query(
+                        "INSERT INTO osv_text_fts(osv_id, summary) VALUES('OSV-EXTRA', 'extra')",
+                    )
+                    .execute(connection)
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(database.check().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn schema_check_detects_missing_required_index() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("DROP INDEX idx_cve_summary_state_published")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(database.check_schema().await.is_err());
+        assert!(database.initialize().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn current_version_does_not_hide_an_incompatible_table_shape() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("ALTER TABLE cve DROP COLUMN serial")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let error = database.check_schema().await.unwrap_err().to_string();
+        assert!(error.contains("cve.serial"));
+        assert!(database.initialize().await.is_err());
     }
 
     #[tokio::test]
@@ -3548,6 +3799,14 @@ mod tests {
             .import_epss_csv(include_str!("../../../fixtures/epss/epss-test.csv").to_owned())
             .await
             .unwrap();
+        let (_, changed) = database
+            .import_epss_csv_with_status(
+                include_str!("../../../fixtures/epss/epss-test.csv").to_owned(),
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!changed);
         let count: i64 = database
             .writer
             .with_connection(|connection| {
@@ -3787,7 +4046,13 @@ mod tests {
         database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE"}}}"#.to_owned()).await.unwrap();
         let fixture = include_str!("../../../fixtures/kev/kev-test.json").to_owned();
         assert_eq!(database.import_kev_json(fixture.clone()).await.unwrap(), 1);
-        assert_eq!(database.import_kev_json(fixture).await.unwrap(), 1);
+        assert_eq!(
+            database
+                .import_kev_json_with_status(fixture, false)
+                .await
+                .unwrap(),
+            (1, false)
+        );
         let row: (String, String) = database.writer.with_connection(|connection| Box::pin(async move {
             sqlx::query_as("SELECT kev_entries.cve_id, cve.cve_id FROM kev_entries JOIN cve ON cve.cve_id = kev_entries.cve_id")
                 .fetch_one(connection).await

@@ -24,11 +24,10 @@ It imports CVE JSON archives into a local SQLite database, applies delta updates
 - Network access for downloading CVE/CWE archives during initialization and updates.
 - SQLite database path or connection URL.
 
-By default, qanvuli stores and opens `db.sqlite` in the directory containing the
-`qanvuli` executable. For example, a Cargo-installed binary uses:
+By default, qanvuli stores and opens `db.sqlite` in the current working directory:
 
 ```bash
-~/.cargo/bin/db.sqlite
+sqlite://./db.sqlite?mode=rwc
 ```
 
 You can override it with `--db-url` or `QANVULI_DB_URL`.
@@ -117,6 +116,7 @@ Verify database storage and rebuild derived search indexes:
 
 ```bash
 cargo run -- db check
+cargo run -- db check --full
 cargo run -- db rebuild-search
 ```
 
@@ -129,9 +129,14 @@ check leaves the previous file untouched.
 
 The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
 foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each
-such physical connection. `db check` runs SQLite integrity and foreign-key checks plus FTS5 and
-search-content validation; `db rebuild-search` rebuilds the derived CVE and OSV FTS structures
-with stable integer content rowids.
+such physical connection. `db check` is a bounded routine check using `quick_check(1)`, schema
+shape validation, and identifier-based search correspondence checks. `db check --full` additionally
+runs the potentially long SQLite integrity, foreign-key, and native FTS scans, reporting each stage
+and elapsed time on stderr while keeping JSON on stdout. `db rebuild-search` rebuilds and directly
+verifies the derived CVE and OSV search structures without running the full SQLite scan.
+
+Existing incompatible schemas are never stamped as current or patched in place; run `init --rebuild`
+to replace them safely.
 
 Normalized CVE affected-product rows retain provider version conditions (`version`, `status`,
 `versionType`, `lessThan`, and `lessThanOrEqual`) under integer foreign keys, while the original
@@ -222,6 +227,16 @@ SBOM results distinguish confirmed findings from name-only candidates. A package
 `vulnerable` only when range/version evaluation confirms it is affected; candidates remain
 explicitly reviewable and do not make the package definitely vulnerable.
 
+PURL lookup recognizes Cargo, RubyGems, GitHub Actions, Go, Maven, npm, NuGet, PyPI, and Pub.
+Range comparison currently supports only Cargo/crates.io SemVer. Exact versions listed directly
+by OSV are supported for every recognized ecosystem. Other ranges are reported under
+`unresolved_versions` as `unsupported_version_scheme`; they are never treated as not affected.
+`--published-since` and `--updated-since` use CVE timestamps for linked CVE findings and OSV
+provider timestamps for OSV findings. `--per-package-limit` limits each final source class
+independently. `--include-rejected` applies to linked CVEs because OSV has no CVE rejection state.
+Package findings include explicit `*_status` fields for aliases, fixed versions, KEV, EPSS,
+priority, and evidence. A placeholder value is reported as `not_queried`, not as source absence.
+
 ## Workspace Layout
 
 - `app/`: CLI entrypoint and user-facing application crates.
@@ -238,13 +253,13 @@ explicitly reviewable and do not make the package definitely vulnerable.
 Format the workspace:
 
 ```bash
-cargo fmt
+cargo fmt --all -- --check
 ```
 
 Check the main app:
 
 ```bash
-cargo check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Run focused crate checks:
@@ -257,5 +272,5 @@ cargo check -p qanvuli-app-mcp
 Run tests:
 
 ```bash
-cargo test
+cargo test --workspace --all-features
 ```

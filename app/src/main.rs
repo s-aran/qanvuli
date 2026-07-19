@@ -67,7 +67,12 @@ fn run() -> Result<(), String> {
 struct Cli {
     #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     version: bool,
-    #[arg(long = "db-url", global = true, value_name = "URL")]
+    #[arg(
+        long = "db-url",
+        global = true,
+        value_name = "URL",
+        help = "Database URL (default: ./db.sqlite in the current working directory)"
+    )]
     db_url: Option<String>,
     #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     pretty: bool,

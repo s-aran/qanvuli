@@ -4,9 +4,11 @@
 //! instead of relying on a pooled connection whose connection-scoped PRAGMAs may differ.
 
 use super::maintenance::{
-    check_required_schema, check_search_integrity, check_sqlite_integrity, finish_cve_bulk_load,
-    finish_cve_bulk_load_with_index_signal, finish_osv_bulk_load, prepare_cve_bulk_load,
-    prepare_osv_bulk_load, rebuild_cve_search, rebuild_osv_search, rebuild_search,
+    check_cve_search_full, check_foreign_key_integrity, check_osv_search_full,
+    check_required_schema, check_search_integrity, check_sqlite_integrity, check_sqlite_quick,
+    finish_cve_bulk_load, finish_cve_bulk_load_with_index_signal, finish_osv_bulk_load,
+    prepare_cve_bulk_load, prepare_osv_bulk_load, rebuild_cve_search, rebuild_osv_search,
+    rebuild_search,
 };
 use super::schema;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
@@ -65,6 +67,28 @@ impl SqliteWriter {
         check_sqlite_integrity(&mut connection).await
     }
 
+    pub(crate) async fn check_quick(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_required_schema(&mut connection).await?;
+        check_sqlite_quick(&mut connection).await?;
+        check_search_integrity(&mut connection).await
+    }
+
+    pub(crate) async fn check_foreign_key_integrity(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_foreign_key_integrity(&mut connection).await
+    }
+
+    pub(crate) async fn check_cve_search_full(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_cve_search_full(&mut connection).await
+    }
+
+    pub(crate) async fn check_osv_search_full(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_osv_search_full(&mut connection).await
+    }
+
     pub(crate) async fn initialize_schema(&self) -> Result<(), sqlx::Error> {
         let mut connection = self.connection.lock().await;
         schema::initialize(&mut connection).await
@@ -117,6 +141,11 @@ impl SqliteWriter {
         let mut connection = self.connection.lock().await;
         check_required_schema(&mut connection).await?;
         check_search_integrity(&mut connection).await
+    }
+
+    pub(crate) async fn check_required_schema(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_required_schema(&mut connection).await
     }
 }
 

@@ -159,7 +159,7 @@ async fn run_with_progress(
         }
         sync_cwe_catalog_sqlx(db_for_build.clone()).await?;
         import_downloaded_osv_selection(db_for_build.clone(), osv_download_result?).await?;
-        sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init").await?;
+        sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init", false).await?;
         db_for_build
             .check_schema()
             .await

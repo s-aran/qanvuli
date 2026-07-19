@@ -51,6 +51,7 @@ Examples:
 const INGEST_CHUNK_SIZE: usize = 20_000;
 const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
 const OSV_IMPORT_PIPELINE_CAPACITY: usize = 1;
+const OSV_IMPORT_HEARTBEAT: Duration = Duration::from_secs(10);
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
@@ -340,23 +341,36 @@ fn is_empty_osv_database_dir(database_dir: &str) -> bool {
 }
 
 /// Synchronizes KEV and EPSS snapshots through the SQLx-only schema.
-pub async fn sync_kev_epss_snapshots_sqlx(db: SqlxDatabase, label: &str) -> Result<(), String> {
+pub async fn sync_kev_epss_snapshots_sqlx(
+    db: SqlxDatabase,
+    label: &str,
+    cve_changed: bool,
+) -> Result<bool, String> {
     let label = label.to_owned();
     let kev = download_kev_json()
         .await
         .map_err(|error| format!("{label}: failed to download CISA KEV: {error}"))?;
-    db.import_kev_json(kev)
+    let (_, kev_changed) = db
+        .import_kev_json_with_status(kev, cve_changed)
         .await
         .map_err(|error| format!("{label}: failed to import CISA KEV: {error}"))?;
     let epss = download_epss_current_csv()
         .await
         .map_err(|error| format!("{label}: failed to download FIRST EPSS: {error}"))?;
-    db.import_epss_csv(epss)
+    let (_, epss_changed) = db
+        .import_epss_csv_with_status(epss, cve_changed)
         .await
         .map_err(|error| format!("{label}: failed to import FIRST EPSS: {error}"))?;
     db.check_schema()
         .await
-        .map_err(|error| format!("{label}: enrichment database check failed: {error}"))
+        .map_err(|error| format!("{label}: enrichment database check failed: {error}"))?;
+    if !kev_changed {
+        eprintln!("{label}: CISA KEV unchanged; database write skipped");
+    }
+    if !epss_changed {
+        eprintln!("{label}: FIRST EPSS unchanged; database write skipped");
+    }
+    Ok(kev_changed || epss_changed)
 }
 
 pub(crate) struct DownloadedOsvSelection {
@@ -491,6 +505,11 @@ pub(crate) async fn import_downloaded_osv_selection(
 ) -> Result<usize, String> {
     let queued_elapsed = download.ready_at.elapsed();
     let import_started = Instant::now();
+    eprintln!(
+        "{}: starting OSV database import ({} ZIPs; queued for {queued_elapsed:?})",
+        download.label,
+        download.zip_paths.len()
+    );
     let result = import_osv_zip_files_sqlx_with_mode(
         db.clone(),
         &download.zip_paths,
@@ -570,10 +589,18 @@ async fn import_osv_zip_files_sqlx_with_mode(
     }
     let mut imported = 0usize;
     let mut changed = 0usize;
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
     let mut unchanged = 0usize;
     let mut import_error = None;
     let mut seen_osv_ids = AHashSet::new();
-    for path in paths {
+    for (path_index, path) in paths.iter().enumerate() {
+        eprintln!(
+            "osv: reading ZIP [{}/{}] {}",
+            path_index + 1,
+            paths.len(),
+            path.display()
+        );
         // One queued batch overlaps ZIP reading with SQLite writes without retaining several
         // batches of raw and parsed advisory JSON at once.
         let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
@@ -599,23 +626,42 @@ async fn import_osv_zip_files_sqlx_with_mode(
                 }
             };
             let batch_started = Instant::now();
-            let import_result = if bulk_load {
-                db.import_osv_records_bulk_init(batch.records)
-                    .await
-                    .map(|examined| qanvuli_core::database::OsvImportStats {
-                        examined,
-                        inserted: examined,
-                        updated: 0,
-                        unchanged: 0,
-                    })
-            } else {
-                db.import_osv_records_deferred_search_with_stats(batch.records)
-                    .await
+            let batch_size = batch.records.len();
+            let import_future = async {
+                if bulk_load {
+                    db.import_osv_records_bulk_init(batch.records)
+                        .await
+                        .map(|examined| qanvuli_core::database::OsvImportStats {
+                            examined,
+                            inserted: examined,
+                            updated: 0,
+                            unchanged: 0,
+                        })
+                } else {
+                    db.import_osv_records_deferred_search_with_stats(batch.records)
+                        .await
+                }
+            };
+            tokio::pin!(import_future);
+            let mut heartbeat = tokio::time::interval(OSV_IMPORT_HEARTBEAT);
+            heartbeat.tick().await;
+            let import_result = loop {
+                tokio::select! {
+                    result = &mut import_future => break result,
+                    _ = heartbeat.tick() => {
+                        eprintln!(
+                            "osv: importing batch of {batch_size} records; elapsed {:?}...",
+                            batch_started.elapsed()
+                        );
+                    }
+                }
             };
             match import_result {
                 Ok(stats) => {
                     imported += stats.examined;
                     changed += stats.changed();
+                    inserted += stats.inserted;
+                    updated += stats.updated;
                     unchanged += stats.unchanged;
                     let batch_elapsed = batch_started.elapsed();
                     let records_per_second = stats.examined as f64 / batch_elapsed.as_secs_f64();
@@ -625,7 +671,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
                         "incremental"
                     };
                     eprintln!(
-                        "osv: mode={mode}, examined={imported}, changed={changed}, unchanged={unchanged} (batch={} in {:?}, {:.0} records/s)",
+                        "osv: mode={mode}, examined={imported}, inserted={inserted}, updated={updated}, unchanged={unchanged} (batch={} in {:?}, {:.0} records/s)",
                         stats.examined, batch_elapsed, records_per_second,
                     );
                 }
@@ -664,6 +710,13 @@ async fn import_osv_zip_files_sqlx_with_mode(
             db.rebuild_osv_search()
                 .await
                 .map_err(|error| format!("failed to rebuild OSV FTS: {error}"))?;
+        } else if db.check_schema().await.is_err() {
+            eprintln!(
+                "osv: unchanged records found an incomplete search projection; rebuilding it"
+            );
+            db.rebuild_osv_search()
+                .await
+                .map_err(|error| format!("failed to repair OSV FTS: {error}"))?;
         } else {
             eprintln!(
                 "osv: all {unchanged} examined records were unchanged; search rebuild skipped"
@@ -1270,6 +1323,7 @@ pub async fn apply_delta_updates(
             .await
             .map_err(|error| format!("failed to rebuild CVE search data: {error}"))
     } else {
+        eprintln!("update: CVE data unchanged; search rebuild skipped");
         Ok(())
     };
     if let Err(error) = apply_result.and(rebuild_result) {
@@ -1304,7 +1358,9 @@ pub async fn sync_all_enrichment_sources_after_update(
     let selection =
         requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
     sync_osv_selection_from_gcs_sqlx(db.clone(), label, selection).await?;
-    sync_kev_epss_snapshots_sqlx(db.clone(), label).await
+    sync_kev_epss_snapshots_sqlx(db.clone(), label, true)
+        .await
+        .map(|_| ())
 }
 
 /// Imports raw CVE JSON into the SQLx schema.
@@ -1523,12 +1579,11 @@ mod tests {
     }
 
     #[test]
-    fn default_database_is_beside_executable() {
+    fn default_database_is_in_current_working_directory() {
         let db_url = default_db_connection_string().unwrap();
         let db_path = database::sqlite_file_path(&db_url).unwrap();
-        let executable = std::env::current_exe().unwrap();
 
-        assert_eq!(db_path, executable.parent().unwrap().join("db.sqlite"));
+        assert_eq!(db_path, std::env::current_dir().unwrap().join("db.sqlite"));
     }
 
     #[test]

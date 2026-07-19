@@ -97,7 +97,7 @@ mod tests {
             "affected"
         );
         assert_eq!(
-            evaluate_version("crates.io", "2.0.0", &[range]).status,
+            evaluate_version("crates.io", "2.0.0", std::slice::from_ref(&range)).status,
             "not_affected"
         );
         let inclusive = OsvRange {
@@ -123,5 +123,20 @@ mod tests {
             evaluate_version("npm", "1.5.0", &[]).status,
             "unsupported_version_scheme"
         );
+        for ecosystem in [
+            "RubyGems",
+            "GitHub Actions",
+            "Go",
+            "Maven",
+            "npm",
+            "NuGet",
+            "PyPI",
+            "Pub",
+        ] {
+            assert_eq!(
+                evaluate_version(ecosystem, "1.5.0", std::slice::from_ref(&range)).status,
+                "unsupported_version_scheme"
+            );
+        }
     }
 }

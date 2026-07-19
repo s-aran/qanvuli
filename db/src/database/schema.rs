@@ -1,6 +1,6 @@
 //! SQLx schema preserving devel's canonical table layout.
 
-use sqlx::SqliteConnection;
+use sqlx::{Connection, SqliteConnection};
 
 pub(crate) const SCHEMA_VERSION: i64 = 7;
 
@@ -17,11 +17,22 @@ pub(crate) async fn restore_cve_search_sync(
 }
 
 pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let existing_objects: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
+            .fetch_one(&mut *connection)
+            .await?;
+    if existing_objects != 0 {
+        // Rebuild-only policy: never fill gaps in, or certify, an existing schema.
+        // A current database must already pass the same quick shape checks used at startup.
+        super::maintenance::check_required_schema(connection).await?;
+        return Ok(());
+    }
+
+    let mut transaction = connection.begin().await?;
     sqlx::raw_sql(
         r#"
         PRAGMA foreign_keys = ON;
         CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL);
-        INSERT OR REPLACE INTO schema_meta(rowid, version) VALUES(1, 7);
 
         CREATE TABLE IF NOT EXISTS cve (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -272,9 +283,12 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json'),
             ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
             ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv');
+
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 7);
         "#,
     )
-    .execute(connection)
+    .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
     Ok(())
 }

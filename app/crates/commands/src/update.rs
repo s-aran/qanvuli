@@ -99,6 +99,7 @@ async fn run_with_progress(
     if sqlx_db.check_schema().await.is_ok() {
         eprintln!("update: applying CVE delta archives");
         let applied_paths = apply_delta_updates(&sqlx_db, None, args.max_chunks).await?;
+        let cve_changed = !applied_paths.is_empty();
         sync_cwe_catalog_sqlx(sqlx_db.clone()).await?;
         let saved_selection = sqlx_db
             .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
@@ -111,7 +112,7 @@ async fn run_with_progress(
             selection.merged_with(&additions)
         });
         sync_osv_selection_from_gcs_sqlx(sqlx_db.clone(), "update", selection).await?;
-        sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update").await?;
+        sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update", cve_changed).await?;
         sqlx_db
             .check_schema()
             .await

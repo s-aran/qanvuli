@@ -40,15 +40,12 @@ pub fn redact_database_url(db_url: &str) -> String {
     url.to_string()
 }
 
-/// Builds the default SQLite URL beside the `qanvuli` executable.
+/// Builds the default SQLite URL in the process current working directory.
 pub fn default_db_connection_string() -> Result<String, String> {
-    let executable = std::env::current_exe()
-        .map_err(|err| format!("failed to locate qanvuli executable: {err}"))?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| format!("qanvuli executable has no parent: {}", executable.display()))?;
+    let directory = std::env::current_dir()
+        .map_err(|err| format!("failed to resolve current working directory: {err}"))?;
     let file_url = Url::from_file_path(directory.join("db.sqlite"))
-        .map_err(|_| "failed to create DB URL beside qanvuli executable".to_owned())?;
+        .map_err(|_| "failed to create DB URL in current working directory".to_owned())?;
     let path = file_url
         .as_str()
         .strip_prefix("file:")

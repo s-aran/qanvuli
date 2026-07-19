@@ -176,12 +176,15 @@ pub struct EnrichedFinding {
     pub primary_id: String,
     pub cve_ids: Vec<String>,
     pub aliases: Vec<String>,
+    pub aliases_status: String,
     pub package: PackageQuery,
     pub affected: AffectedStatus,
     pub fixed_versions: Vec<String>,
+    pub fixed_versions_status: String,
     pub enrichment: FindingEnrichment,
     pub priority_signals: PrioritySignals,
     pub evidence: Vec<Evidence>,
+    pub evidence_status: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -195,7 +198,9 @@ pub struct AffectedStatus {
 /// Risk enrichment attached to a package finding.
 pub struct FindingEnrichment {
     pub kev: Option<KevInfo>,
+    pub kev_status: String,
     pub epss: Option<EpssInfo>,
+    pub epss_status: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,4 +212,5 @@ pub struct PrioritySignals {
     pub affected_confidence: String,
     pub suggested_priority: String,
     pub reasons: Vec<String>,
+    pub enrichment_status: String,
 }
