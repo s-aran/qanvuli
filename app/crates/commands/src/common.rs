@@ -317,7 +317,7 @@ pub async fn sync_kev_epss_snapshots_sqlx(db: SqlxDatabase, label: &str) -> Resu
     db.import_epss_csv(epss)
         .await
         .map_err(|error| format!("{label}: failed to import FIRST EPSS: {error}"))?;
-    db.check()
+    db.check_schema()
         .await
         .map_err(|error| format!("{label}: enrichment database check failed: {error}"))
 }
@@ -515,7 +515,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
                 .await
                 .map_err(|error| format!("failed to rebuild OSV FTS: {error}"))?;
         }
-        db.check()
+        db.check_schema()
             .await
             .map_err(|error| format!("failed OSV database check: {error}"))?;
         db.complete_osv_sync(&completion_cursor)
@@ -1155,7 +1155,7 @@ async fn ingest_zip_sqlx_with_mode(
         "{label}: rebuilt search indexes in {:?}",
         fts_started.elapsed()
     );
-    db.check()
+    db.check_schema()
         .await
         .map_err(|error| format!("{label}: database integrity check failed: {error}"))?;
     Ok(imported)

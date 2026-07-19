@@ -19,12 +19,16 @@ pub(crate) async fn prepare_cve_bulk_load(
         DROP INDEX IF EXISTS idx_cve_updated_at;
         DROP INDEX IF EXISTS idx_cve_published_at_cve_id;
         DROP INDEX IF EXISTS idx_cve_updated_at_cve_id;
-        DROP INDEX IF EXISTS idx_cve_reference_text;
         DROP INDEX IF EXISTS idx_cve_cvss_cve_db_id;
         DROP INDEX IF EXISTS idx_cve_cvss_severity_score;
         DROP INDEX IF EXISTS idx_cve_affected_cve_db_id;
         DROP INDEX IF EXISTS idx_cve_affected_vendor_product_cve_db_id;
         DROP INDEX IF EXISTS idx_cve_cwe_cwe_id_cve_db_id;
+        DROP INDEX IF EXISTS idx_cve_summary_state_published;
+        DROP INDEX IF EXISTS idx_cve_summary_updated;
+        DROP INDEX IF EXISTS idx_cve_cwe_search_sort;
+        DROP INDEX IF EXISTS idx_cve_cvss_search_score;
+        DROP INDEX IF EXISTS idx_cve_affected_search_sort;
         "#,
     )
     .execute(&mut *connection)
@@ -42,7 +46,6 @@ pub(crate) async fn finish_cve_bulk_load(
         CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve(updated_at);
         CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve(published_at, cve_id);
         CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve(updated_at, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_reference_text ON cve(reference_text);
         CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss(cve_db_id);
         CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss(base_severity, base_score);
         CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected(cve_db_id);
@@ -52,6 +55,16 @@ pub(crate) async fn finish_cve_bulk_load(
     .execute(&mut *connection)
     .await?;
     rebuild_cve_search(connection).await?;
+    sqlx::raw_sql(r#"
+        CREATE INDEX IF NOT EXISTS idx_cve_summary_state_published ON cve_summary_index(state, published_at DESC, cve_id);
+        CREATE INDEX IF NOT EXISTS idx_cve_summary_updated ON cve_summary_index(updated_at DESC, cve_id);
+        CREATE INDEX IF NOT EXISTS idx_cve_cwe_search_sort ON cve_cwe_search(cwe_id, state, published_at DESC, cve_id);
+        CREATE INDEX IF NOT EXISTS idx_cve_cvss_search_score ON cve_cvss_search(state, max_cvss_score DESC, published_at DESC, cve_id);
+        CREATE INDEX IF NOT EXISTS idx_cve_affected_search_sort ON cve_affected_search(state, published_at DESC, cve_id);
+        DROP INDEX IF EXISTS idx_cve_reference_text;
+        "#)
+    .execute(&mut *connection)
+    .await?;
     sqlx::query("ANALYZE").execute(&mut *connection).await?;
     sqlx::query("PRAGMA optimize")
         .execute(&mut *connection)
@@ -176,8 +189,7 @@ pub(crate) async fn finish_osv_bulk_load(
 /// Rebuilds every SQLx-owned external-content FTS5 index on one writer connection.
 pub(crate) async fn rebuild_search(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     rebuild_cve_search(connection).await?;
-    rebuild_osv_search(connection).await?;
-    check_sqlite_integrity(connection).await
+    rebuild_osv_search(connection).await
 }
 
 /// Rebuilds only the OSV FTS projection after a deferred OSV ZIP import.
@@ -200,15 +212,33 @@ pub(crate) async fn rebuild_cve_search(
         r#"
         DELETE FROM cve_summary_index;
         INSERT INTO cve_summary_index(cve_db_id, cve_id, state, published_at, updated_at, title, description_en, max_cvss_score, max_cvss_severity, cwe_ids, affected_text, vendor_text, product_text, reference_text)
+        WITH
+        cvss_agg AS (
+            SELECT cve_db_id, MAX(base_score) AS max_score
+            FROM cve_cvss GROUP BY cve_db_id
+        ),
+        cwe_agg AS (
+            SELECT cve_db_id, group_concat('CWE-' || cwe_id, ' ') AS cwe_ids
+            FROM cve_cwe GROUP BY cve_db_id
+        ),
+        affected_agg AS (
+            SELECT cve_db_id,
+                   group_concat(COALESCE(vendor, '') || ' ' || COALESCE(product, '') || ' ' || COALESCE(package_name, '') || ' ' || version_text, ' ') AS affected_text,
+                   group_concat(COALESCE(vendor, ''), ' ') AS vendor_text,
+                   group_concat(COALESCE(product, '') || ' ' || COALESCE(package_name, ''), ' ') AS product_text
+            FROM cve_affected GROUP BY cve_db_id
+        )
         SELECT c.id, c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en,
-               (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id),
-               (SELECT base_severity FROM cve_cvss WHERE cve_db_id=c.id ORDER BY base_score DESC LIMIT 1),
-               COALESCE((SELECT group_concat('CWE-' || cwe_id, ' ') FROM cve_cwe WHERE cve_db_id=c.id), ''),
-               COALESCE((SELECT group_concat(COALESCE(vendor, '') || ' ' || COALESCE(product, '') || ' ' || COALESCE(package_name, '') || ' ' || version_text, ' ') FROM cve_affected WHERE cve_db_id=c.id), ''),
-               COALESCE((SELECT group_concat(COALESCE(vendor, ''), ' ') FROM cve_affected WHERE cve_db_id=c.id), ''),
-               COALESCE((SELECT group_concat(COALESCE(product, '') || ' ' || COALESCE(package_name, ''), ' ') FROM cve_affected WHERE cve_db_id=c.id), ''),
-               c.reference_text
-        FROM cve c;
+               cvss.max_score,
+               (SELECT base_severity FROM cve_cvss severity
+                WHERE severity.cve_db_id=c.id ORDER BY base_score DESC LIMIT 1),
+               COALESCE(cwe.cwe_ids, ''),
+               COALESCE(affected.affected_text, ''), COALESCE(affected.vendor_text, ''),
+               COALESCE(affected.product_text, ''), c.reference_text
+        FROM cve c
+        LEFT JOIN cvss_agg cvss ON cvss.cve_db_id=c.id
+        LEFT JOIN cwe_agg cwe ON cwe.cve_db_id=c.id
+        LEFT JOIN affected_agg affected ON affected.cve_db_id=c.id;
         DELETE FROM cve_summary_fts;
         INSERT INTO cve_summary_fts(cve_id, title, description_en, affected_text, reference_text)
         SELECT cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index;
@@ -218,7 +248,15 @@ pub(crate) async fn rebuild_cve_search(
         DELETE FROM cve_cwe_search;
         INSERT INTO cve_cwe_search SELECT link.cwe_id, c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve_cwe link JOIN cve c ON c.id=link.cve_db_id;
         DELETE FROM cve_cvss_search;
-        INSERT INTO cve_cvss_search SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en, MAX(v.base_score), (SELECT base_severity FROM cve_cvss WHERE cve_db_id=c.id ORDER BY base_score DESC LIMIT 1), COALESCE(group_concat(DISTINCT v.version), '') FROM cve c LEFT JOIN cve_cvss v ON v.cve_db_id=c.id GROUP BY c.id;
+        INSERT INTO cve_cvss_search
+        SELECT summary.cve_id, summary.state, summary.published_at, summary.updated_at,
+               summary.title, summary.description_en, summary.max_cvss_score,
+               summary.max_cvss_severity, COALESCE(versions.cvss_versions, '')
+        FROM cve_summary_index summary
+        LEFT JOIN (
+            SELECT cve_db_id, group_concat(DISTINCT version) AS cvss_versions
+            FROM cve_cvss GROUP BY cve_db_id
+        ) versions ON versions.cve_db_id=summary.cve_db_id;
         DELETE FROM cve_affected_search;
         INSERT INTO cve_affected_search SELECT cve_id, state, published_at, updated_at, title, description_en, vendor_text, product_text, affected_text FROM cve_summary_index;
         "#,

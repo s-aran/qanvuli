@@ -59,7 +59,7 @@ async fn run_with_progress(
     if let Some(zip) = args.zip {
         eprintln!("update: applying local SQLx delta {}", zip.display());
         let db = connect_sqlx_db(db_url).await?;
-        db.check()
+        db.check_schema()
             .await
             .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
         let imported = ingest_zip_sqlx(db.clone(), "update", &zip, args.max_chunks).await?;
@@ -71,7 +71,7 @@ async fn run_with_progress(
         )
         .await
         .map_err(|error| format!("failed to record local delta asset: {error}"))?;
-        db.check()
+        db.check_schema()
             .await
             .map_err(|error| format!("post-update database check failed: {error}"))?;
         db.close()
@@ -84,7 +84,7 @@ async fn run_with_progress(
         return Ok(());
     }
     let sqlx_db = connect_sqlx_db(db_url).await?;
-    if sqlx_db.check().await.is_ok() {
+    if sqlx_db.check_schema().await.is_ok() {
         eprintln!("update: refreshing SQLx database from the latest full CVE archive");
         let asset = download_latest_asset_with_source(super::common::ReleaseAssetKind::All).await?;
         ingest_zip_sqlx(sqlx_db.clone(), "update", &asset.path, args.max_chunks).await?;
@@ -117,7 +117,7 @@ async fn run_with_progress(
             .await
             .map_err(|error| format!("failed to record CVE asset: {error}"))?;
         sqlx_db
-            .check()
+            .check_schema()
             .await
             .map_err(|error| format!("post-update database check failed: {error}"))?;
         sqlx_db
@@ -129,7 +129,7 @@ async fn run_with_progress(
         }
         return Ok(());
     }
-    let error = sqlx_db.check().await.unwrap_err();
+    let error = sqlx_db.check_schema().await.unwrap_err();
     let _ = sqlx_db.close().await;
     Err(format!("database rebuild required before update: {error}"))
 }

@@ -47,7 +47,7 @@ async fn run_with_progress(
             db.initialize()
                 .await
                 .map_err(|error| format!("failed to initialize replacement schema: {error}"))?;
-            db.check()
+            db.check_schema()
                 .await
                 .map_err(|error| format!("failed to validate replacement schema: {error}"))?;
             db.close()
@@ -67,7 +67,7 @@ async fn run_with_progress(
         db.initialize()
             .await
             .map_err(|err| format!("failed to initialize SQLx schema: {err}"))?;
-        db.check()
+        db.check_schema()
             .await
             .map_err(|err| format!("failed to validate SQLx schema: {err}"))?;
         emit_init_progress(&progress, "-", "done");
@@ -124,7 +124,7 @@ async fn run_with_progress(
         sync_osv_selection_from_gcs_sqlx(db_for_build.clone(), "init", osv_selection).await?;
         sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init").await?;
         db_for_build
-            .check()
+            .check_schema()
             .await
             .map_err(|error| format!("replacement database integrity check failed: {error}"))
     }

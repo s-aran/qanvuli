@@ -105,7 +105,7 @@ impl Args {
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let date_filter = args.date_filter()?;
     let db = connect_sqlx_db(db_url).await?;
-    db.check()
+    db.check_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
     if let Some(cve_id) = args.cve_id.as_deref() {

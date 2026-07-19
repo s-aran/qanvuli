@@ -42,7 +42,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     match args.command {
         Command::Resolve(args) => {
             let db = connect_sqlx_db(db_url).await?;
-            db.check()
+            db.check_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
             let result = db
@@ -56,7 +56,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         }
         Command::EnrichedCve(args) => {
             let db = connect_sqlx_db(db_url).await?;
-            db.check()
+            db.check_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
             let summary = db
@@ -74,7 +74,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         }
         Command::Package(args) => {
             let db = connect_sqlx_db(db_url).await?;
-            db.check()
+            db.check_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
             let findings = db

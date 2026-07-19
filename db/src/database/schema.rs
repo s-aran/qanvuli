@@ -246,7 +246,6 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE INDEX IF NOT EXISTS idx_cve_updated_at ON cve(updated_at);
         CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve(published_at, cve_id);
         CREATE INDEX IF NOT EXISTS idx_cve_updated_at_cve_id ON cve(updated_at, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_reference_text ON cve(reference_text);
         CREATE INDEX IF NOT EXISTS idx_cve_cvss_cve_db_id ON cve_cvss(cve_db_id);
         CREATE INDEX IF NOT EXISTS idx_cve_cvss_severity_score ON cve_cvss(base_severity, base_score);
         CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected(cve_db_id);
