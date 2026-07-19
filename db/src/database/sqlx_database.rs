@@ -1678,7 +1678,7 @@ impl SqlxDatabase {
         } else {
             "INSERT INTO osv_raw_records (osv_id, source_path, provider_published_at, provider_modified_at, fetched_at, content_hash, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(osv_id) DO UPDATE SET source_path=excluded.source_path, provider_published_at=excluded.provider_published_at, provider_modified_at=excluded.provider_modified_at, fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_json=excluded.raw_json"
         };
-        sqlx::query(raw_record_sql)
+        let raw_record_result = sqlx::query(raw_record_sql)
             .bind(&advisory.id)
             .bind(&record.source_path)
             .bind(&record.published_at)
@@ -1688,11 +1688,14 @@ impl SqlxDatabase {
             .bind(&record.raw_json)
             .execute(&mut **transaction)
             .await?;
-        let raw_record_id: i64 =
+        let raw_record_id: i64 = if bulk_init {
+            raw_record_result.last_insert_rowid()
+        } else {
             sqlx::query_scalar("SELECT id FROM osv_raw_records WHERE osv_id=?")
                 .bind(&advisory.id)
                 .fetch_one(&mut **transaction)
-                .await?;
+                .await?
+        };
         let advisory_sql = if bulk_init {
             "INSERT INTO osv_advisories (osv_id, schema_version, published_at, modified_at, withdrawn_at, summary, details, raw_record_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         } else {
@@ -1778,17 +1781,20 @@ impl SqlxDatabase {
                 }
             }
         }
-        for reference in &advisory.references {
-            sqlx::query("INSERT OR IGNORE INTO osv_references(osv_id, reference_type, url) VALUES (?, ?, ?)")
-                .bind(&advisory.id)
-                .bind(&reference.reference_type)
-                .bind(&reference.url)
-                .execute(&mut **transaction)
-                .await?;
+        for references in advisory.references.chunks(250) {
+            let mut query = QueryBuilder::<Sqlite>::new(
+                "INSERT OR IGNORE INTO osv_references(osv_id, reference_type, url) ",
+            );
+            query.push_values(references, |mut row, reference| {
+                row.push_bind(&advisory.id)
+                    .push_bind(&reference.reference_type)
+                    .push_bind(&reference.url);
+            });
+            query.build().execute(&mut **transaction).await?;
         }
         for (affected_order, affected) in advisory.affected.iter().enumerate() {
             let package = affected.package.as_ref();
-            sqlx::query("INSERT INTO osv_affected_packages (osv_id, affected_order, ecosystem, package_name, purl) VALUES (?, ?, ?, ?, ?)")
+            let package_result = sqlx::query("INSERT INTO osv_affected_packages (osv_id, affected_order, ecosystem, package_name, purl) VALUES (?, ?, ?, ?, ?)")
                 .bind(&advisory.id)
                 .bind(i64::try_from(affected_order).unwrap_or(i64::MAX))
                 .bind(package.and_then(|value| value.ecosystem.as_deref()))
@@ -1796,40 +1802,45 @@ impl SqlxDatabase {
                 .bind(package.and_then(|value| value.purl.as_deref()))
                 .execute(&mut **transaction)
                 .await?;
-            let package_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
-                .fetch_one(&mut **transaction)
-                .await?;
+            let package_id = package_result.last_insert_rowid();
             for (range_order, range) in affected.ranges.iter().enumerate() {
-                sqlx::query("INSERT INTO osv_ranges (affected_package_id, affected_order, range_order, range_type) VALUES (?, ?, ?, ?)")
+                let range_result = sqlx::query("INSERT INTO osv_ranges (affected_package_id, affected_order, range_order, range_type) VALUES (?, ?, ?, ?)")
                     .bind(package_id)
                     .bind(i64::try_from(affected_order).unwrap_or(i64::MAX))
                     .bind(i64::try_from(range_order).unwrap_or(i64::MAX))
                     .bind(range.range_type.as_deref().unwrap_or("ECOSYSTEM"))
                     .execute(&mut **transaction)
                     .await?;
-                let range_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()")
-                    .fetch_one(&mut **transaction)
-                    .await?;
+                let range_id = range_result.last_insert_rowid();
+                let mut event_rows = Vec::new();
                 let mut event_order = 0_i64;
                 for event in &range.events {
                     for (kind, value) in event.event_pairs() {
-                        sqlx::query("INSERT INTO osv_range_events (range_id, event_type, value, event_order) VALUES (?, ?, ?, ?)")
-                            .bind(range_id)
-                            .bind(kind)
-                            .bind(value)
-                            .bind(event_order)
-                            .execute(&mut **transaction)
-                            .await?;
+                        event_rows.push((kind, value, event_order));
                         event_order += 1;
                     }
                 }
+                for events in event_rows.chunks(200) {
+                    let mut query = QueryBuilder::<Sqlite>::new(
+                        "INSERT INTO osv_range_events (range_id, event_type, value, event_order) ",
+                    );
+                    query.push_values(events, |mut row, (kind, value, order)| {
+                        row.push_bind(range_id)
+                            .push_bind(*kind)
+                            .push_bind(*value)
+                            .push_bind(*order);
+                    });
+                    query.build().execute(&mut **transaction).await?;
+                }
             }
-            for version in &affected.versions {
-                sqlx::query("INSERT OR IGNORE INTO osv_versions VALUES (?, ?)")
-                    .bind(package_id)
-                    .bind(version)
-                    .execute(&mut **transaction)
-                    .await?;
+            for versions in affected.versions.chunks(400) {
+                let mut query = QueryBuilder::<Sqlite>::new(
+                    "INSERT OR IGNORE INTO osv_versions (affected_package_id, version) ",
+                );
+                query.push_values(versions, |mut row, version| {
+                    row.push_bind(package_id).push_bind(version);
+                });
+                query.build().execute(&mut **transaction).await?;
             }
         }
         if update_search {
@@ -2719,8 +2730,8 @@ mod tests {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../collector/src/cwec_latest.xml.zip");
-        let catalog = qanvuli_models::cwe::read_cwe_catalog_zip(path).unwrap();
+            .join("../collector/src/cwec_v4.20.xml");
+        let catalog = qanvuli_models::cwe::read_cwe_catalog_xml(path).unwrap();
         let imported = database.upsert_cwe_catalog(&catalog).await.unwrap();
         assert!(imported > 1_000);
 
@@ -2827,6 +2838,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(advisory_count, 1);
+    }
+
+    #[tokio::test]
+    async fn osv_child_batches_cross_conservative_sqlite_bind_limits() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let versions = (0..1_001)
+            .map(|index| format!("1.0.{index}"))
+            .collect::<Vec<_>>();
+        let references = (0..301)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "WEB",
+                    "url": format!("https://example.invalid/{index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let events = (0..301)
+            .map(|index| serde_json::json!({"introduced": format!("1.0.{index}")}))
+            .collect::<Vec<_>>();
+        let raw_json = serde_json::json!({
+            "schema_version": "1.8.0",
+            "id": "OSV-2099-large-children",
+            "modified": "2099-01-01T00:00:00Z",
+            "references": references,
+            "affected": [{
+                "package": {"ecosystem": "Go", "name": "example.invalid/large"},
+                "ranges": [{"type": "SEMVER", "events": events}],
+                "versions": versions
+            }]
+        })
+        .to_string();
+        database.prepare_osv_bulk_load().await.unwrap();
+        database
+            .import_osv_records_bulk_init(vec![OsvRawRecord {
+                source_path: None,
+                raw_json,
+            }])
+            .await
+            .unwrap();
+        database.finish_osv_bulk_load().await.unwrap();
+        let counts: (i64, i64, i64) = database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query_as("SELECT (SELECT COUNT(*) FROM osv_references), (SELECT COUNT(*) FROM osv_range_events), (SELECT COUNT(*) FROM osv_versions)")
+                .fetch_one(connection).await
+        })).await.unwrap();
+        assert_eq!(counts, (301, 301, 1_001));
     }
 
     #[tokio::test]
@@ -3069,6 +3126,36 @@ mod tests {
         eprintln!(
             "unchanged OSV: records=5000 elapsed={elapsed:?} sqlite_changes={}",
             changes_after - changes_before
+        );
+    }
+
+    /// Reproducible full-init benchmark including deferred index/search construction.
+    #[tokio::test]
+    #[ignore = "performance benchmark"]
+    async fn benchmark_osv_full_init() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let records = (0..5_000)
+            .map(|index| OsvRawRecord {
+                source_path: Some(format!("Go/GO-2099-{index}.json")),
+                raw_json: format!(
+                    r#"{{"schema_version":"1.8.0","id":"GO-2099-{index}","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-{index}"],"references":[{{"type":"WEB","url":"https://example.invalid/{index}"}}],"affected":[{{"package":{{"ecosystem":"Go","name":"example.invalid/package/{index}"}},"ranges":[{{"type":"SEMVER","events":[{{"introduced":"0"}},{{"fixed":"2.0.0"}}]}}],"versions":["1.0.0","1.1.0"]}}]}}"#
+                ),
+            })
+            .collect::<Vec<_>>();
+        database.prepare_osv_bulk_load().await.unwrap();
+        let write_started = std::time::Instant::now();
+        database
+            .import_osv_records_bulk_init(records)
+            .await
+            .unwrap();
+        let write_elapsed = write_started.elapsed();
+        let index_started = std::time::Instant::now();
+        database.finish_osv_bulk_load().await.unwrap();
+        let index_elapsed = index_started.elapsed();
+        eprintln!(
+            "full OSV: records=5000 write={write_elapsed:?} index={index_elapsed:?} total={:?}",
+            write_elapsed + index_elapsed
         );
     }
 

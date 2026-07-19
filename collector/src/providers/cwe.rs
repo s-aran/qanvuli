@@ -64,11 +64,10 @@ impl CweCatalogFile {
         let etag = header_string(response.headers(), reqwest::header::ETAG);
         let last_modified = header_string(response.headers(), reqwest::header::LAST_MODIFIED);
         let path = path.as_ref().to_path_buf();
-        let mut file = std::fs::File::create(&path)?;
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk)?;
+        if let Err(error) = write_response_to_file(&mut response, &path).await {
+            let _ = std::fs::remove_file(&path);
+            return Err(error);
         }
-        file.flush()?;
 
         Ok(CweCatalogDownload {
             path: Some(path),
@@ -86,11 +85,11 @@ impl CweCatalogFile {
             .send()
             .await?
             .error_for_status()?;
-        let mut file = std::fs::File::create(path)?;
-        while let Some(chunk) = response.chunk().await? {
-            file.write_all(&chunk)?;
+        let path = path.as_ref();
+        if let Err(error) = write_response_to_file(&mut response, path).await {
+            let _ = std::fs::remove_file(path);
+            return Err(error);
         }
-        file.flush()?;
         Ok(())
     }
 
@@ -104,6 +103,18 @@ impl CweCatalogFile {
         self.async_download_as(&path).await?;
         Ok(path)
     }
+}
+
+async fn write_response_to_file(
+    response: &mut reqwest::Response,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut file = std::fs::File::create(path)?;
+    while let Some(chunk) = response.chunk().await? {
+        file.write_all(&chunk)?;
+    }
+    file.flush()?;
+    Ok(())
 }
 
 fn header_string(

@@ -365,7 +365,8 @@ pub(crate) struct DownloadedOsvSelection {
     cursor: String,
     target_osv_ids: Option<AHashSet<String>>,
     zip_paths: Vec<PathBuf>,
-    started: Instant,
+    download_elapsed: Duration,
+    ready_at: Instant,
 }
 
 impl Drop for DownloadedOsvSelection {
@@ -471,13 +472,15 @@ pub(crate) async fn download_osv_selection_from_gcs(
             }
         }
     }
+    let download_elapsed = started.elapsed();
     Ok(DownloadedOsvSelection {
         label,
         selection,
         cursor,
         target_osv_ids,
         zip_paths,
-        started,
+        download_elapsed,
+        ready_at: Instant::now(),
     })
 }
 
@@ -486,6 +489,8 @@ pub(crate) async fn import_downloaded_osv_selection(
     db: SqlxDatabase,
     download: DownloadedOsvSelection,
 ) -> Result<usize, String> {
+    let queued_elapsed = download.ready_at.elapsed();
+    let import_started = Instant::now();
     let result = import_osv_zip_files_sqlx_with_mode(
         db.clone(),
         &download.zip_paths,
@@ -503,9 +508,10 @@ pub(crate) async fn import_downloaded_osv_selection(
     .await
     .map_err(|error| format!("{}: failed to save OSV selection: {error}", download.label))?;
     eprintln!(
-        "{}: imported {imported} OSV records in {:?}",
+        "{}: imported {imported} OSV records; download={:?}, queued while other init work ran={queued_elapsed:?}, database import={:?}",
         download.label,
-        download.started.elapsed()
+        download.download_elapsed,
+        import_started.elapsed()
     );
     Ok(imported)
 }
@@ -611,10 +617,16 @@ async fn import_osv_zip_files_sqlx_with_mode(
                     imported += stats.examined;
                     changed += stats.changed();
                     unchanged += stats.unchanged;
+                    let batch_elapsed = batch_started.elapsed();
+                    let records_per_second = stats.examined as f64 / batch_elapsed.as_secs_f64();
+                    let mode = if bulk_load {
+                        "full-init"
+                    } else {
+                        "incremental"
+                    };
                     eprintln!(
-                        "osv: examined {imported} records, changed {changed}, unchanged {unchanged} (batch {} in {:?})",
-                        stats.examined,
-                        batch_started.elapsed()
+                        "osv: mode={mode}, examined={imported}, changed={changed}, unchanged={unchanged} (batch={} in {:?}, {:.0} records/s)",
+                        stats.examined, batch_elapsed, records_per_second,
                     );
                 }
                 Err(error) => {
@@ -643,6 +655,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
             return Err(error);
         }
         eprintln!("osv: rebuilding deferred indexes and search data");
+        let index_started = Instant::now();
         if bulk_load {
             db.finish_osv_bulk_load()
                 .await
@@ -656,6 +669,10 @@ async fn import_osv_zip_files_sqlx_with_mode(
                 "osv: all {unchanged} examined records were unchanged; search rebuild skipped"
             );
         }
+        eprintln!(
+            "osv: index/search maintenance completed in {:?}",
+            index_started.elapsed()
+        );
         db.check_schema()
             .await
             .map_err(|error| format!("failed OSV database check: {error}"))?;
@@ -1060,23 +1077,47 @@ pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
             catalog_file.name
         )
     })?;
-    let download = match catalog_file
-        .async_download_if_changed_as(&path, etag.as_deref(), last_modified.as_deref())
-        .await
+    let mut candidates = vec![path];
+    if let Ok(fallback) =
+        temporary_zip_file_path_in(binary_temporary_directory(), &catalog_file.name)
+        && !candidates.contains(&fallback)
     {
-        Ok(download) => download,
-        Err(error) => {
+        candidates.push(fallback);
+    }
+    let mut download = None;
+    let mut download_errors = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if index > 0 {
+            eprintln!("cwe: retrying download in {}", candidate.display());
+        }
+        match catalog_file
+            .async_download_if_changed_as(candidate, etag.as_deref(), last_modified.as_deref())
+            .await
+        {
+            Ok(result) => {
+                download = Some(result);
+                break;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(candidate);
+                download_errors.push(format!("{}: {error}", candidate.display()));
+            }
+        }
+    }
+    let download = match download {
+        Some(download) => download,
+        None => {
+            let errors = download_errors.join("; ");
             if let Some(path) = local_cwe_catalog_path(&catalog_file.name) {
                 eprintln!(
-                    "cwe: failed to update {} ({error}); using local {}",
-                    catalog_file.name,
+                    "cwe: remote update unavailable ({errors}); loading existing local catalog {}",
                     path.display()
                 );
                 let count = upsert_cwe_catalog_file_sqlx(db, &path).await?;
-                eprintln!("cwe: upserted {count} CWE master rows");
+                eprintln!("cwe: loaded {count} CWE master rows from local catalog");
                 return Ok(());
             }
-            return Err(format!("failed to update {}: {error}", catalog_file.name));
+            return Err(format!("failed to update {}: {errors}", catalog_file.name));
         }
     };
     let Some(path) = download.path else {
@@ -1472,7 +1513,8 @@ mod tests {
             cursor: Utc::now().to_rfc3339(),
             target_osv_ids: None,
             zip_paths: vec![path.clone()],
-            started: Instant::now(),
+            download_elapsed: Duration::ZERO,
+            ready_at: Instant::now(),
         };
 
         drop(download);
