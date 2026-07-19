@@ -48,8 +48,9 @@ Examples:
   qanvuli update --osv-rustsec --osv-go
 "#;
 
-const INGEST_CHUNK_SIZE: usize = 30000;
-const OSV_IMPORT_BATCH_SIZE: usize = 6000;
+const INGEST_CHUNK_SIZE: usize = 20_000;
+const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
+const OSV_IMPORT_PIPELINE_CAPACITY: usize = 1;
 const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
@@ -448,7 +449,9 @@ async fn import_osv_zip_files_sqlx_with_mode(
     let mut import_error = None;
     let mut seen_osv_ids = AHashSet::new();
     for path in paths {
-        let (sender, mut receiver) = mpsc::channel(8);
+        // One queued batch overlaps ZIP reading with SQLite writes without retaining several
+        // batches of raw and parsed advisory JSON at once.
+        let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
         let path = path.clone();
         let selection = selection.cloned();
         let skip_osv_ids = seen_osv_ids.clone();
@@ -1124,12 +1127,14 @@ async fn ingest_zip_sqlx_with_mode(
             read_started.elapsed()
         );
         let write_started = Instant::now();
-        imported += db
-            .import_cve_raw_jsons_deferred_search(records)
-            .await
-            .map_err(|error| {
-                format!("{label}: failed to import CVE chunk {chunk_index}: {error}")
-            })?;
+        let import_result = if bulk_replace {
+            db.import_cve_raw_jsons_bulk_init(records).await
+        } else {
+            db.import_cve_raw_jsons_deferred_search(records).await
+        };
+        imported += import_result.map_err(|error| {
+            format!("{label}: failed to import CVE chunk {chunk_index}: {error}")
+        })?;
         eprintln!(
             "{label}: committed CVE chunk {chunk_index} in {:?}",
             write_started.elapsed()

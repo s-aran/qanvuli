@@ -89,9 +89,9 @@ const ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CVE_JSON_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_NESTED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const NESTED_ARCHIVE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
-// The current all-CVE inner archive is roughly 610 MiB. Keeping it in RAM avoids a second
-// disk pass over hundreds of thousands of independently compressed JSON entries.
-const IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+// Small nested archives avoid a temporary disk copy. The all-CVE inner archive is over 600 MiB,
+// so keeping that archive in RAM would consume a large part of the importer's memory budget.
+const IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct ZipStorage {
     stream: Option<zip::ZipArchive<Box<dyn ReadSeek>>>,
@@ -293,7 +293,7 @@ fn extract_nested_cve_zip(
             "nested zip entry {nested_name} is {nested_zip_size} bytes; maximum is {MAX_NESTED_ARCHIVE_BYTES} bytes"
         ));
     }
-    if nested_zip_size <= IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES {
+    if nested_archive_fits_memory(nested_zip_size) {
         eprintln!("loading nested zip into memory: {nested_name} ({nested_zip_size} bytes)");
         let load_started = std::time::Instant::now();
         let mut entry = stream
@@ -387,6 +387,10 @@ fn extract_nested_cve_zip(
         in_memory_archive: None,
         stream: inner,
     })
+}
+
+fn nested_archive_fits_memory(size: u64) -> bool {
+    size <= IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES
 }
 
 fn read_zip_entry_bytes(reader: &mut impl Read, path: &str) -> Result<Vec<u8>, Error> {
@@ -605,6 +609,17 @@ mod tests {
         let reader = ZipStorage::from_in_memory_archive(archive).unwrap();
         assert_eq!(reader.enum_json_entries().len(), 1);
         std::fs::remove_file(outer_path).unwrap();
+    }
+
+    #[test]
+    fn large_nested_archives_are_spooled_to_disk() {
+        assert!(nested_archive_fits_memory(
+            IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES
+        ));
+        assert!(!nested_archive_fits_memory(
+            IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES + 1
+        ));
+        assert!(!nested_archive_fits_memory(615_520_774));
     }
 
     #[test]

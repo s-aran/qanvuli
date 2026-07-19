@@ -25,6 +25,7 @@ use sqlx::{Acquire, QueryBuilder, Row, Sqlite};
 use std::collections::{BTreeMap, BTreeSet};
 
 type AffectedRow = (i64, Option<String>, Option<String>, Option<String>, String);
+const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
 struct CveParentInput {
     cve_id: String,
@@ -1643,7 +1644,8 @@ impl SqlxDatabase {
     /// Imports a CVE batch in one writer transaction. Parsing and ZIP decoding happen before this
     /// call, while every normalized write remains owned by the single physical SQLite connection.
     pub async fn import_cve_raw_jsons(&self, records: Vec<String>) -> Result<usize, sqlx::Error> {
-        self.import_cve_raw_jsons_with_search(records, true).await
+        self.import_cve_raw_jsons_with_search(records, true, false)
+            .await
     }
 
     /// Imports a batch while deferring global search-index maintenance to the caller.
@@ -1651,32 +1653,27 @@ impl SqlxDatabase {
         &self,
         records: Vec<String>,
     ) -> Result<usize, sqlx::Error> {
-        self.import_cve_raw_jsons_with_search(records, false).await
+        self.import_cve_raw_jsons_with_search(records, false, false)
+            .await
+    }
+
+    /// Imports a full-replacement batch into an empty database without conflict checks or stale
+    /// child deletion. Callers must prepare the CVE bulk-load mode before using this path.
+    pub async fn import_cve_raw_jsons_bulk_init(
+        &self,
+        records: Vec<String>,
+    ) -> Result<usize, sqlx::Error> {
+        self.import_cve_raw_jsons_with_search(records, false, true)
+            .await
     }
 
     async fn import_cve_raw_jsons_with_search(
         &self,
         records: Vec<String>,
         update_search: bool,
+        bulk_init: bool,
     ) -> Result<usize, sqlx::Error> {
         let count = records.len();
-        let parsed_records = tokio::task::spawn_blocking(move || {
-            records
-                .into_par_iter()
-                .map(|raw_json| {
-                    // `simd-json` performs the structural scan with SIMD before materializing the
-                    // serde value used by the normalizer. Keep `raw_json` unchanged because it is
-                    // the provider record persisted in `source_raw_records`.
-                    let mut bytes = raw_json.as_bytes().to_vec();
-                    simd_json::from_slice(&mut bytes)
-                        .map(|value| (raw_json, value))
-                        .map_err(|error| format!("invalid CVE JSON: {error}"))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(|error| sqlx::Error::Protocol(format!("CVE parser task panicked: {error}")))?
-        .map_err(sqlx::Error::Protocol)?;
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
@@ -1688,17 +1685,38 @@ impl SqlxDatabase {
                     sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('CVE', 'CVE List V5', 'vulnerability_db', 'all_CVEs_at_midnight.zip', 'json')")
                         .execute(&mut *transaction)
                         .await?;
-                    let records = parsed_records
-                        .into_iter()
-                        .map(|(raw_json, value)| {
-                            Self::cve_parent_input(raw_json, &value)
-                                .map(|parent| (parent, value))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Self::upsert_cve_identifiers(&mut transaction, &records).await?;
-                    let cve_ids = Self::upsert_cve_parents(&mut transaction, &records).await?;
-                    Self::delete_existing_cve_children(&mut transaction, &records).await?;
-                    Self::insert_cve_children(&mut transaction, &records, &cve_ids).await?;
+                    let mut records = records.into_iter();
+                    loop {
+                        let batch = records
+                            .by_ref()
+                            .take(CVE_NORMALIZE_BATCH_SIZE)
+                            .collect::<Vec<_>>();
+                        if batch.is_empty() {
+                            break;
+                        }
+                        // Bound materialized JSON DOMs independently of the caller's ZIP chunk.
+                        // This mirrors the old 2k database batches while retaining one outer
+                        // transaction, so larger chunks improve I/O without multiplying memory.
+                        let records = batch
+                            .into_par_iter()
+                            .map(|raw_json| {
+                                let mut bytes = raw_json.as_bytes().to_vec();
+                                let value = simd_json::from_slice(&mut bytes)
+                                    .map_err(|error| format!("invalid CVE JSON: {error}"))?;
+                                let parent = Self::cve_parent_input(raw_json, &value)
+                                    .map_err(|error| error.to_string())?;
+                                Ok((parent, value))
+                            })
+                            .collect::<Result<Vec<_>, String>>()
+                            .map_err(sqlx::Error::Protocol)?;
+                        Self::write_cve_identifiers(&mut transaction, &records, bulk_init).await?;
+                        let cve_ids =
+                            Self::write_cve_parents(&mut transaction, &records, bulk_init).await?;
+                        if !bulk_init {
+                            Self::delete_existing_cve_children(&mut transaction, &records).await?;
+                        }
+                        Self::insert_cve_children(&mut transaction, &records, &cve_ids).await?;
+                    }
                     if update_search {
                         rebuild_cve_search(&mut transaction).await?;
                     }
@@ -1712,9 +1730,10 @@ impl SqlxDatabase {
 
     /// Populates CVE identifier master nodes in bulk. Edges are rebuilt from their normalized
     /// sources after the import, so this needs no row-at-a-time graph maintenance.
-    async fn upsert_cve_identifiers(
+    async fn write_cve_identifiers(
         transaction: &mut sqlx::SqliteConnection,
         records: &[(CveParentInput, Value)],
+        insert_only: bool,
     ) -> Result<(), sqlx::Error> {
         let now = chrono::Utc::now().to_rfc3339();
         // Five bindings per row: keep each statement below SQLite's variable limit.
@@ -1729,7 +1748,9 @@ impl SqlxDatabase {
                     .push_bind(&now)
                     .push_bind(&now);
             });
-            builder.push(" ON CONFLICT(identifier) DO UPDATE SET identifier_type='cve', last_seen_at=excluded.last_seen_at");
+            if !insert_only {
+                builder.push(" ON CONFLICT(identifier) DO UPDATE SET identifier_type='cve', last_seen_at=excluded.last_seen_at");
+            }
             builder.build().execute(&mut *transaction).await?;
         }
         Ok(())
@@ -1846,9 +1867,10 @@ impl SqlxDatabase {
         })
     }
 
-    async fn upsert_cve_parents(
+    async fn write_cve_parents(
         transaction: &mut sqlx::SqliteConnection,
         records: &[(CveParentInput, Value)],
+        insert_only: bool,
     ) -> Result<ahash::AHashMap<String, i64>, sqlx::Error> {
         for chunk in records.chunks(2_000) {
             let mut builder = QueryBuilder::<Sqlite>::new(
@@ -1865,7 +1887,9 @@ impl SqlxDatabase {
                     .push_bind(&parent.reference_text)
                     .push_bind(&parent.raw_json);
             });
-            builder.push(" ON CONFLICT(cve_id) DO UPDATE SET state=excluded.state, published_at=excluded.published_at, updated_at=excluded.updated_at, serial=excluded.serial, title=excluded.title, description_en=excluded.description_en, reference_text=excluded.reference_text, raw_json=excluded.raw_json");
+            if !insert_only {
+                builder.push(" ON CONFLICT(cve_id) DO UPDATE SET state=excluded.state, published_at=excluded.published_at, updated_at=excluded.updated_at, serial=excluded.serial, title=excluded.title, description_en=excluded.description_en, reference_text=excluded.reference_text, raw_json=excluded.raw_json");
+            }
             builder.build().execute(&mut *transaction).await?;
         }
         let mut ids = ahash::AHashMap::with_capacity(records.len());
@@ -2248,11 +2272,19 @@ mod tests {
         database.initialize().await.unwrap();
         database.prepare_cve_bulk_load().await.unwrap();
         database
-            .import_cve_raw_jsons_deferred_search(vec![
+            .import_cve_raw_jsons_bulk_init(vec![
                 r#"{"cveMetadata":{"cveId":"CVE-2099-9001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Deferred bulk search fixture"}}}"#.to_owned(),
             ])
             .await
             .unwrap();
+        assert!(
+            database
+                .import_cve_raw_jsons_bulk_init(vec![
+                    r#"{"cveMetadata":{"cveId":"CVE-2099-9001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"duplicate"}}}"#.to_owned(),
+                ])
+                .await
+                .is_err()
+        );
 
         assert!(
             database
