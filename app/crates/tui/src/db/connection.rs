@@ -3,7 +3,7 @@ use qanvuli_core::database::SqlxDatabase;
 
 pub(crate) async fn connect(db_url: &str) -> Result<SqlxDatabase, String> {
     let db = connect_sqlx_db(db_url).await?;
-    db.check_schema()
+    db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required before opening TUI: {error}"))?;
     Ok(db)

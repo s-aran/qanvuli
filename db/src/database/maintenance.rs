@@ -371,6 +371,40 @@ pub(crate) async fn check_required_schema(
             "SELECT name FROM pragma_table_info('cve')",
         ),
         (
+            "cve_cvss",
+            &[
+                "id",
+                "cve_db_id",
+                "version",
+                "base_score",
+                "base_severity",
+                "vector_string",
+                "source",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('cve_cvss')",
+        ),
+        (
+            "cve_affected",
+            &[
+                "id",
+                "cve_db_id",
+                "vendor",
+                "product",
+                "package_name",
+                "collection_url",
+                "default_status",
+                "version_text",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('cve_affected')",
+        ),
+        (
+            "cve_cwe",
+            &["cve_db_id", "cwe_id"][..],
+            "SELECT name FROM pragma_table_info('cve_cwe')",
+        ),
+        (
             "cve_summary_index",
             &[
                 "cve_db_id",
@@ -391,6 +425,20 @@ pub(crate) async fn check_required_schema(
             "SELECT name FROM pragma_table_info('cve_summary_index')",
         ),
         (
+            "osv_raw_records",
+            &[
+                "id",
+                "osv_id",
+                "source_path",
+                "provider_published_at",
+                "provider_modified_at",
+                "fetched_at",
+                "content_hash",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('osv_raw_records')",
+        ),
+        (
             "osv_advisories",
             &[
                 "osv_id",
@@ -404,6 +452,90 @@ pub(crate) async fn check_required_schema(
             ][..],
             "SELECT name FROM pragma_table_info('osv_advisories')",
         ),
+        (
+            "osv_aliases",
+            &["osv_id", "alias_id"][..],
+            "SELECT name FROM pragma_table_info('osv_aliases')",
+        ),
+        (
+            "osv_affected_packages",
+            &[
+                "id",
+                "osv_id",
+                "affected_order",
+                "ecosystem",
+                "package_name",
+                "purl",
+            ][..],
+            "SELECT name FROM pragma_table_info('osv_affected_packages')",
+        ),
+        (
+            "osv_ranges",
+            &[
+                "id",
+                "affected_package_id",
+                "affected_order",
+                "range_order",
+                "range_type",
+            ][..],
+            "SELECT name FROM pragma_table_info('osv_ranges')",
+        ),
+        (
+            "osv_range_events",
+            &["id", "range_id", "event_type", "value", "event_order"][..],
+            "SELECT name FROM pragma_table_info('osv_range_events')",
+        ),
+        (
+            "osv_versions",
+            &["affected_package_id", "version"][..],
+            "SELECT name FROM pragma_table_info('osv_versions')",
+        ),
+        (
+            "source_sync_state",
+            &[
+                "source",
+                "last_attempt_at",
+                "last_success_at",
+                "status",
+                "error_message",
+                "last_cursor",
+                "content_hash",
+                "schema_version",
+                "record_count",
+            ][..],
+            "SELECT name FROM pragma_table_info('source_sync_state')",
+        ),
+        (
+            "kev_entries",
+            &[
+                "cve_id",
+                "vendor_project",
+                "product",
+                "vulnerability_name",
+                "date_added",
+                "short_description",
+                "required_action",
+                "due_date",
+                "known_ransomware_campaign_use",
+                "notes",
+                "fetched_at",
+                "raw_record_id",
+            ][..],
+            "SELECT name FROM pragma_table_info('kev_entries')",
+        ),
+        (
+            "epss_current",
+            &[
+                "cve_id",
+                "epss",
+                "percentile",
+                "score_date",
+                "model_version",
+                "fetched_at",
+                "raw_record_id",
+            ][..],
+            "SELECT name FROM pragma_table_info('epss_current')",
+        ),
     ] {
         let actual: Vec<String> = sqlx::query_scalar(pragma)
             .fetch_all(&mut *connection)
@@ -416,7 +548,120 @@ pub(crate) async fn check_required_schema(
             }
         }
     }
-    Ok(())
+    for fts_table in [
+        "cve_summary_fts",
+        "cve_affected_summary_fts",
+        "osv_text_fts",
+    ] {
+        let definition: Option<String> =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name=? AND type='table'")
+                .bind(fts_table)
+                .fetch_optional(&mut *connection)
+                .await?;
+        if !definition.is_some_and(|sql| sql.to_ascii_lowercase().contains("using fts5")) {
+            return Err(sqlx::Error::Protocol(format!(
+                "required FTS5 virtual table is invalid: {fts_table}; database rebuild required"
+            )));
+        }
+    }
+    for (index, expected_columns) in [
+        ("idx_cve_cvss_cve_db_id", &["cve_db_id"][..]),
+        ("idx_cve_affected_cve_db_id", &["cve_db_id"][..]),
+        ("idx_cve_cwe_cwe_id_cve_db_id", &["cwe_id", "cve_db_id"][..]),
+        (
+            "idx_osv_affected_packages_lookup",
+            &["ecosystem", "package_name"][..],
+        ),
+        ("idx_osv_aliases_alias", &["alias_id"][..]),
+        ("idx_osv_ranges_package", &["affected_package_id"][..]),
+        (
+            "idx_osv_range_events_range",
+            &["range_id", "event_order"][..],
+        ),
+    ] {
+        let actual: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+                .bind(index)
+                .fetch_all(&mut *connection)
+                .await?;
+        if actual.iter().map(String::as_str).collect::<Vec<_>>() != expected_columns {
+            return Err(sqlx::Error::Protocol(format!(
+                "required index has wrong columns: {index}; database rebuild required"
+            )));
+        }
+    }
+    for (table, columns) in [
+        ("osv_raw_records", &["osv_id"][..]),
+        ("osv_aliases", &["osv_id", "alias_id"][..]),
+        ("osv_versions", &["affected_package_id", "version"][..]),
+    ] {
+        let index_names: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM pragma_index_list(?) WHERE \"unique\"=1")
+                .bind(table)
+                .fetch_all(&mut *connection)
+                .await?;
+        let mut found = false;
+        for index in index_names {
+            let actual: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+                    .bind(index)
+                    .fetch_all(&mut *connection)
+                    .await?;
+            if actual.iter().map(String::as_str).collect::<Vec<_>>() == columns {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(sqlx::Error::Protocol(format!(
+                "required UNIQUE constraint is missing: {table}({}); database rebuild required",
+                columns.join(", ")
+            )));
+        }
+    }
+    for (table, from_column, target_table, target_column) in [
+        ("cve_cvss", "cve_db_id", "cve", "id"),
+        ("cve_affected", "cve_db_id", "cve", "id"),
+        ("osv_advisories", "raw_record_id", "osv_raw_records", "id"),
+        ("osv_aliases", "osv_id", "osv_advisories", "osv_id"),
+        (
+            "osv_affected_packages",
+            "osv_id",
+            "osv_advisories",
+            "osv_id",
+        ),
+        (
+            "osv_ranges",
+            "affected_package_id",
+            "osv_affected_packages",
+            "id",
+        ),
+        ("osv_range_events", "range_id", "osv_ranges", "id"),
+        (
+            "osv_versions",
+            "affected_package_id",
+            "osv_affected_packages",
+            "id",
+        ),
+        ("kev_entries", "raw_record_id", "kev_raw_records", "id"),
+        ("epss_current", "raw_record_id", "epss_raw_records", "id"),
+    ] {
+        let rows = sqlx::query("SELECT * FROM pragma_foreign_key_list(?)")
+            .bind(table)
+            .fetch_all(&mut *connection)
+            .await?;
+        let found = rows.iter().any(|row| {
+            row.try_get::<String, _>("from").ok().as_deref() == Some(from_column)
+                && row.try_get::<String, _>("table").ok().as_deref() == Some(target_table)
+                && row.try_get::<String, _>("to").ok().as_deref() == Some(target_column)
+        });
+        if !found {
+            return Err(sqlx::Error::Protocol(format!(
+                "required foreign key is missing: {table}.{from_column} -> {target_table}.{target_column}; database rebuild required"
+            )));
+        }
+    }
+    check_foreign_keys_enabled(connection).await
 }
 
 pub(crate) async fn check_foreign_keys_enabled(
@@ -518,53 +763,52 @@ async fn require_no_mismatch(
     Ok(())
 }
 
-async fn check_projection_samples(
+/// Performs a fixed number of indexed sentinel checks suitable for routine health checks.
+/// These statements intentionally contain no COUNT, OFFSET, or full anti-join.
+pub(crate) async fn check_search_integrity_quick(
     connection: &mut SqliteConnection,
-    label: &str,
-    expected_count_sql: &'static str,
-    actual_count_sql: &'static str,
-    expected_id_sql: &'static str,
-    actual_id_sql: &'static str,
 ) -> Result<(), sqlx::Error> {
-    let expected: i64 = sqlx::query_scalar(expected_count_sql)
-        .fetch_one(&mut *connection)
-        .await?;
-    let actual: i64 = sqlx::query_scalar(actual_count_sql)
-        .fetch_one(&mut *connection)
-        .await?;
-    if expected != actual {
-        return Err(sqlx::Error::Protocol(format!(
-            "search projection mismatch: {label} row count (expected {expected}, found {actual})"
-        )));
-    }
-    if expected == 0 {
-        return Ok(());
-    }
-    let mut offsets = [0, expected / 2, expected - 1];
-    offsets.sort_unstable();
-    for (index, &offset) in offsets.iter().enumerate() {
-        if index > 0 && offsets[index - 1] == offset {
-            continue;
-        }
-        let expected_id: String = sqlx::query_scalar(expected_id_sql)
-            .bind(offset)
-            .fetch_one(&mut *connection)
-            .await?;
-        let actual_id: String = sqlx::query_scalar(actual_id_sql)
-            .bind(offset)
-            .fetch_one(&mut *connection)
-            .await?;
-        if expected_id != actual_id {
+    for (label, query) in [
+        (
+            "CVE summary FTS first row",
+            "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1) IS NOT (SELECT cve_id FROM cve_summary_fts ORDER BY rowid LIMIT 1)",
+        ),
+        (
+            "CVE summary FTS last row",
+            "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT cve_id FROM cve_summary_fts ORDER BY rowid DESC LIMIT 1)",
+        ),
+        (
+            "CVE affected FTS first row",
+            "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1) IS NOT (SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid LIMIT 1)",
+        ),
+        (
+            "CVE affected FTS last row",
+            "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid DESC LIMIT 1)",
+        ),
+        (
+            "OSV text FTS first row",
+            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1)",
+        ),
+        (
+            "OSV text FTS last row",
+            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid DESC LIMIT 1)",
+        ),
+    ] {
+        if sqlx::query_scalar::<_, i64>(query)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_some()
+        {
             return Err(sqlx::Error::Protocol(format!(
-                "search projection mismatch: {label} sample at offset {offset}"
+                "search projection mismatch: {label}"
             )));
         }
     }
     Ok(())
 }
 
-/// Performs bounded correspondence checks suitable for routine health checks.
-pub(crate) async fn check_search_integrity(
+/// Performs complete correspondence checks and may scan tables.
+pub(crate) async fn check_search_integrity_full(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
     for (label, query) in [
@@ -603,33 +847,6 @@ pub(crate) async fn check_search_integrity(
     ] {
         require_no_mismatch(connection, label, query).await?;
     }
-    check_projection_samples(
-        connection,
-        "CVE summary FTS",
-        "SELECT COUNT(*) FROM cve_summary_index",
-        "SELECT COUNT(*) FROM cve_summary_fts",
-        "SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1 OFFSET ?",
-        "SELECT cve_id FROM cve_summary_fts ORDER BY rowid LIMIT 1 OFFSET ?",
-    )
-    .await?;
-    check_projection_samples(
-        connection,
-        "CVE affected FTS",
-        "SELECT COUNT(*) FROM cve_summary_index",
-        "SELECT COUNT(*) FROM cve_affected_summary_fts",
-        "SELECT cve_id FROM cve_summary_index ORDER BY rowid LIMIT 1 OFFSET ?",
-        "SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid LIMIT 1 OFFSET ?",
-    )
-    .await?;
-    check_projection_samples(
-        connection,
-        "OSV text FTS",
-        "SELECT COUNT(*) FROM osv_advisories",
-        "SELECT COUNT(*) FROM osv_text_fts",
-        "SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1 OFFSET ?",
-        "SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1 OFFSET ?",
-    )
-    .await?;
     Ok(())
 }
 
@@ -648,7 +865,7 @@ pub(crate) async fn check_cve_search_full(
 ) -> Result<(), sqlx::Error> {
     check_fts5_integrity(connection, "cve_summary_fts").await?;
     check_fts5_integrity(connection, "cve_affected_summary_fts").await?;
-    check_search_integrity(connection).await?;
+    check_search_integrity_full(connection).await?;
     check_complete_fts_correspondence(
         connection,
         "CVE summary FTS",
@@ -669,7 +886,6 @@ pub(crate) async fn check_osv_search_full(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
     check_fts5_integrity(connection, "osv_text_fts").await?;
-    check_search_integrity(connection).await?;
     check_complete_fts_correspondence(
         connection,
         "OSV text FTS",

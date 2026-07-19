@@ -88,6 +88,12 @@ struct OsvImportBatch {
     records: Vec<OsvRawRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OsvImportMode {
+    InitialReplacement,
+    IncrementalUpdate,
+}
+
 /// CVE release archive kind accepted by download and ingest commands.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum ReleaseAssetKind {
@@ -361,7 +367,7 @@ pub async fn sync_kev_epss_snapshots_sqlx(
         .import_epss_csv_with_status(epss, cve_changed)
         .await
         .map_err(|error| format!("{label}: failed to import FIRST EPSS: {error}"))?;
-    db.check_schema()
+    db.check_required_schema()
         .await
         .map_err(|error| format!("{label}: enrichment database check failed: {error}"))?;
     if !kev_changed {
@@ -502,6 +508,7 @@ pub(crate) async fn download_osv_selection_from_gcs(
 pub(crate) async fn import_downloaded_osv_selection(
     db: SqlxDatabase,
     download: DownloadedOsvSelection,
+    mode: OsvImportMode,
 ) -> Result<usize, String> {
     let queued_elapsed = download.ready_at.elapsed();
     let import_started = Instant::now();
@@ -516,7 +523,7 @@ pub(crate) async fn import_downloaded_osv_selection(
         Some(&download.selection),
         download.target_osv_ids.as_ref(),
         &download.cursor,
-        true,
+        mode,
     )
     .await;
     let imported = result?;
@@ -541,6 +548,15 @@ pub async fn sync_osv_selection_from_gcs_sqlx(
     label: &str,
     selection: OsvImportSelection,
 ) -> Result<usize, String> {
+    sync_osv_selection_from_gcs_sqlx_with_full_snapshot(db, label, selection, false).await
+}
+
+pub async fn sync_osv_selection_from_gcs_sqlx_with_full_snapshot(
+    db: SqlxDatabase,
+    label: &str,
+    selection: OsvImportSelection,
+    full_snapshot: bool,
+) -> Result<usize, String> {
     let previous_cursor = db
         .osv_sync_cursor()
         .await
@@ -551,11 +567,11 @@ pub async fn sync_osv_selection_from_gcs_sqlx(
         .map_err(|error| format!("{label}: failed to read OSV selection: {error}"))?;
     let selection_expanded = OsvImportSelection::from_metadata(stored_selection.as_deref())
         .is_none_or(|stored| stored != selection);
-    let incremental_cursor = (!selection_expanded)
+    let incremental_cursor = (!selection_expanded && !full_snapshot)
         .then_some(previous_cursor.as_deref())
         .flatten();
     let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
-    import_downloaded_osv_selection(db, download).await
+    import_downloaded_osv_selection(db, download, OsvImportMode::IncrementalUpdate).await
 }
 
 /// Imports an OSV ZIP through the SQLx writer and advances the cursor only after every batch,
@@ -567,7 +583,15 @@ pub async fn import_osv_zip_file_sqlx(
     completion_cursor: &str,
 ) -> Result<usize, String> {
     let paths = [path.to_path_buf()];
-    import_osv_zip_files_sqlx_with_mode(db, &paths, selection, None, completion_cursor, false).await
+    import_osv_zip_files_sqlx_with_mode(
+        db,
+        &paths,
+        selection,
+        None,
+        completion_cursor,
+        OsvImportMode::IncrementalUpdate,
+    )
+    .await
 }
 
 async fn import_osv_zip_files_sqlx_with_mode(
@@ -576,13 +600,14 @@ async fn import_osv_zip_files_sqlx_with_mode(
     selection: Option<&OsvImportSelection>,
     target_osv_ids: Option<&AHashSet<String>>,
     completion_cursor: &str,
-    bulk_load: bool,
+    mode: OsvImportMode,
 ) -> Result<usize, String> {
+    let initial_replacement = mode == OsvImportMode::InitialReplacement;
     let completion_cursor = completion_cursor.to_owned();
     db.begin_osv_sync()
         .await
         .map_err(|error| format!("failed to begin OSV sync: {error}"))?;
-    if bulk_load {
+    if initial_replacement {
         db.prepare_osv_bulk_load()
             .await
             .map_err(|error| format!("failed to prepare OSV bulk load: {error}"))?;
@@ -628,7 +653,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
             let batch_started = Instant::now();
             let batch_size = batch.records.len();
             let import_future = async {
-                if bulk_load {
+                if initial_replacement {
                     db.import_osv_records_bulk_init(batch.records)
                         .await
                         .map(|examined| qanvuli_core::database::OsvImportStats {
@@ -665,7 +690,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
                     unchanged += stats.unchanged;
                     let batch_elapsed = batch_started.elapsed();
                     let records_per_second = stats.examined as f64 / batch_elapsed.as_secs_f64();
-                    let mode = if bulk_load {
+                    let mode = if initial_replacement {
                         "full-init"
                     } else {
                         "incremental"
@@ -702,7 +727,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
         }
         eprintln!("osv: rebuilding deferred indexes and search data");
         let index_started = Instant::now();
-        if bulk_load {
+        if initial_replacement {
             db.finish_osv_bulk_load()
                 .await
                 .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
@@ -710,7 +735,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
             db.rebuild_osv_search()
                 .await
                 .map_err(|error| format!("failed to rebuild OSV FTS: {error}"))?;
-        } else if db.check_schema().await.is_err() {
+        } else if db.check_search_integrity_quick().await.is_err() {
             eprintln!(
                 "osv: unchanged records found an incomplete search projection; rebuilding it"
             );
@@ -726,7 +751,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
             "osv: index/search maintenance completed in {:?}",
             index_started.elapsed()
         );
-        db.check_schema()
+        db.check_search_integrity_quick()
             .await
             .map_err(|error| format!("failed OSV database check: {error}"))?;
         db.complete_osv_sync(&completion_cursor)
@@ -736,7 +761,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
     }
     .await;
     if let Err(error) = result {
-        if bulk_load {
+        if initial_replacement {
             let _ = db.finish_osv_bulk_load().await;
         }
         let _ = db.fail_osv_sync(&error).await;
@@ -1491,7 +1516,7 @@ async fn ingest_zip_sqlx_with_mode(
         "{label}: rebuilt search indexes in {:?}",
         fts_started.elapsed()
     );
-    db.check_schema()
+    db.check_search_integrity_quick()
         .await
         .map_err(|error| format!("{label}: database integrity check failed: {error}"))?;
     Ok(imported)
@@ -1826,6 +1851,68 @@ mod tests {
         );
         database.close().await.unwrap();
         let _ = std::fs::remove_file(zip_path);
+    }
+
+    #[tokio::test]
+    async fn normal_osv_update_uses_incremental_upsert_for_changed_and_new_records() {
+        use qanvuli_core::database::SqlxDatabase;
+        use std::io::Write;
+
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let initial_zip = std::env::temp_dir().join(format!("qanvuli-osv-initial-{nonce}.zip"));
+        let update_zip = std::env::temp_dir().join(format!("qanvuli-osv-update-{nonce}.zip"));
+        let options = zip::write::SimpleFileOptions::default();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&initial_zip).unwrap());
+        zip.start_file("GHSA-2099-existing.json", options).unwrap();
+        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-existing","modified":"2099-01-01T00:00:00Z","summary":"before"}"#).unwrap();
+        zip.finish().unwrap();
+
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&update_zip).unwrap());
+        zip.start_file("GHSA-2099-existing.json", options).unwrap();
+        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-existing","modified":"2099-01-02T00:00:00Z","summary":"after"}"#).unwrap();
+        zip.start_file("GHSA-2099-new.json", options).unwrap();
+        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-new","modified":"2099-01-02T00:00:00Z","summary":"new"}"#).unwrap();
+        zip.finish().unwrap();
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        import_osv_zip_file_sqlx(database.clone(), &initial_zip, None, "2099-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            import_osv_zip_file_sqlx(database.clone(), &update_zip, None, "2099-01-02T00:00:00Z")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            database
+                .find_osv_summary("GHSA-2099-existing")
+                .await
+                .unwrap()
+                .unwrap()
+                .summary
+                .as_deref(),
+            Some("after")
+        );
+        assert!(
+            database
+                .find_osv_summary("GHSA-2099-new")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            database.begin_osv_sync().await.unwrap().as_deref(),
+            Some("2099-01-02T00:00:00Z")
+        );
+        database.close().await.unwrap();
+        let _ = std::fs::remove_file(initial_zip);
+        let _ = std::fs::remove_file(update_zip);
     }
 
     #[tokio::test]

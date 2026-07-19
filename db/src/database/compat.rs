@@ -1,6 +1,8 @@
 //! Compatibility API preserving devel callers while the implementation is SQLx-only.
 
-use super::sqlx_database::{SqlxCveSearch, SqlxCvssSearch, SqlxDatabase, SqlxOsvSummary};
+use super::sqlx_database::{
+    SqlxCveSearch, SqlxCveSummary, SqlxCvssSearch, SqlxDatabase, SqlxOsvSummary,
+};
 use crate::{
     AffectedPackageSummary, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
     CveCvssDetail, CveCweDetail, CveDatabaseStatus, CveDetail, CveReference, CveRiskSummary,
@@ -233,6 +235,45 @@ impl SqlxDatabase {
         cve_id: &str,
     ) -> Result<Option<CveSummaryWithDetail>, sqlx::Error> {
         Ok(self.cve_summary_with_detail(cve_id).await?.map(Into::into))
+    }
+
+    /// Loads CVE summaries and normalized details in bounded set-based queries.
+    pub async fn cve_summaries_with_details_batch(
+        &self,
+        cve_ids: &[String],
+        state_scope: CveStateScope,
+    ) -> Result<Vec<Option<CveSummaryWithDetail>>, sqlx::Error> {
+        if cve_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested = cve_ids.to_vec();
+        let requested_json = serde_json::to_string(&requested)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let include_rejected = include_rejected(state_scope);
+        let summaries: Vec<CveSummary> = self
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows: Vec<SqlxCveSummary> = sqlx::query_as(
+                        "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve c WHERE c.cve_id IN (SELECT value FROM json_each(?)) AND (? OR c.state=0)",
+                    )
+                    .bind(requested_json)
+                    .bind(include_rejected)
+                    .fetch_all(connection)
+                    .await?;
+                    Ok(rows.into_iter().map(CveSummary::from).collect())
+                })
+            })
+            .await?;
+        let details = self.attach_cve_overview_details(summaries).await?;
+        let by_id = details
+            .into_iter()
+            .map(|row| (row.summary.cve_id.clone(), row))
+            .collect::<HashMap<_, _>>();
+        Ok(requested
+            .into_iter()
+            .map(|id| by_id.get(&id).cloned())
+            .collect())
     }
 
     pub async fn attach_cve_overview_details(
@@ -1025,7 +1066,7 @@ impl SqlxDatabase {
         include_evidence: bool,
     ) -> Result<Vec<EnrichedFinding>, sqlx::Error> {
         let mut rows = self
-            .query_package_enriched(ecosystem, package, version, purl)
+            .query_package_matches(ecosystem, package, version, purl)
             .await?;
         if !include_evidence {
             for row in &mut rows {

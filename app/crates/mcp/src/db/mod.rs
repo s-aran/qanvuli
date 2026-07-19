@@ -34,12 +34,18 @@ impl DbProvider {
     pub(crate) async fn get(&self) -> Result<&CveDatabase, McpError> {
         self.db
             .get_or_try_init(|| async {
-                CveDatabase::connect(&self.db_url).await.map_err(|err| {
+                let db = CveDatabase::connect(&self.db_url).await.map_err(|err| {
                     mcp_error(format!(
                         "failed to connect database `{}`: {err}",
                         redact_database_url(&self.db_url)
                     ))
-                })
+                })?;
+                db.check_required_schema().await.map_err(|err| {
+                    mcp_error(format!(
+                        "database rebuild required before MCP startup: {err}"
+                    ))
+                })?;
+                Ok(db)
             })
             .await
     }

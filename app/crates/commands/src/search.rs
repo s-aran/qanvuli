@@ -1,9 +1,19 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_sqlx_db, print_json};
 use qanvuli_core::database::{SqlxCveSearch, SqlxCvssSearch};
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+enum SearchSource {
+    #[default]
+    Cve,
+    Osv,
+}
+
 /// CLI arguments for `qanvuli search`.
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
+    /// Select one vulnerability source; filters and pagination apply only to that source.
+    #[arg(long, value_enum, default_value_t = SearchSource::Cve)]
+    source: SearchSource,
     #[arg(long = "cve", value_name = "ID")]
     cve_id: Option<String>,
     #[arg(long, value_name = "QUERY")]
@@ -103,11 +113,50 @@ impl Args {
 
 /// Runs a CVE search and prints raw, summary, or enriched JSON results.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let date_filter = args.date_filter()?;
     let db = connect_sqlx_db(db_url).await?;
-    db.check_schema()
+    db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
+    let limit = i64::try_from(args.limit.unwrap_or(DEFAULT_LIMIT)).unwrap_or(i64::MAX);
+    let offset = i64::try_from(args.offset.unwrap_or_default()).unwrap_or(i64::MAX);
+    if args.source == SearchSource::Osv {
+        let query = args
+            .text
+            .as_deref()
+            .ok_or_else(|| "OSV search requires --text".to_owned())?;
+        if args.cve_id.is_some()
+            || args.vendor.is_some()
+            || args.vendor_exact.is_some()
+            || args.product.is_some()
+            || args.product_exact.is_some()
+            || args.component.is_some()
+            || args.exact
+            || !args.cwe_ids.is_empty()
+            || args.min_score.is_some()
+            || args.max_score.is_some()
+            || args.severity.is_some()
+            || args.cvss_version.is_some()
+            || args.published_since.is_some()
+            || args.updated_since.is_some()
+            || args.include_rejected
+            || args.enriched
+        {
+            return Err(
+                "CVE-specific filters and --enriched are not supported with --source osv"
+                    .to_owned(),
+            );
+        }
+        let advisories = db
+            .search_osv_paginated(query, limit, offset)
+            .await
+            .map_err(|error| format!("failed to search OSV advisories: {error}"))?;
+        print_json(&advisories)?;
+        db.close()
+            .await
+            .map_err(|error| format!("failed to close database: {error}"))?;
+        return Ok(());
+    }
+    let date_filter = args.date_filter()?;
     if let Some(cve_id) = args.cve_id.as_deref() {
         let summary = db
             .find_cve_summary(cve_id)
@@ -125,8 +174,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             .map_err(|error| format!("failed to close database: {error}"))?;
         return Ok(());
     }
-    let limit = i64::try_from(args.limit.unwrap_or(DEFAULT_LIMIT)).unwrap_or(i64::MAX);
-    let offset = i64::try_from(args.offset.unwrap_or_default()).unwrap_or(i64::MAX);
     let filters = SqlxCveSearch {
         text: args.text.clone(),
         cwe_ids: args.cwe_ids.clone(),
@@ -152,26 +199,21 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .search_cves_advanced(filters, args.include_rejected, limit, offset)
         .await
         .map_err(|error| format!("failed to search CVEs: {error}"))?;
-    let osv_advisories = match args.text.as_deref() {
-        Some(query) => Some(
-            db.search_osv(query, limit)
-                .await
-                .map_err(|error| format!("failed to search OSV advisories: {error}"))?,
-        ),
-        None => None,
-    };
     if args.enriched {
-        let mut enriched = Vec::with_capacity(cves.len());
-        for summary in cves {
-            let detail = db
-                .cve_detail(&summary.cve_id)
-                .await
-                .map_err(|error| format!("failed to fetch {} detail: {error}", summary.cve_id))?;
-            enriched.push(serde_json::json!({"summary": summary, "detail": detail}));
-        }
-        print_json(&serde_json::json!({"cves": enriched, "osv_advisories": osv_advisories}))?;
-    } else if let Some(osv_advisories) = osv_advisories {
-        print_json(&serde_json::json!({"cves": cves, "osv_advisories": osv_advisories}))?;
+        let cve_ids = cves
+            .iter()
+            .map(|summary| summary.cve_id.clone())
+            .collect::<Vec<_>>();
+        let details = db
+            .cve_details(&cve_ids)
+            .await
+            .map_err(|error| format!("failed to fetch CVE details: {error}"))?;
+        let enriched = cves
+            .into_iter()
+            .zip(details)
+            .map(|(summary, detail)| serde_json::json!({"summary": summary, "detail": detail}))
+            .collect::<Vec<_>>();
+        print_json(&enriched)?;
     } else {
         print_json(&cves)?;
     }

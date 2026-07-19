@@ -12,7 +12,7 @@ pub struct Args {
 /// Runs a CWE search and prints matching CVE summaries as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_sqlx_db(db_url).await?;
-    db.check_schema()
+    db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
     let cves = db

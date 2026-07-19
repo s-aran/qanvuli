@@ -12,7 +12,7 @@ pub struct Args {
 enum Command {
     /// Return CVE and enrichment database status.
     Status,
-    /// Run a bounded routine health check; use --full for exhaustive scans.
+    /// Run a low-latency health check; use --scan or --full for database-wide scans.
     Check(CheckArgs),
     /// Rebuild derived CVE and OSV search indexes, then verify them.
     RebuildSearch,
@@ -20,8 +20,11 @@ enum Command {
 
 #[derive(Debug, clap::Args)]
 struct CheckArgs {
+    /// Run SQLite quick_check and broader projection scans.
+    #[arg(long, conflicts_with = "full")]
+    scan: bool,
     /// Run expensive SQLite, foreign-key, and native FTS integrity scans.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "scan")]
     full: bool,
 }
 
@@ -30,7 +33,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_sqlx_db(db_url).await?;
     match args.command {
         Command::Status => {
-            db.check_schema()
+            db.check_required_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
             let mut status = serde_json::to_value(
@@ -59,15 +62,16 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             print_json(&status)?;
         }
         Command::Check(check_args) => {
-            db.check()
-                .await
-                .map_err(|error| format!("database check failed: {error}"))?;
             if check_args.full {
                 run_full_check(&db).await?;
+            } else if check_args.scan {
+                run_scan_check(&db).await?;
+            } else {
+                run_quick_check(&db).await?;
             }
             print_json(&serde_json::json!({
                 "ok": true,
-                "mode": if check_args.full { "full" } else { "quick" },
+                "mode": if check_args.full { "full" } else if check_args.scan { "scan" } else { "quick" },
                 "checks": {
                     "schema": "ok",
                     "sqlite": "ok",
@@ -83,7 +87,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             db.rebuild_search()
                 .await
                 .map_err(|error| format!("failed to rebuild search indexes: {error}"))?;
-            db.check_schema()
+            db.check_search_integrity_quick()
                 .await
                 .map_err(|error| format!("search verification failed: {error}"))?;
             print_json(&serde_json::json!({"ok": true}))?;
@@ -95,26 +99,57 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     Ok(())
 }
 
+async fn run_quick_check(db: &qanvuli_core::database::SqlxDatabase) -> Result<(), String> {
+    eprintln!("db check: mode=quick");
+    let started = Instant::now();
+    eprintln!("db check: [1/1] validating schema and bounded search sentinels...");
+    db.check()
+        .await
+        .map_err(|error| format!("database quick check failed: {error}"))?;
+    eprintln!(
+        "db check: [1/1] completed in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+async fn run_scan_check(db: &qanvuli_core::database::SqlxDatabase) -> Result<(), String> {
+    eprintln!("db check: mode=scan");
+    let started = Instant::now();
+    eprintln!("db check: [1/1] running quick_check and broader search scans...");
+    db.check_scan()
+        .await
+        .map_err(|error| format!("database scan check failed: {error}"))?;
+    eprintln!(
+        "db check: [1/1] completed in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 async fn run_full_check(db: &qanvuli_core::database::SqlxDatabase) -> Result<(), String> {
     let stages = [
+        "validating schema",
         "checking SQLite file integrity",
         "checking foreign keys",
         "checking CVE search data",
         "checking OSV search data",
     ];
+    eprintln!("db check: mode=full");
     for (index, label) in stages.iter().enumerate() {
-        eprintln!("db check: [{}/4] {label}...", index + 1);
+        eprintln!("db check: [{}/5] {label}...", index + 1);
         let started = Instant::now();
         match index {
-            0 => db.check_full_sqlite().await,
-            1 => db.check_full_foreign_keys().await,
-            2 => db.check_full_cve_search().await,
-            3 => db.check_full_osv_search().await,
+            0 => db.check_required_schema().await,
+            1 => db.check_full_sqlite().await,
+            2 => db.check_full_foreign_keys().await,
+            3 => db.check_full_cve_search().await,
+            4 => db.check_full_osv_search().await,
             _ => unreachable!(),
         }
         .map_err(|error| format!("database full check failed during {label}: {error}"))?;
         eprintln!(
-            "db check: [{}/4] completed in {:.3}s",
+            "db check: [{}/5] completed in {:.3}s",
             index + 1,
             started.elapsed().as_secs_f64()
         );

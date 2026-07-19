@@ -95,7 +95,7 @@ impl Cli {
 enum Command {
     /// Show help. This is also the default mode.
     Help,
-    /// Initialize the DB from the latest all CVE zip, or only schema with --schema-only.
+    /// Build and install a complete replacement database from current vulnerability sources.
     ///
     /// Full initialization downloads and imports the all-CVE archive, so it can take a while.
     Init(qanvuli_app_commands::init::Args),

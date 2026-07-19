@@ -5,10 +5,10 @@
 
 use super::maintenance::{
     check_cve_search_full, check_foreign_key_integrity, check_osv_search_full,
-    check_required_schema, check_search_integrity, check_sqlite_integrity, check_sqlite_quick,
-    finish_cve_bulk_load, finish_cve_bulk_load_with_index_signal, finish_osv_bulk_load,
-    prepare_cve_bulk_load, prepare_osv_bulk_load, rebuild_cve_search, rebuild_osv_search,
-    rebuild_search,
+    check_required_schema, check_search_integrity_full, check_search_integrity_quick,
+    check_sqlite_integrity, check_sqlite_quick, finish_cve_bulk_load,
+    finish_cve_bulk_load_with_index_signal, finish_osv_bulk_load, prepare_cve_bulk_load,
+    prepare_osv_bulk_load, rebuild_cve_search, rebuild_osv_search, rebuild_search,
 };
 use super::schema;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
@@ -70,8 +70,14 @@ impl SqliteWriter {
     pub(crate) async fn check_quick(&self) -> Result<(), sqlx::Error> {
         let mut connection = self.connection.lock().await;
         check_required_schema(&mut connection).await?;
+        check_search_integrity_quick(&mut connection).await
+    }
+
+    pub(crate) async fn check_scan(&self) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        check_required_schema(&mut connection).await?;
         check_sqlite_quick(&mut connection).await?;
-        check_search_integrity(&mut connection).await
+        check_search_integrity_full(&mut connection).await
     }
 
     pub(crate) async fn check_foreign_key_integrity(&self) -> Result<(), sqlx::Error> {
@@ -137,10 +143,10 @@ impl SqliteWriter {
         finish_osv_bulk_load(&mut connection).await
     }
 
-    pub(crate) async fn check_schema(&self) -> Result<(), sqlx::Error> {
+    pub(crate) async fn check_search_integrity_quick(&self) -> Result<(), sqlx::Error> {
         let mut connection = self.connection.lock().await;
         check_required_schema(&mut connection).await?;
-        check_search_integrity(&mut connection).await
+        check_search_integrity_quick(&mut connection).await
     }
 
     pub(crate) async fn check_required_schema(&self) -> Result<(), sqlx::Error> {

@@ -2,7 +2,7 @@
 
 use sqlx::{Connection, SqliteConnection};
 
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 
 pub(crate) async fn suspend_cve_search_sync(
     _connection: &mut SqliteConnection,
@@ -153,12 +153,12 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             details TEXT,
             raw_record_id INTEGER NOT NULL REFERENCES osv_raw_records(id)
         );
-        CREATE TABLE IF NOT EXISTS osv_aliases (osv_id TEXT NOT NULL, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id));
+        CREATE TABLE IF NOT EXISTS osv_aliases (osv_id TEXT NOT NULL REFERENCES osv_advisories(osv_id) ON DELETE CASCADE, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id));
         CREATE TABLE IF NOT EXISTS osv_cve_search (osv_id TEXT NOT NULL, cve_id TEXT NOT NULL, PRIMARY KEY(osv_id, cve_id));
         CREATE TABLE IF NOT EXISTS osv_token_cve_search (token TEXT NOT NULL, cve_id TEXT NOT NULL, state INTEGER NOT NULL, published_at TEXT NOT NULL, PRIMARY KEY(token, cve_id));
         CREATE TABLE IF NOT EXISTS osv_affected_packages (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            osv_id TEXT NOT NULL,
+            osv_id TEXT NOT NULL REFERENCES osv_advisories(osv_id) ON DELETE CASCADE,
             affected_order INTEGER NOT NULL DEFAULT 0,
             ecosystem TEXT,
             package_name TEXT,
@@ -166,20 +166,20 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         );
         CREATE TABLE IF NOT EXISTS osv_ranges (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            affected_package_id INTEGER NOT NULL,
+            affected_package_id INTEGER NOT NULL REFERENCES osv_affected_packages(id) ON DELETE CASCADE,
             affected_order INTEGER NOT NULL DEFAULT 0,
             range_order INTEGER NOT NULL DEFAULT 0,
             range_type TEXT
         );
         CREATE TABLE IF NOT EXISTS osv_range_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            range_id INTEGER NOT NULL,
+            range_id INTEGER NOT NULL REFERENCES osv_ranges(id) ON DELETE CASCADE,
             event_type TEXT NOT NULL,
             value TEXT NOT NULL,
             event_order INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS osv_versions (affected_package_id INTEGER NOT NULL, version TEXT NOT NULL, PRIMARY KEY(affected_package_id, version));
-        CREATE TABLE IF NOT EXISTS osv_references (osv_id TEXT NOT NULL, reference_type TEXT, url TEXT NOT NULL, PRIMARY KEY(osv_id, url));
+        CREATE TABLE IF NOT EXISTS osv_versions (affected_package_id INTEGER NOT NULL REFERENCES osv_affected_packages(id) ON DELETE CASCADE, version TEXT NOT NULL, PRIMARY KEY(affected_package_id, version));
+        CREATE TABLE IF NOT EXISTS osv_references (osv_id TEXT NOT NULL REFERENCES osv_advisories(osv_id) ON DELETE CASCADE, reference_type TEXT, url TEXT NOT NULL, PRIMARY KEY(osv_id, url));
         CREATE VIRTUAL TABLE IF NOT EXISTS osv_text_fts USING fts5(osv_id UNINDEXED, summary, details, aliases, packages, tokenize='unicode61');
         CREATE TABLE IF NOT EXISTS kev_entries (
             cve_id TEXT PRIMARY KEY NOT NULL,
@@ -284,7 +284,7 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
             ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv');
 
-        INSERT INTO schema_meta(rowid, version) VALUES(1, 7);
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 8);
         "#,
     )
     .execute(&mut *transaction)

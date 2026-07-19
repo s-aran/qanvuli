@@ -1,6 +1,6 @@
 use super::common::{
     CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
-    OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
+    OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
     download_latest_asset_with_source, download_osv_selection_from_gcs,
     import_downloaded_osv_selection, ingest_zip_sqlx_bulk_with_index_signal, redact_database_url,
     remove_processed_zip, remove_sqlite_database_files, replacement_sqlite_database_url,
@@ -13,10 +13,6 @@ use std::path::PathBuf;
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
-    #[arg(long)]
-    schema_only: bool,
-    #[arg(long)]
-    rebuild: bool,
     #[arg(long, value_name = "PATH")]
     zip: Option<PathBuf>,
     #[arg(long, value_name = "N")]
@@ -29,7 +25,7 @@ pub struct Args {
     osv_prefixes: Vec<String>,
 }
 
-/// Initializes the database schema and, unless schema-only, imports CVE data.
+/// Builds and installs a complete replacement vulnerability database.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
@@ -39,46 +35,6 @@ async fn run_with_progress(
     args: Args,
     progress: Option<IngestProgressCallback>,
 ) -> Result<(), String> {
-    if args.schema_only {
-        emit_init_progress(&progress, "-", "connecting");
-        eprintln!("init: connecting database {}", redact_database_url(db_url));
-        if args.rebuild {
-            let (candidate_path, candidate_url) = replacement_sqlite_database_url(db_url)?;
-            let db = connect_sqlx_db(&candidate_url).await?;
-            db.initialize()
-                .await
-                .map_err(|error| format!("failed to initialize replacement schema: {error}"))?;
-            db.check_schema()
-                .await
-                .map_err(|error| format!("failed to validate replacement schema: {error}"))?;
-            db.close()
-                .await
-                .map_err(|error| format!("failed to close replacement database: {error}"))?;
-            let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
-                "schema rebuild requires a file-backed SQLite database".to_owned()
-            })?;
-            install_closed_database(&candidate_path, &target)
-                .map_err(|error| format!("failed to install rebuilt schema: {error}"))?;
-            emit_init_progress(&progress, "-", "done");
-            println!("rebuilt schema: {}", redact_database_url(db_url));
-            return Ok(());
-        }
-        let db = connect_sqlx_db(db_url).await?;
-        emit_init_progress(&progress, "-", "initializing");
-        db.initialize()
-            .await
-            .map_err(|err| format!("failed to initialize SQLx schema: {err}"))?;
-        db.check_schema()
-            .await
-            .map_err(|err| format!("failed to validate SQLx schema: {err}"))?;
-        emit_init_progress(&progress, "-", "done");
-        println!("initialized schema: {}", redact_database_url(db_url));
-        db.close()
-            .await
-            .map_err(|error| format!("failed to close database: {error}"))?;
-        return Ok(());
-    }
-
     let (asset_path, cve_delta_cursor) = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
         let cursor = cve_full_asset_cursor(&zip);
@@ -158,10 +114,15 @@ async fn run_with_progress(
                 .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
         }
         sync_cwe_catalog_sqlx(db_for_build.clone()).await?;
-        import_downloaded_osv_selection(db_for_build.clone(), osv_download_result?).await?;
+        import_downloaded_osv_selection(
+            db_for_build.clone(),
+            osv_download_result?,
+            OsvImportMode::InitialReplacement,
+        )
+        .await?;
         sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init", false).await?;
         db_for_build
-            .check_schema()
+            .check_search_integrity_quick()
             .await
             .map_err(|error| format!("replacement database integrity check failed: {error}"))
     }
@@ -233,7 +194,6 @@ pub async fn run_default_with_progress_and_keep(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qanvuli_core::database::SqlxDatabase;
     use std::io::Write;
 
     #[tokio::test]
@@ -281,34 +241,6 @@ mod tests {
                 .to_string_lossy()
                 .contains(".building-")
         }));
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[tokio::test]
-    async fn schema_rebuild_installs_a_new_sqlx_database_over_an_old_file() {
-        let directory = std::env::temp_dir().join(format!(
-            "qanvuli-schema-rebuild-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("database.sqlite");
-        std::fs::write(&path, b"not a SQLite database").unwrap();
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        run_with_progress(
-            &url,
-            Args {
-                schema_only: true,
-                rebuild: true,
-                ..Args::default()
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        let database = SqlxDatabase::connect(&url).await.unwrap();
-        database.check().await.unwrap();
-        database.close().await.unwrap();
         let _ = std::fs::remove_dir_all(directory);
     }
 }

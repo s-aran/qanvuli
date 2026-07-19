@@ -415,7 +415,7 @@ impl SqlxDatabase {
             .await
     }
 
-    pub async fn query_package_enriched(
+    pub async fn query_package_matches(
         &self,
         ecosystem: &str,
         package: &str,
@@ -469,6 +469,18 @@ impl SqlxDatabase {
             .collect())
     }
 
+    #[deprecated(note = "use query_package_matches; enrichment fields are not populated")]
+    pub async fn query_package_enriched(
+        &self,
+        ecosystem: &str,
+        package: &str,
+        version: &str,
+        purl: Option<&str>,
+    ) -> Result<Vec<EnrichedFinding>, sqlx::Error> {
+        self.query_package_matches(ecosystem, package, version, purl)
+            .await
+    }
+
     pub async fn find_cve_summary_with_detail_with_state_scope(
         &self,
         cve_id: &str,
@@ -497,9 +509,9 @@ impl SqlxDatabase {
         self.writer.rebuild_osv_search().await
     }
 
-    /// Verifies the required schema objects and version without scanning the full database.
-    pub async fn check_schema(&self) -> Result<(), sqlx::Error> {
-        self.writer.check_schema().await
+    /// Verifies schema plus a fixed number of indexed search-projection sentinels.
+    pub async fn check_search_integrity_quick(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_search_integrity_quick().await
     }
 
     /// Verifies schema shape/version without requiring derived search data to be healthy.
@@ -553,6 +565,11 @@ impl SqlxDatabase {
 
     pub async fn check(&self) -> Result<(), sqlx::Error> {
         self.writer.check_quick().await
+    }
+
+    /// Runs SQLite quick_check and complete search correspondence scans.
+    pub async fn check_scan(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_scan().await
     }
 
     /// Runs the expensive SQLite file-integrity stage used by `db check --full`.
@@ -1285,12 +1302,21 @@ impl SqlxDatabase {
         query: &str,
         limit: i64,
     ) -> Result<Vec<SqlxOsvSummary>, sqlx::Error> {
+        self.search_osv_paginated(query, limit, 0).await
+    }
+
+    pub async fn search_osv_paginated(
+        &self,
+        query: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SqlxOsvSummary>, sqlx::Error> {
         let Some(query) = fts_query(query) else {
             return Ok(Vec::new());
         };
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.withdrawn_at FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ? ORDER BY bm25(osv_text_fts), advisory.modified_at DESC LIMIT ?")
-                .bind(query).bind(limit.max(1)).fetch_all(connection).await
+            sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.withdrawn_at FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ? ORDER BY bm25(osv_text_fts), advisory.modified_at DESC, advisory.osv_id LIMIT ? OFFSET ?")
+                .bind(query).bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
         })).await
     }
 
@@ -1327,6 +1353,39 @@ impl SqlxDatabase {
                     .bind(osv_id)
                     .fetch_optional(connection)
                     .await
+                })
+            })
+            .await
+    }
+
+    /// Returns OSV publication/modification timestamps in caller order using one statement.
+    pub async fn osv_advisory_dates_batch(
+        &self,
+        osv_ids: &[String],
+    ) -> Result<Vec<Option<(Option<String>, Option<String>)>>, sqlx::Error> {
+        if osv_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested = osv_ids.to_vec();
+        let requested_json = serde_json::to_string(&requested)
+            .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}")))?;
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                        "SELECT advisory.osv_id, advisory.published_at, advisory.modified_at FROM osv_advisories advisory WHERE advisory.osv_id IN (SELECT value FROM json_each(?))",
+                    )
+                    .bind(requested_json)
+                    .fetch_all(connection)
+                    .await?;
+                    let dates = rows
+                        .into_iter()
+                        .map(|(id, published, modified)| (id, (published, modified)))
+                        .collect::<BTreeMap<_, _>>();
+                    Ok(requested
+                        .into_iter()
+                        .map(|id| dates.get(&id).cloned())
+                        .collect())
                 })
             })
             .await
@@ -2619,16 +2678,16 @@ mod tests {
     #[tokio::test]
     async fn initializes_and_checks_a_new_database_on_one_writer() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        assert!(database.check_schema().await.is_err());
+        assert!(database.check_search_integrity_quick().await.is_err());
         database.initialize().await.unwrap();
-        database.check_schema().await.unwrap();
+        database.check_search_integrity_quick().await.unwrap();
         database.rebuild_search().await.unwrap();
         database.check().await.unwrap();
         database.check_full_sqlite().await.unwrap();
         database.check_full_foreign_keys().await.unwrap();
         database.check_full_cve_search().await.unwrap();
         database.check_full_osv_search().await.unwrap();
-        assert_eq!(SqlxDatabase::schema_version(), 7);
+        assert_eq!(SqlxDatabase::schema_version(), 8);
     }
 
     #[tokio::test]
@@ -2763,7 +2822,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(database.check_schema().await.is_err());
+        assert!(database.check_search_integrity_quick().await.is_err());
         assert!(database.initialize().await.is_err());
     }
 
@@ -2783,9 +2842,100 @@ mod tests {
             })
             .await
             .unwrap();
-        let error = database.check_schema().await.unwrap_err().to_string();
+        let error = database
+            .check_search_integrity_quick()
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("cve.serial"));
         assert!(database.initialize().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn schema_check_rejects_wrong_index_columns() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("DROP INDEX idx_osv_ranges_package")
+                        .execute(&mut *connection)
+                        .await?;
+                    sqlx::query("CREATE INDEX idx_osv_ranges_package ON osv_ranges(range_type)")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            database
+                .check_required_schema()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("wrong columns")
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_check_rejects_missing_foreign_key() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query("DROP TABLE osv_aliases").execute(&mut *connection).await?;
+            sqlx::query("CREATE TABLE osv_aliases (osv_id TEXT NOT NULL, alias_id TEXT NOT NULL, PRIMARY KEY(osv_id, alias_id))").execute(&mut *connection).await?;
+            sqlx::query("CREATE INDEX idx_osv_aliases_alias ON osv_aliases(alias_id)").execute(connection).await?;
+            Ok(())
+        })).await.unwrap();
+        assert!(
+            database
+                .check_required_schema()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("foreign key")
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_check_rejects_normal_table_in_place_of_fts() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query("DROP TABLE osv_text_fts").execute(&mut *connection).await?;
+            sqlx::query("CREATE TABLE osv_text_fts (osv_id TEXT, summary TEXT, details TEXT, aliases TEXT, packages TEXT)").execute(connection).await?;
+            Ok(())
+        })).await.unwrap();
+        assert!(
+            database
+                .check_required_schema()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("FTS5")
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_check_rejects_missing_unique_constraint() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query("DROP TABLE osv_versions").execute(&mut *connection).await?;
+            sqlx::query("CREATE TABLE osv_versions (affected_package_id INTEGER NOT NULL REFERENCES osv_affected_packages(id) ON DELETE CASCADE, version TEXT NOT NULL)").execute(connection).await?;
+            Ok(())
+        })).await.unwrap();
+        assert!(
+            database
+                .check_required_schema()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UNIQUE")
+        );
     }
 
     #[tokio::test]

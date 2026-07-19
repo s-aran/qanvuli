@@ -4,9 +4,6 @@ use serde::{Deserialize, Serialize};
 use simd_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use tokio::task::JoinSet;
-
-const MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY: usize = 16;
 
 /// CLI arguments for `qanvuli sbom`.
 #[derive(Debug, clap::Args)]
@@ -24,9 +21,6 @@ pub struct Args {
     /// Limit final findings per package and source (CVE, OSV, and optional name matches).
     #[arg(long)]
     per_package_limit: Option<u64>,
-    /// Maximum number of packages searched concurrently.
-    #[arg(short = 'j', long, value_name = "N")]
-    jobs: Option<usize>,
     /// Include rejected linked CVEs; OSV advisories have no CVE rejection state.
     #[arg(long)]
     include_rejected: bool,
@@ -53,14 +47,10 @@ impl Args {
 
 /// Reads an SBOM JSON file and prints local vulnerability findings as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let jobs = args.jobs.unwrap_or_else(default_search_concurrency);
-    if jobs == 0 {
-        return Err("--jobs must be at least 1".to_owned());
-    }
     let db = connect_db(db_url).await?;
-    db.initialize_schema()
+    db.check_required_schema()
         .await
-        .map_err(|err| format!("failed to initialize schema: {err}"))?;
+        .map_err(|err| format!("database rebuild required before SBOM search: {err}"))?;
     let date_filter = args.date_filter()?;
     let packages = load_sbom_packages(args.path()?)?;
     let package_count = packages.len();
@@ -71,31 +61,26 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
     let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
-    eprintln!("sbom: searching {package_count} packages with up to {jobs} concurrent searches");
-    let mut pending = JoinSet::new();
-    let mut packages = packages.into_iter().enumerate();
-    let mut completed = 0usize;
-    while pending.len() < jobs {
-        let Some((index, package)) = packages.next() else {
-            break;
-        };
-        start_package_search(
-            &mut pending,
-            db.clone(),
-            package,
+    eprintln!("sbom: searching {package_count} packages");
+    for (index, package) in packages.into_iter().enumerate() {
+        eprintln!(
+            "sbom: [{}/{}] searching {}",
             index + 1,
             package_count,
+            package.name
+        );
+        let result = search_package(
+            db.clone(),
+            package,
             date_filter.clone(),
             state_scope,
             per_package_limit,
             args.include_name_matches,
-        );
-    }
-    while let Some(result) = pending.join_next().await {
-        let result = result.map_err(|err| format!("SBOM search task failed: {err}"))??;
-        completed += 1;
+        )
+        .await?;
         eprintln!(
-            "sbom: [{completed}/{package_count}] completed {} (CVE={}, OSV={})",
+            "sbom: [{}/{package_count}] completed {} (CVE={}, OSV={})",
+            index + 1,
             result.package_name,
             result.cve_findings.len(),
             result.osv_findings.len()
@@ -113,19 +98,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             merge_cve_finding(&mut unverified_name_matches, key, finding);
         }
         unresolved_versions.extend(result.unresolved_versions);
-        if let Some((index, package)) = packages.next() {
-            start_package_search(
-                &mut pending,
-                db.clone(),
-                package,
-                index + 1,
-                package_count,
-                date_filter.clone(),
-                state_scope,
-                per_package_limit,
-                args.include_name_matches,
-            );
-        }
     }
 
     let cve_findings = cve_findings.into_values().collect::<Vec<_>>();
@@ -149,36 +121,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
 
     close_db(db).await?;
     Ok(())
-}
-
-fn default_search_concurrency() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get().saturating_mul(2))
-        .unwrap_or(1)
-        .clamp(1, MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_package_search(
-    pending: &mut JoinSet<Result<PackageSearchResult, String>>,
-    db: qanvuli_core::database::CveDatabase,
-    package: SbomPackage,
-    index: usize,
-    total: usize,
-    date_filter: DateFilter,
-    state_scope: CveStateScope,
-    per_package_limit: u64,
-    include_name_matches: bool,
-) {
-    eprintln!("sbom: [{index}/{total}] searching {}", package.name);
-    pending.spawn(search_package(
-        db,
-        package,
-        date_filter,
-        state_scope,
-        per_package_limit,
-        include_name_matches,
-    ));
 }
 
 struct PackageSearchResult {
@@ -246,7 +188,7 @@ async fn search_package(
             continue;
         }
         let findings = db
-            .query_package_enriched(
+            .query_package_matches(
                 &package_ref.ecosystem,
                 &package_ref.name,
                 version,
@@ -254,15 +196,39 @@ async fn search_package(
             )
             .await
             .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
+        let osv_ids = findings
+            .iter()
+            .map(|finding| finding.primary_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let osv_dates = db
+            .osv_advisory_dates_batch(&osv_ids)
+            .await
+            .map_err(|err| format!("failed to load OSV advisory dates: {err}"))?;
+        let osv_dates = osv_ids
+            .into_iter()
+            .zip(osv_dates)
+            .collect::<BTreeMap<_, _>>();
+        let cve_ids = findings
+            .iter()
+            .flat_map(|finding| finding.cve_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let cves = db
+            .cve_summaries_with_details_batch(&cve_ids, state_scope)
+            .await
+            .map_err(|err| format!("failed to load linked CVEs: {err}"))?;
+        let cves = cve_ids.into_iter().zip(cves).collect::<BTreeMap<_, _>>();
         for finding in findings {
-            let osv_dates = db
-                .osv_advisory_dates(&finding.primary_id)
-                .await
-                .map_err(|err| format!("failed to load {} dates: {err}", finding.primary_id))?;
-            let osv_matches_dates = osv_dates.as_ref().is_some_and(|(published, modified)| {
-                matches_since(published.as_deref(), date_filter.published_since.as_deref())
-                    && matches_since(modified.as_deref(), date_filter.updated_since.as_deref())
-            });
+            let osv_matches_dates = osv_dates
+                .get(&finding.primary_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|(published, modified)| {
+                    matches_since(published.as_deref(), date_filter.published_since.as_deref())
+                        && matches_since(modified.as_deref(), date_filter.updated_since.as_deref())
+                });
             if finding.affected.status != "affected" {
                 if osv_matches_dates {
                     unresolved_versions.push(UnresolvedVersion {
@@ -278,11 +244,7 @@ async fn search_package(
                 continue;
             }
             for cve_id in &finding.cve_ids {
-                let Some(cve) = db
-                    .find_cve_summary_with_detail_with_state_scope(cve_id, state_scope)
-                    .await
-                    .map_err(|err| format!("failed to load {cve_id}: {err}"))?
-                else {
+                let Some(cve) = cves.get(cve_id).and_then(Option::as_ref) else {
                     continue;
                 };
                 if !matches_since(
@@ -300,7 +262,7 @@ async fn search_package(
                     matched_component: package_ref.name.clone(),
                     matched_purl: Some(package_ref.purl.clone()),
                     version_match: CveVersionMatch::OsvRangeMatched,
-                    cve: cve.summary,
+                    cve: cve.summary.clone(),
                 });
             }
             if osv_matches_dates {
@@ -646,11 +608,6 @@ mod tests {
         assert_eq!(packages.len(), 2);
         assert!(packages.iter().any(|package| package.name == "mlua"));
         assert!(packages.iter().any(|package| package.name == "serde_json"));
-    }
-
-    #[test]
-    fn default_search_concurrency_is_nonzero_and_bounded() {
-        assert!((1..=MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY).contains(&default_search_concurrency()));
     }
 
     #[test]
