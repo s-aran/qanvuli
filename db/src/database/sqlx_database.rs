@@ -25,6 +25,25 @@ use sqlx::{Acquire, QueryBuilder, Row, Sqlite};
 use std::collections::{BTreeMap, BTreeSet};
 
 type AffectedRow = (i64, Option<String>, Option<String>, Option<String>, String);
+type BatchedCvssRow = (
+    i64,
+    String,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type BatchedAffectedRow = (i64, Option<String>, Option<String>, Option<String>, String);
+type BatchedEpssRow = (String, f64, f64, Option<String>, Option<String>);
+type BatchedKevRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+);
+type BatchedOsvRow = (String, String, String, Option<String>, Option<String>);
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
 struct CveParentInput {
@@ -49,6 +68,21 @@ struct OsvBatchInput {
     content_hash: String,
     search_aliases: String,
     search_packages: String,
+}
+
+/// Outcome of one bounded OSV database batch.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct OsvImportStats {
+    pub examined: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
+impl OsvImportStats {
+    pub fn changed(self) -> usize {
+        self.inserted + self.updated
+    }
 }
 
 type CvssInput = (
@@ -340,6 +374,7 @@ impl SqlxDatabase {
         self.initialize().await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_cve_summaries_by_affected_component_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -763,6 +798,18 @@ impl SqlxDatabase {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
+        self.search_cves_advanced_with_kev(filters, include_rejected, false, limit, offset)
+            .await
+    }
+
+    pub(crate) async fn search_cves_advanced_with_kev(
+        &self,
+        filters: SqlxCveSearch,
+        include_rejected: bool,
+        kev_only: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
         let cwe_ids = filters
             .cwe_ids
             .iter()
@@ -781,25 +828,41 @@ impl SqlxDatabase {
             .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CWE IDs: {error}")))?;
         let text = filters.text.as_deref().and_then(fts_query);
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c WHERE (? OR c.state=0) AND (? IS NULL OR c.published_at >= ?) AND (? IS NULL OR c.published_at <= ?) AND (? IS NULL OR c.updated_at >= ?) AND (? IS NULL OR c.updated_at <= ?) AND (? IS NULL OR c.cve_id IN (SELECT cve_id FROM cve_summary_fts WHERE cve_summary_fts MATCH ?)) AND (? IS NULL OR EXISTS (SELECT 1 FROM cve_cwe WHERE cve_cwe.cve_db_id=c.id AND cve_cwe.cwe_id IN (SELECT value FROM json_each(?)))) AND ((? IS NULL AND ? IS NULL AND ? IS NULL AND ? IS NULL) OR EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id AND (? IS NULL OR affected.vendor LIKE ?) AND (? IS NULL OR affected.product LIKE ?) AND (? IS NULL OR affected.vendor=?) AND (? IS NULL OR affected.product=?))) AND ((? IS NULL AND ? IS NULL AND ? IS NULL AND ? IS NULL) OR EXISTS (SELECT 1 FROM cve_cvss AS cvss WHERE cvss.cve_db_id=c.id AND (? IS NULL OR cvss.base_score >= ?) AND (? IS NULL OR cvss.base_score <= ?) AND (? IS NULL OR lower(cvss.base_severity)=lower(?)) AND (? IS NULL OR cvss.version=?))) ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
-                .bind(include_rejected)
-                .bind(&filters.published_since).bind(&filters.published_since)
-                .bind(&filters.published_until).bind(&filters.published_until)
-                .bind(&filters.updated_since).bind(&filters.updated_since)
-                .bind(&filters.updated_until).bind(&filters.updated_until)
-                .bind(&text).bind(&text)
-                .bind(&cwe_ids).bind(&cwe_ids)
-                .bind(&filters.vendor_like).bind(&filters.product_like).bind(&filters.vendor_exact).bind(&filters.product_exact)
-                .bind(&filters.vendor_like).bind(&filters.vendor_like)
-                .bind(&filters.product_like).bind(&filters.product_like)
-                .bind(&filters.vendor_exact).bind(&filters.vendor_exact)
-                .bind(&filters.product_exact).bind(&filters.product_exact)
-                .bind(filters.cvss.min_score).bind(filters.cvss.max_score).bind(&filters.cvss.severity).bind(&filters.cvss.version)
-                .bind(filters.cvss.min_score).bind(filters.cvss.min_score)
-                .bind(filters.cvss.max_score).bind(filters.cvss.max_score)
-                .bind(&filters.cvss.severity).bind(&filters.cvss.severity)
-                .bind(&filters.cvss.version).bind(&filters.cvss.version)
-                .bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c WHERE 1=1");
+            if !include_rejected { query.push(" AND c.state=0"); }
+            if let Some(value) = filters.published_since { query.push(" AND c.published_at >= ").push_bind(value); }
+            if let Some(value) = filters.published_until { query.push(" AND c.published_at <= ").push_bind(value); }
+            if let Some(value) = filters.updated_since { query.push(" AND c.updated_at >= ").push_bind(value); }
+            if let Some(value) = filters.updated_until { query.push(" AND c.updated_at <= ").push_bind(value); }
+            if let Some(value) = text {
+                query.push(" AND c.cve_id IN (SELECT cve_id FROM cve_summary_fts WHERE cve_summary_fts MATCH ").push_bind(value).push(")");
+            }
+            if let Some(value) = cwe_ids {
+                query.push(" AND EXISTS (SELECT 1 FROM cve_cwe WHERE cve_cwe.cve_db_id=c.id AND cve_cwe.cwe_id IN (SELECT value FROM json_each(").push_bind(value).push(")))");
+            }
+            if kev_only {
+                query.push(" AND EXISTS (SELECT 1 FROM kev_entries WHERE kev_entries.cve_id=c.cve_id)");
+            }
+            let has_affected = filters.vendor_like.is_some() || filters.product_like.is_some() || filters.vendor_exact.is_some() || filters.product_exact.is_some();
+            if has_affected {
+                query.push(" AND EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id");
+                if let Some(value) = filters.vendor_like { query.push(" AND affected.vendor LIKE ").push_bind(value); }
+                if let Some(value) = filters.product_like { query.push(" AND affected.product LIKE ").push_bind(value); }
+                if let Some(value) = filters.vendor_exact { query.push(" AND affected.vendor=").push_bind(value); }
+                if let Some(value) = filters.product_exact { query.push(" AND affected.product=").push_bind(value); }
+                query.push(")");
+            }
+            let has_cvss = filters.cvss.min_score.is_some() || filters.cvss.max_score.is_some() || filters.cvss.severity.is_some() || filters.cvss.version.is_some();
+            if has_cvss {
+                query.push(" AND EXISTS (SELECT 1 FROM cve_cvss AS cvss WHERE cvss.cve_db_id=c.id");
+                if let Some(value) = filters.cvss.min_score { query.push(" AND cvss.base_score >= ").push_bind(value); }
+                if let Some(value) = filters.cvss.max_score { query.push(" AND cvss.base_score <= ").push_bind(value); }
+                if let Some(value) = filters.cvss.severity { query.push(" AND lower(cvss.base_severity)=lower(").push_bind(value).push(")"); }
+                if let Some(value) = filters.cvss.version { query.push(" AND cvss.version=").push_bind(value); }
+                query.push(")");
+            }
+            query.push(" ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ").push_bind(limit.max(1)).push(" OFFSET ").push_bind(offset.max(0));
+            query.build_query_as().fetch_all(connection).await
         })).await
     }
 
@@ -845,17 +908,90 @@ impl SqlxDatabase {
         Ok(Some(SqlxCveSummaryWithDetail { summary, detail }))
     }
 
-    /// Loads full normalized details in caller order. This deliberately reuses the canonical
-    /// single-CVE path so batch callers cannot silently omit CVSS or CWE data.
+    /// Loads normalized details in a fixed number of set-based queries and restores caller order.
     pub async fn cve_details(
         &self,
         cve_ids: &[String],
     ) -> Result<Vec<Option<SqlxCveDetail>>, sqlx::Error> {
-        let mut details = Vec::with_capacity(cve_ids.len());
-        for cve_id in cve_ids {
-            details.push(self.cve_detail(cve_id).await?);
+        if cve_ids.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(details)
+        let requested = cve_ids.to_vec();
+        let requested_json = serde_json::to_string(&requested)
+            .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CVE IDs: {error}")))?;
+        self.writer.with_connection(|connection| Box::pin(async move {
+            let parents: Vec<(i64, String, String)> = sqlx::query_as(
+                "SELECT id, cve_id, raw_json FROM cve WHERE cve_id IN (SELECT value FROM json_each(?))",
+            ).bind(&requested_json).fetch_all(&mut *connection).await?;
+            let parent_ids = parents.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+            let parent_ids_json = serde_json::to_string(&parent_ids)
+                .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CVE row IDs: {error}")))?;
+            let mut details = BTreeMap::<i64, SqlxCveDetail>::new();
+            let mut ids_by_cve = BTreeMap::<String, i64>::new();
+            for (id, cve_id, raw_json) in parents {
+                let references = serde_json::from_str::<Value>(&raw_json)
+                    .map(|value| cve_references(value.pointer("/containers/cna"), value.pointer("/containers/adp")))
+                    .unwrap_or_default();
+                details.insert(id, SqlxCveDetail { references, ..SqlxCveDetail::default() });
+                ids_by_cve.insert(cve_id, id);
+            }
+
+            let cvss_rows: Vec<BatchedCvssRow> =
+                sqlx::query_as("SELECT cve_db_id, version, base_score, base_severity, vector_string, source FROM cve_cvss WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY id")
+                    .bind(&parent_ids_json).fetch_all(&mut *connection).await?;
+            for (id, version, base_score, base_severity, vector_string, source) in cvss_rows {
+                if let Some(detail) = details.get_mut(&id) {
+                    detail.cvss.push(SqlxCvss { version, base_score, base_severity, vector_string, source });
+                }
+            }
+            let cwe_rows: Vec<(i64, i64, Option<String>)> = sqlx::query_as(
+                "SELECT link.cve_db_id, cwe.id, cwe.description FROM cve_cwe link JOIN cwe ON cwe.id=link.cwe_id WHERE link.cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cwe.id",
+            ).bind(&parent_ids_json).fetch_all(&mut *connection).await?;
+            for (id, cwe_id, description) in cwe_rows {
+                if let Some(detail) = details.get_mut(&id) {
+                    detail.cwes.push(SqlxCwe { id: cwe_id, description });
+                }
+            }
+            let affected_rows: Vec<BatchedAffectedRow> =
+                sqlx::query_as("SELECT cve_db_id, vendor, product, package_name, raw_json FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY id")
+                    .bind(&parent_ids_json).fetch_all(&mut *connection).await?;
+            for (id, vendor, product, package_name, raw_json) in affected_rows {
+                let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
+                    .unwrap_or_default().into_iter()
+                    .map(|(version, status, version_type, less_than, less_than_or_equal)| SqlxAffectedVersion { version, status, version_type, less_than, less_than_or_equal })
+                    .collect();
+                if let Some(detail) = details.get_mut(&id) {
+                    detail.affected.push(SqlxAffected { vendor, product, package_name, versions });
+                }
+            }
+            let epss_rows: Vec<BatchedEpssRow> = sqlx::query_as(
+                "SELECT cve_id, epss, percentile, score_date, model_version FROM epss_current WHERE cve_id IN (SELECT value FROM json_each(?))",
+            ).bind(&requested_json).fetch_all(&mut *connection).await?;
+            for (cve_id, epss, percentile, score_date, model_version) in epss_rows {
+                if let Some(id) = ids_by_cve.get(&cve_id) {
+                    details.get_mut(id).expect("known parent").epss = Some(SqlxEpss { epss, percentile, score_date, model_version });
+                }
+            }
+            let kev_rows: Vec<BatchedKevRow> = sqlx::query_as(
+                "SELECT cve_id, vendor_project, product, vulnerability_name, COALESCE(date_added, ''), due_date FROM kev_entries WHERE cve_id IN (SELECT value FROM json_each(?))",
+            ).bind(&requested_json).fetch_all(&mut *connection).await?;
+            for (cve_id, vendor_project, product, vulnerability_name, date_added, due_date) in kev_rows {
+                if let Some(id) = ids_by_cve.get(&cve_id) {
+                    details.get_mut(id).expect("known parent").kev = Some(SqlxKev { vendor_project, product, vulnerability_name, date_added, due_date });
+                }
+            }
+            let osv_rows: Vec<BatchedOsvRow> = sqlx::query_as(
+                "SELECT alias.alias_id, advisory.osv_id, COALESCE(advisory.modified_at, ''), advisory.summary, advisory.withdrawn_at FROM osv_aliases alias JOIN osv_advisories advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id IN (SELECT value FROM json_each(?)) ORDER BY advisory.modified_at DESC, advisory.osv_id",
+            ).bind(&requested_json).fetch_all(&mut *connection).await?;
+            for (cve_id, osv_id, modified_at, summary, withdrawn_at) in osv_rows {
+                if let Some(id) = ids_by_cve.get(&cve_id) {
+                    details.get_mut(id).expect("known parent").osv_advisories.push(SqlxOsvSummary { osv_id, modified_at, summary, withdrawn_at });
+                }
+            }
+            Ok(requested.into_iter().map(|cve_id| {
+                ids_by_cve.get(&cve_id).and_then(|id| details.get(id)).cloned()
+            }).collect())
+        })).await
     }
 
     pub async fn database_status(&self) -> Result<SqlxDatabaseStatus, sqlx::Error> {
@@ -896,6 +1032,14 @@ impl SqlxDatabase {
         self.writer.with_connection(|connection| Box::pin(async move {
             sqlx::query_as("SELECT source, status, last_cursor, error_message FROM source_sync_state ORDER BY source")
                 .fetch_all(connection).await
+        })).await
+    }
+
+    /// Returns the cursor from the last successfully committed OSV synchronization.
+    pub async fn osv_sync_cursor(&self) -> Result<Option<String>, sqlx::Error> {
+        self.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query_scalar("SELECT last_cursor FROM source_sync_state WHERE source='OSV' AND status='success'")
+                .fetch_optional(connection).await.map(Option::flatten)
         })).await
     }
 
@@ -970,35 +1114,42 @@ impl SqlxDatabase {
         self.writer.with_connection(|connection| Box::pin(async move {
             let packages: Vec<(i64, String)> = sqlx::query_as("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (package.package_name=? COLLATE NOCASE OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id")
                 .bind(&ecosystem).bind(&package_name).bind(&purl).bind(&purl).fetch_all(&mut *connection).await?;
+            let package_ids_json = serde_json::to_string(&packages.iter().map(|(id, _)| id).collect::<Vec<_>>())
+                .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}")))?;
+            let osv_ids_json = serde_json::to_string(&packages.iter().map(|(_, id)| id).collect::<BTreeSet<_>>())
+                .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}")))?;
+            let events: Vec<(i64, i64, String, String, String)> = sqlx::query_as("SELECT range.affected_package_id, range.id, range.range_type, event.event_type, event.value FROM osv_ranges AS range JOIN osv_range_events AS event ON event.range_id=range.id WHERE range.affected_package_id IN (SELECT value FROM json_each(?)) ORDER BY range.affected_package_id, range.id, event.id")
+                .bind(&package_ids_json).fetch_all(&mut *connection).await?;
+            let mut ranges_by_package = BTreeMap::<i64, Vec<OsvRange>>::new();
+            let mut current_range = None;
+            for (package_id, range_id, range_type, event_type, value) in events {
+                let ranges = ranges_by_package.entry(package_id).or_default();
+                if current_range != Some((package_id, range_id)) {
+                    current_range = Some((package_id, range_id));
+                    ranges.push(OsvRange { range_type, events: Vec::new() });
+                }
+                ranges.last_mut().expect("range was inserted").events.push((event_type, value));
+            }
+            let explicit_versions: BTreeSet<i64> = sqlx::query_scalar("SELECT affected_package_id FROM osv_versions WHERE version=? AND affected_package_id IN (SELECT value FROM json_each(?))")
+                .bind(&version).bind(&package_ids_json).fetch_all(&mut *connection).await?.into_iter().collect();
+            let alias_rows: Vec<(String, String)> = sqlx::query_as("SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id")
+                .bind(&osv_ids_json).fetch_all(&mut *connection).await?;
+            let mut aliases_by_osv = BTreeMap::<String, Vec<String>>::new();
+            for (osv_id, alias_id) in alias_rows {
+                aliases_by_osv.entry(osv_id).or_default().push(alias_id);
+            }
             let mut findings = Vec::with_capacity(packages.len());
             for (package_id, osv_id) in packages {
-                let events: Vec<(i64, String, String, String)> = sqlx::query_as("SELECT range.id, range.range_type, event.event_type, event.value FROM osv_ranges AS range JOIN osv_range_events AS event ON event.range_id=range.id WHERE range.affected_package_id=? ORDER BY range.id, event.id")
-                    .bind(package_id).fetch_all(&mut *connection).await?;
-                let mut ranges = Vec::<OsvRange>::new();
-                let mut current_id = None;
-                for (range_id, range_type, event_type, value) in events {
-                    if current_id != Some(range_id) {
-                        current_id = Some(range_id);
-                        ranges.push(OsvRange { range_type, events: Vec::new() });
-                    }
-                    if let Some(range) = ranges.last_mut() { range.events.push((event_type, value)); }
-                }
-                let explicit_version: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM osv_versions WHERE affected_package_id=? AND version=? LIMIT 1",
-                )
-                .bind(package_id)
-                .bind(&version)
-                .fetch_optional(&mut *connection)
-                .await?;
-                let matched = explicit_version.map_or_else(
-                    || evaluate_version(&ecosystem, &version, &ranges),
-                    |_| super::package_eval::VersionMatch {
+                let ranges = ranges_by_package.remove(&package_id).unwrap_or_default();
+                let matched = if explicit_versions.contains(&package_id) {
+                    super::package_eval::VersionMatch {
                         status: "affected".to_owned(),
                         confidence: "high".to_owned(),
-                    },
-                );
-                let cve_ids = sqlx::query_scalar("SELECT alias_id FROM osv_aliases WHERE osv_id=? AND alias_id LIKE 'CVE-%' ORDER BY alias_id")
-                    .bind(&osv_id).fetch_all(&mut *connection).await?;
+                    }
+                } else {
+                    evaluate_version(&ecosystem, &version, &ranges)
+                };
+                let cve_ids = aliases_by_osv.get(&osv_id).cloned().unwrap_or_default();
                 findings.push(SqlxPackageFinding { osv_id, cve_ids, status: matched.status, confidence: matched.confidence });
             }
             Ok(findings)
@@ -1197,7 +1348,10 @@ impl SqlxDatabase {
         &self,
         records: Vec<OsvRawRecord>,
     ) -> Result<usize, sqlx::Error> {
-        self.import_osv_record_batch(records, true, false).await
+        Ok(self
+            .import_osv_record_batch(records, true, false)
+            .await?
+            .examined)
     }
 
     /// Imports OSV batches while deferring the global FTS rebuild to the ZIP-level caller.
@@ -1205,6 +1359,17 @@ impl SqlxDatabase {
         &self,
         records: Vec<OsvRawRecord>,
     ) -> Result<usize, sqlx::Error> {
+        Ok(self
+            .import_osv_records_deferred_search_with_stats(records)
+            .await?
+            .examined)
+    }
+
+    /// Imports an OSV batch and reports records skipped by the batch hash comparison.
+    pub async fn import_osv_records_deferred_search_with_stats(
+        &self,
+        records: Vec<OsvRawRecord>,
+    ) -> Result<OsvImportStats, sqlx::Error> {
         self.import_osv_record_batch(records, false, false).await
     }
 
@@ -1214,7 +1379,10 @@ impl SqlxDatabase {
         &self,
         records: Vec<OsvRawRecord>,
     ) -> Result<usize, sqlx::Error> {
-        self.import_osv_record_batch(records, false, true).await
+        Ok(self
+            .import_osv_record_batch(records, false, true)
+            .await?
+            .examined)
     }
 
     /// Imports one current-schema OSV advisory atomically on the dedicated writer.
@@ -1374,10 +1542,10 @@ impl SqlxDatabase {
         records: Vec<OsvRawRecord>,
         update_search: bool,
         bulk_init: bool,
-    ) -> Result<usize, sqlx::Error> {
+    ) -> Result<OsvImportStats, sqlx::Error> {
         let count = records.len();
         if records.is_empty() {
-            return Ok(0);
+            return Ok(OsvImportStats::default());
         }
         let parsed_records = tokio::task::spawn_blocking(move || {
             records
@@ -1396,7 +1564,39 @@ impl SqlxDatabase {
                     sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json')")
                         .execute(&mut *transaction)
                         .await?;
+                    let mut existing_hashes = BTreeMap::new();
+                    if !bulk_init {
+                        // Stay below conservative SQLite variable limits while avoiding an
+                        // additional lookup for every advisory.
+                        for chunk in parsed_records.chunks(500) {
+                            let mut query = QueryBuilder::<Sqlite>::new(
+                                "SELECT osv_id, content_hash FROM osv_raw_records WHERE osv_id IN (",
+                            );
+                            let mut separated = query.separated(", ");
+                            for record in chunk {
+                                separated.push_bind(&record.advisory.id);
+                            }
+                            separated.push_unseparated(")");
+                            let rows: Vec<(String, String)> = query
+                                .build_query_as()
+                                .fetch_all(&mut *transaction)
+                                .await?;
+                            existing_hashes.extend(rows);
+                        }
+                    }
+                    let mut stats = OsvImportStats {
+                        examined: count,
+                        ..OsvImportStats::default()
+                    };
                     for record in parsed_records {
+                        match existing_hashes.get(&record.advisory.id) {
+                            Some(hash) if hash == &record.content_hash => {
+                                stats.unchanged += 1;
+                                continue;
+                            }
+                            Some(_) => stats.updated += 1,
+                            None => stats.inserted += 1,
+                        }
                         Self::write_osv_batch_record(
                             &mut transaction,
                             record,
@@ -1406,11 +1606,11 @@ impl SqlxDatabase {
                         )
                         .await?;
                     }
-                    transaction.commit().await
+                    transaction.commit().await?;
+                    Ok(stats)
                 })
             })
-            .await?;
-        Ok(count)
+            .await
     }
 
     fn osv_batch_input(record: OsvRawRecord) -> Result<OsvBatchInput, String> {
@@ -2173,6 +2373,24 @@ impl SqlxDatabase {
         let count = parsed.rows.len();
         self.writer.with_connection(|connection| Box::pin(async move {
             let mut transaction = connection.begin().await?;
+            sqlx::query("CREATE TEMP TABLE IF NOT EXISTS epss_import_stage (cve_id TEXT PRIMARY KEY, epss REAL NOT NULL, percentile REAL NOT NULL, input_order INTEGER NOT NULL) WITHOUT ROWID")
+                .execute(&mut *transaction).await?;
+            sqlx::query("DELETE FROM epss_import_stage")
+                .execute(&mut *transaction).await?;
+            // Four bindings per row keep each statement below conservative SQLite limits.
+            for (batch_index, rows) in parsed.rows.chunks(200).enumerate() {
+                let mut query = QueryBuilder::<Sqlite>::new(
+                    "INSERT INTO epss_import_stage (cve_id, epss, percentile, input_order) ",
+                );
+                query.push_values(rows.iter().enumerate(), |mut row, (offset, value)| {
+                    row.push_bind(&value.cve_id)
+                        .push_bind(value.epss)
+                        .push_bind(value.percentile)
+                        .push_bind(i64::try_from(batch_index * 200 + offset).unwrap_or(i64::MAX));
+                });
+                query.push(" ON CONFLICT(cve_id) DO UPDATE SET epss=excluded.epss, percentile=excluded.percentile, input_order=excluded.input_order WHERE excluded.input_order >= epss_import_stage.input_order");
+                query.build().execute(&mut *transaction).await?;
+            }
             sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('EPSS', 'FIRST EPSS', 'enrichment', 'epss_scores-current.csv', 'csv')")
                 .execute(&mut *transaction).await?;
             let now = chrono::Utc::now().to_rfc3339();
@@ -2182,11 +2400,15 @@ impl SqlxDatabase {
             let raw_record_id: i64 = sqlx::query_scalar("SELECT id FROM epss_raw_records WHERE score_date=?")
                 .bind(&parsed.score_date)
                 .fetch_one(&mut *transaction).await?;
-            for row in parsed.rows {
-                sqlx::query("INSERT INTO epss_current (cve_id, raw_record_id, epss, percentile, score_date, model_version, fetched_at) SELECT cve_id, ?, ?, ?, ?, ?, ? FROM cve WHERE cve_id=? ON CONFLICT(cve_id) DO UPDATE SET raw_record_id=excluded.raw_record_id, epss=excluded.epss, percentile=excluded.percentile, score_date=excluded.score_date, model_version=excluded.model_version, fetched_at=excluded.fetched_at")
-                    .bind(raw_record_id).bind(row.epss).bind(row.percentile).bind(&parsed.score_date).bind(&parsed.model_version).bind(&now).bind(&row.cve_id)
-                    .execute(&mut *transaction).await?;
-            }
+            // epss_current represents exactly one current snapshot. Replacing it inside the
+            // same transaction removes CVEs absent from the new feed without exposing a gap.
+            sqlx::query("DELETE FROM epss_current").execute(&mut *transaction).await?;
+            sqlx::query("INSERT INTO epss_current (cve_id, raw_record_id, epss, percentile, score_date, model_version, fetched_at) SELECT c.cve_id, ?, s.epss, s.percentile, ?, ?, ? FROM epss_import_stage s JOIN cve c ON c.cve_id=s.cve_id")
+                .bind(raw_record_id)
+                .bind(&parsed.score_date)
+                .bind(&parsed.model_version)
+                .bind(&now)
+                .execute(&mut *transaction).await?;
             transaction.commit().await
         })).await?;
         Ok(count)
@@ -2748,6 +2970,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_osv_batch_does_not_rewrite_normalized_rows() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let record = OsvRawRecord {
+            source_path: Some("Go/GO-2099-unchanged.json".to_owned()),
+            raw_json: r#"{"schema_version":"1.8.0","id":"GO-2099-unchanged","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-1"],"affected":[{"package":{"ecosystem":"Go","name":"example.invalid/package"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}],"versions":["1.0.0"]}]}"#.to_owned(),
+        };
+        database
+            .import_osv_records_deferred_search_with_stats(vec![record.clone()])
+            .await
+            .unwrap();
+        let changes_before: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT total_changes()")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let stats = database
+            .import_osv_records_deferred_search_with_stats(vec![record])
+            .await
+            .unwrap();
+        let changes_after: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT total_changes()")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stats,
+            OsvImportStats {
+                examined: 1,
+                inserted: 0,
+                updated: 0,
+                unchanged: 1
+            }
+        );
+        assert_eq!(changes_after, changes_before);
+    }
+
+    /// Reproducible local micro-benchmark for the incremental OSV update hot path.
+    /// Run with: cargo test -p qanvuli-db benchmark_unchanged_osv_batch -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "performance benchmark"]
+    async fn benchmark_unchanged_osv_batch() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let records = (0..5_000)
+            .map(|index| OsvRawRecord {
+                source_path: Some(format!("Go/GO-2099-{index}.json")),
+                raw_json: format!(
+                    r#"{{"schema_version":"1.8.0","id":"GO-2099-{index}","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-{index}"],"references":[{{"type":"WEB","url":"https://example.invalid/{index}"}}],"affected":[{{"package":{{"ecosystem":"Go","name":"example.invalid/package/{index}"}},"ranges":[{{"type":"SEMVER","events":[{{"introduced":"0"}},{{"fixed":"2.0.0"}}]}}],"versions":["1.0.0","1.1.0"]}}]}}"#
+                ),
+            })
+            .collect::<Vec<_>>();
+        database
+            .import_osv_records_deferred_search(records.clone())
+            .await
+            .unwrap();
+        let changes_before: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT total_changes()")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        database
+            .import_osv_records_deferred_search(records)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        let changes_after: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT total_changes()")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        eprintln!(
+            "unchanged OSV: records=5000 elapsed={elapsed:?} sqlite_changes={}",
+            changes_after - changes_before
+        );
+    }
+
+    #[tokio::test]
     async fn imports_cve_with_stable_fts_rowid() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
@@ -2910,10 +3235,14 @@ mod tests {
         );
         assert_eq!(
             database
-                .cve_details(&["missing".to_owned(), "CVE-2099-1".to_owned()])
+                .cve_details(&[
+                    "missing".to_owned(),
+                    "CVE-2099-1".to_owned(),
+                    "CVE-2099-1".to_owned(),
+                ])
                 .await
                 .unwrap(),
-            vec![None, Some(detail)]
+            vec![None, Some(detail.clone()), Some(detail)]
         );
     }
 
@@ -3088,6 +3417,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kev_filter_is_applied_before_search_pagination() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"Windows KEV vulnerability"}}}"#.to_owned()).await.unwrap();
+        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-0002","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-03T00:00:00Z"},"containers":{"cna":{"title":"Windows non-KEV vulnerability"}}}"#.to_owned()).await.unwrap();
+        database
+            .import_kev_json(include_str!("../../../fixtures/kev/kev-test.json").to_owned())
+            .await
+            .unwrap();
+
+        let options = crate::CveAdvancedSearch {
+            query: Some("windows".to_owned()),
+            query_mode: Some(crate::CveAdvancedQueryMode::FreeText),
+            kev_only: true,
+            ..Default::default()
+        };
+        let rows = database
+            .search_cve_summaries_advanced(&options, 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2099-0001"]
+        );
+        assert_eq!(
+            database
+                .count_cve_summaries_advanced(&options)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn imports_epss_for_existing_cves_with_checked_scores() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
@@ -3115,6 +3480,118 @@ mod tests {
         assert_eq!(risks.len(), 1);
         assert_eq!(risks[0].cve_id, "CVE-2099-0001");
         assert!(!risks[0].kev_listed);
+    }
+
+    #[tokio::test]
+    async fn epss_snapshot_is_deduplicated_replaced_and_atomic() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for id in ["CVE-2099-0001", "CVE-2099-0002"] {
+            database.import_cve_raw_json(format!(r#"{{"cveMetadata":{{"cveId":"{id}","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"}},"containers":{{"cna":{{"title":"EPSS fixture"}}}}}}"#)).await.unwrap();
+        }
+        database.import_epss_csv("#model_version:v1,score_date:2099-01-01\ncve,epss,percentile\nCVE-2099-0001,0.1,0.2\nCVE-2099-0002,0.3,0.4\nCVE-2099-missing,0.5,0.6\nCVE-2099-0001,0.7,0.8\n".to_owned()).await.unwrap();
+        let first: Vec<(String, f64)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as("SELECT cve_id, epss FROM epss_current ORDER BY cve_id")
+                        .fetch_all(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            vec![
+                ("CVE-2099-0001".to_owned(), 0.7),
+                ("CVE-2099-0002".to_owned(), 0.3)
+            ]
+        );
+
+        database.import_epss_csv("#model_version:v2,score_date:2099-01-02\ncve,epss,percentile\nCVE-2099-0002,0.9,0.95\n".to_owned()).await.unwrap();
+        let replaced: Vec<(String, f64)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as("SELECT cve_id, epss FROM epss_current ORDER BY cve_id")
+                        .fetch_all(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(replaced, vec![("CVE-2099-0002".to_owned(), 0.9)]);
+
+        let failing_csv =
+            "#model_version:v3,score_date:2099-01-04\ncve,epss,percentile\nCVE-2099-0001,0.2,0.3\n"
+                .to_owned();
+        let conflicting_hash = Md5::digest(failing_csv.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        database.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::query("INSERT INTO epss_raw_records(score_date,fetched_at,content_hash,raw_csv) VALUES ('2099-01-03','2099-01-03T00:00:00Z',?,'conflict')")
+                .bind(conflicting_hash).execute(connection).await.map(|_| ())
+        })).await.unwrap();
+        assert!(database.import_epss_csv(failing_csv).await.is_err());
+        let after_error: Vec<(String, f64)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as("SELECT cve_id, epss FROM epss_current ORDER BY cve_id")
+                        .fetch_all(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(after_error, replaced);
+    }
+
+    /// Reproducible local micro-benchmark for a realistic EPSS current snapshot.
+    /// Run with: cargo test -p qanvuli-db benchmark_epss_snapshot -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "performance benchmark"]
+    async fn benchmark_epss_snapshot() {
+        const ROWS: usize = 50_000;
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let mut transaction = connection.begin().await?;
+                    for start in (0..ROWS).step_by(100) {
+                        let mut query = QueryBuilder::<Sqlite>::new(
+                    "INSERT INTO cve(cve_id,state,published_at,updated_at,title,serial,reference_text,raw_json) ",
+                        );
+                        query.push_values(start..(start + 100).min(ROWS), |mut row, index| {
+                            row.push_bind(format!("CVE-2099-{index:05}"))
+                                .push_bind(0_i64)
+                                .push_bind("2099-01-01T00:00:00Z")
+                                .push_bind("2099-01-01T00:00:00Z")
+                        .push_bind("")
+                        .push_bind(i64::try_from(index).unwrap())
+                        .push_bind("")
+                        .push_bind("{}");
+                        });
+                        query.build().execute(&mut *transaction).await?;
+                    }
+                    transaction.commit().await
+                })
+            })
+            .await
+            .unwrap();
+        let mut csv =
+            String::from("#model_version:v2099.01.01,score_date:2099-01-01\ncve,epss,percentile\n");
+        for index in 0..ROWS {
+            use std::fmt::Write as _;
+            writeln!(&mut csv, "CVE-2099-{index:05},0.123,0.456").unwrap();
+        }
+        let started = std::time::Instant::now();
+        let imported = database.import_epss_csv(csv).await.unwrap();
+        eprintln!("EPSS: records={imported} elapsed={:?}", started.elapsed());
     }
 
     #[tokio::test]

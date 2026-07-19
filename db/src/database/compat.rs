@@ -13,6 +13,24 @@ use qanvuli_models::{RawCveStatusRecord, parse_json_with_raw};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
+type CompatCweRow = (i32, Option<String>, Option<String>, Option<i32>);
+type CompatCvssRow = (
+    i64,
+    String,
+    Option<f64>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type CompatAffectedRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn include_rejected(scope: CveStateScope) -> bool {
     scope == CveStateScope::IncludeRejected
 }
@@ -31,9 +49,7 @@ fn cwe_number(value: &str) -> Option<i32> {
         .filter(|id| *id > 0)
 }
 
-fn cwe_entries_with_relation_counts(
-    rows: Vec<(i32, Option<String>, Option<String>, Option<i32>)>,
-) -> Vec<CweEntry> {
+fn cwe_entries_with_relation_counts(rows: Vec<CompatCweRow>) -> Vec<CweEntry> {
     let mut sibling_groups = HashMap::<Option<i32>, usize>::new();
     let mut child_counts = HashMap::<i32, usize>::new();
     for (_, _, _, parent_id) in &rows {
@@ -267,7 +283,7 @@ impl SqlxDatabase {
                         }
                     }
 
-                    let cvss: Vec<(i64, String, Option<f64>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                    let cvss: Vec<CompatCvssRow> = sqlx::query_as(
                         "SELECT cve_db_id, version, base_score, base_severity, vector_string, source FROM cve_cvss WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, base_score DESC, version",
                     )
                     .bind(&db_ids_json)
@@ -287,7 +303,7 @@ impl SqlxDatabase {
                         }
                     }
 
-                    let affected: Vec<(i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                    let affected: Vec<CompatAffectedRow> = sqlx::query_as(
                         "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, vendor, product",
                     )
                     .bind(db_ids_json)
@@ -382,6 +398,7 @@ impl SqlxDatabase {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_cve_summaries_by_vendor_product_exact_with_state_scope(
         &self,
         vendor: Option<&str>,
@@ -410,6 +427,7 @@ impl SqlxDatabase {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_cve_summaries_by_cvss_with_state_scope(
         &self,
         min_score: Option<f64>,
@@ -552,25 +570,15 @@ impl SqlxDatabase {
                     .await;
             }
         }
-        let mut rows = self
-            .search_cves_advanced(
+        let rows = self
+            .search_cves_advanced_with_kev(
                 filters,
                 include_rejected(options.state_scope),
+                options.kev_only,
                 limit as i64,
                 offset as i64,
             )
             .await?;
-        if options.kev_only {
-            let ids: Vec<String> = rows.iter().map(|row| row.cve_id.clone()).collect();
-            if !ids.is_empty() {
-                let json = serde_json::to_string(&ids).unwrap_or_default();
-                let allowed: Vec<String> = self.writer.with_connection(|connection| Box::pin(async move {
-                    sqlx::query_scalar("SELECT cve_id FROM kev_entries WHERE cve_id IN (SELECT value FROM json_each(?))")
-                        .bind(json).fetch_all(connection).await
-                })).await?;
-                rows.retain(|row| allowed.contains(&row.cve_id));
-            }
-        }
         Ok(rows.into_iter().map(summary).collect())
     }
 
@@ -833,7 +841,7 @@ impl SqlxDatabase {
     }
 
     pub async fn get_cwe_entry(&self, id: i32) -> Result<Option<CweEntry>, sqlx::Error> {
-        let row: Option<(i32, Option<String>, Option<String>, Option<i32>)> = self
+        let row: Option<CompatCweRow> = self
             .writer
             .with_connection(|connection| {
                 Box::pin(async move {
@@ -863,7 +871,7 @@ impl SqlxDatabase {
         let pattern = format!("%{query}%");
         let id = cwe_number(query);
         let query = query.to_owned();
-        let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>)> = self
+        let rows: Vec<CompatCweRow> = self
             .writer
             .with_connection(|connection| {
                 Box::pin(async move {
@@ -1091,6 +1099,7 @@ impl SqlxDatabase {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_cve_summaries_by_date_range(
         &self,
         published_from: Option<&str>,

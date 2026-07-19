@@ -645,15 +645,14 @@ pub(crate) async fn apply_updates(
         .await
         .map_err(mcp_error)?;
 
-    let graph = db
-        .rebuild_identifier_graph()
+    db.rebuild_identifier_graph()
         .await
         .map_err(|err| mcp_error(format!("failed to rebuild identifier graph: {err}")))?;
 
     response::tool_result(json!({
         "updated": true,
         "applied_assets": applied.into_iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
-        "identifier_graph": graph,
+        "identifier_graph": (),
     }))
 }
 

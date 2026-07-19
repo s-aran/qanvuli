@@ -12,6 +12,7 @@ pub(crate) struct SearchResult {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum SearchRequest {
     Mode {
         mode: SearchMode,

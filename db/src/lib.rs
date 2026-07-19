@@ -30,7 +30,7 @@ pub use database::package_eval::{
     evaluate_version as evaluate_sqlx_osv_version,
 };
 pub use database::sqlx_database::{
-    SqlxAffected, SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary,
+    OsvImportStats, SqlxAffected, SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary,
     SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase, SqlxDatabaseStatus,
     SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
     SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState,

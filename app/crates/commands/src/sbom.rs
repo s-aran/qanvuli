@@ -154,6 +154,7 @@ fn default_search_concurrency() -> usize {
         .clamp(1, MAX_DEFAULT_SBOM_SEARCH_CONCURRENCY)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_package_search(
     pending: &mut JoinSet<Result<PackageSearchResult, String>>,
     db: qanvuli_core::database::CveDatabase,

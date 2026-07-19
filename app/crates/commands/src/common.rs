@@ -127,6 +127,31 @@ pub fn format_elapsed(duration: Duration) -> String {
     format!("{duration:.2?}")
 }
 
+fn timestamp_is_after(candidate: &str, cursor: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(candidate),
+        DateTime::parse_from_rfc3339(cursor),
+    ) {
+        (Ok(candidate), Ok(cursor)) => candidate > cursor,
+        _ => candidate > cursor,
+    }
+}
+
+fn osv_target_paths_since(
+    selection: &OsvImportSelection,
+    modified_rows: &[OsvModifiedId],
+    cursor: &str,
+) -> AHashSet<String> {
+    modified_rows
+        .iter()
+        .filter(|row| {
+            selection.matches_id(&osv_id_from_path(&row.object_path))
+                && timestamp_is_after(&row.modified_at, cursor)
+        })
+        .map(|row| row.object_path.clone())
+        .collect()
+}
+
 /// Selects which OSV source prefixes should be imported.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OsvImportSelection {
@@ -338,6 +363,7 @@ pub(crate) struct DownloadedOsvSelection {
     label: String,
     selection: OsvImportSelection,
     cursor: String,
+    target_osv_ids: Option<AHashSet<String>>,
     zip_paths: Vec<PathBuf>,
     started: Instant,
 }
@@ -354,6 +380,7 @@ impl Drop for DownloadedOsvSelection {
 pub(crate) async fn download_osv_selection_from_gcs(
     label: &str,
     selection: OsvImportSelection,
+    previous_cursor: Option<&str>,
 ) -> Result<DownloadedOsvSelection, String> {
     let label = label.to_owned();
     let started = Instant::now();
@@ -372,13 +399,38 @@ pub(crate) async fn download_osv_selection_from_gcs(
         .map_err(|error| format!("{label}: failed to download OSV modified_id.csv: {error}"))?;
     let modified_rows = parse_modified_id_csv(&modified);
     let cursor = modified_rows
-        .first()
-        .map(|row| row.modified_at.clone())
+        .iter()
+        .filter_map(|row| DateTime::parse_from_rfc3339(&row.modified_at).ok())
+        .max()
+        .map(|value| value.to_rfc3339())
+        .or_else(|| previous_cursor.map(str::to_owned))
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    let target_paths =
+        previous_cursor.map(|cursor| osv_target_paths_since(&selection, &modified_rows, cursor));
+    let selected_modified_rows = target_paths.as_ref().map_or_else(
+        || modified_rows.clone(),
+        |paths| {
+            modified_rows
+                .iter()
+                .filter(|row| paths.contains(&row.object_path))
+                .cloned()
+                .collect()
+        },
+    );
+    let target_osv_ids = target_paths.as_ref().map(|paths| {
+        paths
+            .iter()
+            .map(|path| osv_id_from_path(path))
+            .collect::<AHashSet<_>>()
+    });
     let object_paths = if selection.all {
-        vec![OSV_ALL_ZIP.to_owned()]
+        if target_paths.as_ref().is_some_and(|paths| paths.is_empty()) {
+            Vec::new()
+        } else {
+            vec![OSV_ALL_ZIP.to_owned()]
+        }
     } else {
-        let database_dirs = osv_database_dirs_for_selection(&selection, &modified_rows);
+        let database_dirs = osv_database_dirs_for_selection(&selection, &selected_modified_rows);
         if database_dirs.is_empty() {
             eprintln!(
                 "{label}: OSV modified_id.csv did not contain records for {}; skipping OSV ZIP download",
@@ -423,6 +475,7 @@ pub(crate) async fn download_osv_selection_from_gcs(
         label,
         selection,
         cursor,
+        target_osv_ids,
         zip_paths,
         started,
     })
@@ -437,6 +490,7 @@ pub(crate) async fn import_downloaded_osv_selection(
         db.clone(),
         &download.zip_paths,
         Some(&download.selection),
+        download.target_osv_ids.as_ref(),
         &download.cursor,
         true,
     )
@@ -462,7 +516,20 @@ pub async fn sync_osv_selection_from_gcs_sqlx(
     label: &str,
     selection: OsvImportSelection,
 ) -> Result<usize, String> {
-    let download = download_osv_selection_from_gcs(label, selection).await?;
+    let previous_cursor = db
+        .osv_sync_cursor()
+        .await
+        .map_err(|error| format!("{label}: failed to read OSV cursor: {error}"))?;
+    let stored_selection = db
+        .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
+        .await
+        .map_err(|error| format!("{label}: failed to read OSV selection: {error}"))?;
+    let selection_expanded = OsvImportSelection::from_metadata(stored_selection.as_deref())
+        .is_none_or(|stored| stored != selection);
+    let incremental_cursor = (!selection_expanded)
+        .then_some(previous_cursor.as_deref())
+        .flatten();
+    let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
     import_downloaded_osv_selection(db, download).await
 }
 
@@ -475,13 +542,14 @@ pub async fn import_osv_zip_file_sqlx(
     completion_cursor: &str,
 ) -> Result<usize, String> {
     let paths = [path.to_path_buf()];
-    import_osv_zip_files_sqlx_with_mode(db, &paths, selection, completion_cursor, false).await
+    import_osv_zip_files_sqlx_with_mode(db, &paths, selection, None, completion_cursor, false).await
 }
 
 async fn import_osv_zip_files_sqlx_with_mode(
     db: SqlxDatabase,
     paths: &[PathBuf],
     selection: Option<&OsvImportSelection>,
+    target_osv_ids: Option<&AHashSet<String>>,
     completion_cursor: &str,
     bulk_load: bool,
 ) -> Result<usize, String> {
@@ -495,6 +563,8 @@ async fn import_osv_zip_files_sqlx_with_mode(
             .map_err(|error| format!("failed to prepare OSV bulk load: {error}"))?;
     }
     let mut imported = 0usize;
+    let mut changed = 0usize;
+    let mut unchanged = 0usize;
     let mut import_error = None;
     let mut seen_osv_ids = AHashSet::new();
     for path in paths {
@@ -503,9 +573,16 @@ async fn import_osv_zip_files_sqlx_with_mode(
         let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
         let path = path.clone();
         let selection = selection.cloned();
+        let target_osv_ids = target_osv_ids.cloned();
         let skip_osv_ids = seen_osv_ids.clone();
         let reader = tokio::task::spawn_blocking(move || {
-            read_osv_zip_batches(&path, None, selection.as_ref(), Some(&skip_osv_ids), sender)
+            read_osv_zip_batches(
+                &path,
+                target_osv_ids.as_ref(),
+                selection.as_ref(),
+                Some(&skip_osv_ids),
+                sender,
+            )
         });
         while let Some(batch) = receiver.recv().await {
             let batch = match batch {
@@ -517,15 +594,26 @@ async fn import_osv_zip_files_sqlx_with_mode(
             };
             let batch_started = Instant::now();
             let import_result = if bulk_load {
-                db.import_osv_records_bulk_init(batch.records).await
+                db.import_osv_records_bulk_init(batch.records)
+                    .await
+                    .map(|examined| qanvuli_core::database::OsvImportStats {
+                        examined,
+                        inserted: examined,
+                        updated: 0,
+                        unchanged: 0,
+                    })
             } else {
-                db.import_osv_records_deferred_search(batch.records).await
+                db.import_osv_records_deferred_search_with_stats(batch.records)
+                    .await
             };
             match import_result {
-                Ok(count) => {
-                    imported += count;
+                Ok(stats) => {
+                    imported += stats.examined;
+                    changed += stats.changed();
+                    unchanged += stats.unchanged;
                     eprintln!(
-                        "osv: imported {imported} records (batch {count} in {:?})",
+                        "osv: examined {imported} records, changed {changed}, unchanged {unchanged} (batch {} in {:?})",
+                        stats.examined,
                         batch_started.elapsed()
                     );
                 }
@@ -559,10 +647,14 @@ async fn import_osv_zip_files_sqlx_with_mode(
             db.finish_osv_bulk_load()
                 .await
                 .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
-        } else {
+        } else if changed > 0 {
             db.rebuild_osv_search()
                 .await
                 .map_err(|error| format!("failed to rebuild OSV FTS: {error}"))?;
+        } else {
+            eprintln!(
+                "osv: all {unchanged} examined records were unchanged; search rebuild skipped"
+            );
         }
         db.check_schema()
             .await
@@ -585,7 +677,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
 
 fn read_osv_zip_batches(
     path: &Path,
-    target_paths: Option<&AHashSet<String>>,
+    target_osv_ids: Option<&AHashSet<String>>,
     selection: Option<&OsvImportSelection>,
     skip_osv_ids: Option<&AHashSet<String>>,
     batch_tx: mpsc::Sender<Result<OsvImportBatch, String>>,
@@ -606,12 +698,12 @@ fn read_osv_zip_batches(
         if !name.ends_with(".json") {
             continue;
         }
-        if let Some(target_paths) = target_paths
-            && !target_paths.contains(&name)
+        let osv_id = osv_id_from_path(&name);
+        if let Some(target_osv_ids) = target_osv_ids
+            && !target_osv_ids.contains(&osv_id)
         {
             continue;
         }
-        let osv_id = osv_id_from_path(&name);
         if let Some(selection) = selection
             && !selection.matches_id(&osv_id)
         {
@@ -1055,9 +1147,7 @@ async fn latest_asset_with_published_at(
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
 
     let asset = match kind {
-        ReleaseAssetKind::All => cve
-            .get_latest_all_file_with_published_at()
-            .map(|(asset, published_at)| (asset, published_at)),
+        ReleaseAssetKind::All => cve.get_latest_all_file_with_published_at(),
         ReleaseAssetKind::Delta => cve.get_latest_delta_file().map(|asset| (asset, None)),
         ReleaseAssetKind::DeltaMidnight => cve
             .get_latest_delta_midnight_file()
@@ -1147,15 +1237,13 @@ pub async fn apply_delta_updates(
         }
         return Err(error);
     }
-    if database_changed {
-        if max_chunks.is_none() {
-            db.set_metadata_value(
-                CVE_DELTA_CURSOR_METADATA_KEY,
-                &completed_cursor.to_rfc3339(),
-            )
-            .await
-            .map_err(|error| format!("failed to advance CVE delta cursor: {error}"))?;
-        }
+    if database_changed && max_chunks.is_none() {
+        db.set_metadata_value(
+            CVE_DELTA_CURSOR_METADATA_KEY,
+            &completed_cursor.to_rfc3339(),
+        )
+        .await
+        .map_err(|error| format!("failed to advance CVE delta cursor: {error}"))?;
     }
     Ok(paths)
 }
@@ -1382,6 +1470,7 @@ mod tests {
             label: "test".to_owned(),
             selection: OsvImportSelection::default_init(false, &[]),
             cursor: Utc::now().to_rfc3339(),
+            target_osv_ids: None,
             zip_paths: vec![path.clone()],
             started: Instant::now(),
         };
@@ -1470,6 +1559,34 @@ mod tests {
         );
         assert!(!database_dirs.contains_key("crates.io"));
         assert!(!database_dirs.contains_key("empty"));
+    }
+
+    #[test]
+    fn osv_cursor_selects_only_newer_matching_object_paths() {
+        let selection = OsvImportSelection::default_init(false, &["pysec".to_owned()]);
+        let rows = vec![
+            OsvModifiedId {
+                modified_at: "2026-07-06T23:59:59Z".to_owned(),
+                object_path: "PyPI/PYSEC-2026-old.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:00Z".to_owned(),
+                object_path: "PyPI/GHSA-equal.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-07T00:00:01+00:00".to_owned(),
+                object_path: "PyPI/PYSEC-2026-new.json".to_owned(),
+            },
+            OsvModifiedId {
+                modified_at: "2026-07-08T00:00:00Z".to_owned(),
+                object_path: "crates.io/RUSTSEC-2026-new.json".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            osv_target_paths_since(&selection, &rows, "2026-07-07T00:00:00Z"),
+            AHashSet::from(["PyPI/PYSEC-2026-new.json".to_owned()])
+        );
     }
 
     #[test]

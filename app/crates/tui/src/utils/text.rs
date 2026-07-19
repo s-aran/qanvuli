@@ -1,3 +1,5 @@
+use ratatui::widgets::{Paragraph, Wrap};
+
 pub(crate) fn normalize_spaces(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -31,4 +33,3 @@ mod tests {
         assert_eq!(wrapped_line_count("one two three", 7), 2);
     }
 }
-use ratatui::widgets::{Paragraph, Wrap};

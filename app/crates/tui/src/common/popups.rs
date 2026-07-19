@@ -199,10 +199,12 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
     } else {
         "Enable OSV to choose registered advisories".to_owned()
     }));
-    lines.extend(entries.iter().filter_map(|entry| {
-        matches!(entry, crate::form::ScopeEntry::Advisory(_))
-            .then(|| scope_entry_line(form, *entry, active(*entry)))
-    }));
+    lines.extend(
+        entries
+            .iter()
+            .filter(|entry| matches!(entry, crate::form::ScopeEntry::Advisory(_)))
+            .map(|entry| scope_entry_line(form, *entry, active(*entry))),
+    );
     lines.push(
         ButtonRow {
             buttons: vec![

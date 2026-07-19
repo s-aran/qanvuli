@@ -127,10 +127,10 @@ fn product_vendor_summaries(affected: &[CveAffectedDetail]) -> (String, String) 
     for affected in affected {
         let vendor = affected.vendor.as_deref().unwrap_or("-");
         let product = affected.product.as_deref().unwrap_or("-");
-        if !products.iter().any(|value| *value == product) {
+        if !products.contains(&product) {
             products.push(product);
         }
-        if !vendors.iter().any(|value| *value == vendor) {
+        if !vendors.contains(&vendor) {
             vendors.push(vendor);
         }
         if products.len() >= 3 && vendors.len() >= 3 {
