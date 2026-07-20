@@ -498,6 +498,10 @@ mod tests {
                 assert!(result.rows.is_empty());
                 assert_eq!(result.osv_rows.len(), 1);
                 assert_eq!(result.osv_rows[0].osv_id, "MAL-2099-1");
+                assert_eq!(
+                    result.osv_rows[0].details.as_deref(),
+                    Some("OSV-only fixture")
+                );
             }
 
             let request = SearchRequest::Mode {

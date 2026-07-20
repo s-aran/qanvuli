@@ -1872,10 +1872,20 @@ fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
             } else {
                 format!(" {collection}")
             };
-            wrapped_line_count(
+            let component_lines = wrapped_line_count(
                 &format!("{vendor}/{product} pkg:{package} status:{status}{suffix}"),
                 width,
-            )
+            );
+            let description_lines = affected
+                .description
+                .as_deref()
+                .map(normalize_spaces)
+                .filter(|description| !description.is_empty())
+                .map(|description| {
+                    wrapped_line_count(&format!("  Description: {description}"), width)
+                })
+                .unwrap_or_default();
+            component_lines + description_lines
         })
         .sum::<usize>()
         .max(1);

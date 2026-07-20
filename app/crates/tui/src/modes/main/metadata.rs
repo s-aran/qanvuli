@@ -46,7 +46,7 @@ pub(super) fn metadata_lines(
     if detail.affected.is_empty() {
         lines.push(Line::from("No affected component"));
     } else {
-        lines.extend(detail.affected.iter().map(|affected| {
+        lines.extend(detail.affected.iter().flat_map(|affected| {
             let vendor = affected.vendor.as_deref().unwrap_or("-");
             let product = affected.product.as_deref().unwrap_or("-");
             let package = affected.package_name.as_deref().unwrap_or("-");
@@ -57,10 +57,22 @@ pub(super) fn metadata_lines(
             } else {
                 format!(" {}", collection)
             };
-            highlighted_line(
+            let mut affected_lines = vec![highlighted_line(
                 &format!("{vendor}/{product} pkg:{package} status:{status}{suffix}"),
                 detail_search,
-            )
+            )];
+            if let Some(description) = affected
+                .description
+                .as_deref()
+                .map(normalize_spaces)
+                .filter(|description| !description.is_empty())
+            {
+                affected_lines.push(highlighted_line(
+                    &format!("  Description: {description}"),
+                    detail_search,
+                ));
+            }
+            affected_lines
         }));
     }
     lines

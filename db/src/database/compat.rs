@@ -2,6 +2,7 @@
 
 use super::sqlx_database::{
     SqlxCveSearch, SqlxCveSummary, SqlxCvssSearch, SqlxDatabase, SqlxOsvSummary,
+    cve_affected_descriptions,
 };
 use crate::{
     AffectedPackageSummary, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
@@ -150,7 +151,7 @@ fn osv_summary(row: SqlxOsvSummary) -> OsvSummary {
         modified_at: Some(row.modified_at),
         withdrawn_at: row.withdrawn_at,
         summary: row.summary,
-        details: None,
+        details: row.details,
         package_summary: None,
     }
 }
@@ -294,20 +295,27 @@ impl SqlxDatabase {
             .writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    let id_rows: Vec<(i64, String)> = sqlx::query_as(
-                        "SELECT c.id, c.cve_id FROM cve c JOIN json_each(?) requested ON requested.value=c.cve_id",
+                    let id_rows: Vec<(i64, String, String)> = sqlx::query_as(
+                        "SELECT c.id, c.cve_id, c.raw_json FROM cve c JOIN json_each(?) requested ON requested.value=c.cve_id",
                     )
                     .bind(cve_ids_json)
                     .fetch_all(&mut *connection)
                     .await?;
                     let db_ids_json = serde_json::to_string(
-                        &id_rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                        &id_rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
                     )
                     .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-                    let cve_id_by_db_id = id_rows.iter().cloned().collect::<HashMap<_, _>>();
+                    let cve_id_by_db_id = id_rows
+                        .iter()
+                        .map(|(id, cve_id, _)| (*id, cve_id.clone()))
+                        .collect::<HashMap<_, _>>();
+                    let affected_descriptions_by_db_id = id_rows
+                        .iter()
+                        .map(|(id, _, raw_json)| (*id, cve_affected_descriptions(raw_json)))
+                        .collect::<HashMap<_, _>>();
                     let mut details = id_rows
                         .into_iter()
-                        .map(|(_, cve_id)| (cve_id, CveDetail::default()))
+                        .map(|(_, cve_id, _)| (cve_id, CveDetail::default()))
                         .collect::<HashMap<_, _>>();
 
                     let cwes: Vec<(i64, i32, Option<String>)> = sqlx::query_as(
@@ -345,19 +353,28 @@ impl SqlxDatabase {
                     }
 
                     let affected: Vec<CompatAffectedRow> = sqlx::query_as(
-                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, vendor, product",
+                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, id",
                     )
                     .bind(db_ids_json)
                     .fetch_all(&mut *connection)
                     .await?;
+                    let mut affected_indexes = HashMap::<i64, usize>::new();
                     for (db_id, vendor, product, package_name, collection_url, default_status) in affected {
                         if let Some(cve_id) = cve_id_by_db_id.get(&db_id)
                             && let Some(detail) = details.get_mut(cve_id)
                         {
+                            let affected_index = affected_indexes.entry(db_id).or_default();
+                            let description = affected_descriptions_by_db_id
+                                .get(&db_id)
+                                .and_then(|descriptions| descriptions.get(*affected_index))
+                                .cloned()
+                                .flatten();
+                            *affected_index += 1;
                             detail.affected.push(CveAffectedDetail {
                                 vendor,
                                 product,
                                 package_name,
+                                description,
                                 collection_url,
                                 default_status,
                                 versions: Vec::new(),
@@ -811,7 +828,7 @@ impl SqlxDatabase {
         self.writer.with_connection(|connection| Box::pin(async move {
             let families_json = serde_json::to_string(&families).unwrap_or_default();
             let ecosystems_json = serde_json::to_string(&ecosystems).unwrap_or_default();
-            let rows: Vec<SqlxOsvSummary> = sqlx::query_as("SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.withdrawn_at FROM osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (? IS NULL OR p.package_name=? COLLATE NOCASE) ORDER BY a.modified_at DESC, a.osv_id LIMIT ? OFFSET ?")
+            let rows: Vec<SqlxOsvSummary> = sqlx::query_as("SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (? IS NULL OR p.package_name=? COLLATE NOCASE) ORDER BY a.modified_at DESC, a.osv_id LIMIT ? OFFSET ?")
                 .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
                 .bind(&families_json).bind(&families_json).bind(&ecosystems_json).bind(&ecosystems_json)
                 .bind(&package).bind(&package).bind(limit as i64).bind(offset as i64)

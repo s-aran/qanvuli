@@ -43,7 +43,14 @@ type BatchedKevRow = (
     String,
     Option<String>,
 );
-type BatchedOsvRow = (String, String, String, Option<String>, Option<String>);
+type BatchedOsvRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
 struct CveParentInput {
@@ -179,6 +186,7 @@ pub struct SqlxAffected {
     pub vendor: Option<String>,
     pub product: Option<String>,
     pub package_name: Option<String>,
+    pub description: Option<String>,
     pub versions: Vec<SqlxAffectedVersion>,
 }
 
@@ -239,6 +247,7 @@ pub struct SqlxOsvSummary {
     pub osv_id: String,
     pub modified_at: String,
     pub summary: Option<String>,
+    pub details: Option<String>,
     pub withdrawn_at: Option<String>,
 }
 
@@ -330,6 +339,7 @@ impl From<SqlxCveSummaryWithDetail> for CveSummaryWithDetail {
                         vendor: row.vendor,
                         product: row.product,
                         package_name: row.package_name,
+                        description: row.description,
                         collection_url: None,
                         default_status: None,
                         versions: row
@@ -920,23 +930,25 @@ impl SqlxDatabase {
             let Some(id): Option<i64> = sqlx::query_scalar("SELECT id FROM cve WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await? else { return Ok(None); };
             let cvss = sqlx::query_as("SELECT version, base_score, base_severity, vector_string, source FROM cve_cvss WHERE cve_db_id=? ORDER BY id").bind(id).fetch_all(&mut *connection).await?;
             let cwes = sqlx::query_as("SELECT cwe.id, cwe.description FROM cve_cwe JOIN cwe ON cwe.id=cve_cwe.cwe_id WHERE cve_cwe.cve_db_id=? ORDER BY cwe.id").bind(id).fetch_all(&mut *connection).await?;
+            let raw_json: String = sqlx::query_scalar("SELECT raw_json FROM cve WHERE id=?").bind(id).fetch_one(&mut *connection).await?;
+            let affected_descriptions = cve_affected_descriptions(&raw_json);
             let affected_rows: Vec<AffectedRow> = sqlx::query_as("SELECT id, vendor, product, package_name, raw_json FROM cve_affected WHERE cve_db_id=? ORDER BY id").bind(id).fetch_all(&mut *connection).await?;
             let mut affected = Vec::with_capacity(affected_rows.len());
-            for (_affected_id, vendor, product, package_name, raw_json) in affected_rows {
+            for (affected_index, (_affected_id, vendor, product, package_name, raw_json)) in affected_rows.into_iter().enumerate() {
                 let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
                     .unwrap_or_default()
                     .into_iter()
                     .map(|(version, status, version_type, less_than, less_than_or_equal)| SqlxAffectedVersion { version, status, version_type, less_than, less_than_or_equal })
                     .collect();
-                affected.push(SqlxAffected { vendor, product, package_name, versions });
+                let description = affected_descriptions.get(affected_index).cloned().flatten();
+                affected.push(SqlxAffected { vendor, product, package_name, description, versions });
             }
-            let raw_json: String = sqlx::query_scalar("SELECT raw_json FROM cve WHERE id=?").bind(id).fetch_one(&mut *connection).await?;
             let references = serde_json::from_str::<Value>(&raw_json)
                 .map(|value| cve_references(value.pointer("/containers/cna"), value.pointer("/containers/adp")))
                 .unwrap_or_default();
             let epss = sqlx::query_as("SELECT epss, percentile, score_date, model_version FROM epss_current WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
             let kev = sqlx::query_as("SELECT vendor_project, product, vulnerability_name, COALESCE(date_added, '') AS date_added, due_date FROM kev_entries WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
-            let osv_advisories = sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.withdrawn_at FROM osv_aliases AS alias JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id=? ORDER BY advisory.modified_at DESC, advisory.osv_id").bind(&cve_id).fetch_all(&mut *connection).await?;
+            let osv_advisories = sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at FROM osv_aliases AS alias JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id=? ORDER BY advisory.modified_at DESC, advisory.osv_id").bind(&cve_id).fetch_all(&mut *connection).await?;
             Ok(Some(SqlxCveDetail { cvss, cwes, affected, references, epss, kev, osv_advisories }))
         })).await
     }
@@ -975,11 +987,13 @@ impl SqlxDatabase {
                 .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CVE row IDs: {error}")))?;
             let mut details = BTreeMap::<i64, SqlxCveDetail>::new();
             let mut ids_by_cve = BTreeMap::<String, i64>::new();
+            let mut affected_descriptions_by_id = BTreeMap::<i64, Vec<Option<String>>>::new();
             for (id, cve_id, raw_json) in parents {
                 let references = serde_json::from_str::<Value>(&raw_json)
                     .map(|value| cve_references(value.pointer("/containers/cna"), value.pointer("/containers/adp")))
                     .unwrap_or_default();
                 details.insert(id, SqlxCveDetail { references, ..SqlxCveDetail::default() });
+                affected_descriptions_by_id.insert(id, cve_affected_descriptions(&raw_json));
                 ids_by_cve.insert(cve_id, id);
             }
 
@@ -1002,13 +1016,21 @@ impl SqlxDatabase {
             let affected_rows: Vec<BatchedAffectedRow> =
                 sqlx::query_as("SELECT cve_db_id, vendor, product, package_name, raw_json FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY id")
                     .bind(&parent_ids_json).fetch_all(&mut *connection).await?;
+            let mut affected_indexes = BTreeMap::<i64, usize>::new();
             for (id, vendor, product, package_name, raw_json) in affected_rows {
                 let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
                     .unwrap_or_default().into_iter()
                     .map(|(version, status, version_type, less_than, less_than_or_equal)| SqlxAffectedVersion { version, status, version_type, less_than, less_than_or_equal })
                     .collect();
                 if let Some(detail) = details.get_mut(&id) {
-                    detail.affected.push(SqlxAffected { vendor, product, package_name, versions });
+                    let affected_index = affected_indexes.entry(id).or_default();
+                    let description = affected_descriptions_by_id
+                        .get(&id)
+                        .and_then(|descriptions| descriptions.get(*affected_index))
+                        .cloned()
+                        .flatten();
+                    *affected_index += 1;
+                    detail.affected.push(SqlxAffected { vendor, product, package_name, description, versions });
                 }
             }
             let epss_rows: Vec<BatchedEpssRow> = sqlx::query_as(
@@ -1028,11 +1050,11 @@ impl SqlxDatabase {
                 }
             }
             let osv_rows: Vec<BatchedOsvRow> = sqlx::query_as(
-                "SELECT alias.alias_id, advisory.osv_id, COALESCE(advisory.modified_at, ''), advisory.summary, advisory.withdrawn_at FROM osv_aliases alias JOIN osv_advisories advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id IN (SELECT value FROM json_each(?)) ORDER BY advisory.modified_at DESC, advisory.osv_id",
+                "SELECT alias.alias_id, advisory.osv_id, COALESCE(advisory.modified_at, ''), advisory.summary, advisory.details, advisory.withdrawn_at FROM osv_aliases alias JOIN osv_advisories advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id IN (SELECT value FROM json_each(?)) ORDER BY advisory.modified_at DESC, advisory.osv_id",
             ).bind(&requested_json).fetch_all(&mut *connection).await?;
-            for (cve_id, osv_id, modified_at, summary, withdrawn_at) in osv_rows {
+            for (cve_id, osv_id, modified_at, summary, osv_details, withdrawn_at) in osv_rows {
                 if let Some(id) = ids_by_cve.get(&cve_id) {
-                    details.get_mut(id).expect("known parent").osv_advisories.push(SqlxOsvSummary { osv_id, modified_at, summary, withdrawn_at });
+                    details.get_mut(id).expect("known parent").osv_advisories.push(SqlxOsvSummary { osv_id, modified_at, summary, details: osv_details, withdrawn_at });
                 }
             }
             Ok(requested.into_iter().map(|cve_id| {
@@ -1315,7 +1337,7 @@ impl SqlxDatabase {
             return Ok(Vec::new());
         };
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.withdrawn_at FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ? ORDER BY bm25(osv_text_fts), advisory.modified_at DESC, advisory.osv_id LIMIT ? OFFSET ?")
+            sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ? ORDER BY bm25(osv_text_fts), advisory.modified_at DESC, advisory.osv_id LIMIT ? OFFSET ?")
                 .bind(query).bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
         })).await
     }
@@ -1329,7 +1351,7 @@ impl SqlxDatabase {
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    sqlx::query_as("SELECT osv_id, COALESCE(modified_at, '') AS modified_at, summary, withdrawn_at FROM osv_advisories WHERE osv_id=? COLLATE NOCASE")
+                    sqlx::query_as("SELECT osv_id, COALESCE(modified_at, '') AS modified_at, summary, details, withdrawn_at FROM osv_advisories WHERE osv_id=? COLLATE NOCASE")
                         .bind(osv_id)
                         .fetch_optional(connection)
                         .await
@@ -2600,6 +2622,26 @@ async fn delete_osv_identifier_edges(
     Ok(())
 }
 
+pub(crate) fn cve_affected_descriptions(raw_json: &str) -> Vec<Option<String>> {
+    serde_json::from_str::<Value>(raw_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/containers/cna/affected")
+                .and_then(Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(|affected| {
+            affected
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
+
 fn cve_references(cna: Option<&Value>, adp: Option<&Value>) -> Vec<SqlxCveReference> {
     let mut rows: BTreeMap<String, (Option<String>, BTreeSet<String>)> = BTreeMap::new();
     let containers = cna.into_iter().chain(adp.into_iter().flat_map(|value| {
@@ -3051,14 +3093,16 @@ mod tests {
         let matches = database.search_osv("fixture", 10).await.unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(
-            database
-                .find_osv_summary("GHSA-TEST-0001")
-                .await
-                .unwrap()
-                .unwrap()
-                .osv_id,
-            "GHSA-TEST-0001"
+            matches[0].details.as_deref(),
+            Some("Withdrawn records remain in the alias graph.")
         );
+        let found = database
+            .find_osv_summary("GHSA-TEST-0001")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.osv_id, "GHSA-TEST-0001");
+        assert_eq!(found.details, matches[0].details);
     }
 
     #[tokio::test]
@@ -3086,8 +3130,8 @@ mod tests {
         database.initialize().await.unwrap();
         database
             .import_cve_raw_jsons(vec![
-                r#"{"cveMetadata":{"cveId":"CVE-2099-7101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"First overview fixture","affected":[{"vendor":"Acme","product":"widget"}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned(),
-                r#"{"cveMetadata":{"cveId":"CVE-2099-7102","state":"PUBLISHED","datePublished":"2099-01-02T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"Second overview fixture","affected":[{"vendor":"Example","product":"service"}],"metrics":[{"cvssV4_0":{"version":"4.0","baseScore":7.2,"baseSeverity":"HIGH"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-89","description":"SQL injection"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-7101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"First overview fixture","affected":[{"vendor":"Acme","product":"widget","description":"Widget deployment is affected."}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-7102","state":"PUBLISHED","datePublished":"2099-01-02T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"Second overview fixture","affected":[{"vendor":"Example","product":"service","description":"Service deployment is affected."}],"metrics":[{"cvssV4_0":{"version":"4.0","baseScore":7.2,"baseSeverity":"HIGH"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-89","description":"SQL injection"}]}]}}}"#.to_owned(),
             ])
             .await
             .unwrap();
@@ -3120,6 +3164,12 @@ mod tests {
         assert!(rows.iter().all(|row| row.detail.cwes.len() == 1));
         assert!(rows.iter().all(|row| row.detail.cvss.len() == 1));
         assert!(rows.iter().all(|row| row.detail.affected.len() == 1));
+        assert!(rows.iter().all(|row| {
+            row.detail.affected[0]
+                .description
+                .as_deref()
+                .is_some_and(|description| description.ends_with("deployment is affected."))
+        }));
         assert!(
             rows.iter()
                 .all(|row| row.detail.affected[0].versions.is_empty())
@@ -3564,7 +3614,7 @@ mod tests {
     async fn imports_cve_with_stable_fts_rowid() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0","lessThanOrEqual":"1.9"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
+        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","description":"Affected widget description.","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0","lessThanOrEqual":"1.9"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
         let rowid: i64 = database
             .writer
             .with_connection(|connection| {
@@ -3646,6 +3696,10 @@ mod tests {
             "CVE-2099-1"
         );
         assert_eq!(detail.cvss.len(), 1);
+        assert_eq!(
+            detail.affected[0].description.as_deref(),
+            Some("Affected widget description.")
+        );
         assert_eq!(
             detail.affected[0].versions[0].less_than.as_deref(),
             Some("2.0")

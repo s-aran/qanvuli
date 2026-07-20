@@ -60,6 +60,7 @@ pub struct CveAffectedDetail {
     pub vendor: Option<String>,
     pub product: Option<String>,
     pub package_name: Option<String>,
+    pub description: Option<String>,
     pub collection_url: Option<String>,
     pub default_status: Option<String>,
     pub versions: Vec<CveAffectedVersionDetail>,
