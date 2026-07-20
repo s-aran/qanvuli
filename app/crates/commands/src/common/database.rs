@@ -90,7 +90,7 @@ pub(crate) fn replacement_sqlite_database_url(db_url: &str) -> Result<(PathBuf, 
     ))
 }
 
-/// Removes a closed candidate database and its SQLite sidecars after a failed replacement.
+/// Removes a SQLite database and its sidecars.
 pub(crate) fn remove_sqlite_database_files(path: &std::path::Path) -> Result<(), String> {
     for path in [
         path.to_path_buf(),

@@ -102,6 +102,7 @@ Build and install a complete replacement database:
 ```bash
 cargo run -- init
 cargo run -- init --zip ./path/to/cve.zip
+cargo run -- init --preserve-existing
 ```
 
 Apply updates:
@@ -123,10 +124,16 @@ cargo run -- db rebuild-search
 
 ### Database rebuild policy
 
-The SQLite file is derived from source feeds and is intentionally rebuildable. A full `init`
-builds and validates a candidate database in the same directory, closes its connections, and only
-then installs it over the active file. A failed download, parse, import, index build, or integrity
-check leaves the previous file untouched.
+The SQLite file is derived from source feeds and is intentionally rebuildable. After the complete
+CVE archive is available, a full `init` removes the active database and its SQLite sidecars before
+building and validating a replacement in the same directory. This reduces peak disk usage, but a
+failed parse, import, index build, or integrity check leaves no active database. The downloaded CVE
+archive is retained after a failure so initialization can be retried. Run `init` only while other
+qanvuli processes are stopped.
+
+Use `init --preserve-existing` to keep the active database until the replacement has been built,
+validated, closed, and installed. Partial builds requested with `--max-chunks` also preserve the
+active database during construction.
 
 The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
 foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each

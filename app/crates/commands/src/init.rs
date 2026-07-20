@@ -20,6 +20,9 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
+    /// Keeps the active database available until its replacement is ready.
+    #[arg(long)]
+    preserve_existing: bool,
     #[arg(long)]
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
@@ -49,7 +52,24 @@ async fn run_with_progress(
         (asset.path, cursor)
     };
 
+    let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
+        "full database replacement requires a file-backed SQLite database".to_owned()
+    })?;
     let (candidate_path, candidate_url) = replacement_sqlite_database_url(db_url)?;
+    let preserve_existing = args.preserve_existing || args.max_chunks.is_some();
+    if args.max_chunks.is_some() && !args.preserve_existing {
+        eprintln!(
+            "init: --max-chunks is a partial build; preserving the active database until installation"
+        );
+    }
+    if !preserve_existing {
+        eprintln!(
+            "init: removing existing database before import: {}",
+            target.display()
+        );
+        remove_sqlite_database_files(&target)
+            .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
+    }
     emit_init_progress(
         &progress,
         &asset_path.display().to_string(),
@@ -59,11 +79,18 @@ async fn run_with_progress(
         "init: building replacement database beside {}",
         redact_database_url(db_url)
     );
-    let db = connect_sqlx_db(&candidate_url).await?;
+    let db = match connect_sqlx_db(&candidate_url).await {
+        Ok(db) => db,
+        Err(error) => {
+            let _ = remove_sqlite_database_files(&candidate_path);
+            return Err(error);
+        }
+    };
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
     let db_for_build = db.clone();
     let asset_for_build = asset_path.clone();
     let progress_for_build = progress.clone();
+    let max_chunks = args.max_chunks;
     let build_result = async move {
         emit_init_progress(
             &progress_for_build,
@@ -87,21 +114,15 @@ async fn run_with_progress(
             db_for_build.clone(),
             "all",
             &asset_for_build,
-            args.max_chunks,
+            max_chunks,
             index_started_tx,
         )
         .await;
-        let zip_removal_result = if cve_result.is_ok() && !args.keep {
-            remove_processed_zip(&asset_for_build)
-        } else {
-            Ok(())
-        };
         let osv_download_result = osv_download_task
             .await
             .map_err(|error| format!("OSV download task failed: {error}"))?;
         cve_result?;
-        zip_removal_result?;
-        if args.max_chunks.is_none() {
+        if max_chunks.is_none() {
             let cve_delta_cursor = cve_delta_cursor.ok_or_else(|| {
                 "cannot determine the full CVE archive timestamp from its release or filename"
                     .to_owned()
@@ -138,11 +159,16 @@ async fn run_with_progress(
         &asset_path.display().to_string(),
         "installing replacement",
     );
-    let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
-        "full database replacement requires a file-backed SQLite database".to_owned()
-    })?;
     install_closed_database(&candidate_path, &target)
         .map_err(|error| format!("failed to install validated replacement database: {error}"))?;
+    if !args.keep
+        && let Err(error) = remove_processed_zip(&asset_path)
+    {
+        eprintln!(
+            "init: replacement installed, but failed to remove processed archive {}: {error}",
+            asset_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -359,7 +385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_full_init_preserves_the_existing_database_file() {
+    async fn failed_full_init_removes_the_existing_database_file() {
         let directory = std::env::temp_dir().join(format!(
             "qanvuli-init-replacement-{}-{}",
             std::process::id(),
@@ -384,7 +410,6 @@ mod tests {
             &url,
             Args {
                 zip: Some(archive_path.clone()),
-                keep: true,
                 ..Args::default()
             },
             None,
@@ -392,6 +417,52 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("failed") || error.contains("invalid"));
+        assert!(!database_path.exists());
+        assert!(archive_path.exists());
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".building-")
+        }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn failed_full_init_preserves_the_existing_database_when_requested() {
+        let directory = std::env::temp_dir().join(format!(
+            "qanvuli-init-preserved-replacement-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("database.sqlite");
+        let archive_path = directory.join("broken.zip");
+        std::fs::write(&database_path, b"last known good database bytes").unwrap();
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .start_file(
+                "cves/2099/CVE-2099-0001.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"{not valid JSON").unwrap();
+        archive.finish().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", database_path.display());
+        run_with_progress(
+            &url,
+            Args {
+                zip: Some(archive_path),
+                keep: true,
+                preserve_existing: true,
+                ..Args::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             std::fs::read(&database_path).unwrap(),
             b"last known good database bytes"
