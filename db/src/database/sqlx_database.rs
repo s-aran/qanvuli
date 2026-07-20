@@ -24,6 +24,15 @@ use serde_json::Value;
 use sqlx::{Acquire, QueryBuilder, Row, Sqlite};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Maximum number of caller package queries encoded in one SQLite JSON input.
+const PACKAGE_QUERY_BATCH_SIZE: usize = 200;
+/// Maximum number of affected-package IDs used by one range/version statement.
+const PACKAGE_ID_BATCH_SIZE: usize = 2_000;
+/// Maximum number of OSV IDs used by one alias statement.
+const OSV_ID_BATCH_SIZE: usize = 2_000;
+/// Maximum number of OSV IDs used by one advisory-date statement.
+const OSV_DATE_BATCH_SIZE: usize = 2_000;
+
 type AffectedRow = (i64, Option<String>, Option<String>, Option<String>, String);
 type BatchedCvssRow = (
     i64,
@@ -445,8 +454,8 @@ impl SqlxDatabase {
             .unwrap_or_default())
     }
 
-    /// Matches a whole set of package/version queries with one candidate scan and bounded
-    /// follow-up reads for ranges, explicit versions, and CVE aliases.
+    /// Matches package/version queries with bounded candidate scans and bounded follow-up reads
+    /// for ranges, explicit versions, and CVE aliases.
     pub async fn query_package_matches_batch(
         &self,
         packages: &[PackageQuery],
@@ -455,75 +464,116 @@ impl SqlxDatabase {
             return Ok(Vec::new());
         }
         let packages = packages.to_vec();
-        let input_json = serde_json::to_string(&packages).map_err(|error| {
-            sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
-        })?;
         self.writer.with_connection(|connection| Box::pin(async move {
-            let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
-                "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
-            )
-            .bind(input_json)
-            .fetch_all(&mut *connection)
-            .await?;
-            let package_ids = candidates.iter().map(|(_, id, _)| *id).collect::<BTreeSet<_>>();
-            let package_ids_json = serde_json::to_string(&package_ids).map_err(|error| {
-                sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}"))
-            })?;
-            let events: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
-                "SELECT range.affected_package_id, range.id, range.range_type, event.event_type, event.value FROM osv_ranges AS range JOIN osv_range_events AS event ON event.range_id=range.id WHERE range.affected_package_id IN (SELECT value FROM json_each(?)) ORDER BY range.affected_package_id, range.id, event.id",
-            )
-            .bind(&package_ids_json)
-            .fetch_all(&mut *connection)
-            .await?;
-            let mut ranges_by_package = BTreeMap::<i64, Vec<OsvRange>>::new();
-            let mut current_range = None;
-            for (package_id, range_id, range_type, event_type, value) in events {
-                let ranges = ranges_by_package.entry(package_id).or_default();
-                if current_range != Some((package_id, range_id)) {
-                    current_range = Some((package_id, range_id));
-                    ranges.push(OsvRange { range_type, events: Vec::new() });
-                }
-                ranges.last_mut().expect("range inserted").events.push((event_type, value));
-            }
-            let version_rows: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT affected_package_id, version FROM osv_versions WHERE affected_package_id IN (SELECT value FROM json_each(?))",
-            )
-            .bind(&package_ids_json)
-            .fetch_all(&mut *connection)
-            .await?;
-            let mut versions_by_package = BTreeMap::<i64, BTreeSet<String>>::new();
-            for (package_id, version) in version_rows {
-                versions_by_package.entry(package_id).or_default().insert(version);
-            }
-            let osv_ids = candidates.iter().map(|(_, _, id)| id).collect::<BTreeSet<_>>();
-            let osv_ids_json = serde_json::to_string(&osv_ids).map_err(|error| {
-                sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}"))
-            })?;
-            let alias_rows: Vec<(String, String)> = sqlx::query_as(
-                "SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id",
-            )
-            .bind(osv_ids_json)
-            .fetch_all(&mut *connection)
-            .await?;
-            let mut aliases_by_osv = BTreeMap::<String, Vec<String>>::new();
-            for (osv_id, alias) in alias_rows {
-                aliases_by_osv.entry(osv_id).or_default().push(alias);
-            }
             let mut output = vec![Vec::new(); packages.len()];
-            for (query_index, package_id, osv_id) in candidates {
-                let query = &packages[usize::try_from(query_index).map_err(|_| sqlx::Error::Protocol("invalid package query index".to_owned()))?];
-                let matched = if versions_by_package.get(&package_id).is_some_and(|versions| versions.contains(&query.version)) {
-                    super::package_eval::VersionMatch { status: "affected".to_owned(), confidence: "high".to_owned() }
-                } else {
-                    evaluate_version(&query.ecosystem, &query.version, ranges_by_package.get(&package_id).map(Vec::as_slice).unwrap_or_default())
-                };
-                if matched.status == "not_affected" {
-                    continue;
+            for (query_batch_index, package_batch) in
+                packages.chunks(PACKAGE_QUERY_BATCH_SIZE).enumerate()
+            {
+                let input_json = serde_json::to_string(package_batch).map_err(|error| {
+                    sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
+                })?;
+                let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
+                )
+                .bind(input_json)
+                .fetch_all(&mut *connection)
+                .await?;
+
+                let package_ids = candidates
+                    .iter()
+                    .map(|(_, id, _)| *id)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let mut ranges_by_package = BTreeMap::<i64, Vec<OsvRange>>::new();
+                let mut versions_by_package = BTreeMap::<i64, BTreeSet<String>>::new();
+                for package_id_batch in package_ids.chunks(PACKAGE_ID_BATCH_SIZE) {
+                    let package_ids_json = serde_json::to_string(package_id_batch).map_err(|error| {
+                        sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}"))
+                    })?;
+                    let events: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
+                        "SELECT range.affected_package_id, range.id, range.range_type, event.event_type, event.value FROM osv_ranges AS range JOIN osv_range_events AS event ON event.range_id=range.id WHERE range.affected_package_id IN (SELECT value FROM json_each(?)) ORDER BY range.affected_package_id, range.id, event.id",
+                    )
+                    .bind(&package_ids_json)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    let mut current_range = None;
+                    for (package_id, range_id, range_type, event_type, value) in events {
+                        let ranges = ranges_by_package.entry(package_id).or_default();
+                        if current_range != Some((package_id, range_id)) {
+                            current_range = Some((package_id, range_id));
+                            ranges.push(OsvRange { range_type, events: Vec::new() });
+                        }
+                        ranges.last_mut().expect("range inserted").events.push((event_type, value));
+                    }
+                    let version_rows: Vec<(i64, String)> = sqlx::query_as(
+                        "SELECT affected_package_id, version FROM osv_versions WHERE affected_package_id IN (SELECT value FROM json_each(?))",
+                    )
+                    .bind(&package_ids_json)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    for (package_id, version) in version_rows {
+                        versions_by_package.entry(package_id).or_default().insert(version);
+                    }
                 }
-                let affected = AffectedStatus { status: matched.status, confidence: matched.confidence };
-                output[usize::try_from(query_index).unwrap()].push(EnrichedFinding {
-                    primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions: Vec::new(), fixed_versions_status: "not_queried".to_owned(), enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: false, affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
-                });
+
+                let osv_ids = candidates
+                    .iter()
+                    .map(|(_, _, id)| id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let mut aliases_by_osv = BTreeMap::<String, Vec<String>>::new();
+                for osv_id_batch in osv_ids.chunks(OSV_ID_BATCH_SIZE) {
+                    let osv_ids_json = serde_json::to_string(osv_id_batch).map_err(|error| {
+                        sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}"))
+                    })?;
+                    let alias_rows: Vec<(String, String)> = sqlx::query_as(
+                        "SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id",
+                    )
+                    .bind(osv_ids_json)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    for (osv_id, alias) in alias_rows {
+                        aliases_by_osv.entry(osv_id).or_default().push(alias);
+                    }
+                }
+
+                let query_offset = query_batch_index * PACKAGE_QUERY_BATCH_SIZE;
+                for (query_index, package_id, osv_id) in candidates {
+                    let local_index = usize::try_from(query_index).map_err(|_| {
+                        sqlx::Error::Protocol("invalid package query index".to_owned())
+                    })?;
+                    let output_index = query_offset + local_index;
+                    let query = packages.get(output_index).ok_or_else(|| {
+                        sqlx::Error::Protocol("package query index is out of bounds".to_owned())
+                    })?;
+                    let matched = if versions_by_package
+                        .get(&package_id)
+                        .is_some_and(|versions| versions.contains(&query.version))
+                    {
+                        super::package_eval::VersionMatch {
+                            status: "affected".to_owned(),
+                            confidence: "high".to_owned(),
+                        }
+                    } else {
+                        evaluate_version(
+                            &query.ecosystem,
+                            &query.version,
+                            ranges_by_package
+                                .get(&package_id)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                        )
+                    };
+                    if matched.status == "not_affected" {
+                        continue;
+                    }
+                    let affected = AffectedStatus { status: matched.status, confidence: matched.confidence };
+                    output[output_index].push(EnrichedFinding {
+                        primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions: Vec::new(), fixed_versions_status: "not_queried".to_owned(), enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: false, affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                    });
+                }
             }
             Ok(output)
         })).await
@@ -1436,7 +1486,7 @@ impl SqlxDatabase {
             .await
     }
 
-    /// Returns OSV publication/modification timestamps in caller order using one statement.
+    /// Returns OSV publication/modification timestamps in caller order using bounded statements.
     pub async fn osv_advisory_dates_batch(
         &self,
         osv_ids: &[String],
@@ -1445,28 +1495,27 @@ impl SqlxDatabase {
             return Ok(Vec::new());
         }
         let requested = osv_ids.to_vec();
-        let requested_json = serde_json::to_string(&requested)
-            .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}")))?;
-        self.writer
-            .with_connection(|connection| {
-                Box::pin(async move {
+        self.writer.with_connection(|connection| Box::pin(async move {
+            let mut dates = BTreeMap::new();
+            for batch in requested.chunks(OSV_DATE_BATCH_SIZE) {
+                let requested_json = serde_json::to_string(batch).map_err(|error| {
+                    sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}"))
+                })?;
                     let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
                         "SELECT advisory.osv_id, advisory.published_at, advisory.modified_at FROM osv_advisories advisory WHERE advisory.osv_id IN (SELECT value FROM json_each(?))",
                     )
                     .bind(requested_json)
-                    .fetch_all(connection)
+                    .fetch_all(&mut *connection)
                     .await?;
-                    let dates = rows
-                        .into_iter()
-                        .map(|(id, published, modified)| (id, (published, modified)))
-                        .collect::<BTreeMap<_, _>>();
-                    Ok(requested
-                        .into_iter()
-                        .map(|id| dates.get(&id).cloned())
-                        .collect())
-                })
-            })
-            .await
+                dates.extend(rows.into_iter().map(|(id, published, modified)| {
+                    (id, (published, modified))
+                }));
+            }
+            Ok(requested
+                .into_iter()
+                .map(|id| dates.get(&id).cloned())
+                .collect())
+        })).await
     }
 
     /// Marks an OSV synchronization as running and returns its last completed cursor.
@@ -4584,6 +4633,64 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, "unknown");
         assert_eq!(findings[0].confidence, "low");
+    }
+
+    #[tokio::test]
+    async fn package_matching_preserves_order_across_query_batch_boundaries() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-batched-package","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-9999"],"affected":[{"package":{"ecosystem":"crates.io","name":"example"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        let queries = (0..=PACKAGE_QUERY_BATCH_SIZE)
+            .map(|_| PackageQuery {
+                ecosystem: "crates.io".to_owned(),
+                package: "example".to_owned(),
+                version: "1.0.0".to_owned(),
+                purl: None,
+            })
+            .collect::<Vec<_>>();
+        let findings = database
+            .query_package_matches_batch(&queries)
+            .await
+            .unwrap();
+        assert_eq!(findings.len(), PACKAGE_QUERY_BATCH_SIZE + 1);
+        assert!(findings.iter().all(|rows| {
+            rows.len() == 1
+                && rows[0].primary_id == "GHSA-2099-batched-package"
+                && rows[0].cve_ids == ["CVE-2099-9999"]
+        }));
+    }
+
+    #[tokio::test]
+    async fn osv_date_batch_preserves_order_across_id_batch_boundaries() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let ids = (0..=OSV_DATE_BATCH_SIZE)
+            .map(|index| format!("OSV-MISSING-{index}"))
+            .collect::<Vec<_>>();
+        let dates = database.osv_advisory_dates_batch(&ids).await.unwrap();
+        assert_eq!(dates.len(), OSV_DATE_BATCH_SIZE + 1);
+        assert!(dates.iter().all(Option::is_none));
+    }
+
+    #[tokio::test]
+    async fn cve_detail_batch_preserves_order_across_id_batch_boundaries() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let ids = (0..=2_000)
+            .map(|index| format!("CVE-2099-{index:04}"))
+            .collect::<Vec<_>>();
+        let details = database
+            .cve_summaries_with_details_batch(&ids, CveStateScope::PublishedOnly)
+            .await
+            .unwrap();
+        assert_eq!(details.len(), 2_001);
+        assert!(details.iter().all(Option::is_none));
     }
 
     #[tokio::test]

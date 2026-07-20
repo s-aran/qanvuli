@@ -102,7 +102,7 @@ Build and install a complete replacement database:
 ```bash
 cargo run -- init
 cargo run -- init --zip ./path/to/cve.zip
-cargo run -- init --preserve-existing
+cargo run -- init --remove-existing-first
 ```
 
 Apply updates:
@@ -124,16 +124,14 @@ cargo run -- db rebuild-search
 
 ### Database rebuild policy
 
-The SQLite file is derived from source feeds and is intentionally rebuildable. After the complete
-CVE archive is available, a full `init` removes the active database and its SQLite sidecars before
-building and validating a replacement in the same directory. This reduces peak disk usage, but a
-failed parse, import, index build, or integrity check leaves no active database. The downloaded CVE
-archive is retained after a failure so initialization can be retried. Run `init` only while other
-qanvuli processes are stopped.
+The SQLite file is derived from source feeds and is intentionally rebuildable. A full `init` builds,
+validates, and closes a replacement beside the active database, then installs it with same-filesystem
+renames and rollback protection. A failed parse, import, index build, or integrity check leaves the
+active database unchanged. The downloaded CVE archive is retained after a failure so initialization
+can be retried. Run `init` only while other qanvuli processes are stopped.
 
-Use `init --preserve-existing` to keep the active database until the replacement has been built,
-validated, closed, and installed. Partial builds requested with `--max-chunks` also preserve the
-active database during construction.
+Use `init --remove-existing-first` (`-r`) to delete the active database before constructing its
+replacement. This reduces peak disk usage, but an initialization failure leaves no usable database.
 
 `init` propagates every import, index, and FTS build error, then performs only bounded schema and
 first/last search-projection sentinel checks. It deliberately avoids rescanning the database it has

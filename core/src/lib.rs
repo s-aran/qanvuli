@@ -5,7 +5,10 @@
 
 /// Database connection, query, and synchronization API.
 pub mod database {
-    pub use qanvuli_db::database::replacement::install_closed_database;
+    pub use qanvuli_db::database::replacement::{
+        DatabaseReplacement, RecoveryAction, ReplacementError, candidate_database_path,
+        recover_interrupted_replacement, remove_sqlite_database_files,
+    };
     pub use qanvuli_db::{
         AffectedStatus, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
         CveAffectedVersionDetail, CveCvssDetail, CveCweDetail, CveDatabase, CveDetail,

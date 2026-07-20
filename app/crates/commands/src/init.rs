@@ -3,10 +3,12 @@ use super::common::{
     OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
     download_latest_asset_with_source, download_osv_selection_from_gcs,
     import_downloaded_osv_selection, ingest_zip_sqlx_bulk_with_index_signal, redact_database_url,
-    remove_processed_zip, remove_sqlite_database_files, replacement_sqlite_database_url,
-    sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
+    remove_processed_zip, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
 };
-use qanvuli_core::database::install_closed_database;
+use qanvuli_core::database::{
+    DatabaseReplacement, RecoveryAction, candidate_database_path, recover_interrupted_replacement,
+    remove_sqlite_database_files,
+};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -20,9 +22,10 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
-    /// Keeps the active database available until its replacement is ready.
-    #[arg(long)]
-    preserve_existing: bool,
+    /// Remove the existing database before building the replacement.
+    /// This reduces peak disk usage, but no usable database remains if initialization fails.
+    #[arg(short = 'r', long, verbatim_doc_comment)]
+    remove_existing_first: bool,
     #[arg(long)]
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
@@ -39,6 +42,33 @@ async fn run_with_progress(
     args: Args,
     progress: Option<IngestProgressCallback>,
 ) -> Result<(), String> {
+    let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
+        "full database replacement requires a file-backed SQLite database".to_owned()
+    })?;
+    for action in recover_interrupted_replacement(&target)
+        .map_err(|error| format!("failed to inspect interrupted database replacements: {error}"))?
+    {
+        match action {
+            RecoveryAction::RestoredBackup(path) => eprintln!(
+                "init: restored interrupted replacement backup {} to {}",
+                path.display(),
+                target.display()
+            ),
+            RecoveryAction::StaleBackup(path) => eprintln!(
+                "init: warning: active database is present; leaving stale replacement backup {}",
+                path.display()
+            ),
+        }
+    }
+    if args.remove_existing_first {
+        eprintln!("init: removing the existing database before replacement construction");
+        eprintln!(
+            "init: this reduces peak disk usage but leaves no usable database if initialization fails"
+        );
+        remove_sqlite_database_files(&target)
+            .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
+    }
+
     let (asset_path, cve_delta_cursor) = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
         let cursor = cve_full_asset_cursor(&zip);
@@ -52,24 +82,9 @@ async fn run_with_progress(
         (asset.path, cursor)
     };
 
-    let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
-        "full database replacement requires a file-backed SQLite database".to_owned()
-    })?;
-    let (candidate_path, candidate_url) = replacement_sqlite_database_url(db_url)?;
-    let preserve_existing = args.preserve_existing || args.max_chunks.is_some();
-    if args.max_chunks.is_some() && !args.preserve_existing {
-        eprintln!(
-            "init: --max-chunks is a partial build; preserving the active database until installation"
-        );
-    }
-    if !preserve_existing {
-        eprintln!(
-            "init: removing existing database before import: {}",
-            target.display()
-        );
-        remove_sqlite_database_files(&target)
-            .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
-    }
+    let candidate_path = candidate_database_path(&target)
+        .map_err(|error| format!("failed to create replacement path: {error}"))?;
+    let candidate_url = format!("sqlite://{}?mode=rwc", candidate_path.display());
     emit_init_progress(
         &progress,
         &asset_path.display().to_string(),
@@ -82,8 +97,7 @@ async fn run_with_progress(
     let db = match connect_sqlx_db(&candidate_url).await {
         Ok(db) => db,
         Err(error) => {
-            let _ = remove_sqlite_database_files(&candidate_path);
-            return Err(error);
+            return Err(with_candidate_cleanup(error, &candidate_path));
         }
     };
     let osv_selection = OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes);
@@ -151,16 +165,36 @@ async fn run_with_progress(
         .await
         .map_err(|error| format!("failed to close replacement database: {error}"));
     if let Err(error) = build_result.and(close_result) {
-        let _ = remove_sqlite_database_files(&candidate_path);
-        return Err(error);
+        return Err(with_candidate_cleanup(error, &candidate_path));
     }
+    eprintln!("init: replacement database built successfully");
     emit_init_progress(
         &progress,
         &asset_path.display().to_string(),
         "installing replacement",
     );
-    install_closed_database(&candidate_path, &target)
+    let had_target = target.exists();
+    let mut replacement = DatabaseReplacement::new(target.clone(), candidate_path)
+        .map_err(|error| format!("failed to prepare database replacement: {error}"))?;
+    if had_target {
+        eprintln!(
+            "init: moving the active database to {}",
+            replacement.backup_path().display()
+        );
+    }
+    eprintln!("init: installing replacement database");
+    replacement
+        .install()
         .map_err(|error| format!("failed to install validated replacement database: {error}"))?;
+    eprintln!("init: replacement installed successfully");
+    if had_target {
+        eprintln!("init: removing previous database backup");
+    }
+    if let Err(error) = replacement.commit() {
+        eprintln!(
+            "init: warning: replacement is active, but previous database cleanup failed: {error}"
+        );
+    }
     if !args.keep
         && let Err(error) = remove_processed_zip(&asset_path)
     {
@@ -170,6 +204,16 @@ async fn run_with_progress(
         );
     }
     Ok(())
+}
+
+fn with_candidate_cleanup(error: String, candidate: &std::path::Path) -> String {
+    match remove_sqlite_database_files(candidate) {
+        Ok(()) => error,
+        Err(cleanup_error) => format!(
+            "{error}; additionally failed to remove replacement candidate {} and its sidecars: {cleanup_error}",
+            candidate.display()
+        ),
+    }
 }
 
 async fn validate_replacement_database(
@@ -316,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_full_init_removes_the_existing_database_file() {
+    async fn failed_full_init_preserves_the_existing_database_by_default() {
         let directory = std::env::temp_dir().join(format!(
             "qanvuli-init-replacement-{}-{}",
             std::process::id(),
@@ -348,20 +392,23 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.contains("failed") || error.contains("invalid"));
-        assert!(!database_path.exists());
+        assert_eq!(
+            std::fs::read(&database_path).unwrap(),
+            b"last known good database bytes"
+        );
         assert!(archive_path.exists());
         assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".building-")
+                .contains(".qanvuli-new-")
         }));
         let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
-    async fn failed_full_init_preserves_the_existing_database_when_requested() {
+    async fn failed_destructive_init_removes_the_existing_database() {
         let directory = std::env::temp_dir().join(format!(
             "qanvuli-init-preserved-replacement-{}-{}",
             std::process::id(),
@@ -387,23 +434,20 @@ mod tests {
             Args {
                 zip: Some(archive_path),
                 keep: true,
-                preserve_existing: true,
+                remove_existing_first: true,
                 ..Args::default()
             },
             None,
         )
         .await
         .unwrap_err();
-        assert_eq!(
-            std::fs::read(&database_path).unwrap(),
-            b"last known good database bytes"
-        );
+        assert!(!database_path.exists());
         assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .contains(".building-")
+                .contains(".qanvuli-new-")
         }));
         let _ = std::fs::remove_dir_all(directory);
     }

@@ -16,6 +16,9 @@ use qanvuli_models::{RawCveStatusRecord, parse_json_with_raw};
 use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 
+/// Maximum number of CVE IDs expanded into one detail-loading operation.
+const CVE_ID_BATCH_SIZE: usize = 2_000;
+
 type CompatCweRow = (i32, Option<String>, Option<String>, Option<i32>);
 type CompatCvssRow = (
     i64,
@@ -248,29 +251,30 @@ impl SqlxDatabase {
             return Ok(Vec::new());
         }
         let requested = cve_ids.to_vec();
-        let requested_json = serde_json::to_string(&requested)
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
         let include_rejected = include_rejected(state_scope);
-        let summaries: Vec<CveSummary> = self
-            .writer
-            .with_connection(|connection| {
-                Box::pin(async move {
-                    let rows: Vec<SqlxCveSummary> = sqlx::query_as(
-                        "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve c WHERE c.cve_id IN (SELECT value FROM json_each(?)) AND (? OR c.state=0)",
-                    )
-                    .bind(requested_json)
-                    .bind(include_rejected)
-                    .fetch_all(connection)
-                    .await?;
-                    Ok(rows.into_iter().map(CveSummary::from).collect())
+        let mut by_id = HashMap::new();
+        for batch in requested.chunks(CVE_ID_BATCH_SIZE) {
+            let requested_json = serde_json::to_string(batch)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            let summaries: Vec<CveSummary> = self
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        let rows: Vec<SqlxCveSummary> = sqlx::query_as(
+                            "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve c WHERE c.cve_id IN (SELECT value FROM json_each(?)) AND (? OR c.state=0)",
+                        )
+                        .bind(requested_json)
+                        .bind(include_rejected)
+                        .fetch_all(connection)
+                        .await?;
+                        Ok(rows.into_iter().map(CveSummary::from).collect())
+                    })
                 })
-            })
-            .await?;
-        let details = self.attach_cve_overview_details(summaries).await?;
-        let by_id = details
-            .into_iter()
-            .map(|row| (row.summary.cve_id.clone(), row))
-            .collect::<HashMap<_, _>>();
+                .await?;
+            for row in self.attach_cve_overview_details(summaries).await? {
+                by_id.insert(row.summary.cve_id.clone(), row);
+            }
+        }
         Ok(requested
             .into_iter()
             .map(|id| by_id.get(&id).cloned())

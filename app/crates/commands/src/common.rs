@@ -25,7 +25,6 @@ pub use database::{
     close_db, connect_db, connect_sqlx_db, default_db_connection_string, print_json,
     redact_database_url,
 };
-pub(crate) use database::{remove_sqlite_database_files, replacement_sqlite_database_url};
 
 /// Default row limit used by CLI search commands.
 pub const DEFAULT_LIMIT: u64 = 25;

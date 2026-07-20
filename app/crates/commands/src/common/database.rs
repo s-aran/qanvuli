@@ -65,47 +65,6 @@ pub(crate) fn sqlite_file_path(db_url: &str) -> Option<PathBuf> {
     (!path.is_empty() && path != ":memory:").then(|| PathBuf::from(path))
 }
 
-/// Creates a same-directory SQLite URL for a candidate full replacement database.
-///
-/// The caller must close every connection to this URL before installing it over the target.
-pub(crate) fn replacement_sqlite_database_url(db_url: &str) -> Result<(PathBuf, String), String> {
-    let target = sqlite_file_path(db_url).ok_or_else(|| {
-        "full database replacement requires a file-backed SQLite database".to_owned()
-    })?;
-    let parent = target
-        .parent()
-        .ok_or_else(|| format!("database path has no parent: {}", target.display()))?;
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("database path has no UTF-8 file name: {}", target.display()))?;
-    let candidate = parent.join(format!(
-        ".{file_name}.building-{}-{}",
-        std::process::id(),
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-    ));
-    Ok((
-        candidate.clone(),
-        format!("sqlite://{}?mode=rwc", candidate.display()),
-    ))
-}
-
-/// Removes a SQLite database and its sidecars.
-pub(crate) fn remove_sqlite_database_files(path: &std::path::Path) -> Result<(), String> {
-    for path in [
-        path.to_path_buf(),
-        PathBuf::from(format!("{}-wal", path.display())),
-        PathBuf::from(format!("{}-shm", path.display())),
-    ] {
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("failed to remove {}: {error}", path.display())),
-        }
-    }
-    Ok(())
-}
-
 /// Prints a value as JSON, honoring the global `--pretty` flag.
 pub fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
     let text = if std::env::args_os().any(|arg| arg == "--pretty") {
