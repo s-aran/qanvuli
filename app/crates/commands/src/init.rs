@@ -8,7 +8,7 @@ use super::common::{
 };
 use qanvuli_core::database::install_closed_database;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// CLI arguments for `qanvuli init`.
 #[derive(Debug, Default, clap::Args)]
@@ -175,65 +175,17 @@ async fn run_with_progress(
 async fn validate_replacement_database(
     db: &qanvuli_core::database::SqlxDatabase,
 ) -> Result<(), String> {
-    const STAGES: usize = 5;
     let validation_started = Instant::now();
-    eprintln!("init: validating replacement database");
-
-    macro_rules! validation_stage {
-        ($number:literal, $label:literal, $future:expr) => {{
-            let stage_started = Instant::now();
-            eprintln!("init: [{}/{}] {}...", $number, STAGES, $label);
-            let stage_future = $future;
-            tokio::pin!(stage_future);
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
-            heartbeat.tick().await;
-            let stage_result = loop {
-                tokio::select! {
-                    result = &mut stage_future => break result,
-                    _ = heartbeat.tick() => {
-                        eprintln!(
-                            "init: [{}/{}] {} still running; elapsed {:?}",
-                            $number,
-                            STAGES,
-                            $label,
-                            stage_started.elapsed()
-                        );
-                    }
-                }
-            };
-            stage_result.map_err(|error| {
-                format!(
-                    "replacement database validation failed at stage {} ({}): {error}",
-                    $number, $label
-                )
-            })?;
-            eprintln!(
-                "init: [{}/{}] {} completed in {:?}",
-                $number,
-                STAGES,
-                $label,
-                stage_started.elapsed()
-            );
-        }};
-    }
-
-    validation_stage!(1, "checking required schema", db.check_required_schema());
-    validation_stage!(2, "running SQLite quick_check", db.check_scan_sqlite());
-    validation_stage!(3, "checking foreign keys", db.check_full_foreign_keys());
-    // These APIs include both native FTS5 integrity commands and complete projection
-    // correspondence checks for their respective source.
-    validation_stage!(
-        4,
-        "checking CVE search projections and FTS5",
-        db.check_full_cve_search()
-    );
-    validation_stage!(
-        5,
-        "checking OSV search projections and FTS5",
-        db.check_full_osv_search()
-    );
+    eprintln!("init: checking replacement schema and search sentinels");
+    // Every build/index SQL statement has already completed successfully at this point. Keep
+    // init's final check bounded: this verifies the required schema plus fixed first/last search
+    // projection sentinels without rescanning the newly written database. Full SQLite, foreign-key,
+    // FTS5, and projection scans remain available through `db check --scan` and `db check --full`.
+    db.check_search_integrity_quick().await.map_err(|error| {
+        format!("replacement database schema/search validation failed: {error}")
+    })?;
     eprintln!(
-        "init: replacement database validation completed in {:?}",
+        "init: replacement schema/search validation completed in {:?}",
         validation_started.elapsed()
     );
     Ok(())
@@ -315,27 +267,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_validation_rejects_a_foreign_key_violation() {
-        let (path, url, database) = initialized_database("foreign-key-failure").await;
-        database.close().await.unwrap();
-        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
-        connection
-            .execute("PRAGMA foreign_keys = OFF")
-            .await
-            .unwrap();
-        connection
-            .execute("INSERT INTO cve_affected (cve_db_id, version_text, raw_json) VALUES (999, '', '{}')")
-            .await
-            .unwrap();
-        connection.close().await.unwrap();
-        let database = SqlxDatabase::connect(&url).await.unwrap();
-        let error = validate_replacement_database(&database).await.unwrap_err();
-        assert!(error.contains("stage 3 (checking foreign keys)"));
-        database.close().await.unwrap();
-        remove_sqlite_database_files(&path).unwrap();
-    }
-
-    #[tokio::test]
     async fn replacement_validation_rejects_a_missing_osv_fts_row() {
         let (path, url, database) = initialized_database("missing-osv-fts").await;
         database
@@ -356,7 +287,7 @@ mod tests {
         connection.close().await.unwrap();
         let database = SqlxDatabase::connect(&url).await.unwrap();
         let error = validate_replacement_database(&database).await.unwrap_err();
-        assert!(error.contains("stage 5 (checking OSV search projections and FTS5)"));
+        assert!(error.contains("OSV text FTS"));
         database.close().await.unwrap();
         remove_sqlite_database_files(&path).unwrap();
     }
@@ -379,7 +310,7 @@ mod tests {
         connection.close().await.unwrap();
         let database = SqlxDatabase::connect(&url).await.unwrap();
         let error = validate_replacement_database(&database).await.unwrap_err();
-        assert!(error.contains("stage 4 (checking CVE search projections and FTS5)"));
+        assert!(error.contains("CVE summary FTS"));
         database.close().await.unwrap();
         remove_sqlite_database_files(&path).unwrap();
     }

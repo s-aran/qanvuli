@@ -135,6 +135,11 @@ Use `init --preserve-existing` to keep the active database until the replacement
 validated, closed, and installed. Partial builds requested with `--max-chunks` also preserve the
 active database during construction.
 
+`init` propagates every import, index, and FTS build error, then performs only bounded schema and
+first/last search-projection sentinel checks. It deliberately avoids rescanning the database it has
+just created. Run `db check --scan` or `db check --full` when an explicit complete integrity scan is
+required.
+
 The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
 foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each
 such physical connection. `db check` is a low-latency schema and fixed-sentinel check; it does not
