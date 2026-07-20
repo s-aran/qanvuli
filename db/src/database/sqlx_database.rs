@@ -2729,7 +2729,7 @@ mod tests {
         database.check_full_foreign_keys().await.unwrap();
         database.check_full_cve_search().await.unwrap();
         database.check_full_osv_search().await.unwrap();
-        assert_eq!(SqlxDatabase::schema_version(), 8);
+        assert_eq!(SqlxDatabase::schema_version(), 9);
     }
 
     #[tokio::test]
@@ -2856,7 +2856,7 @@ mod tests {
             .writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    sqlx::query("DROP INDEX idx_cve_summary_state_published")
+                    sqlx::query("DROP INDEX idx_cve_updated_at_cve_id")
                         .execute(connection)
                         .await?;
                     Ok(())

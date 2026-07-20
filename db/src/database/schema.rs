@@ -2,7 +2,7 @@
 
 use sqlx::{Connection, SqliteConnection};
 
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 
 pub(crate) async fn suspend_cve_search_sync(
     _connection: &mut SqliteConnection,
@@ -220,14 +220,8 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE TABLE IF NOT EXISTS cve_summary_index (
             cve_db_id INTEGER PRIMARY KEY NOT NULL,
             cve_id TEXT NOT NULL UNIQUE,
-            state INTEGER NOT NULL,
-            published_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
             title TEXT NOT NULL,
             description_en TEXT,
-            max_cvss_score REAL,
-            max_cvss_severity TEXT,
-            cwe_ids TEXT NOT NULL DEFAULT '',
             affected_text TEXT NOT NULL DEFAULT '',
             vendor_text TEXT NOT NULL DEFAULT '',
             product_text TEXT NOT NULL DEFAULT '',
@@ -235,22 +229,6 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS cve_summary_fts USING fts5(cve_id UNINDEXED, title, description_en, affected_text, reference_text, tokenize='unicode61');
         CREATE VIRTUAL TABLE IF NOT EXISTS cve_affected_summary_fts USING fts5(cve_id UNINDEXED, vendor_text, product_text, affected_text, tokenize='unicode61');
-        CREATE TABLE IF NOT EXISTS cve_cwe_search (
-            cwe_id INTEGER NOT NULL, cve_id TEXT NOT NULL, state INTEGER NOT NULL,
-            published_at TEXT NOT NULL, updated_at TEXT NOT NULL, title TEXT NOT NULL,
-            description_en TEXT, PRIMARY KEY(cwe_id, cve_id)
-        );
-        CREATE TABLE IF NOT EXISTS cve_cvss_search (
-            cve_id TEXT PRIMARY KEY NOT NULL, state INTEGER NOT NULL, published_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, title TEXT NOT NULL, description_en TEXT,
-            max_cvss_score REAL, max_cvss_severity TEXT, cvss_versions TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS cve_affected_search (
-            cve_id TEXT PRIMARY KEY NOT NULL, state INTEGER NOT NULL, published_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL, title TEXT NOT NULL, description_en TEXT,
-            vendor_text TEXT NOT NULL DEFAULT '', product_text TEXT NOT NULL DEFAULT '',
-            affected_text TEXT NOT NULL DEFAULT ''
-        );
 
         CREATE INDEX IF NOT EXISTS idx_read_json_file_filename ON read_json_file(filename);
         CREATE INDEX IF NOT EXISTS idx_cve_published_at_cve_id ON cve(published_at, cve_id);
@@ -270,11 +248,6 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges(to_identifier);
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_from ON vulnerability_identifier_edges(from_identifier);
         CREATE INDEX IF NOT EXISTS idx_identifier_components_component ON identifier_components(component_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_summary_state_published ON cve_summary_index(state, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_summary_updated ON cve_summary_index(updated_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cwe_search_sort ON cve_cwe_search(cwe_id, state, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_cvss_search_score ON cve_cvss_search(state, max_cvss_score DESC, published_at DESC, cve_id);
-        CREATE INDEX IF NOT EXISTS idx_cve_affected_search_sort ON cve_affected_search(state, published_at DESC, cve_id);
 
         INSERT OR IGNORE INTO db_sources(source, display_name, source_type, default_filename, raw_format) VALUES
             ('CVE', 'CVE List V5', 'vulnerability_db', 'all_CVEs_at_midnight.zip', 'json'),
@@ -282,7 +255,7 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
             ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv');
 
-        INSERT INTO schema_meta(rowid, version) VALUES(1, 8);
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 9);
         "#,
     )
     .execute(&mut *transaction)
