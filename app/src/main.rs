@@ -157,9 +157,12 @@ where
             normalized.push(arg);
             continue;
         };
-        if value == "--osv-all" {
+        if value == "--osv-all" || value == "--osv-refresh-all" {
             normalized.push(arg);
             continue;
+        }
+        if value == "--osv-full-snapshot" {
+            return Err("--osv-full-snapshot was renamed to --osv-refresh-all because it does not infer deletions from missing snapshot entries".to_owned());
         }
         if value == "--osv-prefix" || value.starts_with("--osv-prefix=") {
             return Err("use --osv-<prefix>, for example --osv-ghsa or --osv-pysec".to_owned());
@@ -197,4 +200,35 @@ fn locale_is_utf8() -> bool {
             let value = value.to_ascii_uppercase();
             value.contains("UTF-8") || value.contains("UTF8")
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osv_refresh_all_is_a_real_option_not_a_dynamic_source_prefix() {
+        let normalized = normalize_osv_prefix_flags(
+            ["qanvuli", "update", "--osv-refresh-all"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap();
+        assert_eq!(
+            normalized,
+            ["qanvuli", "update", "--osv-refresh-all"].map(OsString::from)
+        );
+        Cli::try_parse_from(normalized).unwrap();
+    }
+
+    #[test]
+    fn removed_osv_full_snapshot_name_is_rejected() {
+        let error = normalize_osv_prefix_flags(
+            ["qanvuli", "update", "--osv-full-snapshot"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("--osv-refresh-all"));
+    }
 }

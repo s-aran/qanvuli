@@ -8,6 +8,7 @@ use super::common::{
 };
 use qanvuli_core::database::install_closed_database;
 use std::path::PathBuf;
+use std::time::Instant;
 
 /// CLI arguments for `qanvuli init`.
 #[derive(Debug, Default, clap::Args)]
@@ -121,10 +122,7 @@ async fn run_with_progress(
         )
         .await?;
         sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init", false).await?;
-        db_for_build
-            .check_search_integrity_quick()
-            .await
-            .map_err(|error| format!("replacement database integrity check failed: {error}"))
+        validate_replacement_database(&db_for_build).await
     }
     .await;
     let close_result = db
@@ -145,6 +143,55 @@ async fn run_with_progress(
     })?;
     install_closed_database(&candidate_path, &target)
         .map_err(|error| format!("failed to install validated replacement database: {error}"))?;
+    Ok(())
+}
+
+async fn validate_replacement_database(
+    db: &qanvuli_core::database::SqlxDatabase,
+) -> Result<(), String> {
+    const STAGES: usize = 5;
+    let validation_started = Instant::now();
+    eprintln!("init: validating replacement database");
+
+    macro_rules! validation_stage {
+        ($number:literal, $label:literal, $future:expr) => {{
+            let stage_started = Instant::now();
+            eprintln!("init: [{}/{}] {}...", $number, STAGES, $label);
+            $future.await.map_err(|error| {
+                format!(
+                    "replacement database validation failed at stage {} ({}): {error}",
+                    $number, $label
+                )
+            })?;
+            eprintln!(
+                "init: [{}/{}] {} completed in {:?}",
+                $number,
+                STAGES,
+                $label,
+                stage_started.elapsed()
+            );
+        }};
+    }
+
+    validation_stage!(1, "checking required schema", db.check_required_schema());
+    validation_stage!(2, "running SQLite quick_check", db.check_scan_sqlite());
+    validation_stage!(3, "checking foreign keys", db.check_full_foreign_keys());
+    // These APIs include both native FTS5 integrity commands and complete projection
+    // correspondence checks for their respective source.
+    validation_stage!(
+        4,
+        "checking CVE search projections and FTS5",
+        db.check_full_cve_search()
+    );
+    validation_stage!(
+        5,
+        "checking OSV search projections and FTS5",
+        db.check_full_osv_search()
+    );
+    eprintln!(
+        "init: replacement database validation completed in {:?}",
+        validation_started.elapsed()
+    );
     Ok(())
 }
 
@@ -194,7 +241,104 @@ pub async fn run_default_with_progress_and_keep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
+    use sqlx::{Connection, Executor};
     use std::io::Write;
+
+    fn test_database_path(label: &str) -> (PathBuf, String) {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-init-{label}-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        (path, url)
+    }
+
+    async fn initialized_database(label: &str) -> (PathBuf, String, SqlxDatabase) {
+        let (path, url) = test_database_path(label);
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        database.initialize().await.unwrap();
+        (path, url, database)
+    }
+
+    #[tokio::test]
+    async fn replacement_validation_accepts_a_consistent_database() {
+        let (path, _, database) = initialized_database("valid-replacement").await;
+        validate_replacement_database(&database).await.unwrap();
+        database.close().await.unwrap();
+        remove_sqlite_database_files(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_validation_rejects_a_foreign_key_violation() {
+        let (path, url, database) = initialized_database("foreign-key-failure").await;
+        database.close().await.unwrap();
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        connection
+            .execute("PRAGMA foreign_keys = OFF")
+            .await
+            .unwrap();
+        connection
+            .execute("INSERT INTO cve_affected (cve_db_id, version_text, raw_json) VALUES (999, '', '{}')")
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        let error = validate_replacement_database(&database).await.unwrap_err();
+        assert!(error.contains("stage 3 (checking foreign keys)"));
+        database.close().await.unwrap();
+        remove_sqlite_database_files(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_validation_rejects_a_missing_osv_fts_row() {
+        let (path, url, database) = initialized_database("missing-osv-fts").await;
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: Some("fixture.json".to_owned()),
+                raw_json:
+                    r#"{"id":"OSV-TEST-1","modified":"2026-01-01T00:00:00Z","summary":"fixture"}"#
+                        .to_owned(),
+            })
+            .await
+            .unwrap();
+        database.close().await.unwrap();
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        connection
+            .execute("DELETE FROM osv_text_fts WHERE osv_id='OSV-TEST-1'")
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        let error = validate_replacement_database(&database).await.unwrap_err();
+        assert!(error.contains("stage 5 (checking OSV search projections and FTS5)"));
+        database.close().await.unwrap();
+        remove_sqlite_database_files(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_validation_rejects_a_missing_cve_fts_row() {
+        let (path, url, database) = initialized_database("missing-cve-fts").await;
+        database
+            .import_cve_raw_json(
+                r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"fixture"}}}"#.to_owned(),
+            )
+            .await
+            .unwrap();
+        database.close().await.unwrap();
+        let mut connection = sqlx::SqliteConnection::connect(&url).await.unwrap();
+        connection
+            .execute("DELETE FROM cve_summary_fts WHERE cve_id='CVE-2099-0001'")
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        let error = validate_replacement_database(&database).await.unwrap_err();
+        assert!(error.contains("stage 4 (checking CVE search projections and FTS5)"));
+        database.close().await.unwrap();
+        remove_sqlite_database_files(&path).unwrap();
+    }
 
     #[tokio::test]
     async fn failed_full_init_preserves_the_existing_database_file() {

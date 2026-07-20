@@ -1,5 +1,7 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
-use qanvuli_core::database::{CveStateScope, CveSummary, EnrichedFinding};
+use qanvuli_core::database::{
+    CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
+};
 use serde::{Deserialize, Serialize};
 use simd_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -54,6 +56,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let date_filter = args.date_filter()?;
     let packages = load_sbom_packages(args.path()?)?;
     let package_count = packages.len();
+    let packages = deduplicate_sbom_packages(packages);
+    let unique_package_count = packages.len();
     let mut cve_findings = BTreeMap::<(String, String, String), SbomCveFinding>::new();
     let mut osv_findings = BTreeMap::<(String, String, String, String), SbomOsvFinding>::new();
     let mut unverified_name_matches = BTreeMap::<(String, String, String), SbomCveFinding>::new();
@@ -61,7 +65,71 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let per_package_limit = args.per_package_limit.unwrap_or(DEFAULT_LIMIT);
     let state_scope = CveStateScope::from_include_rejected(args.include_rejected);
 
-    eprintln!("sbom: searching {package_count} packages");
+    let mut package_query_owners = Vec::new();
+    let mut package_queries = Vec::new();
+    for (package_index, package) in packages.iter().enumerate() {
+        for package_ref in package.package_refs() {
+            let Some(version) = package_ref
+                .version
+                .as_deref()
+                .filter(|value| is_concrete_version(value))
+            else {
+                continue;
+            };
+            package_query_owners.push((package_index, package_ref.purl.clone()));
+            package_queries.push(PackageQuery {
+                ecosystem: package_ref.ecosystem,
+                package: package_ref.name,
+                version: version.to_owned(),
+                purl: Some(package_ref.purl),
+            });
+        }
+    }
+    let package_match_batches = db
+        .query_package_matches_batch(&package_queries)
+        .await
+        .map_err(|err| format!("failed to batch package matching: {err}"))?;
+    let global_osv_ids = package_match_batches
+        .iter()
+        .flatten()
+        .map(|finding| finding.primary_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let global_osv_dates = db
+        .osv_advisory_dates_batch(&global_osv_ids)
+        .await
+        .map_err(|err| format!("failed to load OSV advisory dates: {err}"))?;
+    let global_osv_dates = global_osv_ids
+        .into_iter()
+        .zip(global_osv_dates)
+        .collect::<BTreeMap<_, _>>();
+    let global_cve_ids = package_match_batches
+        .iter()
+        .flatten()
+        .flat_map(|finding| finding.cve_ids.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let global_cves = db
+        .cve_summaries_with_details_batch(&global_cve_ids, state_scope)
+        .await
+        .map_err(|err| format!("failed to load linked CVEs: {err}"))?;
+    let global_cves = global_cve_ids
+        .into_iter()
+        .zip(global_cves)
+        .collect::<BTreeMap<_, _>>();
+    let mut prefetched_matches =
+        vec![BTreeMap::<String, Vec<EnrichedFinding>>::new(); unique_package_count];
+    for ((package_index, purl), findings) in
+        package_query_owners.into_iter().zip(package_match_batches)
+    {
+        prefetched_matches[package_index].insert(purl, findings);
+    }
+
+    eprintln!(
+        "sbom: searching {package_count} components as {unique_package_count} unique package queries"
+    );
     for (index, package) in packages.into_iter().enumerate() {
         eprintln!(
             "sbom: [{}/{}] searching {}",
@@ -76,6 +144,11 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             state_scope,
             per_package_limit,
             args.include_name_matches,
+            Some(PackagePrefetch {
+                findings: &prefetched_matches[index],
+                osv_dates: &global_osv_dates,
+                cves: &global_cves,
+            }),
         )
         .await?;
         eprintln!(
@@ -110,6 +183,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     print_json(&json!({
         "vulnerable": !cve_findings.is_empty() || !osv_findings.is_empty(),
         "package_count": package_count,
+        "unique_package_query_count": unique_package_count,
         "count": cve_findings.len() + osv_findings.len(),
         "cve_count": cve_findings.len(),
         "osv_count": osv_findings.len(),
@@ -131,6 +205,16 @@ struct PackageSearchResult {
     unresolved_versions: Vec<UnresolvedVersion>,
 }
 
+type OsvDateMap = BTreeMap<String, Option<(Option<String>, Option<String>)>>;
+type CveDetailMap = BTreeMap<String, Option<CveSummaryWithDetail>>;
+
+#[derive(Clone, Copy)]
+struct PackagePrefetch<'a> {
+    findings: &'a BTreeMap<String, Vec<EnrichedFinding>>,
+    osv_dates: &'a OsvDateMap,
+    cves: &'a CveDetailMap,
+}
+
 async fn search_package(
     db: qanvuli_core::database::CveDatabase,
     package: SbomPackage,
@@ -138,6 +222,7 @@ async fn search_package(
     state_scope: CveStateScope,
     per_package_limit: u64,
     include_name_matches: bool,
+    prefetch: Option<PackagePrefetch<'_>>,
 ) -> Result<PackageSearchResult, String> {
     let mut cve_findings = Vec::new();
     let mut osv_findings = Vec::new();
@@ -171,10 +256,7 @@ async fn search_package(
         }
     }
 
-    for purl in package.purls() {
-        let Some(package_ref) = package_ref_from_purl(purl, package.version.as_deref()) else {
-            continue;
-        };
+    for package_ref in package.package_refs() {
         let Some(version) = package_ref.version.as_deref() else {
             continue;
         };
@@ -187,40 +269,56 @@ async fn search_package(
             });
             continue;
         }
-        let findings = db
-            .query_package_matches(
+        let findings = if let Some(prefetched) = prefetch {
+            prefetched
+                .findings
+                .get(&package_ref.purl)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            db.query_package_matches(
                 &package_ref.ecosystem,
                 &package_ref.name,
                 version,
                 Some(&package_ref.purl),
             )
             .await
-            .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?;
-        let osv_ids = findings
-            .iter()
-            .map(|finding| finding.primary_id.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let osv_dates = db
-            .osv_advisory_dates_batch(&osv_ids)
-            .await
-            .map_err(|err| format!("failed to load OSV advisory dates: {err}"))?;
-        let osv_dates = osv_ids
-            .into_iter()
-            .zip(osv_dates)
-            .collect::<BTreeMap<_, _>>();
-        let cve_ids = findings
-            .iter()
-            .flat_map(|finding| finding.cve_ids.iter().cloned())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let cves = db
-            .cve_summaries_with_details_batch(&cve_ids, state_scope)
-            .await
-            .map_err(|err| format!("failed to load linked CVEs: {err}"))?;
-        let cves = cve_ids.into_iter().zip(cves).collect::<BTreeMap<_, _>>();
+            .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?
+        };
+        let owned_osv_dates;
+        let osv_dates = if let Some(prefetched) = prefetch {
+            prefetched.osv_dates
+        } else {
+            let osv_ids = findings
+                .iter()
+                .map(|finding| finding.primary_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let dates = db
+                .osv_advisory_dates_batch(&osv_ids)
+                .await
+                .map_err(|err| format!("failed to load OSV advisory dates: {err}"))?;
+            owned_osv_dates = osv_ids.into_iter().zip(dates).collect();
+            &owned_osv_dates
+        };
+        let owned_cves;
+        let cves = if let Some(prefetched) = prefetch {
+            prefetched.cves
+        } else {
+            let cve_ids = findings
+                .iter()
+                .flat_map(|finding| finding.cve_ids.iter().cloned())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let summaries = db
+                .cve_summaries_with_details_batch(&cve_ids, state_scope)
+                .await
+                .map_err(|err| format!("failed to load linked CVEs: {err}"))?;
+            owned_cves = cve_ids.into_iter().zip(summaries).collect();
+            &owned_cves
+        };
         for finding in findings {
             let osv_matches_dates = osv_dates
                 .get(&finding.primary_id)
@@ -377,6 +475,32 @@ fn load_sbom_packages_from_slice(json: &mut [u8]) -> Result<Vec<SbomPackage>, St
         .collect())
 }
 
+fn deduplicate_sbom_packages(packages: Vec<SbomPackage>) -> Vec<SbomPackage> {
+    let mut unique = BTreeMap::new();
+    for package in packages {
+        let normalized_purls = package
+            .purls()
+            .into_iter()
+            .filter_map(|purl| package_ref_from_purl(purl, package.version.as_deref()))
+            .map(|package_ref| {
+                format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    package_ref.ecosystem.to_ascii_lowercase(),
+                    package_ref.name.to_ascii_lowercase(),
+                    package_ref.version.unwrap_or_default()
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let key = (
+            package.name.to_ascii_lowercase(),
+            package.version.clone().unwrap_or_default(),
+            normalized_purls,
+        );
+        unique.entry(key).or_insert(package);
+    }
+    unique.into_values().collect()
+}
+
 #[derive(Debug, Deserialize)]
 struct GitHubSbom {
     sbom: Option<SbomDocument>,
@@ -430,6 +554,23 @@ impl SbomPackage {
         purls.sort();
         purls.dedup();
         purls
+    }
+
+    fn package_refs(&self) -> Vec<PackageRef> {
+        let mut normalized = BTreeMap::new();
+        for package_ref in self
+            .purls()
+            .into_iter()
+            .filter_map(|purl| package_ref_from_purl(purl, self.version.as_deref()))
+        {
+            let key = (
+                package_ref.ecosystem.to_ascii_lowercase(),
+                package_ref.name.to_ascii_lowercase(),
+                package_ref.version.clone().unwrap_or_default(),
+            );
+            normalized.entry(key).or_insert(package_ref);
+        }
+        normalized.into_values().collect()
     }
 }
 
@@ -710,6 +851,7 @@ mod tests {
             CveStateScope::PublishedOnly,
             1,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -723,6 +865,7 @@ mod tests {
             CveStateScope::PublishedOnly,
             1,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -810,5 +953,118 @@ mod tests {
         let packages = load_sbom_packages_from_slice(&mut json).unwrap();
         assert_eq!(packages.len(), 1);
         assert_eq!(packages[0].search_names(), vec!["serde_json".to_owned()]);
+    }
+
+    #[test]
+    fn deduplicates_equivalent_normalized_package_entries_without_merging_versions() {
+        let packages = vec![
+            SbomPackage {
+                name: "Example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:npm/%65xample@1.0.0".to_owned()),
+            },
+            SbomPackage {
+                name: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:npm/example@1.0.0".to_owned()),
+            },
+            SbomPackage {
+                name: "example".to_owned(),
+                version: Some("2.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:npm/example@2.0.0".to_owned()),
+            },
+        ];
+        let unique = deduplicate_sbom_packages(packages);
+        assert_eq!(unique.len(), 2);
+        assert_eq!(
+            unique
+                .iter()
+                .map(|package| package.version.as_deref().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["1.0.0", "2.0.0"])
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "performance benchmark"]
+    async fn benchmark_sbom_document_batch_sizes() {
+        use qanvuli_core::database::SqlxDatabase;
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for (label, input_count, distinct_count) in [
+            ("100", 100_usize, 100_usize),
+            ("1000", 1_000, 1_000),
+            ("duplicate-heavy-1000", 1_000, 100),
+        ] {
+            let packages = (0..input_count)
+                .map(|index| {
+                    let package_index = index % distinct_count;
+                    SbomPackage {
+                        name: format!("package-{package_index}"),
+                        version: Some(format!("1.{}.0", package_index % 10)),
+                        external_refs: Vec::new(),
+                        package_url: Some(format!(
+                            "pkg:npm/package-{package_index}@1.{}.0",
+                            package_index % 10
+                        )),
+                    }
+                })
+                .collect();
+            let unique = deduplicate_sbom_packages(packages);
+            let queries = unique
+                .iter()
+                .flat_map(|package| package.purls())
+                .filter_map(|purl| package_ref_from_purl(purl, None))
+                .map(|package| PackageQuery {
+                    ecosystem: package.ecosystem,
+                    package: package.name,
+                    version: package.version.unwrap(),
+                    purl: Some(package.purl),
+                })
+                .collect::<Vec<_>>();
+            let baseline_queries = (0..input_count)
+                .map(|index| {
+                    let package_index = index % distinct_count;
+                    PackageQuery {
+                        ecosystem: "npm".to_owned(),
+                        package: format!("package-{package_index}"),
+                        version: format!("1.{}.0", package_index % 10),
+                        purl: Some(format!(
+                            "pkg:npm/package-{package_index}@1.{}.0",
+                            package_index % 10
+                        )),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let baseline_started = std::time::Instant::now();
+            for query in &baseline_queries {
+                database
+                    .query_package_matches(
+                        &query.ecosystem,
+                        &query.package,
+                        &query.version,
+                        query.purl.as_deref(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let baseline_elapsed = baseline_started.elapsed();
+            let batched_started = std::time::Instant::now();
+            let results = database
+                .query_package_matches_batch(&queries)
+                .await
+                .unwrap();
+            eprintln!(
+                "SBOM batch: fixture={label} input={input_count} unique={} baseline_per_component={baseline_elapsed:?} batched_elapsed={:?} result_groups={}",
+                queries.len(),
+                batched_started.elapsed(),
+                results.len()
+            );
+        }
+        database.close().await.unwrap();
     }
 }

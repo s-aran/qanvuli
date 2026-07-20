@@ -432,51 +432,101 @@ impl SqlxDatabase {
         version: &str,
         purl: Option<&str>,
     ) -> Result<Vec<EnrichedFinding>, sqlx::Error> {
-        let findings = self
-            .query_osv_package_with_purl(ecosystem, package, version, purl)
+        let query = PackageQuery {
+            ecosystem: ecosystem.to_owned(),
+            package: package.to_owned(),
+            version: version.to_owned(),
+            purl: purl.map(str::to_owned),
+        };
+        Ok(self
+            .query_package_matches_batch(std::slice::from_ref(&query))
+            .await?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// Matches a whole set of package/version queries with one candidate scan and bounded
+    /// follow-up reads for ranges, explicit versions, and CVE aliases.
+    pub async fn query_package_matches_batch(
+        &self,
+        packages: &[PackageQuery],
+    ) -> Result<Vec<Vec<EnrichedFinding>>, sqlx::Error> {
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packages = packages.to_vec();
+        let input_json = serde_json::to_string(&packages).map_err(|error| {
+            sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
+        })?;
+        self.writer.with_connection(|connection| Box::pin(async move {
+            let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
+                "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
+            )
+            .bind(input_json)
+            .fetch_all(&mut *connection)
             .await?;
-        Ok(findings
-            .into_iter()
-            .filter(|finding| finding.status != "not_affected")
-            .map(|finding| {
-                let affected = AffectedStatus {
-                    status: finding.status,
-                    confidence: finding.confidence,
-                };
-                EnrichedFinding {
-                    primary_id: finding.osv_id,
-                    cve_ids: finding.cve_ids,
-                    aliases: Vec::new(),
-                    aliases_status: "not_queried".to_owned(),
-                    package: PackageQuery {
-                        ecosystem: ecosystem.to_owned(),
-                        package: package.to_owned(),
-                        version: version.to_owned(),
-                        purl: purl.map(str::to_owned),
-                    },
-                    affected: affected.clone(),
-                    fixed_versions: Vec::new(),
-                    fixed_versions_status: "not_queried".to_owned(),
-                    enrichment: FindingEnrichment {
-                        kev: None,
-                        kev_status: "not_queried".to_owned(),
-                        epss: None,
-                        epss_status: "not_queried".to_owned(),
-                    },
-                    priority_signals: PrioritySignals {
-                        known_exploited: false,
-                        epss_percentile: None,
-                        has_fixed_version: false,
-                        affected_confidence: affected.confidence,
-                        suggested_priority: "unknown".to_owned(),
-                        reasons: Vec::new(),
-                        enrichment_status: "not_queried".to_owned(),
-                    },
-                    evidence: Vec::new(),
-                    evidence_status: "not_queried".to_owned(),
+            let package_ids = candidates.iter().map(|(_, id, _)| *id).collect::<BTreeSet<_>>();
+            let package_ids_json = serde_json::to_string(&package_ids).map_err(|error| {
+                sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}"))
+            })?;
+            let events: Vec<(i64, i64, String, String, String)> = sqlx::query_as(
+                "SELECT range.affected_package_id, range.id, range.range_type, event.event_type, event.value FROM osv_ranges AS range JOIN osv_range_events AS event ON event.range_id=range.id WHERE range.affected_package_id IN (SELECT value FROM json_each(?)) ORDER BY range.affected_package_id, range.id, event.id",
+            )
+            .bind(&package_ids_json)
+            .fetch_all(&mut *connection)
+            .await?;
+            let mut ranges_by_package = BTreeMap::<i64, Vec<OsvRange>>::new();
+            let mut current_range = None;
+            for (package_id, range_id, range_type, event_type, value) in events {
+                let ranges = ranges_by_package.entry(package_id).or_default();
+                if current_range != Some((package_id, range_id)) {
+                    current_range = Some((package_id, range_id));
+                    ranges.push(OsvRange { range_type, events: Vec::new() });
                 }
-            })
-            .collect())
+                ranges.last_mut().expect("range inserted").events.push((event_type, value));
+            }
+            let version_rows: Vec<(i64, String)> = sqlx::query_as(
+                "SELECT affected_package_id, version FROM osv_versions WHERE affected_package_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(&package_ids_json)
+            .fetch_all(&mut *connection)
+            .await?;
+            let mut versions_by_package = BTreeMap::<i64, BTreeSet<String>>::new();
+            for (package_id, version) in version_rows {
+                versions_by_package.entry(package_id).or_default().insert(version);
+            }
+            let osv_ids = candidates.iter().map(|(_, _, id)| id).collect::<BTreeSet<_>>();
+            let osv_ids_json = serde_json::to_string(&osv_ids).map_err(|error| {
+                sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}"))
+            })?;
+            let alias_rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id",
+            )
+            .bind(osv_ids_json)
+            .fetch_all(&mut *connection)
+            .await?;
+            let mut aliases_by_osv = BTreeMap::<String, Vec<String>>::new();
+            for (osv_id, alias) in alias_rows {
+                aliases_by_osv.entry(osv_id).or_default().push(alias);
+            }
+            let mut output = vec![Vec::new(); packages.len()];
+            for (query_index, package_id, osv_id) in candidates {
+                let query = &packages[usize::try_from(query_index).map_err(|_| sqlx::Error::Protocol("invalid package query index".to_owned()))?];
+                let matched = if versions_by_package.get(&package_id).is_some_and(|versions| versions.contains(&query.version)) {
+                    super::package_eval::VersionMatch { status: "affected".to_owned(), confidence: "high".to_owned() }
+                } else {
+                    evaluate_version(&query.ecosystem, &query.version, ranges_by_package.get(&package_id).map(Vec::as_slice).unwrap_or_default())
+                };
+                if matched.status == "not_affected" {
+                    continue;
+                }
+                let affected = AffectedStatus { status: matched.status, confidence: matched.confidence };
+                output[usize::try_from(query_index).unwrap()].push(EnrichedFinding {
+                    primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions: Vec::new(), fixed_versions_status: "not_queried".to_owned(), enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: false, affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                });
+            }
+            Ok(output)
+        })).await
     }
 
     #[deprecated(note = "use query_package_matches; enrichment fields are not populated")]
@@ -580,6 +630,12 @@ impl SqlxDatabase {
     /// Runs SQLite quick_check and complete search correspondence scans.
     pub async fn check_scan(&self) -> Result<(), sqlx::Error> {
         self.writer.check_scan().await
+    }
+
+    /// Runs only SQLite quick_check (plus connection foreign-key enforcement verification).
+    /// Replacement validation uses this separately so failures identify the exact stage.
+    pub async fn check_scan_sqlite(&self) -> Result<(), sqlx::Error> {
+        self.writer.check_sqlite_quick().await
     }
 
     /// Runs the expensive SQLite file-integrity stage used by `db check --full`.
@@ -1502,6 +1558,15 @@ impl SqlxDatabase {
         records: Vec<OsvRawRecord>,
     ) -> Result<OsvImportStats, sqlx::Error> {
         self.import_osv_record_batch(records, false, false).await
+    }
+
+    /// Imports an incremental OSV batch and updates FTS only for inserted or changed IDs.
+    /// Unchanged hashes produce no normalized or search writes.
+    pub async fn import_osv_records_incremental_with_stats(
+        &self,
+        records: Vec<OsvRawRecord>,
+    ) -> Result<OsvImportStats, sqlx::Error> {
+        self.import_osv_record_batch(records, true, false).await
     }
 
     /// Inserts an OSV batch into an empty replacement database. Unlike the update path, this
@@ -3527,6 +3592,98 @@ mod tests {
         assert_eq!(changes_after, changes_before);
     }
 
+    #[tokio::test]
+    async fn incremental_osv_search_updates_only_changed_projection_and_matches_rebuild() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let unchanged = OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"id":"GO-2099-unchanged","modified":"2099-01-01T00:00:00Z","summary":"untouched"}"#.to_owned(),
+        };
+        let original = OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"id":"GO-2099-changed","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-old"],"affected":[{"package":{"ecosystem":"Go","name":"old.example/pkg","purl":"pkg:golang/old.example/pkg"}}]}"#.to_owned(),
+        };
+        database
+            .import_osv_records_incremental_with_stats(vec![unchanged.clone(), original])
+            .await
+            .unwrap();
+        let untouched_before: (i64, String) = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT rowid, summary FROM osv_text_fts WHERE osv_id='GO-2099-unchanged'",
+                    )
+                    .fetch_one(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        let changed = OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"id":"GO-2099-changed","modified":"2099-01-02T00:00:00Z","aliases":["CVE-2099-new"],"affected":[{"package":{"ecosystem":"Go","name":"new.example/pkg","purl":"pkg:golang/new.example/pkg"}}]}"#.to_owned(),
+        };
+        let stats = database
+            .import_osv_records_incremental_with_stats(vec![unchanged, changed])
+            .await
+            .unwrap();
+        assert_eq!(stats.updated, 1);
+        assert_eq!(stats.unchanged, 1);
+
+        let untouched_after: (i64, String) = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT rowid, summary FROM osv_text_fts WHERE osv_id='GO-2099-unchanged'",
+                    )
+                    .fetch_one(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(untouched_after, untouched_before);
+        let incremental_rows: Vec<(String, String, String)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT osv_id, aliases, packages FROM osv_text_fts ORDER BY osv_id",
+                    )
+                    .fetch_all(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(incremental_rows.iter().any(|(id, aliases, packages)| {
+            id == "GO-2099-changed"
+                && aliases == "CVE-2099-new"
+                && packages.contains("new.example/pkg")
+                && packages.contains("pkg:golang/new.example/pkg")
+                && !aliases.contains("old")
+                && !packages.contains("old.example")
+        }));
+        database.rebuild_osv_search().await.unwrap();
+        let rebuilt_rows: Vec<(String, String, String)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT osv_id, aliases, packages FROM osv_text_fts ORDER BY osv_id",
+                    )
+                    .fetch_all(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(incremental_rows, rebuilt_rows);
+    }
+
     /// Reproducible local micro-benchmark for the incremental OSV update hot path.
     /// Run with: cargo test -p qanvuli-db benchmark_unchanged_osv_batch -- --ignored --nocapture
     #[tokio::test]
@@ -3608,6 +3765,192 @@ mod tests {
             "full OSV: records=5000 write={write_elapsed:?} index={index_elapsed:?} total={:?}",
             write_elapsed + index_elapsed
         );
+    }
+
+    /// Measures connection, strong schema validation, first lookup, and warmed repeated lookup
+    /// against QANVULI_BENCH_DB_URL or the workspace's db.sqlite.
+    #[tokio::test]
+    #[ignore = "requires a realistic local database"]
+    async fn benchmark_schema_and_lookup_latency() {
+        let url = std::env::var("QANVULI_BENCH_DB_URL").unwrap_or_else(|_| {
+            let current = std::env::current_dir().unwrap();
+            let path = current
+                .ancestors()
+                .map(|directory| directory.join("db.sqlite"))
+                .find(|candidate| candidate.exists())
+                .expect("set QANVULI_BENCH_DB_URL or place db.sqlite in a parent directory");
+            format!(
+                "sqlite:///{}?mode=rw",
+                path.display().to_string().replace('\\', "/")
+            )
+        });
+        let started = std::time::Instant::now();
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        let connection_elapsed = started.elapsed();
+        let cve_id: String = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT cve_id FROM cve ORDER BY cve_id LIMIT 1")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        database.check_required_schema().await.unwrap();
+        let schema_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        assert!(database.find_cve_summary(&cve_id).await.unwrap().is_some());
+        let first_lookup_elapsed = started.elapsed();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(database.find_cve_summary(&cve_id).await.unwrap().is_some());
+        }
+        let repeated_elapsed = started.elapsed();
+        eprintln!(
+            "schema/search benchmark: cve_id={cve_id} connection={connection_elapsed:?} schema={schema_elapsed:?} first_lookup={first_lookup_elapsed:?} repeated_100={repeated_elapsed:?} repeated_average={:?}",
+            repeated_elapsed / 100
+        );
+        database.close().await.unwrap();
+    }
+
+    /// Reproducible incremental FTS benchmark for zero, one, and one hundred changes.
+    #[tokio::test]
+    #[ignore = "performance benchmark"]
+    async fn benchmark_incremental_osv_change_counts() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let records = (0..100)
+            .map(|index| OsvRawRecord {
+                source_path: None,
+                raw_json: format!(
+                    r#"{{"id":"GO-2099-{index:04}","modified":"2099-01-01T00:00:00Z","summary":"original {index}","aliases":["CVE-2099-{index:04}"],"affected":[{{"package":{{"ecosystem":"Go","name":"example.invalid/pkg/{index}","purl":"pkg:golang/example.invalid/pkg/{index}@1.0.0"}}}}]}}"#
+                ),
+            })
+            .collect::<Vec<_>>();
+        database
+            .import_osv_records_incremental_with_stats(records.clone())
+            .await
+            .unwrap();
+        for changed_count in [0_usize, 1, 100] {
+            let input = records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    if index < changed_count {
+                        let modified_date = if changed_count == 100 {
+                            "2099-01-03"
+                        } else {
+                            "2099-01-02"
+                        };
+                        OsvRawRecord {
+                            source_path: None,
+                            raw_json: record
+                                .raw_json
+                                .replace("2099-01-01", modified_date)
+                                .replace("original", "changed"),
+                        }
+                    } else {
+                        record.clone()
+                    }
+                })
+                .collect();
+            let writes_before: i64 = database
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar("SELECT total_changes()")
+                            .fetch_one(connection)
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            let stats = database
+                .import_osv_records_incremental_with_stats(input)
+                .await
+                .unwrap();
+            let elapsed = started.elapsed();
+            let writes_after: i64 = database
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar("SELECT total_changes()")
+                            .fetch_one(connection)
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            eprintln!(
+                "incremental OSV: requested_changes={changed_count} actual_changes={} elapsed={elapsed:?} sqlite_row_changes={}",
+                stats.changed(),
+                writes_after - writes_before
+            );
+        }
+        for changed_count in [1_usize, 100] {
+            let baseline = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+            baseline.initialize().await.unwrap();
+            baseline
+                .import_osv_records_deferred_search(records.clone())
+                .await
+                .unwrap();
+            baseline.rebuild_osv_search().await.unwrap();
+            let input = records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    if index < changed_count {
+                        OsvRawRecord {
+                            source_path: None,
+                            raw_json: record
+                                .raw_json
+                                .replace("2099-01-01", "2099-01-04")
+                                .replace("original", "baseline-changed"),
+                        }
+                    } else {
+                        record.clone()
+                    }
+                })
+                .collect();
+            let writes_before: i64 = baseline
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar("SELECT total_changes()")
+                            .fetch_one(connection)
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            let started = std::time::Instant::now();
+            baseline
+                .import_osv_records_deferred_search(input)
+                .await
+                .unwrap();
+            baseline.rebuild_osv_search().await.unwrap();
+            let elapsed = started.elapsed();
+            let writes_after: i64 = baseline
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar("SELECT total_changes()")
+                            .fetch_one(connection)
+                            .await
+                    })
+                })
+                .await
+                .unwrap();
+            eprintln!(
+                "baseline global OSV FTS rebuild: requested_changes={changed_count} elapsed={elapsed:?} sqlite_row_changes={}",
+                writes_after - writes_before
+            );
+            baseline.close().await.unwrap();
+        }
     }
 
     #[tokio::test]

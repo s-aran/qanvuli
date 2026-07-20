@@ -69,16 +69,14 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             } else {
                 run_quick_check(&db).await?;
             }
-            print_json(&serde_json::json!({
-                "ok": true,
-                "mode": if check_args.full { "full" } else if check_args.scan { "scan" } else { "quick" },
-                "checks": {
-                    "schema": "ok",
-                    "sqlite": "ok",
-                    "foreign_keys_enabled": true,
-                    "search": "ok"
-                }
-            }))?;
+            let mode = if check_args.full {
+                "full"
+            } else if check_args.scan {
+                "scan"
+            } else {
+                "quick"
+            };
+            print_json(&check_report(mode))?;
         }
         Command::RebuildSearch => {
             db.check_required_schema()
@@ -97,6 +95,35 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .await
         .map_err(|error| format!("failed to close database: {error}"))?;
     Ok(())
+}
+
+fn check_report(mode: &str) -> serde_json::Value {
+    let (sqlite_status, sqlite_coverage, foreign_key_coverage, search_coverage) = match mode {
+        "quick" => ("not_run", "none", "connection_setting", "sentinel"),
+        "scan" => (
+            "ok",
+            "quick_check",
+            "complete_correspondence",
+            "fts_native_and_complete_correspondence",
+        ),
+        "full" => (
+            "ok",
+            "integrity_check",
+            "complete_correspondence",
+            "fts_native_and_complete_correspondence",
+        ),
+        _ => unreachable!("known check mode"),
+    };
+    serde_json::json!({
+        "ok": true,
+        "mode": mode,
+        "checks": {
+            "schema": { "status": "ok", "coverage": "full_schema_shape" },
+            "sqlite": { "status": sqlite_status, "coverage": sqlite_coverage },
+            "foreign_keys": { "status": "ok", "coverage": foreign_key_coverage },
+            "search": { "status": "ok", "coverage": search_coverage }
+        }
+    })
 }
 
 async fn run_quick_check(db: &qanvuli_core::database::SqlxDatabase) -> Result<(), String> {
@@ -155,4 +182,30 @@ async fn run_full_check(db: &qanvuli_core::database::SqlxDatabase) -> Result<(),
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_reports_describe_actual_mode_coverage() {
+        let quick = check_report("quick");
+        assert_eq!(quick["checks"]["sqlite"]["status"], "not_run");
+        assert_eq!(quick["checks"]["search"]["coverage"], "sentinel");
+
+        let scan = check_report("scan");
+        assert_eq!(scan["checks"]["sqlite"]["coverage"], "quick_check");
+        assert_eq!(
+            scan["checks"]["search"]["coverage"],
+            "fts_native_and_complete_correspondence"
+        );
+
+        let full = check_report("full");
+        assert_eq!(full["checks"]["sqlite"]["coverage"], "integrity_check");
+        assert_eq!(
+            full["checks"]["foreign_keys"]["coverage"],
+            "complete_correspondence"
+        );
+    }
 }

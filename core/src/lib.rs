@@ -28,7 +28,7 @@ pub mod ingest {
         cwe::CweCatalogFile,
         epss::download_epss_current_csv,
         kev::download_kev_json,
-        osv::{OSV_ALL_ZIP, OsvGcsSource, OsvModifiedId, parse_modified_id_csv},
+        osv::{OSV_ALL_ZIP, OsvDownloadError, OsvGcsSource, OsvModifiedId, parse_modified_id_csv},
     };
     pub use qanvuli_utils::{
         github::GitHubReleaseFile,

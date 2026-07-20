@@ -6,8 +6,9 @@ use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
 use qanvuli_core::{
     database::{OsvRawRecord, SqlxDatabase},
     ingest::{
-        CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile, OSV_ALL_ZIP, OsvGcsSource,
-        ZipStorage, download_epss_current_csv, download_kev_json, parse_modified_id_csv,
+        CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile, OSV_ALL_ZIP,
+        OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv, download_kev_json,
+        parse_modified_id_csv,
     },
     model::{is_known_osv_database_prefix, read_cwe_catalog_zip},
 };
@@ -551,14 +552,19 @@ pub async fn sync_osv_selection_from_gcs_sqlx(
     label: &str,
     selection: OsvImportSelection,
 ) -> Result<usize, String> {
-    sync_osv_selection_from_gcs_sqlx_with_full_snapshot(db, label, selection, false).await
+    sync_osv_selection_from_gcs_sqlx_with_refresh_all(db, label, selection, false).await
 }
 
-pub async fn sync_osv_selection_from_gcs_sqlx_with_full_snapshot(
+/// Synchronizes OSV data, optionally ignoring the cursor and redownloading every selected ZIP.
+///
+/// `refresh_all` is deliberately refresh/upsert semantics: an ID absent from a downloaded ZIP is
+/// not inferred to be deleted. Withdrawn advisories remain present as ordinary OSV records with a
+/// `withdrawn` timestamp.
+pub async fn sync_osv_selection_from_gcs_sqlx_with_refresh_all(
     db: SqlxDatabase,
     label: &str,
     selection: OsvImportSelection,
-    full_snapshot: bool,
+    refresh_all: bool,
 ) -> Result<usize, String> {
     let previous_cursor = db
         .osv_sync_cursor()
@@ -570,7 +576,7 @@ pub async fn sync_osv_selection_from_gcs_sqlx_with_full_snapshot(
         .map_err(|error| format!("{label}: failed to read OSV selection: {error}"))?;
     let selection_expanded = OsvImportSelection::from_metadata(stored_selection.as_deref())
         .is_none_or(|stored| stored != selection);
-    let incremental_cursor = (!selection_expanded && !full_snapshot)
+    let incremental_cursor = (!selection_expanded && !refresh_all)
         .then_some(previous_cursor.as_deref())
         .flatten();
     let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
@@ -666,7 +672,7 @@ async fn import_osv_zip_files_sqlx_with_mode(
                             unchanged: 0,
                         })
                 } else {
-                    db.import_osv_records_deferred_search_with_stats(batch.records)
+                    db.import_osv_records_incremental_with_stats(batch.records)
                         .await
                 }
             };
@@ -735,19 +741,10 @@ async fn import_osv_zip_files_sqlx_with_mode(
                 .await
                 .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
         } else if changed > 0 {
-            db.rebuild_osv_search()
-                .await
-                .map_err(|error| format!("failed to rebuild OSV FTS: {error}"))?;
-        } else if db.check_search_integrity_quick().await.is_err() {
-            eprintln!(
-                "osv: unchanged records found an incomplete search projection; rebuilding it"
-            );
-            db.rebuild_osv_search()
-                .await
-                .map_err(|error| format!("failed to repair OSV FTS: {error}"))?;
+            eprintln!("osv: incrementally updated search rows for {changed} changed record(s)");
         } else {
             eprintln!(
-                "osv: all {unchanged} examined records were unchanged; search rebuild skipped"
+                "osv: all {unchanged} examined records were unchanged; search writes skipped"
             );
         }
         eprintln!(
@@ -914,7 +911,7 @@ async fn download_osv_zip_to_temp(
                 fallback.display()
             );
             let _ = std::fs::remove_file(&primary);
-            if err.to_ascii_lowercase().contains("failed to write") {
+            if err.is_local_storage() {
                 *prefer_fallback_temp = true;
                 eprintln!(
                     "{label}: disabling primary temporary storage for remaining OSV downloads"
@@ -937,23 +934,19 @@ async fn download_osv_zip_object(
     osv: &OsvGcsSource,
     object_path: &str,
     output: &Path,
-) -> Result<(), String> {
-    let result = if object_path == OSV_ALL_ZIP {
+) -> Result<(), OsvDownloadError> {
+    if object_path == OSV_ALL_ZIP {
         osv.download_all_zip_to_file(output).await
     } else {
         let Some((source_prefix, filename)) = object_path.split_once('/') else {
-            return osv
-                .download_all_zip_to_file(output)
-                .await
-                .map_err(|err| err.to_string());
+            return osv.download_all_zip_to_file(output).await;
         };
         if filename == OSV_ALL_ZIP {
             osv.download_source_zip_to_file(source_prefix, output).await
         } else {
             osv.download_all_zip_to_file(output).await
         }
-    };
-    result.map_err(|err| err.to_string())
+    }
 }
 
 fn temporary_zip_file_path(filename: &str, required_bytes: Option<u64>) -> Result<PathBuf, String> {

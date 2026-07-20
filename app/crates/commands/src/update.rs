@@ -1,7 +1,7 @@
 use super::common::{
     IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, apply_delta_updates,
     connect_sqlx_db, ingest_zip_sqlx, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
-    sync_osv_selection_from_gcs_sqlx_with_full_snapshot,
+    sync_osv_selection_from_gcs_sqlx_with_refresh_all,
 };
 use std::path::PathBuf;
 
@@ -19,9 +19,10 @@ pub struct Args {
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
     osv_prefixes: Vec<String>,
-    /// Ignore the OSV cursor and refresh complete selected source snapshots.
+    /// Ignore the OSV cursor, redownload selected snapshots, and upsert all records.
+    /// Missing snapshot entries are not treated as deletions.
     #[arg(long)]
-    osv_full_snapshot: bool,
+    osv_refresh_all: bool,
 }
 
 /// Applies CVE deltas, refreshes enrichment sources, and rebuilds the graph.
@@ -49,7 +50,7 @@ pub async fn run_sqlx_update(
             keep,
             osv_all,
             osv_prefixes,
-            osv_full_snapshot: false,
+            osv_refresh_all: false,
         },
     )
     .await
@@ -84,11 +85,11 @@ async fn run_with_progress(
                 .map_err(|error| format!("failed to read OSV selection: {error}"))?;
             let current = OsvImportSelection::from_metadata(stored.as_deref())
                 .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
-            sync_osv_selection_from_gcs_sqlx_with_full_snapshot(
+            sync_osv_selection_from_gcs_sqlx_with_refresh_all(
                 db.clone(),
                 "update",
                 current.merged_with(&additions),
-                args.osv_full_snapshot,
+                args.osv_refresh_all,
             )
             .await?;
         }
@@ -120,11 +121,11 @@ async fn run_with_progress(
         let selection = additions.map_or(selection.clone(), |additions| {
             selection.merged_with(&additions)
         });
-        sync_osv_selection_from_gcs_sqlx_with_full_snapshot(
+        sync_osv_selection_from_gcs_sqlx_with_refresh_all(
             sqlx_db.clone(),
             "update",
             selection,
-            args.osv_full_snapshot,
+            args.osv_refresh_all,
         )
         .await?;
         sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update", cve_changed).await?;

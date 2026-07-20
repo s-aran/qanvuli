@@ -82,16 +82,10 @@ pub(crate) fn osv_detail_lines(
         timestamp("Withdrawn", osv.withdrawn_at.as_deref()),
         Line::from(""),
         // summary
-        highlighted_line(
-            &format!("{}", osv.summary.as_deref().unwrap_or("-")),
-            detail_search,
-        ),
+        highlighted_line(osv.summary.as_deref().unwrap_or("-"), detail_search),
         Line::from(""),
         // details
-        highlighted_line(
-            &format!("{}", osv.details.as_deref().unwrap_or("-")),
-            detail_search,
-        ),
+        highlighted_line(osv.details.as_deref().unwrap_or("-"), detail_search),
     ]
 }
 

@@ -9,6 +9,52 @@ pub const OSV_BUCKET: &str = "osv-vulnerabilities";
 pub const OSV_ALL_ZIP: &str = "all.zip";
 pub const OSV_MODIFIED_ID_CSV: &str = "modified_id.csv";
 
+#[derive(Debug)]
+pub enum OsvDownloadError {
+    CreateFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    WriteFile {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+    Network(anyhow::Error),
+    InvalidResponse(anyhow::Error),
+}
+
+impl OsvDownloadError {
+    pub const fn is_local_storage(&self) -> bool {
+        matches!(self, Self::CreateFile { .. } | Self::WriteFile { .. })
+    }
+}
+
+impl std::fmt::Display for OsvDownloadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateFile { path, source } => {
+                write!(formatter, "failed to create {}: {source}", path.display())
+            }
+            Self::WriteFile { path, source } => {
+                write!(formatter, "failed to write {}: {source}", path.display())
+            }
+            Self::Network(error) => write!(formatter, "network download failed: {error:#}"),
+            Self::InvalidResponse(error) => {
+                write!(formatter, "invalid download response: {error:#}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OsvDownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::CreateFile { source, .. } | Self::WriteFile { source, .. } => Some(source),
+            Self::Network(error) | Self::InvalidResponse(error) => Some(error.as_ref()),
+        }
+    }
+}
+
 pub struct OsvGcsSource {
     store: object_store::gcp::GoogleCloudStorage,
 }
@@ -27,7 +73,7 @@ impl OsvGcsSource {
         self.get_object(OSV_ALL_ZIP).await
     }
 
-    pub async fn download_all_zip_to_file(&self, output: &FsPath) -> Result<()> {
+    pub async fn download_all_zip_to_file(&self, output: &FsPath) -> Result<(), OsvDownloadError> {
         self.download_zip_to_file(OSV_ALL_ZIP, output).await
     }
 
@@ -35,56 +81,72 @@ impl OsvGcsSource {
         &self,
         source_prefix: &str,
         output: &FsPath,
-    ) -> Result<()> {
+    ) -> Result<(), OsvDownloadError> {
         self.download_zip_to_file(&format!("{source_prefix}/{OSV_ALL_ZIP}"), output)
             .await
     }
 
-    async fn download_zip_to_file(&self, object_path: &str, output: &FsPath) -> Result<()> {
-        let mut file = tokio::fs::File::create(output)
-            .await
-            .with_context(|| format!("failed to create {}", output.display()))?;
+    async fn download_zip_to_file(
+        &self,
+        object_path: &str,
+        output: &FsPath,
+    ) -> Result<(), OsvDownloadError> {
+        let mut file = tokio::fs::File::create(output).await.map_err(|source| {
+            OsvDownloadError::CreateFile {
+                path: output.to_path_buf(),
+                source,
+            }
+        })?;
         match self.store.get(&Path::from(object_path)).await {
             Ok(result) => {
                 let mut stream = result.into_stream();
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.with_context(|| {
-                        format!("failed to read OSV zip chunk from {object_path}")
+                    let chunk = chunk.map_err(|error| {
+                        OsvDownloadError::Network(anyhow!(
+                            "failed to read OSV zip chunk from {object_path}: {error}"
+                        ))
                     })?;
                     file.write_all(&chunk)
                         .await
-                        .with_context(|| format!("failed to write {}", output.display()))?;
+                        .map_err(|source| OsvDownloadError::WriteFile {
+                            path: output.to_path_buf(),
+                            source,
+                        })?;
                 }
             }
             Err(gcs_err) => {
-                let url = object_url(object_path)?;
+                let url = object_url(object_path).map_err(OsvDownloadError::InvalidResponse)?;
                 let response = reqwest::get(url.clone())
                     .await
-                    .with_context(|| {
-                        format!(
-                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}"
-                        )
-                    })?
+                    .map_err(|error| OsvDownloadError::Network(anyhow!(
+                        "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}: {error}"
+                    )))?
                     .error_for_status()
-                    .with_context(|| {
-                        format!(
-                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}"
-                        )
-                    })?;
+                    .map_err(|error| OsvDownloadError::InvalidResponse(anyhow!(
+                        "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}: {error}"
+                    )))?;
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.with_context(|| {
-                        format!("failed to read OSV zip chunk from HTTPS fallback {url}")
+                    let chunk = chunk.map_err(|error| {
+                        OsvDownloadError::Network(anyhow!(
+                            "failed to read OSV zip chunk from HTTPS fallback {url}: {error}"
+                        ))
                     })?;
                     file.write_all(&chunk)
                         .await
-                        .with_context(|| format!("failed to write {}", output.display()))?;
+                        .map_err(|source| OsvDownloadError::WriteFile {
+                            path: output.to_path_buf(),
+                            source,
+                        })?;
                 }
             }
         }
         file.flush()
             .await
-            .with_context(|| format!("failed to flush {}", output.display()))?;
+            .map_err(|source| OsvDownloadError::WriteFile {
+                path: output.to_path_buf(),
+                source,
+            })?;
         Ok(())
     }
 
@@ -141,6 +203,32 @@ fn object_url(object_path: &str) -> Result<Url> {
         }
     }
     Ok(url)
+}
+
+#[cfg(test)]
+mod download_error_tests {
+    use super::*;
+
+    #[test]
+    fn only_local_storage_errors_request_fallback() {
+        let io_error = || std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(
+            OsvDownloadError::CreateFile {
+                path: "primary.zip".into(),
+                source: io_error(),
+            }
+            .is_local_storage()
+        );
+        assert!(
+            OsvDownloadError::WriteFile {
+                path: "primary.zip".into(),
+                source: io_error(),
+            }
+            .is_local_storage()
+        );
+        assert!(!OsvDownloadError::Network(anyhow!("offline")).is_local_storage());
+        assert!(!OsvDownloadError::InvalidResponse(anyhow!("bad status")).is_local_storage());
+    }
 }
 
 #[derive(Clone, Debug)]
