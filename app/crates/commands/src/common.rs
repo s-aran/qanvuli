@@ -470,10 +470,13 @@ pub(crate) async fn download_osv_selection_from_gcs(
         );
     }
     let mut zip_paths = Vec::with_capacity(object_paths.len());
+    let mut prefer_fallback_temp = false;
     for object_path in &object_paths {
         let download_started = Instant::now();
         eprintln!("{label}: downloading OSV {object_path}");
-        match download_osv_zip_to_temp(&source, object_path, &label).await {
+        match download_osv_zip_to_temp(&source, object_path, &label, &mut prefer_fallback_temp)
+            .await
+        {
             Ok(path) => {
                 let bytes = std::fs::metadata(&path)
                     .map(|metadata| metadata.len())
@@ -865,6 +868,7 @@ async fn download_osv_zip_to_temp(
     osv: &OsvGcsSource,
     object_path: &str,
     label: &str,
+    prefer_fallback_temp: &mut bool,
 ) -> Result<PathBuf, String> {
     let object_filename = object_path.replace('/', "-");
     let filename = format!(
@@ -872,6 +876,20 @@ async fn download_osv_zip_to_temp(
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
+    if *prefer_fallback_temp {
+        let fallback = temporary_zip_file_path_in(binary_temporary_directory(), &filename)
+            .map_err(|err| format!("{label}: failed to prepare temporary OSV zip path: {err}"))?;
+        download_osv_zip_object(osv, object_path, &fallback)
+            .await
+            .map_err(|err| {
+                format!(
+                    "{label}: failed to download OSV {object_path} to fallback {}: {err}",
+                    fallback.display()
+                )
+            })?;
+        return Ok(fallback);
+    }
+
     let primary = temporary_zip_file_path(&filename, None)
         .map_err(|err| format!("{label}: failed to prepare temporary OSV zip path: {err}"))?;
     match download_osv_zip_object(osv, object_path, &primary).await {
@@ -896,6 +914,12 @@ async fn download_osv_zip_to_temp(
                 fallback.display()
             );
             let _ = std::fs::remove_file(&primary);
+            if err.to_ascii_lowercase().contains("failed to write") {
+                *prefer_fallback_temp = true;
+                eprintln!(
+                    "{label}: disabling primary temporary storage for remaining OSV downloads"
+                );
+            }
             download_osv_zip_object(osv, object_path, &fallback)
                 .await
                 .map_err(|fallback_err| {
