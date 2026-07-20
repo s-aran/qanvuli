@@ -838,11 +838,11 @@ pub(crate) async fn check_search_integrity_full(
     for (label, query) in [
         (
             "cve missing summary",
-            "SELECT 1 FROM cve c LEFT JOIN cve_summary_index s ON s.cve_db_id=c.id WHERE s.cve_db_id IS NULL LIMIT 1",
+            "SELECT id FROM cve EXCEPT SELECT cve_db_id FROM cve_summary_index LIMIT 1",
         ),
         (
             "extra CVE summary",
-            "SELECT 1 FROM cve_summary_index s LEFT JOIN cve c ON c.id=s.cve_db_id WHERE c.id IS NULL LIMIT 1",
+            "SELECT cve_db_id FROM cve_summary_index EXCEPT SELECT id FROM cve LIMIT 1",
         ),
     ] {
         require_no_mismatch(connection, label, query).await?;

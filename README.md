@@ -108,7 +108,7 @@ Apply updates:
 
 ```bash
 cargo run -- update
-cargo run -- update --osv-full-snapshot
+cargo run -- update --osv-refresh-all
 cargo run -- update --zip ./path/to/delta.zip
 ```
 
@@ -131,8 +131,10 @@ check leaves the previous file untouched.
 The database layer has a dedicated SQLx write connection for schema creation, bulk writes,
 foreign-key PRAGMAs, FTS rebuilds, and integrity checks. SQLite foreign keys are enabled on each
 such physical connection. `db check` is a low-latency schema and fixed-sentinel check; it does not
-run `quick_check`, `integrity_check`, full counts, or OFFSET sampling. `db check --scan` adds
-`quick_check(1)` and broader correspondence scans. `db check --full` additionally
+run `quick_check`, `integrity_check`, full counts, or complete search correspondence scans; quick
+success therefore does not prove that every FTS row is present. `db check --scan` adds
+`quick_check(1)`, foreign-key validation, native FTS checks, and complete CVE/OSV correspondence
+scans. `db check --full` additionally
 runs the potentially long SQLite integrity, foreign-key, and native FTS scans, reporting each stage
 and elapsed time on stderr while keeping JSON on stdout. `db rebuild-search` rebuilds and directly
 verifies the derived CVE and OSV search structures without running the full SQLite scan.
@@ -151,8 +153,14 @@ OSV aliases, upstream identifiers, and related identifiers are stored as distinc
 types. OSV synchronization advances its cursor only after every selected record, derived index,
 and integrity check succeeds; a failed run keeps the prior cursor so the records are retried.
 OSV exports retain withdrawn records, including their `withdrawn` timestamp. The incremental feed
-lists new or modified records; `update --osv-full-snapshot` explicitly ignores the cursor and
+lists new or modified records; `update --osv-refresh-all` explicitly ignores the cursor and
 downloads complete selected snapshots. It does not delete local IDs absent from those snapshots.
+
+Slower offline performance and large-fixture tests are opt-in:
+
+```bash
+cargo test --workspace --all-features -- --ignored --nocapture
+```
 
 `init` builds a new SQLx-backed database from CVE, CWE, OSV, KEV, and EPSS sources. `update --zip`
 imports a local CVE archive through the same schema without network access; a normal `update`

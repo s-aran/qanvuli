@@ -8,7 +8,7 @@ use super::common::{
 };
 use qanvuli_core::database::install_closed_database;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// CLI arguments for `qanvuli init`.
 #[derive(Debug, Default, clap::Args)]
@@ -157,7 +157,25 @@ async fn validate_replacement_database(
         ($number:literal, $label:literal, $future:expr) => {{
             let stage_started = Instant::now();
             eprintln!("init: [{}/{}] {}...", $number, STAGES, $label);
-            $future.await.map_err(|error| {
+            let stage_future = $future;
+            tokio::pin!(stage_future);
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+            heartbeat.tick().await;
+            let stage_result = loop {
+                tokio::select! {
+                    result = &mut stage_future => break result,
+                    _ = heartbeat.tick() => {
+                        eprintln!(
+                            "init: [{}/{}] {} still running; elapsed {:?}",
+                            $number,
+                            STAGES,
+                            $label,
+                            stage_started.elapsed()
+                        );
+                    }
+                }
+            };
+            stage_result.map_err(|error| {
                 format!(
                     "replacement database validation failed at stage {} ({}): {error}",
                     $number, $label
