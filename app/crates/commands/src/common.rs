@@ -948,13 +948,32 @@ async fn download_osv_zip_object(
     }
 }
 
-fn temporary_zip_file_path(filename: &str, required_bytes: Option<u64>) -> Result<PathBuf, String> {
+// Keep enough headroom for concurrent range writes, filesystem accounting, and unrelated small
+// temporary files. Checking only the advertised payload size can select an almost-full /tmp and
+// fail partway through a sparse preallocated download.
+const ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+
+fn zip_download_required_bytes(payload_bytes: u64) -> u64 {
+    payload_bytes.saturating_add(ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES)
+}
+
+fn temporary_zip_file_path(filename: &str, payload_bytes: Option<u64>) -> Result<PathBuf, String> {
     let system_temp_root = std::env::temp_dir();
     let temp_root = system_temp_root.join("qanvuli");
-    if required_bytes.is_some_and(|required| {
-        available_storage_bytes(&system_temp_root).is_some_and(|available| available < required)
-    }) {
-        return temporary_zip_file_path_in(binary_temporary_directory(), filename);
+    if let Some((required, available)) = payload_bytes
+        .map(zip_download_required_bytes)
+        .zip(available_storage_bytes(&system_temp_root))
+        .filter(|(required, available)| available < required)
+    {
+        let fallback = binary_temporary_directory();
+        eprintln!(
+            "temporary storage {} has only {} bytes available; download needs at least {} bytes including safety margin, using {}",
+            system_temp_root.display(),
+            available,
+            required,
+            fallback.display()
+        );
+        return temporary_zip_file_path_in(fallback, filename);
     }
     temporary_zip_file_path_in(temp_root, filename)
         .or_else(|_| temporary_zip_file_path_in(binary_temporary_directory(), filename))
@@ -1060,6 +1079,7 @@ pub async fn download_latest_asset_with_source(
     let output_path = temporary_zip_file_path(&filename, Some(asset.size)).map_err(|err| {
         format!("failed to prepare temporary download path for {filename}: {err}")
     })?;
+    eprintln!("{kind}: download target {}", output_path.display());
     asset
         .async_download_as(&output_path)
         .await
@@ -1625,6 +1645,16 @@ mod tests {
         let db_path = database::sqlite_file_path(&db_url).unwrap();
 
         assert_eq!(db_path, std::env::current_dir().unwrap().join("db.sqlite"));
+    }
+
+    #[test]
+    fn zip_download_capacity_includes_safety_margin() {
+        let payload = 556_000_000;
+        assert_eq!(
+            zip_download_required_bytes(payload),
+            payload + ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES
+        );
+        assert!(zip_download_required_bytes(payload) > 722_000_000);
     }
 
     #[test]
