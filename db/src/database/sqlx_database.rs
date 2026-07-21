@@ -615,6 +615,14 @@ impl SqlxDatabase {
         self.writer.rebuild_cve_search().await
     }
 
+    /// Refreshes search projections for the CVEs changed by a delta update.
+    pub async fn refresh_cve_search_for_ids(
+        &self,
+        cve_ids: Vec<String>,
+    ) -> Result<(), sqlx::Error> {
+        self.writer.refresh_cve_search_for_ids(cve_ids).await
+    }
+
     pub async fn rebuild_osv_search(&self) -> Result<(), sqlx::Error> {
         self.writer.rebuild_osv_search().await
     }
@@ -2124,6 +2132,31 @@ impl SqlxDatabase {
     ) -> Result<usize, sqlx::Error> {
         self.import_cve_raw_jsons_with_search(records, false, false)
             .await
+    }
+
+    /// As above, but returns the parent identifiers whose search rows must be refreshed.
+    pub async fn import_cve_raw_jsons_deferred_search_with_ids(
+        &self,
+        records: Vec<String>,
+    ) -> Result<(usize, Vec<String>), sqlx::Error> {
+        let cve_ids = records
+            .iter()
+            .map(|raw_json| {
+                let value: Value = serde_json::from_str(raw_json)
+                    .map_err(|error| sqlx::Error::Protocol(format!("invalid CVE JSON: {error}")))?;
+                value
+                    .pointer("/cveMetadata/cveId")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .ok_or_else(|| {
+                        sqlx::Error::Protocol("CVE record is missing cveMetadata.cveId".to_owned())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let imported = self
+            .import_cve_raw_jsons_with_search(records, false, false)
+            .await?;
+        Ok((imported, cve_ids))
     }
 
     /// Imports a full-replacement batch into an empty database without conflict checks or stale
@@ -3716,6 +3749,10 @@ mod tests {
                 && !aliases.contains("old")
                 && !packages.contains("old.example")
         }));
+        // An updated FTS document is deleted and reinserted, so its FTS rowid no longer
+        // matches the advisory table's insertion order. The routine health check must not
+        // mistake that normal condition for a projection mismatch.
+        database.check_search_integrity_quick().await.unwrap();
         database.rebuild_osv_search().await.unwrap();
         let rebuilt_rows: Vec<(String, String, String)> = database
             .writer
@@ -3726,6 +3763,59 @@ mod tests {
                     )
                     .fetch_all(connection)
                     .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(incremental_rows, rebuilt_rows);
+    }
+
+    #[tokio::test]
+    async fn incremental_cve_search_refresh_matches_full_rebuild() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"unchanged"}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1002","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"old title"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        let (_, changed_ids) = database
+            .import_cve_raw_jsons_deferred_search_with_ids(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1002","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"new title"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        database
+            .refresh_cve_search_for_ids(changed_ids)
+            .await
+            .unwrap();
+        database.check_full_cve_search().await.unwrap();
+        let incremental_rows: Vec<(String, String)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as("SELECT cve_id, title FROM cve_summary_index ORDER BY cve_id")
+                        .fetch_all(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        assert!(
+            incremental_rows
+                .iter()
+                .any(|(id, title)| id == "CVE-2099-1002" && title == "new title")
+        );
+        database.rebuild_cve_search().await.unwrap();
+        let rebuilt_rows: Vec<(String, String)> = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as("SELECT cve_id, title FROM cve_summary_index ORDER BY cve_id")
+                        .fetch_all(connection)
+                        .await
                 })
             })
             .await

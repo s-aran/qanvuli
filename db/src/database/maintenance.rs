@@ -1,6 +1,7 @@
 //! SQLite maintenance and integrity checks for SQLx-owned connections.
 
-use sqlx::{Connection, Row, SqliteConnection};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection};
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 async fn run_timed_stage(
@@ -311,6 +312,85 @@ pub(crate) async fn rebuild_cve_search(
         "#,
     )
     .await?;
+    Ok(())
+}
+
+/// Refreshes the derived CVE projections for a delta's changed CVE IDs.
+///
+/// Delta imports already normalize only these parent rows. Rebuilding all search tables here
+/// would turn a small update into a full-table delete and FTS reindex.
+pub(crate) async fn refresh_cve_search_for_ids(
+    connection: &mut SqliteConnection,
+    cve_ids: impl IntoIterator<Item = String>,
+) -> Result<(), sqlx::Error> {
+    let cve_ids = cve_ids.into_iter().collect::<BTreeSet<_>>();
+    if cve_ids.is_empty() {
+        return Ok(());
+    }
+    // SQLite's default variable limit is commonly 999. Leave headroom for future query changes.
+    let cve_ids = cve_ids.into_iter().collect::<Vec<_>>();
+    for ids in cve_ids.chunks(900) {
+        for table in [
+            "cve_summary_fts",
+            "cve_affected_summary_fts",
+            "cve_summary_index",
+        ] {
+            let mut query =
+                QueryBuilder::<Sqlite>::new(format!("DELETE FROM {table} WHERE cve_id IN ("));
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            query.build().execute(&mut *connection).await?;
+        }
+
+        let mut projection = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO cve_summary_index(cve_db_id, cve_id, title, description_en, affected_text, vendor_text, product_text, reference_text) \
+             WITH target AS (SELECT id, cve_id, title, description_en, reference_text FROM cve WHERE cve_id IN (",
+        );
+        {
+            let mut separated = projection.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+        }
+        projection.push(
+            ")), affected_agg AS ( \
+                SELECT affected.cve_db_id, \
+                       group_concat(COALESCE(affected.vendor, '') || ' ' || COALESCE(affected.product, '') || ' ' || COALESCE(affected.package_name, '') || ' ' || affected.version_text, ' ') AS affected_text, \
+                       group_concat(COALESCE(affected.vendor, ''), ' ') AS vendor_text, \
+                       group_concat(COALESCE(affected.product, '') || ' ' || COALESCE(affected.package_name, ''), ' ') AS product_text \
+                FROM cve_affected affected JOIN target ON target.id=affected.cve_db_id GROUP BY affected.cve_db_id \
+              ) \
+              SELECT target.id, target.cve_id, target.title, target.description_en, \
+                     COALESCE(affected.affected_text, ''), COALESCE(affected.vendor_text, ''), \
+                     COALESCE(affected.product_text, ''), target.reference_text \
+              FROM target LEFT JOIN affected_agg affected ON affected.cve_db_id=target.id",
+        );
+        projection.build().execute(&mut *connection).await?;
+
+        for (table, columns) in [
+            (
+                "cve_summary_fts",
+                "cve_id, title, description_en, affected_text, reference_text",
+            ),
+            (
+                "cve_affected_summary_fts",
+                "cve_id, vendor_text, product_text, affected_text",
+            ),
+        ] {
+            let mut query = QueryBuilder::<Sqlite>::new(format!(
+                "INSERT INTO {table}({columns}) SELECT {columns} FROM cve_summary_index WHERE cve_id IN ("
+            ));
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            query.build().execute(&mut *connection).await?;
+        }
+    }
     Ok(())
 }
 
@@ -808,14 +888,6 @@ pub(crate) async fn check_search_integrity_quick(
         (
             "CVE affected FTS last row",
             "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid DESC LIMIT 1)",
-        ),
-        (
-            "OSV text FTS first row",
-            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1)",
-        ),
-        (
-            "OSV text FTS last row",
-            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid DESC LIMIT 1)",
         ),
     ] {
         if sqlx::query_scalar::<_, i64>(query)

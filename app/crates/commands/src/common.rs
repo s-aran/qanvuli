@@ -1380,9 +1380,10 @@ pub async fn apply_delta_updates(
     }
     .await;
     let rebuild_result = if database_changed {
-        db.rebuild_cve_search()
-            .await
-            .map_err(|error| format!("failed to rebuild CVE search data: {error}"))
+        // Each delta archive refreshed only its changed CVE projection rows while it was
+        // ingested. A global rebuild here would rescan and reindex the entire CVE corpus.
+        eprintln!("update: CVE delta search rows refreshed incrementally");
+        Ok(())
     } else {
         eprintln!("update: CVE data unchanged; search rebuild skipped");
         Ok(())
@@ -1494,6 +1495,7 @@ async fn ingest_zip_sqlx_with_mode(
             .map_err(|error| format!("{label}: failed to prepare CVE bulk load: {error}"))?;
     }
     let mut imported = 0usize;
+    let mut changed_cve_ids = Vec::new();
     for (chunk_index, chunk) in entries.chunks(INGEST_CHUNK_SIZE).enumerate() {
         if max_chunks.is_some_and(|maximum| chunk_index >= maximum) {
             break;
@@ -1518,19 +1520,33 @@ async fn ingest_zip_sqlx_with_mode(
         );
         let write_started = Instant::now();
         let import_result = if bulk_replace {
-            db.import_cve_raw_jsons_bulk_init(records).await
+            db.import_cve_raw_jsons_bulk_init(records)
+                .await
+                .map(|count| (count, Vec::new()))
         } else {
-            db.import_cve_raw_jsons_deferred_search(records).await
+            db.import_cve_raw_jsons_deferred_search_with_ids(records)
+                .await
         };
-        imported += import_result.map_err(|error| {
+        let (count, cve_ids) = import_result.map_err(|error| {
             format!("{label}: failed to import CVE chunk {chunk_index}: {error}")
         })?;
+        imported += count;
+        changed_cve_ids.extend(cve_ids);
         eprintln!(
             "{label}: committed CVE chunk {chunk_index} in {:?}",
             write_started.elapsed()
         );
     }
     if !rebuild_after {
+        if !bulk_replace {
+            eprintln!(
+                "{label}: refreshing CVE search rows for {} changed CVE records",
+                changed_cve_ids.len()
+            );
+            db.refresh_cve_search_for_ids(changed_cve_ids)
+                .await
+                .map_err(|error| format!("{label}: failed to refresh CVE search data: {error}"))?;
+        }
         return Ok(imported);
     }
     let fts_started = Instant::now();
@@ -1544,9 +1560,13 @@ async fn ingest_zip_sqlx_with_mode(
         };
         result.map_err(|error| format!("{label}: failed to finish CVE bulk load: {error}"))?;
     } else {
-        db.rebuild_cve_search()
+        eprintln!(
+            "{label}: refreshing CVE search rows for {} changed CVE records",
+            changed_cve_ids.len()
+        );
+        db.refresh_cve_search_for_ids(changed_cve_ids)
             .await
-            .map_err(|error| format!("{label}: failed to rebuild CVE search data: {error}"))?;
+            .map_err(|error| format!("{label}: failed to refresh CVE search data: {error}"))?;
     }
     eprintln!(
         "{label}: rebuilt search indexes in {:?}",

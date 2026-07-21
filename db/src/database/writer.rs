@@ -8,7 +8,7 @@ use super::maintenance::{
     check_required_schema, check_search_integrity_quick, check_sqlite_integrity,
     check_sqlite_quick, finish_cve_bulk_load, finish_cve_bulk_load_with_index_signal,
     finish_osv_bulk_load, prepare_cve_bulk_load, prepare_osv_bulk_load, rebuild_cve_search,
-    rebuild_osv_search, rebuild_search,
+    rebuild_osv_search, rebuild_search, refresh_cve_search_for_ids,
 };
 use super::schema;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
@@ -115,6 +115,14 @@ impl SqliteWriter {
     pub(crate) async fn rebuild_cve_search(&self) -> Result<(), sqlx::Error> {
         let mut connection = self.connection.lock().await;
         rebuild_cve_search(&mut connection).await
+    }
+
+    pub(crate) async fn refresh_cve_search_for_ids(
+        &self,
+        cve_ids: Vec<String>,
+    ) -> Result<(), sqlx::Error> {
+        let mut connection = self.connection.lock().await;
+        refresh_cve_search_for_ids(&mut connection, cve_ids).await
     }
 
     pub(crate) async fn rebuild_osv_search(&self) -> Result<(), sqlx::Error> {
