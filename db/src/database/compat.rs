@@ -610,6 +610,7 @@ impl SqlxDatabase {
             product_like: options.product.as_ref().map(|v| format!("%{v}%")),
             vendor_exact: options.vendor_exact.clone(),
             product_exact: options.product_exact.clone(),
+            sort_order: options.sort_order,
             ..Default::default()
         };
         match options.query_mode.unwrap_or(CveAdvancedQueryMode::FreeText) {

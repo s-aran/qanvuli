@@ -310,7 +310,8 @@ impl App {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
         let sort_order = self.display.sort_order();
-        let request = if sort_order == CveSummarySortOrder::PublishedDesc {
+        let request = if self.search_mode == SearchMode::Identifier && !self.query.trim().is_empty()
+        {
             SearchRequest::Mode {
                 mode: self.search_mode,
                 query: self.query.clone(),
@@ -321,7 +322,9 @@ impl App {
             SearchRequest::Advanced {
                 options: self.main_search_options(sort_order),
                 include_cve: true,
-                include_osv: true,
+                // Empty Enter is the TUI's browse-all action. Do not append every OSV
+                // advisory to that CVE list.
+                include_osv: !self.query.trim().is_empty(),
                 osv_families: Vec::new(),
                 ecosystems: None,
             }
@@ -1905,4 +1908,34 @@ fn default_cwe_status_filter() -> [bool; CWE_STATUS_COUNT] {
     let mut filter = [false; CWE_STATUS_COUNT];
     filter[0] = true;
     filter
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_enter_starts_a_sorted_cve_browse_search() {
+        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize_schema().await.unwrap();
+        let mut app = App::new(String::new(), 25);
+
+        app.start_search(database);
+
+        match &app.searched_request {
+            SearchRequest::Advanced {
+                options,
+                include_cve,
+                include_osv,
+                ..
+            } => {
+                assert_eq!(options.sort_order, CveSummarySortOrder::PublishedDesc);
+                assert!(options.query.is_none());
+                assert!(*include_cve);
+                assert!(!include_osv);
+            }
+            SearchRequest::Mode { .. } => panic!("empty Enter must browse CVEs"),
+        }
+        app.abort_search();
+    }
 }

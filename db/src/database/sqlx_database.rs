@@ -10,8 +10,8 @@ use super::{
 };
 use crate::{
     AffectedStatus, CveAffectedDetail, CveAffectedVersionDetail, CveCvssDetail, CveCweDetail,
-    CveDetail, CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, FindingEnrichment,
-    OsvRawRecord, PackageQuery, PrioritySignals,
+    CveDetail, CveStateScope, CveSummary, CveSummarySortOrder, CveSummaryWithDetail,
+    EnrichedFinding, FindingEnrichment, OsvRawRecord, PackageQuery, PrioritySignals,
 };
 use md5::{Digest, Md5};
 use qanvuli_models::cwe::WeaknessCatalog;
@@ -182,6 +182,7 @@ pub struct SqlxCveSearch {
     pub published_until: Option<String>,
     pub updated_since: Option<String>,
     pub updated_until: Option<String>,
+    pub sort_order: CveSummarySortOrder,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
@@ -1032,7 +1033,21 @@ impl SqlxDatabase {
                 if let Some(value) = filters.cvss.version { query.push(" AND cvss.version=").push_bind(value); }
                 query.push(")");
             }
-            query.push(" ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ").push_bind(limit.max(1)).push(" OFFSET ").push_bind(offset.max(0));
+            match filters.sort_order {
+                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY c.published_at ASC, c.cve_id ASC"),
+                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY c.published_at DESC, c.cve_id DESC"),
+                CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY c.updated_at ASC, c.cve_id ASC"),
+                CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY c.updated_at DESC, c.cve_id DESC"),
+                CveSummarySortOrder::CveIdAsc => query.push(" ORDER BY c.cve_id ASC"),
+                CveSummarySortOrder::CveIdDesc => query.push(" ORDER BY c.cve_id DESC"),
+                // Relation rank is only meaningful for identifier-graph searches. Keep the
+                // normal CVE list deterministic when no graph ranking is available.
+                CveSummarySortOrder::RelationRankAsc => query.push(" ORDER BY c.published_at ASC, c.cve_id ASC"),
+                CveSummarySortOrder::RelationRankDesc => query.push(" ORDER BY c.published_at DESC, c.cve_id DESC"),
+                CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) ASC, c.cve_id ASC"),
+                CveSummarySortOrder::ScoreDesc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) DESC, c.cve_id DESC"),
+            };
+            query.push(" LIMIT ").push_bind(limit.max(1)).push(" OFFSET ").push_bind(offset.max(0));
             query.build_query_as().fetch_all(connection).await
         })).await
     }
@@ -4438,6 +4453,37 @@ mod tests {
             .await
             .unwrap();
         assert!(outside_range.is_empty());
+    }
+
+    #[tokio::test]
+    async fn advanced_search_honors_default_published_desc_sorting() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-newer-published","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"newer published"}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-newer-updated","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-03-01T00:00:00Z"},"containers":{"cna":{"title":"newer updated"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        let published = database
+            .search_cves_advanced(SqlxCveSearch::default(), false, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(published[0].cve_id, "CVE-2099-newer-published");
+        let updated = database
+            .search_cves_advanced(
+                SqlxCveSearch {
+                    sort_order: CveSummarySortOrder::UpdatedDesc,
+                    ..SqlxCveSearch::default()
+                },
+                false,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated[0].cve_id, "CVE-2099-newer-updated");
     }
 
     #[tokio::test]
