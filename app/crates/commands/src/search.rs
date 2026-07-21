@@ -194,6 +194,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         published_until: None,
         updated_since: date_filter.updated_since,
         updated_until: None,
+        sort_order: Default::default(),
     };
     let cves = db
         .search_cves_advanced(filters, args.include_rejected, limit, offset)
