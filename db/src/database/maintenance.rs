@@ -292,8 +292,8 @@ pub(crate) async fn rebuild_cve_search(
         connection,
         "build CVE summary FTS",
         r#"
-        INSERT INTO cve_summary_fts(cve_id, title, description_en, affected_text, reference_text)
-        SELECT cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index
+        INSERT INTO cve_summary_fts(rowid, cve_id, title, description_en, affected_text, reference_text)
+        SELECT cve_db_id, cve_id, title, COALESCE(description_en, ''), affected_text, reference_text FROM cve_summary_index
         "#,
     )
     .await?;
@@ -307,8 +307,8 @@ pub(crate) async fn rebuild_cve_search(
         connection,
         "build affected FTS",
         r#"
-        INSERT INTO cve_affected_summary_fts(cve_id, vendor_text, product_text, affected_text)
-        SELECT cve_id, vendor_text, product_text, affected_text FROM cve_summary_index
+        INSERT INTO cve_affected_summary_fts(rowid, cve_id, vendor_text, product_text, affected_text)
+        SELECT cve_db_id, cve_id, vendor_text, product_text, affected_text FROM cve_summary_index
         "#,
     )
     .await?;
@@ -330,20 +330,25 @@ pub(crate) async fn refresh_cve_search_for_ids(
     // SQLite's default variable limit is commonly 999. Leave headroom for future query changes.
     let cve_ids = cve_ids.into_iter().collect::<Vec<_>>();
     for ids in cve_ids.chunks(900) {
-        for table in [
-            "cve_summary_fts",
-            "cve_affected_summary_fts",
-            "cve_summary_index",
-        ] {
-            let mut query =
-                QueryBuilder::<Sqlite>::new(format!("DELETE FROM {table} WHERE cve_id IN ("));
+        for table in ["cve_summary_fts", "cve_affected_summary_fts"] {
+            let mut query = QueryBuilder::<Sqlite>::new(format!(
+                "DELETE FROM {table} WHERE rowid IN (SELECT cve_db_id FROM cve_summary_index WHERE cve_id IN ("
+            ));
             let mut separated = query.separated(", ");
             for id in ids {
                 separated.push_bind(id);
             }
-            separated.push_unseparated(")");
+            separated.push_unseparated("))");
             query.build().execute(&mut *connection).await?;
         }
+        let mut delete_projection =
+            QueryBuilder::<Sqlite>::new("DELETE FROM cve_summary_index WHERE cve_id IN (");
+        let mut separated = delete_projection.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        delete_projection.build().execute(&mut *connection).await?;
 
         let mut projection = QueryBuilder::<Sqlite>::new(
             "INSERT INTO cve_summary_index(cve_db_id, cve_id, title, description_en, affected_text, vendor_text, product_text, reference_text) \
@@ -381,7 +386,7 @@ pub(crate) async fn refresh_cve_search_for_ids(
             ),
         ] {
             let mut query = QueryBuilder::<Sqlite>::new(format!(
-                "INSERT INTO {table}({columns}) SELECT {columns} FROM cve_summary_index WHERE cve_id IN ("
+                "INSERT INTO {table}(rowid, {columns}) SELECT cve_db_id, {columns} FROM cve_summary_index WHERE cve_id IN ("
             ));
             let mut separated = query.separated(", ");
             for id in ids {
@@ -888,6 +893,14 @@ pub(crate) async fn check_search_integrity_quick(
         (
             "CVE affected FTS last row",
             "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid DESC LIMIT 1)",
+        ),
+        (
+            "OSV text FTS first row",
+            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1)",
+        ),
+        (
+            "OSV text FTS last row",
+            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid DESC LIMIT 1)",
         ),
     ] {
         if sqlx::query_scalar::<_, i64>(query)

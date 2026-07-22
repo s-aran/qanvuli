@@ -16,9 +16,7 @@ pub(crate) async fn close(db: SqlxDatabase) -> Result<(), String> {
 }
 
 pub(crate) async fn latest_data_timestamp(db: &SqlxDatabase) -> Result<Option<String>, String> {
-    Ok(db
-        .database_status()
+    db.latest_cve_updated_at()
         .await
-        .map_err(|error| format!("failed to read DB timestamp: {error}"))?
-        .latest_cve_updated_at)
+        .map_err(|error| format!("failed to read DB timestamp: {error}"))
 }

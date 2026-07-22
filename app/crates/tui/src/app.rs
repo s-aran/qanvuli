@@ -751,6 +751,38 @@ impl App {
         self.show_timeout_prompt = false;
     }
 
+    /// Cancels and joins every task that may retain a cloned database handle.
+    /// Maintenance must wait for these before closing the single-owner SQLite writer.
+    pub(super) async fn abort_database_tasks(&mut self) {
+        if let Some(search) = self.search.take() {
+            search.handle.abort();
+            let _ = search.handle.await;
+        }
+        if let Some(task) = self.count_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.raw_json_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.enrichment_task.take() {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
+        if let Some(task) = self.cwe_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.scope_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        self.search_started_at = None;
+        self.search_timeout_at = None;
+        self.show_timeout_prompt = false;
+    }
+
     pub(super) fn open_maintenance(&mut self) {
         if self.maintenance_running() {
             self.status_message = Some("database maintenance is already running".to_owned());

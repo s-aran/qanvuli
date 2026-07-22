@@ -1,7 +1,7 @@
 use crate::mode::SearchMode;
 use qanvuli_core::database::{
-    CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary, CveSummaryWithDetail,
-    EnrichedCveSummary, OsvSummary,
+    CveAdvancedQueryMode, CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary,
+    CveSummaryWithDetail, EnrichedCveSummary, OsvSummary,
 };
 
 #[derive(Debug)]
@@ -93,6 +93,14 @@ pub(crate) async fn run_search_request(
             let osv_rows =
                 if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options) {
                     Vec::new()
+                } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
+                    db.search_osv_summaries_free_text(
+                        options.query.as_deref().unwrap_or_default(),
+                        limit,
+                        offset,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?
                 } else if let Some(package_name) = options
                     .product_exact
                     .as_deref()
@@ -231,6 +239,10 @@ pub(crate) async fn run_count_request(
             let osv = if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options)
             {
                 0
+            } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
+                db.count_osv_summaries_free_text(options.query.as_deref().unwrap_or_default())
+                    .await
+                    .map_err(|err| err.to_string())?
             } else if let Some(package_name) = options
                 .product_exact
                 .as_deref()
@@ -268,6 +280,27 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
     .into_iter()
     .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
         || options.kev_only
+}
+
+/// A plain free-text query can use OSV's FTS5 projection. Other advanced filters still need
+/// normalized package joins, but routing this common TUI path away from LIKE/DISTINCT avoids a
+/// full advisory/package scan for every keystroke search.
+fn uses_osv_text_fts(
+    options: &CveAdvancedSearch,
+    families: &[String],
+    ecosystems: Option<&[String]>,
+) -> bool {
+    options.query_mode.unwrap_or(CveAdvancedQueryMode::FreeText) == CveAdvancedQueryMode::FreeText
+        && options
+            .query
+            .as_deref()
+            .is_some_and(|query| !query.trim().is_empty())
+        && options.product.is_none()
+        && options.product_exact.is_none()
+        && options.vendor.is_none()
+        && options.vendor_exact.is_none()
+        && families.is_empty()
+        && ecosystems.is_none_or(|ecosystems| ecosystems.is_empty())
 }
 
 fn advanced_osv_query(options: &CveAdvancedSearch) -> Option<String> {
@@ -452,6 +485,36 @@ mod tests {
             kev_only: true,
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn plain_advanced_free_text_uses_osv_fts() {
+        assert!(uses_osv_text_fts(
+            &CveAdvancedSearch {
+                query: Some("openssl".to_owned()),
+                query_mode: Some(CveAdvancedQueryMode::FreeText),
+                ..Default::default()
+            },
+            &[],
+            None,
+        ));
+        assert!(!uses_osv_text_fts(
+            &CveAdvancedSearch {
+                query: Some("openssl".to_owned()),
+                product: Some("openssl".to_owned()),
+                ..Default::default()
+            },
+            &[],
+            None,
+        ));
+        assert!(!uses_osv_text_fts(
+            &CveAdvancedSearch {
+                query: Some("openssl".to_owned()),
+                ..Default::default()
+            },
+            &["GHSA".to_owned()],
+            None,
+        ));
     }
 
     #[test]

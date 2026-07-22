@@ -5,7 +5,7 @@ use super::{
     db::connection,
     form::AdvancedField,
     modes,
-    terminal::TerminalGuard,
+    terminal::{TerminalGuard, TuiLogGuard},
     ui::draw,
     utils::task::{maintenance_progress_channel, spawn_maintenance_task},
 };
@@ -26,6 +26,7 @@ pub struct Args {
 
 /// Opens the interactive terminal UI for local CVE search and maintenance.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
+    let tui_log = TuiLogGuard::redirect()?;
     let mut db = Some(connection::connect(db_url).await?);
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(args.query.unwrap_or_default(), args.limit);
@@ -38,6 +39,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         app.start_search(db.clone());
     }
 
+    app.status_message = Some(format!("TUI logs: {}", tui_log.path.display()));
     let result = run_loop(&mut terminal.terminal, db_url, &mut db, &mut app).await;
     terminal.leave()?;
     if let Some(db) = db.take() {
@@ -324,7 +326,7 @@ async fn run_loop(
         }
     }
 
-    app.abort_search();
+    app.abort_database_tasks().await;
     Ok(())
 }
 
@@ -374,7 +376,7 @@ async fn close_db_before_maintenance(
     app: &mut App,
     operation: &str,
 ) -> Result<(), String> {
-    app.abort_search();
+    app.abort_database_tasks().await;
     if let Some(current_db) = db.take() {
         connection::close(current_db)
             .await

@@ -32,6 +32,9 @@ const PACKAGE_ID_BATCH_SIZE: usize = 2_000;
 const OSV_ID_BATCH_SIZE: usize = 2_000;
 /// Maximum number of OSV IDs used by one advisory-date statement.
 const OSV_DATE_BATCH_SIZE: usize = 2_000;
+/// Above this FTS candidate count, walking the published-date index can stop at the requested
+/// page and is substantially cheaper than sorting every FTS match.
+const FTS_PUBLISHED_INDEX_MIN_CANDIDATES: i64 = 128;
 
 type AffectedRow = (i64, Option<String>, Option<String>, Option<String>, String);
 type BatchedCvssRow = (
@@ -999,8 +1002,33 @@ impl SqlxDatabase {
             .transpose()
             .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CWE IDs: {error}")))?;
         let text = filters.text.as_deref().and_then(fts_query);
+        let use_published_index = matches!(
+            filters.sort_order,
+            CveSummarySortOrder::PublishedAsc | CveSummarySortOrder::PublishedDesc
+        ) && if let Some(text) = text.clone() {
+            let candidates: i64 = self
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM cve_summary_fts WHERE cve_summary_fts MATCH ?",
+                        )
+                        .bind(text)
+                        .fetch_one(connection)
+                        .await
+                    })
+                })
+                .await?;
+            candidates >= FTS_PUBLISHED_INDEX_MIN_CANDIDATES
+        } else {
+            false
+        };
         self.writer.with_connection(|connection| Box::pin(async move {
-            let mut query = QueryBuilder::<Sqlite>::new("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c WHERE 1=1");
+            let mut query = QueryBuilder::<Sqlite>::new(if use_published_index {
+                "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c INDEXED BY idx_cve_published_at_cve_id WHERE 1=1"
+            } else {
+                "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c WHERE 1=1"
+            });
             if !include_rejected { query.push(" AND c.state=0"); }
             if let Some(value) = filters.published_since { query.push(" AND c.published_at >= ").push_bind(value); }
             if let Some(value) = filters.published_until { query.push(" AND c.published_at <= ").push_bind(value); }
@@ -1197,6 +1225,22 @@ impl SqlxDatabase {
             sqlx::query_as("SELECT (SELECT COUNT(*) FROM cve) AS cve_count, (SELECT COUNT(*) FROM osv_advisories) AS osv_count, (SELECT COUNT(*) FROM cwe) AS cwe_count, (SELECT COUNT(*) FROM cve_affected) AS affected_count, (SELECT COUNT(*) FROM cve_cvss) AS cvss_count, (SELECT MAX(updated_at) FROM cve) AS latest_cve_updated_at")
                 .fetch_one(connection).await
         })).await
+    }
+
+    /// Returns the newest CVE update timestamp without scanning unrelated table counts.
+    /// The TUI uses this lightweight value for its status line on startup and after update.
+    pub async fn latest_cve_updated_at(&self) -> Result<Option<String>, sqlx::Error> {
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT updated_at FROM cve ORDER BY updated_at DESC, cve_id DESC LIMIT 1",
+                    )
+                    .fetch_optional(connection)
+                    .await
+                })
+            })
+            .await
     }
 
     pub async fn kev_entries(
@@ -3807,6 +3851,20 @@ mod tests {
             .await
             .unwrap();
         database.check_full_cve_search().await.unwrap();
+        let aligned_rows: i64 = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM cve_summary_index projection JOIN cve_summary_fts fts ON fts.rowid=projection.cve_db_id AND fts.cve_id=projection.cve_id",
+                    )
+                    .fetch_one(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(aligned_rows, 2);
         let incremental_rows: Vec<(String, String)> = database
             .writer
             .with_connection(|connection| {

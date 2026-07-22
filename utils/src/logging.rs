@@ -1,7 +1,9 @@
 use log::{LevelFilter, Log, Metadata, Record};
 use std::fmt;
-use std::io::Write;
-use std::sync::Once;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, Once, OnceLock};
 
 const STDOUT_TARGET: &str = "qanvuli::stdout";
 const STDERR_TARGET: &str = "qanvuli::stderr";
@@ -17,6 +19,22 @@ impl Log for QanvuliLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        if let Ok(mut output) = file_output().lock()
+            && let Some(output) = output.as_mut()
+        {
+            if output.file.is_none() {
+                output.file = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&output.path)
+                    .ok();
+            }
+            if let Some(file) = output.file.as_mut() {
+                let _ = writeln!(file, "{}", record.args());
+            }
+            return;
+        }
         if record.target() == STDOUT_TARGET {
             let _ = writeln!(std::io::stdout().lock(), "{}", record.args());
         } else {
@@ -25,6 +43,13 @@ impl Log for QanvuliLogger {
     }
 
     fn flush(&self) {
+        if let Ok(mut output) = file_output().lock()
+            && let Some(output) = output.as_mut()
+            && let Some(file) = output.file.as_mut()
+        {
+            let _ = file.flush();
+            return;
+        }
         let _ = std::io::stdout().flush();
         let _ = std::io::stderr().flush();
     }
@@ -32,6 +57,16 @@ impl Log for QanvuliLogger {
 
 static LOGGER: QanvuliLogger = QanvuliLogger;
 static INIT: Once = Once::new();
+struct FileOutput {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+static FILE_OUTPUT: OnceLock<Mutex<Option<FileOutput>>> = OnceLock::new();
+
+fn file_output() -> &'static Mutex<Option<FileOutput>> {
+    FILE_OUTPUT.get_or_init(|| Mutex::new(None))
+}
 
 pub fn init() {
     INIT.call_once(|| {
@@ -49,4 +84,28 @@ pub fn stdout(args: fmt::Arguments<'_>) {
 pub fn stderr(args: fmt::Arguments<'_>) {
     init();
     log::info!(target: STDERR_TARGET, "{args}");
+}
+
+/// Sends qanvuli log output to `path` until the returned guard is dropped.
+/// This is used by the full-screen TUI so background maintenance does not corrupt the terminal.
+pub fn redirect_to_file(path: &Path) -> io::Result<LogFileGuard> {
+    init();
+    let mut output = file_output()
+        .lock()
+        .map_err(|_| io::Error::other("qanvuli logger output lock poisoned"))?;
+    *output = Some(FileOutput {
+        path: path.to_owned(),
+        file: None,
+    });
+    Ok(LogFileGuard)
+}
+
+pub struct LogFileGuard;
+
+impl Drop for LogFileGuard {
+    fn drop(&mut self) {
+        if let Ok(mut output) = file_output().lock() {
+            *output = None;
+        }
+    }
 }
