@@ -458,6 +458,70 @@ impl SqlxDatabase {
             .unwrap_or_default())
     }
 
+    /// Returns whether the local OSV corpus has any non-withdrawn advisory for this package
+    /// identity, independently of the queried version.
+    pub async fn has_osv_package_advisory(
+        &self,
+        ecosystem: &str,
+        package: &str,
+        purl: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let ecosystem = ecosystem.to_owned();
+        let package = package.to_owned();
+        let purl = purl.map(str::to_owned);
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let exists: i64 = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (package.package_name=? COLLATE NOCASE OR (? IS NOT NULL AND package.purl=?)))",
+                    )
+                    .bind(ecosystem)
+                    .bind(package)
+                    .bind(&purl)
+                    .bind(&purl)
+                    .fetch_one(connection)
+                    .await?;
+                    Ok(exists != 0)
+                })
+            })
+            .await
+    }
+
+    /// Returns local OSV coverage for every query in order, without evaluating versions.
+    pub async fn has_osv_package_advisories_batch(
+        &self,
+        packages: &[PackageQuery],
+    ) -> Result<Vec<bool>, sqlx::Error> {
+        if packages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let packages = packages.to_vec();
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let input = serde_json::to_string(&packages).map_err(|error| {
+                        sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
+                    })?;
+                    let rows: Vec<(i64, i64)> = sqlx::query_as(
+                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index",
+                    )
+                    .bind(input)
+                    .fetch_all(connection)
+                    .await?;
+                    let mut coverage = vec![false; packages.len()];
+                    for (index, covered) in rows {
+                        if let Ok(index) = usize::try_from(index)
+                            && let Some(value) = coverage.get_mut(index)
+                        {
+                            *value = covered != 0;
+                        }
+                    }
+                    Ok(coverage)
+                })
+            })
+            .await
+    }
+
     /// Matches package/version queries with bounded candidate scans and bounded follow-up reads
     /// for ranges, explicit versions, and CVE aliases.
     pub async fn query_package_matches_batch(
@@ -574,8 +638,18 @@ impl SqlxDatabase {
                         continue;
                     }
                     let affected = AffectedStatus { status: matched.status, confidence: matched.confidence };
+                    let fixed_versions = ranges_by_package
+                        .get(&package_id)
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|range| range.events.iter())
+                        .filter(|(event_type, _)| event_type == "fixed")
+                        .map(|(_, version)| version.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
                     output[output_index].push(EnrichedFinding {
-                        primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions: Vec::new(), fixed_versions_status: "not_queried".to_owned(), enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: false, affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                        primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions_status: "available".to_owned(), priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: !fixed_versions.is_empty(), affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, fixed_versions, enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
                     });
                 }
             }
@@ -4836,7 +4910,7 @@ mod tests {
         database
             .import_osv_record(OsvRawRecord {
                 source_path: None,
-                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-batched-package","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-9999"],"affected":[{"package":{"ecosystem":"crates.io","name":"example"},"versions":["1.0.0"]}]}"#.to_owned(),
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-batched-package","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-9999"],"affected":[{"package":{"ecosystem":"crates.io","name":"example"},"versions":["1.0.0"],"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
             })
             .await
             .unwrap();
@@ -4852,11 +4926,17 @@ mod tests {
             .query_package_matches_batch(&queries)
             .await
             .unwrap();
+        let coverage = database
+            .has_osv_package_advisories_batch(&queries)
+            .await
+            .unwrap();
         assert_eq!(findings.len(), PACKAGE_QUERY_BATCH_SIZE + 1);
+        assert_eq!(coverage, vec![true; PACKAGE_QUERY_BATCH_SIZE + 1]);
         assert!(findings.iter().all(|rows| {
             rows.len() == 1
                 && rows[0].primary_id == "GHSA-2099-batched-package"
                 && rows[0].cve_ids == ["CVE-2099-9999"]
+                && rows[0].fixed_versions == ["2.0.0"]
         }));
     }
 

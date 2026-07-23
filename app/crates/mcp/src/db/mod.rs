@@ -6,13 +6,14 @@ use qanvuli_app_commands::common::{
     sync_all_enrichment_sources_after_update,
 };
 use qanvuli_core::database::{
-    CveDatabase, CveRiskSummary, CveStateScope, CveSummary, EnrichedFinding,
+    CveDatabase, CveRiskSummary, CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding,
+    PackageQuery,
 };
 use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 use serde::Serialize;
 use simd_json::{OwnedValue as Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -300,6 +301,10 @@ pub(crate) async fn query_package_enriched(
         .query_package_enriched_with_evidence(ecosystem, package, version, purl, include_evidence)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
+    let has_osv_advisory = db
+        .has_osv_package_advisory(ecosystem, package, purl)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
     let confirmed_count = result
         .iter()
         .filter(|finding| finding.affected.status == "affected")
@@ -316,11 +321,11 @@ pub(crate) async fn query_package_enriched(
         .drain(offset.min(matching_count)..)
         .take(limit)
         .collect::<Vec<_>>();
-    let findings = serialize_findings(&findings, include_evidence)?;
+    let findings = serialize_findings(&findings, include_evidence, false)?;
     response::tool_result(json!({
         "vulnerable": confirmed_count > 0,
         "confirmed_count": confirmed_count,
-        "coverage_notice": coverage_notice(ecosystem, confirmed_count),
+        "coverage_notice": coverage_notice(ecosystem, !has_osv_advisory),
         "status": status,
         "has_more": has_more,
         "findings": findings,
@@ -332,64 +337,127 @@ pub(crate) async fn query_packages_enriched(
     packages: Vec<crate::args::PackageQueryArgs>,
     status: Option<&str>,
     include_evidence: bool,
+    verbosity: Option<&str>,
+    include_fixed: bool,
+    include_enrichment: bool,
 ) -> Result<CallToolResult, McpError> {
     let status = status.unwrap_or("affected");
     if !matches!(status, "affected" | "all") {
         return Err(mcp_error("status must be either 'affected' or 'all'"));
     }
+    let verbosity = verbosity.unwrap_or("full");
+    if !matches!(verbosity, "full" | "summary") {
+        return Err(mcp_error("verbosity must be either 'full' or 'summary'"));
+    }
     let requested = packages.len();
-    let mut results = Vec::with_capacity(requested.min(200));
-    for package in packages.into_iter().take(200) {
-        match db
-            .query_package_enriched_with_evidence(
-                &package.ecosystem,
-                &package.package,
-                &package.version,
-                package.purl.as_deref(),
-                include_evidence,
-            )
-            .await
-        {
-            Ok(findings) => {
-                let findings = findings
-                    .into_iter()
-                    .filter(|finding| status == "all" || finding.affected.status == "affected")
-                    .collect::<Vec<_>>();
-                let cve_ids = findings
-                    .iter()
-                    .flat_map(|finding| finding.cve_ids.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let risk = db
-                    .cve_risk_summaries(&cve_ids)
-                    .await
-                    .map_err(|err| mcp_error(err.to_string()))?;
-                let summary = batch_summary(
-                    &package,
-                    cve_ids,
-                    &risk,
-                    findings
-                        .iter()
-                        .any(|finding| finding.affected.status == "affected"),
-                );
-                let findings = serialize_findings(&findings, include_evidence)?;
-                let coverage_notice =
-                    coverage_notice(&package.ecosystem, if summary.vulnerable { 1 } else { 0 });
-                results.push(json!({"package": package, "findings": findings, "summary": summary, "coverage_notice": coverage_notice}));
-            }
-            Err(error) => results.push(json!({"package": package, "error": error.to_string()})),
+    let packages = packages.into_iter().take(200).collect::<Vec<_>>();
+    let queries = packages
+        .iter()
+        .map(|package| PackageQuery {
+            ecosystem: package.ecosystem.clone(),
+            package: package.package.clone(),
+            version: package.version.clone(),
+            purl: package.purl.clone(),
+        })
+        .collect::<Vec<_>>();
+    let findings_by_package = db
+        .query_package_matches_batch(&queries)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    let coverage = db
+        .has_osv_package_advisories_batch(&queries)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    let all_cve_ids = findings_by_package
+        .iter()
+        .flatten()
+        .filter(|finding| status == "all" || finding.affected.status == "affected")
+        .flat_map(|finding| finding.cve_ids.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let risks_by_cve = db
+        .cve_risk_summaries(&all_cve_ids)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?
+        .into_iter()
+        .map(|risk| (risk.cve_id.clone(), risk))
+        .collect::<BTreeMap<_, _>>();
+    let details_by_cve = db
+        .cve_summaries_with_details_batch(&all_cve_ids, CveStateScope::PublishedOnly)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?
+        .into_iter()
+        .flatten()
+        .map(|detail| (detail.summary.cve_id.clone(), detail))
+        .collect::<BTreeMap<_, _>>();
+    let mut results = Vec::with_capacity(packages.len());
+    for ((package, findings), has_osv_advisory) in
+        packages.into_iter().zip(findings_by_package).zip(coverage)
+    {
+        let mut findings = findings
+            .into_iter()
+            .filter(|finding| status == "all" || finding.affected.status == "affected")
+            .collect::<Vec<_>>();
+        let cve_ids = findings
+            .iter()
+            .flat_map(|finding| finding.cve_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let source_conflicts = cna_explicit_version_conflicts(&package, &cve_ids, &details_by_cve);
+        downgrade_conflicting_findings(&mut findings, &source_conflicts);
+        let risk = cve_ids
+            .iter()
+            .filter_map(|cve_id| risks_by_cve.get(cve_id).cloned())
+            .collect::<Vec<_>>();
+        let summary = batch_summary(
+            &package,
+            cve_ids,
+            &risk,
+            findings
+                .iter()
+                .any(|finding| finding.affected.status == "affected"),
+            include_fixed.then(|| fixed_versions(&findings)),
+        );
+        let coverage_notice = coverage_notice(&package.ecosystem, !has_osv_advisory);
+        let mut result =
+            json!({"package": package, "summary": summary, "coverage_notice": coverage_notice});
+        let Value::Object(object) = &mut result else {
+            return Err(mcp_error("package result did not serialize to an object"));
+        };
+        if verbosity == "full" {
+            object.insert(
+                "findings".into(),
+                serialize_findings(&findings, include_evidence, include_fixed)?,
+            );
         }
+        if include_enrichment {
+            object.insert(
+                "cve_risk".into(),
+                simd_json::serde::to_owned_value(&risk)
+                    .map_err(|err| mcp_error(format!("failed to encode CVE risk: {err}")))?,
+            );
+        }
+        if !source_conflicts.is_empty() {
+            object.insert(
+                "source_conflicts".into(),
+                simd_json::serde::to_owned_value(&source_conflicts).map_err(|err| {
+                    mcp_error(format!("failed to encode source conflicts: {err}"))
+                })?,
+            );
+        }
+        results.push(result);
     }
     response::tool_result(
-        json!({"requested": requested, "truncated": requested > 200, "status": status, "results": results}),
+        json!({"requested": requested, "truncated": requested > 200, "status": status, "verbosity": verbosity, "results": results}),
     )
 }
 
-fn coverage_notice(ecosystem: &str, confirmed_count: usize) -> Option<&'static str> {
-    (ecosystem.eq_ignore_ascii_case("pypi") && confirmed_count == 0).then_some(
-        "No OSV-affected finding was confirmed. OSV ranges can omit vulnerabilities left unpatched on end-of-life branches; cross-check critical EOL packages with CVE List or vendor advisories.",
-    )
+fn coverage_notice(ecosystem: &str, no_osv_candidates: bool) -> Option<String> {
+    no_osv_candidates.then(|| format!(
+        "No local OSV advisory covers {ecosystem} for this package. This is not evidence that the package has no known CVEs; cross-check critical or end-of-life packages with CVE List and vendor advisories."
+    ))
 }
 
 #[derive(Serialize)]
@@ -401,6 +469,8 @@ struct BatchPackageSummary {
     max_cvss: Option<f64>,
     max_epss: Option<f64>,
     kev: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixed_versions: Option<Vec<String>>,
 }
 
 fn batch_summary(
@@ -408,6 +478,7 @@ fn batch_summary(
     cve_ids: Vec<String>,
     risk: &[CveRiskSummary],
     vulnerable: bool,
+    fixed_versions: Option<Vec<String>>,
 ) -> BatchPackageSummary {
     BatchPackageSummary {
         package: package.package.clone(),
@@ -423,19 +494,132 @@ fn batch_summary(
             .filter_map(|summary| summary.epss)
             .max_by(f64::total_cmp),
         kev: risk.iter().any(|summary| summary.kev_listed),
+        fixed_versions,
     }
+}
+
+fn fixed_versions(findings: &[EnrichedFinding]) -> Vec<String> {
+    findings
+        .iter()
+        .flat_map(|finding| finding.fixed_versions.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+#[derive(Serialize)]
+struct CnaExplicitVersionConflict {
+    cve_id: String,
+    package_name: String,
+    queried_version: String,
+    cna_versions: Vec<String>,
+    reason: &'static str,
+}
+
+fn cna_explicit_version_conflicts(
+    package: &crate::args::PackageQueryArgs,
+    cve_ids: &[String],
+    details_by_cve: &BTreeMap<String, CveSummaryWithDetail>,
+) -> Vec<CnaExplicitVersionConflict> {
+    cve_ids
+        .iter()
+        .filter_map(|cve_id| details_by_cve.get(cve_id))
+        .flat_map(|detail| cna_explicit_version_conflicts_for_detail(package, detail))
+        .collect()
+}
+
+fn cna_explicit_version_conflicts_for_detail(
+    package: &crate::args::PackageQueryArgs,
+    detail: &CveSummaryWithDetail,
+) -> Vec<CnaExplicitVersionConflict> {
+    detail
+        .detail
+        .affected
+        .iter()
+        .filter(|affected| {
+            affected
+                .package_name
+                .as_deref()
+                .or(affected.product.as_deref())
+                .is_some_and(|name| {
+                    normalized_package_name(name) == normalized_package_name(&package.package)
+                })
+        })
+        .filter_map(|affected| {
+            let versions = &affected.versions;
+            (!versions.is_empty()
+                && versions
+                    .iter()
+                    .all(|version| version.less_than.is_none() && version.less_than_or_equal.is_none()))
+            .then(|| {
+                versions
+                    .iter()
+                    .filter_map(|version| version.version.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+        })
+        .filter(|versions| !versions.is_empty() && !versions.iter().any(|version| version == &package.version))
+        .map(|cna_versions| CnaExplicitVersionConflict {
+            cve_id: detail.summary.cve_id.clone(),
+            package_name: package.package.clone(),
+            queried_version: package.version.clone(),
+            cna_versions,
+            reason: "OSV matched, but CNA lists only explicit versions that exclude the queried version",
+        })
+        .collect()
+}
+
+fn downgrade_conflicting_findings(
+    findings: &mut [EnrichedFinding],
+    conflicts: &[CnaExplicitVersionConflict],
+) {
+    let conflicting_cves = conflicts
+        .iter()
+        .map(|conflict| conflict.cve_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for finding in findings {
+        if finding
+            .cve_ids
+            .iter()
+            .any(|cve_id| conflicting_cves.contains(cve_id.as_str()))
+        {
+            finding.affected.status = "conflicting_sources".to_owned();
+            finding.affected.confidence = "low".to_owned();
+            finding.priority_signals.affected_confidence = "low".to_owned();
+            finding
+                .priority_signals
+                .reasons
+                .push("CNA explicit versions exclude the queried version".to_owned());
+        }
+    }
+}
+
+fn normalized_package_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_separator = false;
+    for character in name.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            if !previous_separator {
+                normalized.push('-');
+            }
+            previous_separator = true;
+        } else {
+            normalized.push(character.to_ascii_lowercase());
+            previous_separator = false;
+        }
+    }
+    normalized
 }
 
 fn serialize_findings(
     findings: &[EnrichedFinding],
     include_evidence: bool,
+    include_fixed: bool,
 ) -> Result<Value, McpError> {
     let mut value = simd_json::serde::to_owned_value(findings)
         .map_err(|err| mcp_error(format!("failed to encode package findings: {err}")))?;
-    if include_evidence {
-        return Ok(value);
-    }
-
     let Value::Array(values) = &mut value else {
         return Err(mcp_error("package findings did not serialize to an array"));
     };
@@ -443,7 +627,13 @@ fn serialize_findings(
         let Value::Object(object) = finding else {
             return Err(mcp_error("package finding did not serialize to an object"));
         };
-        object.remove("evidence");
+        if !include_evidence {
+            object.remove("evidence");
+        }
+        if !include_fixed {
+            object.remove("fixed_versions");
+            object.remove("fixed_versions_status");
+        }
     }
     Ok(value)
 }
@@ -728,11 +918,67 @@ mod tests {
             vec!["CVE-2099-0001".to_owned(), "CVE-2099-0002".to_owned()],
             &risk,
             true,
+            None,
         );
 
         assert!(summary.vulnerable);
         assert!(summary.kev);
         assert_eq!(summary.max_cvss, Some(9.8));
         assert_eq!(summary.max_epss, Some(0.91));
+    }
+
+    #[test]
+    fn coverage_notice_is_consistent_for_all_ecosystems_without_osv_coverage() {
+        let notice = coverage_notice("npm", true).expect("coverage notice");
+        assert!(notice.contains("npm"));
+        assert!(coverage_notice("PyPI", false).is_none());
+    }
+
+    #[test]
+    fn cna_explicit_versions_excluding_the_query_are_reported_as_a_source_conflict() {
+        use qanvuli_core::database::{CveAffectedDetail, CveAffectedVersionDetail, CveDetail};
+
+        let package = crate::args::PackageQueryArgs {
+            ecosystem: "PyPI".to_owned(),
+            package: "Pygments".to_owned(),
+            version: "2.15.1".to_owned(),
+            purl: None,
+        };
+        let detail = CveSummaryWithDetail {
+            summary: CveSummary {
+                cve_id: "CVE-2026-4539".to_owned(),
+                state: 0,
+                published_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                title: String::new(),
+                description_en: None,
+            },
+            detail: CveDetail {
+                affected: vec![CveAffectedDetail {
+                    vendor: None,
+                    product: Some("pygments".to_owned()),
+                    package_name: None,
+                    description: None,
+                    collection_url: None,
+                    default_status: None,
+                    versions: vec![
+                        CveAffectedVersionDetail {
+                            version: Some("2.19.0".to_owned()),
+                            ..Default::default()
+                        },
+                        CveAffectedVersionDetail {
+                            version: Some("2.19.1".to_owned()),
+                            ..Default::default()
+                        },
+                    ],
+                }],
+                ..Default::default()
+            },
+        };
+
+        let conflicts = cna_explicit_version_conflicts_for_detail(&package, &detail);
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].cna_versions, ["2.19.0", "2.19.1"]);
     }
 }

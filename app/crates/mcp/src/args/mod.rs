@@ -292,6 +292,12 @@ pub(crate) struct QueryPackagesEnrichedArgs {
     pub(crate) status: Option<String>,
     /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
     pub(crate) include_evidence: Option<bool>,
+    /// Return full findings (default) or only one compact summary per package.
+    pub(crate) verbosity: Option<String>,
+    /// Include OSV fixed-version candidates in findings and package summaries. Defaults to false.
+    pub(crate) include_fixed: Option<bool>,
+    /// Include per-CVE KEV, EPSS, and CVSS risk rows in each package result. Defaults to false.
+    pub(crate) include_enrichment: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

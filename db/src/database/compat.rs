@@ -6,11 +6,11 @@ use super::sqlx_database::{
 };
 use crate::{
     AffectedPackageSummary, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
-    CveCvssDetail, CveCweDetail, CveDatabaseStatus, CveDetail, CveReference, CveRiskSummary,
-    CveStateScope, CveSummary, CveSummaryWithDetail, CweEntry, DatabaseStatus, DbSource,
-    EnrichedCve, EnrichedCveSummary, EnrichedFinding, EnrichmentDatabaseStatus,
-    EnrichmentStatusSummary, EpssInfo, Evidence, IdentifierEdgeEvidence, KevInfo, OsvSummary,
-    SourceSyncState,
+    CveAffectedVersionDetail, CveCvssDetail, CveCweDetail, CveDatabaseStatus, CveDetail,
+    CveReference, CveRiskSummary, CveStateScope, CveSummary, CveSummaryWithDetail, CweEntry,
+    DatabaseStatus, DbSource, EnrichedCve, EnrichedCveSummary, EnrichedFinding,
+    EnrichmentDatabaseStatus, EnrichmentStatusSummary, EpssInfo, Evidence, IdentifierEdgeEvidence,
+    KevInfo, OsvSummary, SourceSyncState,
 };
 use qanvuli_models::{RawCveStatusRecord, parse_json_with_raw};
 use sqlx::Row;
@@ -35,6 +35,7 @@ type CompatAffectedRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    String,
 );
 
 fn include_rejected(scope: CveStateScope) -> bool {
@@ -357,13 +358,13 @@ impl SqlxDatabase {
                     }
 
                     let affected: Vec<CompatAffectedRow> = sqlx::query_as(
-                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, id",
+                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status, version_text FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, id",
                     )
                     .bind(db_ids_json)
                     .fetch_all(&mut *connection)
                     .await?;
                     let mut affected_indexes = HashMap::<i64, usize>::new();
-                    for (db_id, vendor, product, package_name, collection_url, default_status) in affected {
+                    for (db_id, vendor, product, package_name, collection_url, default_status, version_text) in affected {
                         if let Some(cve_id) = cve_id_by_db_id.get(&db_id)
                             && let Some(detail) = details.get_mut(cve_id)
                         {
@@ -374,6 +375,17 @@ impl SqlxDatabase {
                                 .cloned()
                                 .flatten();
                             *affected_index += 1;
+                            let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&version_text)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|(version, status, version_type, less_than, less_than_or_equal)| CveAffectedVersionDetail {
+                                    version,
+                                    status,
+                                    version_type,
+                                    less_than,
+                                    less_than_or_equal,
+                                })
+                                .collect();
                             detail.affected.push(CveAffectedDetail {
                                 vendor,
                                 product,
@@ -381,7 +393,7 @@ impl SqlxDatabase {
                                 description,
                                 collection_url,
                                 default_status,
-                                versions: Vec::new(),
+                                versions,
                             });
                         }
                     }

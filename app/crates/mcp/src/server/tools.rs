@@ -307,7 +307,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Batch-query up to 200 package/version tuples. Each input returns findings plus a compact CVE/KEV/EPSS/CVSS summary; status defaults to affected. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence."
+        description = "Batch-query up to 200 package/version tuples. Set verbosity='summary' to omit verbose findings. Set include_fixed=true for OSV fixed-version candidates and include_enrichment=true for per-CVE KEV/EPSS/CVSS rows. Status defaults to affected. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence."
     )]
     pub(crate) async fn query_packages_enriched(
         &self,
@@ -319,6 +319,9 @@ impl CveSearchServer {
             args.packages,
             args.status.as_deref(),
             args.include_evidence.unwrap_or(false),
+            args.verbosity.as_deref(),
+            args.include_fixed.unwrap_or(false),
+            args.include_enrichment.unwrap_or(false),
         )
         .await
     }
