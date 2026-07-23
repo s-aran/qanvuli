@@ -894,14 +894,6 @@ pub(crate) async fn check_search_integrity_quick(
             "CVE affected FTS last row",
             "SELECT 1 WHERE (SELECT cve_id FROM cve_summary_index ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT cve_id FROM cve_affected_summary_fts ORDER BY rowid DESC LIMIT 1)",
         ),
-        (
-            "OSV text FTS first row",
-            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid LIMIT 1)",
-        ),
-        (
-            "OSV text FTS last row",
-            "SELECT 1 WHERE (SELECT osv_id FROM osv_advisories ORDER BY rowid DESC LIMIT 1) IS NOT (SELECT osv_id FROM osv_text_fts ORDER BY rowid DESC LIMIT 1)",
-        ),
     ] {
         if sqlx::query_scalar::<_, i64>(query)
             .fetch_optional(&mut *connection)
