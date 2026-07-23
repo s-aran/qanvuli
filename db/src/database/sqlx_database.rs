@@ -65,6 +65,26 @@ type BatchedOsvRow = (
 );
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
+/// PEP 503's package-name comparison rule.  Applying it to the lookup key also
+/// makes common `-`/`_`/`.` spellings resolve for feeds that did not normalize
+/// names when they were published.
+fn normalized_package_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut previous_separator = false;
+    for character in name.chars() {
+        if matches!(character, '-' | '_' | '.') {
+            if !previous_separator {
+                normalized.push('-');
+            }
+            previous_separator = true;
+        } else {
+            normalized.push(character.to_ascii_lowercase());
+            previous_separator = false;
+        }
+    }
+    normalized
+}
+
 struct CveParentInput {
     cve_id: String,
     state: i64,
@@ -467,13 +487,13 @@ impl SqlxDatabase {
         purl: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
         let ecosystem = ecosystem.to_owned();
-        let package = package.to_owned();
+        let package = normalized_package_name(package);
         let purl = purl.map(str::to_owned);
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
                     let exists: i64 = sqlx::query_scalar(
-                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (package.package_name=? COLLATE NOCASE OR (? IS NOT NULL AND package.purl=?)))",
+                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=? OR (? IS NOT NULL AND package.purl=?)))",
                     )
                     .bind(ecosystem)
                     .bind(package)
@@ -495,7 +515,10 @@ impl SqlxDatabase {
         if packages.is_empty() {
             return Ok(Vec::new());
         }
-        let packages = packages.to_vec();
+        let mut packages = packages.to_vec();
+        for package in &mut packages {
+            package.package = normalized_package_name(&package.package);
+        }
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
@@ -503,7 +526,7 @@ impl SqlxDatabase {
                         sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
                     })?;
                     let rows: Vec<(i64, i64)> = sqlx::query_as(
-                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index",
+                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=input.ecosystem COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=input.package_name OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index",
                     )
                     .bind(input)
                     .fetch_all(connection)
@@ -531,7 +554,10 @@ impl SqlxDatabase {
         if packages.is_empty() {
             return Ok(Vec::new());
         }
-        let packages = packages.to_vec();
+        let mut packages = packages.to_vec();
+        for package in &mut packages {
+            package.package = normalized_package_name(&package.package);
+        }
         self.writer.with_connection(|connection| Box::pin(async move {
             let mut output = vec![Vec::new(); packages.len()];
             for (query_batch_index, package_batch) in
@@ -541,7 +567,7 @@ impl SqlxDatabase {
                     sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
                 })?;
                 let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (package.package_name=input.package_name COLLATE NOCASE OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=input.package_name OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
                 )
                 .bind(input_json)
                 .fetch_all(&mut *connection)
@@ -976,9 +1002,9 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Searches affected records and, when supplied, a provider-declared affected version value.
-    /// This is intentionally a candidate lookup: CVE version expressions are not interpreted as
-    /// a vulnerability verdict here.
+    /// Searches affected records by vendor/product. Version expressions are deliberately not
+    /// filtered here: a CNA value such as `< 2.0.0` cannot be safely matched with SQL `LIKE` to
+    /// an installed version such as `1.5.0`. This is a candidate lookup, not a verdict.
     pub async fn search_cves_by_affected_version(
         &self,
         vendor: Option<String>,
@@ -990,13 +1016,12 @@ impl SqlxDatabase {
     ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
         let vendor = vendor.map(|value| format!("%{value}%"));
         let product = product.map(|value| format!("%{value}%"));
-        let version = version.filter(|value| !value.trim().is_empty());
+        let _version = version;
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR affected.vendor LIKE ?) AND (? IS NULL OR affected.product LIKE ? OR affected.package_name LIKE ?) AND (? IS NULL OR affected.version_text LIKE '%' || ? || '%') ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
+            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR affected.vendor LIKE ?) AND (? IS NULL OR affected.product LIKE ? OR affected.package_name LIKE ?) ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
                 .bind(include_rejected)
                 .bind(&vendor).bind(&vendor)
                 .bind(&product).bind(&product).bind(&product)
-                .bind(&version).bind(&version)
                 .bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
         })).await
     }
@@ -1424,11 +1449,11 @@ impl SqlxDatabase {
         purl: Option<&str>,
     ) -> Result<Vec<SqlxPackageFinding>, sqlx::Error> {
         let ecosystem = ecosystem.to_owned();
-        let package_name = package_name.to_owned();
+        let package_name = normalized_package_name(package_name);
         let version = version.to_owned();
         let purl = purl.map(str::to_owned);
         self.writer.with_connection(|connection| Box::pin(async move {
-            let packages: Vec<(i64, String)> = sqlx::query_as("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (package.package_name=? COLLATE NOCASE OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id")
+            let packages: Vec<(i64, String)> = sqlx::query_as("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=? OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id")
                 .bind(&ecosystem).bind(&package_name).bind(&purl).bind(&purl).fetch_all(&mut *connection).await?;
             let package_ids_json = serde_json::to_string(&packages.iter().map(|(id, _)| id).collect::<Vec<_>>())
                 .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}")))?;
@@ -4875,6 +4900,46 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn package_query_evaluates_npm_and_pypi_ranges_and_normalizes_names() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-npm","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"jquery"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"PYSEC-2099-name","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"PyPI","name":"pillow-heif"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.0.post1"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let npm = database
+            .query_package_matches("npm", "jquery", "1.10.2", None)
+            .await
+            .unwrap();
+        assert_eq!(npm.len(), 1);
+        assert_eq!(npm[0].affected.status, "affected");
+
+        let pypi = database
+            .query_package_matches("PyPI", "pillow_heif", "1.0", None)
+            .await
+            .unwrap();
+        assert_eq!(pypi.len(), 1);
+        assert_eq!(pypi[0].affected.status, "affected");
+        assert!(
+            database
+                .has_osv_package_advisory("PyPI", "pillow_heif", None)
+                .await
+                .unwrap()
         );
     }
 

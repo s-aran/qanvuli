@@ -1,5 +1,6 @@
 //! DB-independent OSV range evaluation used by SQLx package queries.
 
+use pep440_rs::Version as Pep440Version;
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -15,49 +16,103 @@ pub struct VersionMatch {
 }
 
 pub fn evaluate_version(ecosystem: &str, installed: &str, ranges: &[OsvRange]) -> VersionMatch {
-    if !ecosystem.eq_ignore_ascii_case("crates.io") {
-        return unsupported();
-    }
-    let Ok(installed) = semver::Version::parse(installed) else {
-        return unknown();
-    };
     if ranges.is_empty() {
         return unknown();
     }
+    if ecosystem.eq_ignore_ascii_case("PyPI") {
+        return evaluate_pep440(installed, ranges);
+    }
+    evaluate_semver(installed, ranges)
+}
+
+fn evaluate_semver(installed: &str, ranges: &[OsvRange]) -> VersionMatch {
+    let Ok(installed) = semver::Version::parse(installed.trim_start_matches('v')) else {
+        return unknown();
+    };
+    evaluate_ranges(
+        &installed,
+        ranges,
+        |range_type| {
+            range_type.eq_ignore_ascii_case("SEMVER")
+                || range_type.eq_ignore_ascii_case("ECOSYSTEM")
+        },
+        |version| semver::Version::parse(version.trim_start_matches('v')).ok(),
+    )
+}
+
+fn evaluate_pep440(installed: &str, ranges: &[OsvRange]) -> VersionMatch {
+    let Ok(installed) = installed.parse::<Pep440Version>() else {
+        return unknown();
+    };
+    evaluate_ranges(
+        &installed,
+        ranges,
+        |range_type| {
+            range_type.eq_ignore_ascii_case("ECOSYSTEM")
+                || range_type.eq_ignore_ascii_case("SEMVER")
+        },
+        |version| version.parse::<Pep440Version>().ok(),
+    )
+}
+
+/// Evaluate OSV's alternating introduced/fixed/last_affected event sequence.
+/// A range can contain multiple affected intervals, not merely one lower/upper bound.
+fn evaluate_ranges<T: Ord>(
+    installed: &T,
+    ranges: &[OsvRange],
+    accepts_range_type: impl Fn(&str) -> bool,
+    parse: impl Fn(&str) -> Option<T>,
+) -> VersionMatch {
     let mut affected = false;
+    let mut evaluated = false;
     for range in ranges {
-        if !range.range_type.eq_ignore_ascii_case("SEMVER") {
-            return unsupported();
+        if !accepts_range_type(&range.range_type) {
+            continue;
         }
-        let mut introduced = semver::Version::new(0, 0, 0);
-        let mut fixed = None;
-        let mut last_affected = None;
+        evaluated = true;
+        // OSV ranges begin affected from version zero unless an event has closed
+        // that interval. `introduced: "0"` is the explicit spelling of this.
+        let mut open = true;
+        let mut introduced: Option<T> = None;
         for (event_type, value) in &range.events {
             match event_type.as_str() {
-                "introduced" if value != "0" => {
-                    if let Ok(version) = semver::Version::parse(value) {
-                        introduced = version;
-                    }
+                "introduced" => {
+                    introduced = if value == "0" {
+                        None
+                    } else {
+                        let Some(start) = parse(value) else {
+                            return unknown();
+                        };
+                        Some(start)
+                    };
+                    open = true;
                 }
-                "fixed" => {
-                    if let Ok(version) = semver::Version::parse(value) {
-                        fixed = Some(version);
+                "fixed" | "last_affected" => {
+                    let Some(end) = parse(value) else {
+                        return unknown();
+                    };
+                    let starts_before_or_at =
+                        introduced.as_ref().is_none_or(|start| installed >= start);
+                    let ends_after = if event_type == "fixed" {
+                        installed < &end
+                    } else {
+                        installed <= &end
+                    };
+                    if starts_before_or_at && ends_after {
+                        affected = true;
                     }
-                }
-                "last_affected" => {
-                    if let Ok(version) = semver::Version::parse(value) {
-                        last_affected = Some(version);
-                    }
+                    open = false;
+                    introduced = None;
                 }
                 _ => {}
             }
         }
-        if installed >= introduced
-            && fixed.as_ref().is_none_or(|fixed| installed < *fixed)
-            && last_affected.as_ref().is_none_or(|last| installed <= *last)
-        {
+        if open && introduced.as_ref().is_none_or(|start| installed >= start) {
             affected = true;
         }
+    }
+    if !evaluated {
+        return unsupported();
     }
     VersionMatch {
         status: if affected { "affected" } else { "not_affected" }.to_owned(),
@@ -119,24 +174,55 @@ mod tests {
             evaluate_version("crates.io", "invalid", &[]).status,
             "unknown"
         );
-        assert_eq!(
-            evaluate_version("npm", "1.5.0", &[]).status,
-            "unsupported_version_scheme"
-        );
-        for ecosystem in [
-            "RubyGems",
-            "GitHub Actions",
-            "Go",
-            "Maven",
-            "npm",
-            "NuGet",
-            "PyPI",
-            "Pub",
-        ] {
+        for ecosystem in ["npm", "Go", "NuGet", "Pub"] {
             assert_eq!(
                 evaluate_version(ecosystem, "1.5.0", std::slice::from_ref(&range)).status,
-                "unsupported_version_scheme"
+                "affected"
             );
         }
+    }
+
+    #[test]
+    fn pypi_ecosystem_ranges_use_pep440() {
+        let range = OsvRange {
+            range_type: "ECOSYSTEM".to_owned(),
+            events: vec![
+                ("introduced".to_owned(), "2.0rc1".to_owned()),
+                ("fixed".to_owned(), "2.0.0.post1".to_owned()),
+            ],
+        };
+        assert_eq!(
+            evaluate_version("PyPI", "2.0", &[range.clone()]).status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_version("PyPI", "2.0.post1", &[range]).status,
+            "not_affected"
+        );
+    }
+
+    #[test]
+    fn multiple_osv_intervals_are_evaluated_independently() {
+        let range = OsvRange {
+            range_type: "SEMVER".to_owned(),
+            events: vec![
+                ("introduced".to_owned(), "1.0.0".to_owned()),
+                ("fixed".to_owned(), "1.1.0".to_owned()),
+                ("introduced".to_owned(), "1.2.0".to_owned()),
+                ("fixed".to_owned(), "1.3.0".to_owned()),
+            ],
+        };
+        assert_eq!(
+            evaluate_version("npm", "1.0.5", &[range.clone()]).status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_version("npm", "1.1.5", &[range.clone()]).status,
+            "not_affected"
+        );
+        assert_eq!(
+            evaluate_version("npm", "1.2.5", &[range]).status,
+            "affected"
+        );
     }
 }

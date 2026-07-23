@@ -167,6 +167,12 @@ where
         if value == "--osv-prefix" || value.starts_with("--osv-prefix=") {
             return Err("use --osv-<prefix>, for example --osv-ghsa or --osv-pysec".to_owned());
         }
+        if value == "--osv-source" || value.starts_with("--osv-source=") {
+            return Err(
+                "use --osv-<prefix>, for example --osv-ghsa or --osv-pysec; --osv-source is internal"
+                    .to_owned(),
+            );
+        }
         if let Some(prefix) = value.strip_prefix("--osv-") {
             if prefix.is_empty() || prefix.starts_with('-') {
                 return Err(format!("invalid OSV source prefix flag `{value}`"));
@@ -230,5 +236,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("--osv-refresh-all"));
+    }
+
+    #[test]
+    fn internal_osv_source_flag_is_rejected_but_dynamic_prefix_is_accepted() {
+        let error = normalize_osv_prefix_flags(
+            ["qanvuli", "update", "--osv-source", "pysec"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("--osv-<prefix>"));
+
+        let normalized = normalize_osv_prefix_flags(
+            ["qanvuli", "update", "--osv-pysec"]
+                .into_iter()
+                .map(OsString::from),
+        )
+        .unwrap();
+        Cli::try_parse_from(normalized).unwrap();
     }
 }
