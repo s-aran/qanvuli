@@ -14,6 +14,8 @@ pub(crate) struct CweArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -39,6 +41,10 @@ pub(crate) struct ProductArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
+    /// Exclude WordPress.org collection records, which often match generic library names. Defaults to false.
+    pub(crate) exclude_collection: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -51,6 +57,8 @@ pub(crate) struct TextArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -69,6 +77,8 @@ pub(crate) struct ReferenceSearchArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -87,6 +97,8 @@ pub(crate) struct CvssArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -109,6 +121,8 @@ pub(crate) struct ProductCvssArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -123,6 +137,8 @@ pub(crate) struct DateArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -141,6 +157,8 @@ pub(crate) struct DateRangeArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -153,6 +171,8 @@ pub(crate) struct IdPrefixArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -169,6 +189,8 @@ pub(crate) struct ProductVersionArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -206,6 +228,8 @@ pub(crate) struct RecentUpdatesArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
+    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    pub(crate) full_description: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -222,6 +246,8 @@ pub(crate) struct KnownExploitedArgs {
 pub(crate) struct CveRiskLookupArgs {
     /// CVE IDs to check for KEV, EPSS, and max CVSS. Intended for batch triage.
     pub(crate) cve_ids: Vec<String>,
+    /// Include title and enrichment metadata normally omitted from triage rows. Defaults to false.
+    pub(crate) verbosity: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

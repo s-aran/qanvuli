@@ -11,7 +11,7 @@ use simd_json::json;
 #[tool_router]
 impl CveSearchServer {
     #[tool(
-        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. List results include a 280-character description_preview by default; set full_description=true for complete English text."
     )]
     pub(crate) async fn search_by_cwe(
         &self,
@@ -19,6 +19,7 @@ impl CveSearchServer {
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
         let include_rejected = args.include_rejected;
+        let full_description = args.full_description.unwrap_or(false);
         let limit = limit(args.limit);
         let offset = offset(args.offset);
         let cves = db::search_by_cwe(
@@ -29,11 +30,11 @@ impl CveSearchServer {
             offset,
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, full_description).await
     }
 
     #[tool(
-        description = "Search CVEs by affected vendor and/or product name. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by affected vendor and/or product name. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Matching is ranked exact, word-boundary, then substring; set exclude_collection=true to exclude wordpress.org collection entries. List results use a 280-character description_preview by default; set full_description=true for complete text. A library CVE's affected product can be its implementation host (for example pdf.js may be Firefox), so substring search can miss it; use query_package_enriched (ecosystem/package) or resolve_identifier (alias graph) in that case."
     )]
     pub(crate) async fn search_by_product(
         &self,
@@ -46,16 +47,23 @@ impl CveSearchServer {
             args.product.as_deref(),
             args.vendor_exact.as_deref(),
             args.product_exact.as_deref(),
+            args.exclude_collection.unwrap_or(false),
             state_scope(args.include_rejected),
             limit(args.limit) + 1,
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit(args.limit)).await
+        db::paged_search_result(
+            db,
+            cves,
+            limit(args.limit),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
-        description = "Search CVEs by CVE ID, title, or English description text. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by CVE ID, title, or English description text. List results include a 280-character description_preview by default; set full_description=true for complete English text."
     )]
     pub(crate) async fn search_text(
         &self,
@@ -70,11 +78,17 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit(args.limit)).await
+        db::paged_search_result(
+            db,
+            cves,
+            limit(args.limit),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
-        description = "Search CVEs by CVSS score, severity, and/or CVSS version. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search CVEs by CVSS score, severity, and/or CVSS version. List results include a 280-character description_preview by default; set full_description=true for complete English text."
     )]
     pub(crate) async fn search_by_cvss(
         &self,
@@ -92,11 +106,17 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit(args.limit)).await
+        db::paged_search_result(
+            db,
+            cves,
+            limit(args.limit),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
-        description = "Search high-risk CVEs for a specific affected vendor/product. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search high-risk CVEs for a specific affected vendor/product. Use vendor/product for substring filters, or vendor_exact/product_exact for exact affected field matches. List results include a 280-character description_preview by default; set full_description=true for complete English text."
     )]
     pub(crate) async fn search_product_by_cvss(
         &self,
@@ -116,7 +136,13 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit(args.limit)).await
+        db::paged_search_result(
+            db,
+            cves,
+            limit(args.limit),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
@@ -140,7 +166,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. Results include cve_id, state, published_at, updated_at, title, complete English description, CWE entries, CVSS metrics, and affected vendor/product/version data. Results do not include raw CVE JSON; use get_cve only when raw CVE JSON is explicitly required."
+        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. List results include a 280-character description_preview by default; set full_description=true for complete English text."
     )]
     pub(crate) async fn search_recent(
         &self,
@@ -156,7 +182,13 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit(args.limit)).await
+        db::paged_search_result(
+            db,
+            cves,
+            limit(args.limit),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(
@@ -198,7 +230,7 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
     }
 
     #[tool(
@@ -220,7 +252,7 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
     }
 
     #[tool(
@@ -272,7 +304,7 @@ impl CveSearchServer {
         Parameters(args): Parameters<CveRiskLookupArgs>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
-        db::lookup_cve_risk(db, &args.cve_ids).await
+        db::lookup_cve_risk(db, &args.cve_ids, args.verbosity.as_deref()).await
     }
 
     #[tool(description = "Fetch one local OSV advisory summary by OSV/GHSA/RUSTSEC/PYSEC/GO ID.")]
@@ -346,7 +378,7 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
     }
 
     #[tool(description = "Search CVEs by CVE ID prefix such as CVE-2026- or CVE-2026-12.")]
@@ -364,7 +396,7 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
     }
 
     #[tool(description = "Search the local CWE catalog by CWE ID or description text.")]
@@ -422,7 +454,7 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit).await
+        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
     }
 
     #[tool(

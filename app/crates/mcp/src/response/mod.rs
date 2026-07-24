@@ -7,14 +7,101 @@ use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::model::{CallToolResult, ContentBlock};
 use simd_json::{OwnedValue as Value, json};
 
+pub(crate) const DESC_PREVIEW_CHARS: usize = 280;
+pub(crate) const MAX_RESULT_BYTES: usize = 40_000;
+
 pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
+    let value = if encoded_len(&value)? > MAX_RESULT_BYTES {
+        shrink_over_budget(&value, MAX_RESULT_BYTES).ok_or_else(|| {
+            mcp_error(format!(
+                "tool result exceeds {MAX_RESULT_BYTES} byte response budget"
+            ))
+        })?
+    } else {
+        value
+    };
     let text = simd_json::to_string(&value)
         .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
+fn encoded_len(value: &Value) -> Result<usize, rmcp::ErrorData> {
+    simd_json::to_string(value)
+        .map(|text| text.len())
+        .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))
+}
+
+/// Removes optional list detail, then pages a top-level results/findings array until it fits.
+pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> {
+    let mut compact = value.clone();
+    let array_key = match &compact {
+        Value::Object(object) if object.contains_key("results") => "results",
+        Value::Object(object) if object.contains_key("findings") => "findings",
+        _ => return None,
+    };
+    let total = {
+        let Value::Object(object) = &mut compact else {
+            return None;
+        };
+        let Value::Array(items) = object.get_mut(array_key)? else {
+            return None;
+        };
+        for item in items.iter_mut() {
+            if let Value::Object(item) = item {
+                item.remove("description");
+                item.remove("description_preview");
+            }
+        }
+        items.len()
+    };
+    if encoded_len(&compact).ok()? <= budget {
+        return Some(compact);
+    }
+
+    loop {
+        let returned = {
+            let Value::Object(object) = &mut compact else {
+                return None;
+            };
+            let Value::Array(items) = object.get_mut(array_key)? else {
+                return None;
+            };
+            items.pop();
+            items.len()
+        };
+        let Value::Object(object) = &mut compact else {
+            return None;
+        };
+        object.insert("response_truncated".into(), json!(true));
+        object.insert("returned".into(), json!(returned));
+        object.insert("total".into(), json!(total));
+        object.insert("hint".into(), json!("narrow query or page with offset"));
+        if encoded_len(&compact).ok()? <= budget {
+            return Some(compact);
+        }
+        if returned == 0 {
+            break;
+        }
+    }
+    (encoded_len(&compact).ok()? <= budget).then_some(compact)
+}
+
 pub(crate) fn summaries_with_detail(cves: Vec<CveSummaryWithDetail>) -> Vec<Value> {
     cves.into_iter().map(summary_with_detail).collect()
+}
+
+pub(crate) fn summaries_with_detail_compact(cves: Vec<CveSummaryWithDetail>) -> Vec<Value> {
+    cves.into_iter().map(summary_with_detail_compact).collect()
+}
+
+pub(crate) fn preview(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 pub(crate) fn summary(cve: CveSummary) -> Value {
@@ -28,8 +115,32 @@ pub(crate) fn summary(cve: CveSummary) -> Value {
     })
 }
 
+pub(crate) fn summary_compact(cve: CveSummary) -> Value {
+    json!({
+        "cve_id": cve.cve_id,
+        "state": cve_state_label(cve.state),
+        "published_at": cve.published_at,
+        "updated_at": cve.updated_at,
+        "title": cve.title,
+        "description_preview": cve.description_en.as_deref().map(|value| preview(value, DESC_PREVIEW_CHARS)),
+    })
+}
+
 pub(crate) fn summary_with_detail(cve: CveSummaryWithDetail) -> Value {
     let mut value = summary(cve.summary);
+    if let Value::Object(ref mut object) = value {
+        object.insert("cwe".into(), json!(cwe_values(cve.detail.cwes)));
+        object.insert("cvss".into(), json!(cvss_values(cve.detail.cvss)));
+        object.insert(
+            "affected".into(),
+            json!(affected_values(cve.detail.affected)),
+        );
+    }
+    value
+}
+
+pub(crate) fn summary_with_detail_compact(cve: CveSummaryWithDetail) -> Value {
+    let mut value = summary_compact(cve.summary);
     if let Value::Object(ref mut object) = value {
         object.insert("cwe".into(), json!(cwe_values(cve.detail.cwes)));
         object.insert("cvss".into(), json!(cvss_values(cve.detail.cvss)));
@@ -182,5 +293,31 @@ fn push_text_match(evidence: &mut Vec<Value>, field: &str, value: &str, query: &
             "field": field,
             "value": value,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_is_character_based_and_marks_truncation() {
+        assert_eq!(preview("あいうえお", 3), "あいう…");
+        assert_eq!(preview("short", 280), "short");
+    }
+
+    #[test]
+    fn shrink_over_budget_marks_and_truncates_results() {
+        let results = (0..20)
+            .map(|index| json!({"cve_id": format!("CVE-2026-{index}"), "title": "x".repeat(2_000), "description": "x".repeat(2_000)}))
+            .collect::<Vec<_>>();
+        let value = json!({"results": results});
+        let shrunk = shrink_over_budget(&value, 800).expect("response can be truncated");
+        let Value::Object(object) = shrunk else {
+            panic!("object result")
+        };
+        assert_eq!(object.get("response_truncated"), Some(&json!(true)));
+        assert!(object.get("returned").is_some());
+        assert!(object.get("total").is_some());
     }
 }

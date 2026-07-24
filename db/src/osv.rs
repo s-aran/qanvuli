@@ -103,20 +103,34 @@ pub struct EnrichedCveSummary {
 /// Compact risk row for CVE triage.
 pub struct CveRiskSummary {
     pub cve_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub published_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<i32>,
     pub kev_listed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kev_date_added: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kev_due_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kev_known_ransomware_campaign_use: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epss: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epss_percentile: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epss_score_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub epss_model_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cvss_score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cvss_severity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_cvss_version: Option<String>,
 }
 

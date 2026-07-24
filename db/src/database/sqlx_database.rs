@@ -987,17 +987,22 @@ impl SqlxDatabase {
         vendor: Option<String>,
         product: Option<String>,
         exact: bool,
+        exclude_wordpress_collection: bool,
         include_rejected: bool,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
         let vendor = vendor.map(|value| if exact { value } else { format!("%{value}%") });
+        let product_rank = product.clone();
         let product = product.map(|value| if exact { value } else { format!("%{value}%") });
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND (? IS NULL OR CASE WHEN ? THEN (affected.product=? OR affected.package_name=?) ELSE (affected.product LIKE ? OR affected.package_name LIKE ?) END) ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
+            sqlx::query_as("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? OR affected.collection_url NOT LIKE '%wordpress.org%') AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND (? IS NULL OR CASE WHEN ? THEN (affected.product=? OR affected.package_name=?) ELSE (affected.product LIKE ? OR affected.package_name LIKE ?) END) GROUP BY c.id ORDER BY MIN(CASE WHEN ? IS NULL THEN 0 WHEN affected.product=? OR affected.package_name=? THEN 0 WHEN affected.product LIKE ? || ' %' OR affected.product LIKE '% ' || ? OR affected.product LIKE ? || '-%' OR affected.product LIKE '%-' || ? OR affected.package_name LIKE ? || ' %' OR affected.package_name LIKE '% ' || ? OR affected.package_name LIKE ? || '-%' OR affected.package_name LIKE '%-' || ? THEN 1 ELSE 2 END), c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
                 .bind(include_rejected)
+                .bind(!exclude_wordpress_collection)
                 .bind(&vendor).bind(exact).bind(&vendor).bind(&vendor)
                 .bind(&product).bind(exact).bind(&product).bind(&product).bind(&product).bind(&product)
+                .bind(&product_rank).bind(&product_rank).bind(&product_rank)
+                .bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank)
                 .bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
         })).await
     }
@@ -4387,6 +4392,7 @@ mod tests {
                     Some("Acme".to_owned()),
                     Some("widget".to_owned()),
                     true,
+                    false,
                     false,
                     10,
                     0,

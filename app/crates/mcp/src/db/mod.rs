@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 
+const BATCH_COVERAGE_NOTICE: &str = "osv_covered=false means OSV has no local coverage; it does not prove there are no CVEs. Cross-check end-of-life or critical packages with the CVE List and vendor advisories.";
+
 #[derive(Clone)]
 pub(crate) struct DbProvider {
     db_url: String,
@@ -56,6 +58,7 @@ pub(crate) async fn paged_search_result(
     db: &CveDatabase,
     mut cves: Vec<CveSummary>,
     requested_limit: u64,
+    full_description: bool,
 ) -> Result<CallToolResult, McpError> {
     let has_more = cves.len() > requested_limit as usize;
     cves.truncate(requested_limit as usize);
@@ -65,7 +68,11 @@ pub(crate) async fn paged_search_result(
         .map_err(|err| mcp_error(err.to_string()))?;
     response::tool_result(json!({
         "has_more": has_more,
-        "results": response::summaries_with_detail(cves),
+        "results": if full_description {
+            response::summaries_with_detail(cves)
+        } else {
+            response::summaries_with_detail_compact(cves)
+        },
     }))
 }
 
@@ -87,6 +94,7 @@ pub(crate) async fn search_by_product(
     product: Option<&str>,
     vendor_exact: Option<&str>,
     product_exact: Option<&str>,
+    exclude_wordpress_collection: bool,
     state_scope: CveStateScope,
     limit: u64,
     offset: u64,
@@ -96,6 +104,7 @@ pub(crate) async fn search_by_product(
         product,
         vendor_exact,
         product_exact,
+        exclude_wordpress_collection,
         state_scope,
         limit,
         offset,
@@ -420,9 +429,11 @@ pub(crate) async fn query_packages_enriched(
                 .any(|finding| finding.affected.status == "affected"),
             include_fixed.then(|| fixed_versions(&findings)),
         );
-        let coverage_notice = coverage_notice(&package.ecosystem, !has_osv_advisory);
-        let mut result =
-            json!({"package": package, "summary": summary, "coverage_notice": coverage_notice});
+        let mut result = json!({
+            "package": package,
+            "summary": summary,
+            "osv_covered": has_osv_advisory,
+        });
         let Value::Object(object) = &mut result else {
             return Err(mcp_error("package result did not serialize to an object"));
         };
@@ -449,9 +460,14 @@ pub(crate) async fn query_packages_enriched(
         }
         results.push(result);
     }
-    response::tool_result(
-        json!({"requested": requested, "truncated": requested > 200, "status": status, "verbosity": verbosity, "results": results}),
-    )
+    response::tool_result(json!({
+        "requested": requested,
+        "truncated": requested > 200,
+        "status": status,
+        "verbosity": verbosity,
+        "coverage_notice": BATCH_COVERAGE_NOTICE,
+        "results": results,
+    }))
 }
 
 fn coverage_notice(ecosystem: &str, no_osv_candidates: bool) -> Option<String> {
@@ -675,13 +691,38 @@ pub(crate) async fn known_exploited(
 pub(crate) async fn lookup_cve_risk(
     db: &CveDatabase,
     cve_ids: &[String],
+    verbosity: Option<&str>,
 ) -> Result<CallToolResult, McpError> {
+    let full = matches!(verbosity, Some("full"));
     let requested = cve_ids.len();
     let cve_ids = cve_ids.iter().take(200).cloned().collect::<Vec<_>>();
     let results = db
         .cve_risk_summaries(&cve_ids)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
+    let results = if full {
+        simd_json::serde::to_owned_value(&results)
+            .map_err(|err| mcp_error(format!("failed to encode CVE risk: {err}")))?
+    } else {
+        let mut results = simd_json::serde::to_owned_value(&results)
+            .map_err(|err| mcp_error(format!("failed to encode CVE risk: {err}")))?;
+        if let Value::Array(rows) = &mut results {
+            for row in rows.iter_mut() {
+                if let Value::Object(row) = row {
+                    for key in [
+                        "title",
+                        "published_at",
+                        "updated_at",
+                        "state",
+                        "epss_model_version",
+                    ] {
+                        row.remove(key);
+                    }
+                }
+            }
+        }
+        results
+    };
     response::tool_result(json!({
         "requested": requested,
         "truncated": requested > cve_ids.len(),
@@ -928,10 +969,9 @@ mod tests {
     }
 
     #[test]
-    fn coverage_notice_is_consistent_for_all_ecosystems_without_osv_coverage() {
-        let notice = coverage_notice("npm", true).expect("coverage notice");
-        assert!(notice.contains("npm"));
-        assert!(coverage_notice("PyPI", false).is_none());
+    fn batch_coverage_notice_is_shared_and_osv_coverage_is_boolean() {
+        assert!(BATCH_COVERAGE_NOTICE.contains("osv_covered=false"));
+        assert!(BATCH_COVERAGE_NOTICE.contains("does not prove"));
     }
 
     #[test]
