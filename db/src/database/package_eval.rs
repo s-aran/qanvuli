@@ -22,10 +22,10 @@ pub fn evaluate_version(ecosystem: &str, installed: &str, ranges: &[OsvRange]) -
     if ecosystem.eq_ignore_ascii_case("PyPI") {
         return evaluate_pep440(installed, ranges);
     }
-    evaluate_semver(installed, ranges)
+    evaluate_semver(ecosystem, installed, ranges)
 }
 
-fn evaluate_semver(installed: &str, ranges: &[OsvRange]) -> VersionMatch {
+fn evaluate_semver(ecosystem: &str, installed: &str, ranges: &[OsvRange]) -> VersionMatch {
     let Ok(installed) = semver::Version::parse(installed.trim_start_matches('v')) else {
         return unknown();
     };
@@ -34,7 +34,11 @@ fn evaluate_semver(installed: &str, ranges: &[OsvRange]) -> VersionMatch {
         ranges,
         |range_type| {
             range_type.eq_ignore_ascii_case("SEMVER")
-                || range_type.eq_ignore_ascii_case("ECOSYSTEM")
+                // npm's OSV ECOSYSTEM ranges have node-semver semantics. Other
+                // ecosystems must not be guessed as semver merely because their
+                // strings happen to parse successfully.
+                || (ecosystem.eq_ignore_ascii_case("npm")
+                    && range_type.eq_ignore_ascii_case("ECOSYSTEM"))
         },
         |version| semver::Version::parse(version.trim_start_matches('v')).ok(),
     )
@@ -74,9 +78,11 @@ fn evaluate_ranges<T: Ord>(
         // that interval. `introduced: "0"` is the explicit spelling of this.
         let mut open = true;
         let mut introduced: Option<T> = None;
+        let mut has_version_event = false;
         for (event_type, value) in &range.events {
             match event_type.as_str() {
                 "introduced" => {
+                    has_version_event = true;
                     introduced = if value == "0" {
                         None
                     } else {
@@ -88,6 +94,7 @@ fn evaluate_ranges<T: Ord>(
                     open = true;
                 }
                 "fixed" | "last_affected" => {
+                    has_version_event = true;
                     let Some(end) = parse(value) else {
                         return unknown();
                     };
@@ -106,6 +113,9 @@ fn evaluate_ranges<T: Ord>(
                 }
                 _ => {}
             }
+        }
+        if !has_version_event {
+            return unknown();
         }
         if open && introduced.as_ref().is_none_or(|start| installed >= start) {
             affected = true;
@@ -183,6 +193,31 @@ mod tests {
     }
 
     #[test]
+    fn go_and_rust_semver_ranges_are_evaluated() {
+        let range = OsvRange {
+            range_type: "SEMVER".to_owned(),
+            events: vec![
+                ("introduced".to_owned(), "0".to_owned()),
+                ("fixed".to_owned(), "1.2.0".to_owned()),
+            ],
+        };
+        // Go module versions conventionally carry a leading v and may use a
+        // semver prerelease-shaped pseudo-version.
+        assert_eq!(
+            evaluate_version("Go", "v1.1.0-20240101120000-abcdef123456", &[range.clone()]).status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_version("Go", "v1.2.0", &[range.clone()]).status,
+            "not_affected"
+        );
+        assert_eq!(
+            evaluate_version("crates.io", "1.1.0", &[range]).status,
+            "affected"
+        );
+    }
+
+    #[test]
     fn pypi_ecosystem_ranges_use_pep440() {
         let range = OsvRange {
             range_type: "ECOSYSTEM".to_owned(),
@@ -199,6 +234,34 @@ mod tests {
             evaluate_version("PyPI", "2.0.post1", &[range]).status,
             "not_affected"
         );
+    }
+
+    #[test]
+    fn unsupported_ecosystem_ranges_are_not_guessed_as_semver() {
+        let range = OsvRange {
+            range_type: "ECOSYSTEM".to_owned(),
+            events: vec![
+                ("introduced".to_owned(), "1.0.0".to_owned()),
+                ("fixed".to_owned(), "2.0.0".to_owned()),
+            ],
+        };
+        assert_eq!(
+            evaluate_version("Maven", "1.5.0", &[range.clone()]).status,
+            "unsupported_version_scheme"
+        );
+        assert_eq!(
+            evaluate_version("npm", "1.5.0", &[range]).status,
+            "affected"
+        );
+    }
+
+    #[test]
+    fn malformed_empty_range_is_unknown_not_affected() {
+        let range = OsvRange {
+            range_type: "SEMVER".to_owned(),
+            events: Vec::new(),
+        };
+        assert_eq!(evaluate_version("npm", "1.5.0", &[range]).status, "unknown");
     }
 
     #[test]
