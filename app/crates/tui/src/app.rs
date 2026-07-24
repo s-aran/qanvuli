@@ -339,6 +339,12 @@ impl App {
         self.state_scope = self.advanced.state_scope;
         let mut options = self.advanced.to_search_options(self.display.sort_order());
         options.kev_only = self.display.kev_only;
+        let ecosystems = options
+            .package_ecosystem
+            .as_deref()
+            .map(str::trim)
+            .filter(|ecosystem| !ecosystem.is_empty())
+            .map(|ecosystem| vec![ecosystem.to_owned()]);
         let request = SearchRequest::Advanced {
             options,
             include_cve: self.advanced.source_cve,
@@ -348,7 +354,7 @@ impl App {
             } else {
                 Vec::new()
             },
-            ecosystems: None,
+            ecosystems,
         };
         self.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to search");
@@ -1479,6 +1485,8 @@ impl App {
             cwe: None,
             product: None,
             product_exact: None,
+            package_ecosystem: None,
+            package_version: None,
             vendor: None,
             vendor_exact: None,
             kev_only: self.display.kev_only,

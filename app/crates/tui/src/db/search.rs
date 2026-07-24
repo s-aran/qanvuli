@@ -83,51 +83,78 @@ pub(crate) async fn run_search_request(
             ecosystems,
         } => {
             let osv_query = advanced_osv_query(&options);
+            let package_version = package_version_query(&options);
             let rows = if include_cve {
-                db.search_cve_summaries_advanced(&options, limit, offset)
-                    .await
-                    .map_err(|err| err.to_string())?
+                if let Some((ecosystem, package, version)) = package_version.as_ref() {
+                    let findings = db
+                        .query_package_matches(ecosystem, package, version, None)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    let cve_ids = findings
+                        .into_iter()
+                        .filter(|finding| finding.affected.status == "affected")
+                        .flat_map(|finding| finding.cve_ids)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .skip(offset as usize)
+                        .take(limit as usize)
+                        .collect::<Vec<_>>();
+                    db.cve_summaries_with_details_batch(&cve_ids, options.state_scope)
+                        .await
+                        .map_err(|err| err.to_string())?
+                        .into_iter()
+                        .flatten()
+                        .map(|row| row.summary)
+                        .collect()
+                } else {
+                    db.search_cve_summaries_advanced(&options, limit, offset)
+                        .await
+                        .map_err(|err| err.to_string())?
+                }
             } else {
                 Vec::new()
             };
-            let osv_rows =
-                if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options) {
-                    Vec::new()
-                } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
-                    db.search_osv_summaries_free_text(
-                        options.query.as_deref().unwrap_or_default(),
-                        limit,
-                        offset,
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?
-                } else if let Some(package_name) = options
-                    .product_exact
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                {
-                    db.search_osv_summaries_scoped_by_exact_package(
-                        osv_query.as_deref(),
-                        &osv_families,
-                        ecosystems.as_deref(),
-                        package_name,
-                        limit,
-                        offset,
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?
-                } else {
-                    db.search_osv_summaries_scoped(
-                        osv_query.as_deref(),
-                        &osv_families,
-                        ecosystems.as_deref(),
-                        limit,
-                        offset,
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?
-                };
+            let osv_rows = if package_version.is_some()
+                || options.kev_only
+                || !include_osv
+                || has_cve_only_advanced_filters(&options)
+            {
+                Vec::new()
+            } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
+                db.search_osv_summaries_free_text(
+                    options.query.as_deref().unwrap_or_default(),
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string())?
+            } else if let Some(package_name) = options
+                .product_exact
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                db.search_osv_summaries_scoped_by_exact_package(
+                    osv_query.as_deref(),
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    package_name,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string())?
+            } else {
+                db.search_osv_summaries_scoped(
+                    osv_query.as_deref(),
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string())?
+            };
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
@@ -230,13 +257,29 @@ pub(crate) async fn run_count_request(
         } => {
             let osv_query = advanced_osv_query(&options);
             let cve = if include_cve {
-                db.count_cve_summaries_advanced(&options)
-                    .await
-                    .map_err(|err| err.to_string())?
+                if let Some((ecosystem, package, version)) = package_version_query(&options) {
+                    let findings = db
+                        .query_package_matches(&ecosystem, &package, &version, None)
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    findings
+                        .into_iter()
+                        .filter(|finding| finding.affected.status == "affected")
+                        .flat_map(|finding| finding.cve_ids)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len() as u64
+                } else {
+                    db.count_cve_summaries_advanced(&options)
+                        .await
+                        .map_err(|err| err.to_string())?
+                }
             } else {
                 0
             };
-            let osv = if options.kev_only || !include_osv || has_cve_only_advanced_filters(&options)
+            let osv = if package_version_query(&options).is_some()
+                || options.kev_only
+                || !include_osv
+                || has_cve_only_advanced_filters(&options)
             {
                 0
             } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
@@ -280,6 +323,21 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
     .into_iter()
     .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
         || options.kev_only
+}
+
+/// A package verdict requires all three values. Partial input deliberately
+/// leaves F3 in ordinary CVE metadata-search mode rather than guessing a
+/// version scheme or returning a false vulnerability verdict.
+fn package_version_query(options: &CveAdvancedSearch) -> Option<(String, String, String)> {
+    let ecosystem = options.package_ecosystem.as_deref()?.trim();
+    let package = options
+        .product_exact
+        .as_deref()
+        .or(options.product.as_deref())?
+        .trim();
+    let version = options.package_version.as_deref()?.trim();
+    (!ecosystem.is_empty() && !package.is_empty() && !version.is_empty())
+        .then(|| (ecosystem.to_owned(), package.to_owned(), version.to_owned()))
 }
 
 /// A plain free-text query can use OSV's FTS5 projection. Other advanced filters still need
@@ -515,6 +573,28 @@ mod tests {
             &["GHSA".to_owned()],
             None,
         ));
+    }
+
+    #[test]
+    fn package_version_query_requires_ecosystem_package_and_version() {
+        assert!(package_version_query(&CveAdvancedSearch::default()).is_none());
+        assert!(
+            package_version_query(&CveAdvancedSearch {
+                package_ecosystem: Some("npm".to_owned()),
+                product_exact: Some("jquery".to_owned()),
+                ..Default::default()
+            })
+            .is_none()
+        );
+        assert_eq!(
+            package_version_query(&CveAdvancedSearch {
+                package_ecosystem: Some("npm".to_owned()),
+                product_exact: Some("jquery".to_owned()),
+                package_version: Some("1.10.2".to_owned()),
+                ..Default::default()
+            }),
+            Some(("npm".to_owned(), "jquery".to_owned(), "1.10.2".to_owned()))
+        );
     }
 
     #[test]

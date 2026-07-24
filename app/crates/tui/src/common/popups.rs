@@ -50,7 +50,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
 }
 
 pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_rect(70, 58, frame.area());
+    let area = centered_rect(70, 66, frame.area());
     let form = &app.advanced;
     let lines = vec![
         advanced_line(
@@ -78,6 +78,18 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
             AdvancedField::ProductExact,
             "Product exact match",
             form.product_exact,
+        ),
+        advanced_line(
+            form,
+            AdvancedField::Ecosystem,
+            "Ecosystem (OSV)",
+            &form.ecosystem,
+        ),
+        advanced_line(
+            form,
+            AdvancedField::InstalledVersion,
+            "Installed version (OSV)",
+            &form.installed_version,
         ),
         advanced_line(form, AdvancedField::Vendor, "Vendor", &form.vendor),
         advanced_checkbox(

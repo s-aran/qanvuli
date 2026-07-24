@@ -13,6 +13,8 @@ pub(super) struct AdvancedForm {
     pub(super) cwe: String,
     pub(super) product: String,
     pub(super) product_exact: bool,
+    pub(super) ecosystem: String,
+    pub(super) installed_version: String,
     pub(super) vendor: String,
     pub(super) vendor_exact: bool,
     pub(super) state_scope: CveStateScope,
@@ -32,6 +34,8 @@ pub(super) enum AdvancedField {
     Cwe,
     Product,
     ProductExact,
+    Ecosystem,
+    InstalledVersion,
     Vendor,
     VendorExact,
     StateScope,
@@ -47,6 +51,8 @@ impl Default for AdvancedForm {
             cwe: String::new(),
             product: String::new(),
             product_exact: false,
+            ecosystem: String::new(),
+            installed_version: String::new(),
             vendor: String::new(),
             vendor_exact: false,
             state_scope: CveStateScope::PublishedOnly,
@@ -165,6 +171,8 @@ impl AdvancedForm {
             AdvancedField::PublishedTo => Some(&mut self.published_to),
             AdvancedField::Cwe => Some(&mut self.cwe),
             AdvancedField::Product => Some(&mut self.product),
+            AdvancedField::Ecosystem => Some(&mut self.ecosystem),
+            AdvancedField::InstalledVersion => Some(&mut self.installed_version),
             AdvancedField::Vendor => Some(&mut self.vendor),
             AdvancedField::ProductExact
             | AdvancedField::VendorExact
@@ -216,6 +224,8 @@ impl AdvancedForm {
                 | AdvancedField::PublishedTo
                 | AdvancedField::Cwe
                 | AdvancedField::Product
+                | AdvancedField::Ecosystem
+                | AdvancedField::InstalledVersion
                 | AdvancedField::Vendor
         )
     }
@@ -231,6 +241,8 @@ impl AdvancedForm {
             cwe: option_string(&self.cwe),
             product: (!self.product_exact).then(|| product.clone()).flatten(),
             product_exact: self.product_exact.then_some(product).flatten(),
+            package_ecosystem: option_string(&self.ecosystem),
+            package_version: option_string(&self.installed_version),
             vendor: (!self.vendor_exact).then(|| vendor.clone()).flatten(),
             vendor_exact: self.vendor_exact.then_some(vendor).flatten(),
             kev_only: false,
@@ -290,7 +302,9 @@ impl AdvancedField {
             Self::PublishedTo => Self::Cwe,
             Self::Cwe => Self::Product,
             Self::Product => Self::ProductExact,
-            Self::ProductExact => Self::Vendor,
+            Self::ProductExact => Self::Ecosystem,
+            Self::Ecosystem => Self::InstalledVersion,
+            Self::InstalledVersion => Self::Vendor,
             Self::Vendor => Self::VendorExact,
             Self::VendorExact => Self::StateScope,
             Self::StateScope => Self::Query,
@@ -305,7 +319,9 @@ impl AdvancedField {
             Self::Cwe => Self::PublishedTo,
             Self::Product => Self::Cwe,
             Self::ProductExact => Self::Product,
-            Self::Vendor => Self::ProductExact,
+            Self::Ecosystem => Self::ProductExact,
+            Self::InstalledVersion => Self::Ecosystem,
+            Self::Vendor => Self::InstalledVersion,
             Self::VendorExact => Self::Vendor,
             Self::StateScope => Self::VendorExact,
         }

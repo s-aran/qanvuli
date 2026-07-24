@@ -95,6 +95,10 @@ pub struct CveAdvancedSearch {
     pub cwe: Option<String>,
     pub product: Option<String>,
     pub product_exact: Option<String>,
+    /// OSV ecosystem used with package_version for verified package matching.
+    pub package_ecosystem: Option<String>,
+    /// Installed package version used with package_ecosystem for OSV range evaluation.
+    pub package_version: Option<String>,
     pub vendor: Option<String>,
     pub vendor_exact: Option<String>,
     pub kev_only: bool,
