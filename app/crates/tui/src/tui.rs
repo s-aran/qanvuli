@@ -384,6 +384,7 @@ async fn close_db_before_maintenance(
     }
     app.results.clear();
     app.osv_results.clear();
+    app.linked_osv.clear();
     app.enrichment.clear();
     app.total_results = None;
     Ok(())

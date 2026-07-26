@@ -16,7 +16,7 @@ use qanvuli_core::database::{
     CweEntry, EnrichedCveSummary, OsvSummary,
 };
 use ratatui::widgets::{ListState, Paragraph, Wrap};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 
@@ -42,8 +42,10 @@ pub(super) struct App {
     pub(super) advanced: AdvancedForm,
     pub(super) display: DisplaySettings,
     pub(super) limit: u64,
+    search_offset: u64,
     pub(super) results: Vec<CveSummaryWithDetail>,
     pub(super) osv_results: Vec<OsvSummary>,
+    pub(super) linked_osv: HashMap<String, Vec<OsvSummary>>,
     pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
     pub(super) focus: PaneFocus,
@@ -104,6 +106,7 @@ pub(super) enum PaneFocus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RightPaneTab {
     Cve,
+    Osv,
     Metadata,
     Enrichment,
 }
@@ -111,7 +114,8 @@ pub(super) enum RightPaneTab {
 impl RightPaneTab {
     pub(super) fn next(self) -> Self {
         match self {
-            Self::Cve => Self::Metadata,
+            Self::Cve => Self::Osv,
+            Self::Osv => Self::Metadata,
             Self::Metadata => Self::Enrichment,
             Self::Enrichment => Self::Cve,
         }
@@ -120,7 +124,8 @@ impl RightPaneTab {
     pub(super) fn previous(self) -> Self {
         match self {
             Self::Cve => Self::Enrichment,
-            Self::Metadata => Self::Cve,
+            Self::Osv => Self::Cve,
+            Self::Metadata => Self::Osv,
             Self::Enrichment => Self::Metadata,
         }
     }
@@ -128,6 +133,7 @@ impl RightPaneTab {
     pub(super) fn title(self) -> &'static str {
         match self {
             Self::Cve => "CVE",
+            Self::Osv => "OSV",
             Self::Metadata => "Metadata",
             Self::Enrichment => "Enrichment",
         }
@@ -245,8 +251,10 @@ impl App {
             advanced: AdvancedForm::default(),
             display: DisplaySettings::default(),
             limit,
+            search_offset: 0,
             results: Vec::new(),
             osv_results: Vec::new(),
+            linked_osv: HashMap::new(),
             total_results: None,
             list_state,
             focus: PaneFocus::Left,
@@ -419,7 +427,7 @@ impl App {
         }
 
         let request = self.searched_request.clone();
-        let offset = self.results.len().max(self.osv_results.len()) as u64;
+        let offset = self.search_offset;
         let select_offset = self.candidate_count();
         self.start_pending_search(
             db,
@@ -468,10 +476,11 @@ impl App {
         }
         match kind {
             SearchKind::Replace => {
-                self.exhausted = result.rows.len() < self.limit as usize
-                    && result.osv_rows.len() < self.limit as usize;
+                self.exhausted = result.exhausted;
+                self.search_offset = result.consumed;
                 self.results = result.rows;
                 self.osv_results = result.osv_rows;
+                self.linked_osv = result.linked_osv;
                 self.clear_detail();
                 self.select_candidate(0);
                 if let Some(count) = count {
@@ -480,10 +489,42 @@ impl App {
                 }
             }
             SearchKind::Append { select_offset } => {
-                self.exhausted = result.rows.len() < TUI_LOAD_MORE_LIMIT as usize
-                    && result.osv_rows.len() < TUI_LOAD_MORE_LIMIT as usize;
-                self.results.extend(result.rows);
-                self.osv_results.extend(result.osv_rows);
+                self.exhausted = result.exhausted;
+                self.search_offset = self.search_offset.saturating_add(result.consumed);
+                let mut cve_ids = self
+                    .results
+                    .iter()
+                    .map(|row| row.summary.cve_id.clone())
+                    .collect::<HashSet<_>>();
+                self.results.extend(
+                    result
+                        .rows
+                        .into_iter()
+                        .filter(|row| cve_ids.insert(row.summary.cve_id.clone())),
+                );
+                let mut osv_ids = self
+                    .osv_results
+                    .iter()
+                    .map(|row| row.osv_id.clone())
+                    .collect::<HashSet<_>>();
+                self.osv_results.extend(
+                    result
+                        .osv_rows
+                        .into_iter()
+                        .filter(|row| osv_ids.insert(row.osv_id.clone())),
+                );
+                for (cve_id, advisories) in result.linked_osv {
+                    let existing = self.linked_osv.entry(cve_id).or_default();
+                    let mut ids = existing
+                        .iter()
+                        .map(|row| row.osv_id.clone())
+                        .collect::<HashSet<_>>();
+                    existing.extend(
+                        advisories
+                            .into_iter()
+                            .filter(|row| ids.insert(row.osv_id.clone())),
+                    );
+                }
                 self.select_candidate(select_offset);
             }
         }
@@ -1096,11 +1137,27 @@ impl App {
     }
 
     pub(super) fn next_right_tab(&mut self) {
-        self.right_tab = self.right_tab.next();
+        self.right_tab = if self.selected_osv().is_some() {
+            match self.right_tab {
+                RightPaneTab::Cve | RightPaneTab::Osv => RightPaneTab::Metadata,
+                RightPaneTab::Metadata => RightPaneTab::Enrichment,
+                RightPaneTab::Enrichment => RightPaneTab::Cve,
+            }
+        } else {
+            self.right_tab.next()
+        };
     }
 
     pub(super) fn previous_right_tab(&mut self) {
-        self.right_tab = self.right_tab.previous();
+        self.right_tab = if self.selected_osv().is_some() {
+            match self.right_tab {
+                RightPaneTab::Cve | RightPaneTab::Osv => RightPaneTab::Enrichment,
+                RightPaneTab::Metadata => RightPaneTab::Cve,
+                RightPaneTab::Enrichment => RightPaneTab::Metadata,
+            }
+        } else {
+            self.right_tab.previous()
+        };
     }
 
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
@@ -1431,6 +1488,8 @@ impl App {
         self.display = DisplaySettings::default();
         self.results.clear();
         self.osv_results.clear();
+        self.linked_osv.clear();
+        self.search_offset = 0;
         self.enrichment.clear();
         self.total_results = None;
         self.list_state.select(Some(0));
@@ -1663,6 +1722,12 @@ impl App {
     fn max_metadata_scroll(&self) -> u16 {
         let line_count = match self.right_tab {
             RightPaneTab::Cve => 1,
+            RightPaneTab::Osv => Paragraph::new(crate::modes::main::right::osv_lines(
+                self,
+                &crate::common::DetailSearch::new(""),
+            ))
+            .wrap(Wrap { trim: false })
+            .line_count(self.metadata_content_width.min(u16::MAX as usize) as u16),
             RightPaneTab::Metadata => {
                 if let Some(cve) = self.selected() {
                     metadata_line_count(cve, self.metadata_content_width)

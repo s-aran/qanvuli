@@ -3,12 +3,16 @@ use qanvuli_core::database::{
     CveAdvancedQueryMode, CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary,
     CveSummaryWithDetail, EnrichedCveSummary, OsvSummary,
 };
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug)]
 pub(crate) struct SearchResult {
     pub(crate) rows: Vec<CveSummaryWithDetail>,
     pub(crate) osv_rows: Vec<OsvSummary>,
     pub(crate) enrichment: Vec<EnrichedCveSummary>,
+    pub(crate) linked_osv: HashMap<String, Vec<OsvSummary>>,
+    pub(crate) consumed: u64,
+    pub(crate) exhausted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -64,15 +68,22 @@ pub(crate) async fn run_search_request(
             } else {
                 search_osv_by_mode(&db, mode, &query, limit, offset).await?
             };
+            let consumed = rows.len().max(osv_rows.len()) as u64;
+            let exhausted = rows.len() < limit as usize && osv_rows.len() < limit as usize;
+            let (rows, osv_rows) = collapse_linked_osv(&db, rows, osv_rows, state_scope).await?;
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
                 .map_err(|err| err.to_string())?;
             let enrichment = load_enrichment_summaries(&db, &rows).await?;
+            let linked_osv = load_linked_osv(&db, &rows).await?;
             Ok(SearchResult {
                 rows,
                 osv_rows,
                 enrichment,
+                linked_osv,
+                consumed,
+                exhausted,
             })
         }
         SearchRequest::Advanced {
@@ -155,18 +166,86 @@ pub(crate) async fn run_search_request(
                 .await
                 .map_err(|err| err.to_string())?
             };
+            let consumed = rows.len().max(osv_rows.len()) as u64;
+            let exhausted = rows.len() < limit as usize && osv_rows.len() < limit as usize;
+            let (rows, osv_rows) = if include_cve {
+                collapse_linked_osv(&db, rows, osv_rows, options.state_scope).await?
+            } else {
+                (rows, osv_rows)
+            };
             let rows = db
                 .attach_cve_overview_details(rows)
                 .await
                 .map_err(|err| err.to_string())?;
             let enrichment = load_enrichment_summaries(&db, &rows).await?;
+            let linked_osv = load_linked_osv(&db, &rows).await?;
             Ok(SearchResult {
                 rows,
                 osv_rows,
                 enrichment,
+                linked_osv,
+                consumed,
+                exhausted,
             })
         }
     }
+}
+
+async fn load_linked_osv(
+    db: &CveDatabase,
+    rows: &[CveSummaryWithDetail],
+) -> Result<HashMap<String, Vec<OsvSummary>>, String> {
+    let cve_ids = rows
+        .iter()
+        .map(|row| row.summary.cve_id.clone())
+        .collect::<Vec<_>>();
+    db.osv_summaries_for_cve_ids(&cve_ids)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+async fn collapse_linked_osv(
+    db: &CveDatabase,
+    mut rows: Vec<CveSummary>,
+    osv_rows: Vec<OsvSummary>,
+    state_scope: CveStateScope,
+) -> Result<(Vec<CveSummary>, Vec<OsvSummary>), String> {
+    let osv_ids = osv_rows
+        .iter()
+        .map(|row| row.osv_id.clone())
+        .collect::<Vec<_>>();
+    let aliases = db
+        .cve_aliases_for_osv_ids(&osv_ids, state_scope)
+        .await
+        .map_err(|err| err.to_string())?;
+    if aliases.is_empty() {
+        return Ok((rows, osv_rows));
+    }
+
+    let mut known_cves = rows
+        .iter()
+        .map(|row| row.cve_id.clone())
+        .collect::<HashSet<_>>();
+    let promoted_ids = aliases
+        .values()
+        .flatten()
+        .filter(|cve_id| known_cves.insert((*cve_id).clone()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !promoted_ids.is_empty() {
+        rows.extend(
+            db.cve_summaries_by_ids_with_state_scope(&promoted_ids, state_scope)
+                .await
+                .map_err(|err| err.to_string())?,
+        );
+    }
+    let osv_rows = osv_rows
+        .into_iter()
+        .filter(|row| !aliases.contains_key(&row.osv_id))
+        .collect();
+    Ok((rows, osv_rows))
 }
 
 async fn search_osv_by_mode(
@@ -659,6 +738,76 @@ mod tests {
             assert!(result.rows.is_empty());
             assert!(result.osv_rows.is_empty());
             assert_eq!(run_count_request(db, request).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn linked_osv_result_is_promoted_to_its_cve() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+            db.import_cve_raw_json(
+                r#"{
+                    "cveMetadata":{
+                        "cveId":"CVE-2099-4242",
+                        "state":"PUBLISHED",
+                        "datePublished":"2099-01-01T00:00:00Z",
+                        "dateUpdated":"2099-01-01T00:00:00Z"
+                    },
+                    "containers":{"cna":{"title":"CVE fixture"}}
+                }"#
+                .to_owned(),
+            )
+            .await
+            .unwrap();
+            db.import_osv_records(vec![OsvRawRecord {
+                source_path: Some("GHSA-2099-promoted.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-2099-promoted",
+                    "published":"2099-01-01T12:00:00Z",
+                    "modified":"2099-01-02T00:00:00Z",
+                    "aliases":["CVE-2099-4242"],
+                    "summary":"unique-osv-search-needle",
+                    "details":"OSV details",
+                    "affected":[],
+                    "references":[]
+                }"#
+                .to_owned(),
+            }])
+            .await
+            .unwrap();
+
+            let result = run_search_request(
+                db,
+                SearchRequest::Mode {
+                    mode: SearchMode::FreeText,
+                    query: "unique-osv-search-needle".to_owned(),
+                    state_scope: CveStateScope::PublishedOnly,
+                    kev_only: false,
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].summary.cve_id, "CVE-2099-4242");
+            assert!(result.osv_rows.is_empty());
+            assert_eq!(result.enrichment.len(), 1);
+            assert_eq!(result.enrichment[0].osv_ids, "GHSA-2099-promoted");
+            let linked = &result.linked_osv["CVE-2099-4242"][0];
+            assert_eq!(linked.osv_id, "GHSA-2099-promoted");
+            assert_eq!(linked.summary.as_deref(), Some("unique-osv-search-needle"));
+            assert_eq!(linked.details.as_deref(), Some("OSV details"));
+            assert_eq!(linked.published_at.as_deref(), Some("2099-01-01T12:00:00Z"));
+            assert_eq!(result.consumed, 1);
+            assert!(result.exhausted);
         });
     }
 

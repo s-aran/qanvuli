@@ -18,6 +18,9 @@ pub(super) fn render(
     detail_search: &DetailSearch,
     area: Rect,
 ) {
+    if app.selected_osv().is_some() && app.right_tab == RightPaneTab::Osv {
+        app.right_tab = RightPaneTab::Cve;
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_style(app.focus == PaneFocus::Right));
@@ -31,6 +34,7 @@ pub(super) fn render(
 
     match app.right_tab {
         RightPaneTab::Cve => detail::MainDetailPanel.render(frame, app, detail_search, rows[1]),
+        RightPaneTab::Osv => render_lines(frame, app, osv_lines(app, detail_search), rows[1]),
         RightPaneTab::Metadata => render_lines(
             frame,
             app,
@@ -48,35 +52,44 @@ pub(super) fn render(
 }
 
 fn tab_title(app: &App) -> Tabs<'static> {
-    let titles = [
+    let tabs = visible_tabs(app);
+    let selected = tabs
+        .iter()
+        .position(|tab| *tab == app.right_tab)
+        .unwrap_or_default();
+    let titles = tabs
+        .into_iter()
+        .map(|tab| {
+            let title = if tab == RightPaneTab::Cve && app.selected_osv().is_some() {
+                "OSV"
+            } else {
+                tab.title()
+            };
+            if app.right_tab == tab {
+                Line::from(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(title)
+            }
+        })
+        .collect::<Vec<_>>();
+    Tabs::new(titles).select(selected)
+}
+
+fn visible_tabs(app: &App) -> Vec<RightPaneTab> {
+    [
         RightPaneTab::Cve,
+        RightPaneTab::Osv,
         RightPaneTab::Metadata,
         RightPaneTab::Enrichment,
     ]
     .into_iter()
-    .map(|tab| {
-        let title = if tab == RightPaneTab::Cve && app.selected_osv().is_some() {
-            "OSV"
-        } else {
-            tab.title()
-        };
-        if app.right_tab == tab {
-            Line::from(Span::styled(
-                title,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ))
-        } else {
-            Line::from(title)
-        }
-    })
-    .collect::<Vec<_>>();
-    Tabs::new(titles).select(match app.right_tab {
-        RightPaneTab::Cve => 0,
-        RightPaneTab::Metadata => 1,
-        RightPaneTab::Enrichment => 2,
-    })
+    .filter(|tab| *tab != RightPaneTab::Osv || app.selected_osv().is_none())
+    .collect()
 }
 
 fn render_lines(
@@ -114,6 +127,31 @@ fn enrichment_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static
         ];
     };
     render_enrichment(enrichment, detail_search)
+}
+
+pub(crate) fn osv_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static>> {
+    let Some(cve) = app.selected() else {
+        return vec![Line::from("No result")];
+    };
+    let Some(advisories) = app.linked_osv.get(&cve.summary.cve_id) else {
+        return vec![Line::from("No linked OSV advisories")];
+    };
+    let mut lines = Vec::new();
+    for (index, advisory) in advisories.iter().enumerate() {
+        if index != 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(highlighted_line(
+            &format!("Identifier: {}", advisory.osv_id),
+            detail_search,
+        ));
+        lines.extend(detail::osv_detail_lines(
+            advisory,
+            app.display.timezone,
+            detail_search,
+        ));
+    }
+    lines
 }
 
 fn render_enrichment(
@@ -222,4 +260,39 @@ fn split_summary_list(value: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qanvuli_core::database::OsvSummary;
+
+    #[test]
+    fn osv_result_hides_the_linked_osv_tab() {
+        let mut app = App::new(String::new(), 25);
+        app.osv_results.push(OsvSummary {
+            osv_id: "GHSA-2099-only".to_owned(),
+            schema_version: None,
+            published_at: None,
+            modified_at: None,
+            withdrawn_at: None,
+            summary: None,
+            details: None,
+            package_summary: None,
+        });
+        app.list_state.select(Some(0));
+
+        assert_eq!(
+            visible_tabs(&app),
+            vec![
+                RightPaneTab::Cve,
+                RightPaneTab::Metadata,
+                RightPaneTab::Enrichment
+            ]
+        );
+        app.next_right_tab();
+        assert_eq!(app.right_tab, RightPaneTab::Metadata);
+        app.previous_right_tab();
+        assert_eq!(app.right_tab, RightPaneTab::Cve);
+    }
 }

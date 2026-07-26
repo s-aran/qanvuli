@@ -429,6 +429,37 @@ impl SqlxDatabase {
         })).await
     }
 
+    pub async fn cve_summaries_by_ids_with_state_scope(
+        &self,
+        ids: &[String],
+        scope: CveStateScope,
+    ) -> Result<Vec<CveSummary>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json =
+            serde_json::to_string(ids).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let include_rejected = include_rejected(scope);
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows = sqlx::query_as(
+                        "SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en \
+                         FROM json_each(?) AS requested \
+                         JOIN cve AS c ON c.cve_id=requested.value \
+                         WHERE (? OR c.state=0) \
+                         ORDER BY CAST(requested.key AS INTEGER)",
+                    )
+                    .bind(ids_json)
+                    .bind(include_rejected)
+                    .fetch_all(connection)
+                    .await?;
+                    Ok(rows.into_iter().map(summary).collect())
+                })
+            })
+            .await
+    }
+
     pub async fn search_cve_summaries_by_cwe_with_state_scope(
         &self,
         cwe_ids: &[String],
@@ -798,6 +829,97 @@ impl SqlxDatabase {
             }
         }
         Ok(rows)
+    }
+
+    /// Resolves a page of OSV advisories to CVEs that exist in the local CVE table.
+    ///
+    /// The `osv_aliases` primary key starts with `osv_id`, so this remains one indexed
+    /// lookup for the whole page instead of an identifier-graph query per result.
+    pub async fn cve_aliases_for_osv_ids(
+        &self,
+        ids: &[String],
+        scope: CveStateScope,
+    ) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids_json =
+            serde_json::to_string(ids).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let include_rejected = include_rejected(scope);
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows: Vec<(String, String)> = sqlx::query_as(
+                        "SELECT alias.osv_id, cve.cve_id \
+                         FROM osv_aliases AS alias \
+                         JOIN cve ON cve.cve_id=alias.alias_id \
+                         WHERE alias.osv_id IN (SELECT value FROM json_each(?)) \
+                           AND (? OR cve.state=0) \
+                         ORDER BY alias.osv_id, cve.cve_id",
+                    )
+                    .bind(ids_json)
+                    .bind(include_rejected)
+                    .fetch_all(connection)
+                    .await?;
+                    let mut aliases = HashMap::<String, Vec<String>>::new();
+                    for (osv_id, cve_id) in rows {
+                        aliases.entry(osv_id).or_default().push(cve_id);
+                    }
+                    Ok(aliases)
+                })
+            })
+            .await
+    }
+
+    /// Loads complete OSV summaries for a page of CVEs in one indexed query.
+    pub async fn osv_summaries_for_cve_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<HashMap<String, Vec<OsvSummary>>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids_json =
+            serde_json::to_string(ids).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT alias.alias_id AS cve_id, advisory.osv_id, \
+                                advisory.schema_version, advisory.published_at, \
+                                advisory.modified_at, advisory.withdrawn_at, \
+                                advisory.summary, advisory.details, \
+                                (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') \
+                                 FROM osv_affected_packages AS package \
+                                 WHERE package.osv_id=advisory.osv_id) AS package_summary \
+                         FROM osv_aliases AS alias \
+                         JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id \
+                         WHERE alias.alias_id IN (SELECT value FROM json_each(?)) \
+                         ORDER BY alias.alias_id, advisory.modified_at DESC, advisory.osv_id",
+                    )
+                    .bind(ids_json)
+                    .fetch_all(connection)
+                    .await?;
+                    let mut advisories = HashMap::<String, Vec<OsvSummary>>::new();
+                    for row in rows {
+                        advisories
+                            .entry(row.try_get("cve_id")?)
+                            .or_default()
+                            .push(OsvSummary {
+                                osv_id: row.try_get("osv_id")?,
+                                schema_version: row.try_get("schema_version")?,
+                                published_at: row.try_get("published_at")?,
+                                modified_at: row.try_get("modified_at")?,
+                                withdrawn_at: row.try_get("withdrawn_at")?,
+                                summary: row.try_get("summary")?,
+                                details: row.try_get("details")?,
+                                package_summary: row.try_get("package_summary")?,
+                            });
+                    }
+                    Ok(advisories)
+                })
+            })
+            .await
     }
 
     pub async fn osv_advisory_families(&self) -> Result<Vec<String>, sqlx::Error> {

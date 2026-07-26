@@ -3,7 +3,7 @@ pub(crate) mod detail;
 pub(crate) mod handler;
 mod keyword;
 mod metadata;
-mod right;
+pub(crate) mod right;
 pub(crate) mod status;
 
 use crate::traits::{keyword::KeywordInput, list::ResultList, status::StatusLine};
