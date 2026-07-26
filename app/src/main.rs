@@ -1,7 +1,11 @@
 use clap::{CommandFactory, Parser, Subcommand};
-use qanvuli_app_commands::common::default_db_connection_string;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use qanvuli_app_commands::common::{
+    IngestProgress, IngestProgressCallback, default_db_connection_string,
+};
 use std::ffi::OsString;
 use std::io::IsTerminal;
+use std::sync::{Arc, Mutex};
 
 fn main() {
     qanvuli_utils::logging::init();
@@ -41,8 +45,40 @@ fn run() -> Result<(), String> {
     runtime.block_on(async {
         match command {
             Command::Help => Ok(()),
-            Command::Init(args) => qanvuli_app_commands::init::run(&db_url, args).await,
-            Command::Update(args) => qanvuli_app_commands::update::run(&db_url, args).await,
+            Command::Init(args) => {
+                if args.use_progress() {
+                    let display = CliProgress::new("init");
+                    let silence = qanvuli_utils::logging::suppress();
+                    let result = qanvuli_app_commands::init::run_with_cli_progress(
+                        &db_url,
+                        args,
+                        display.callback(),
+                    )
+                    .await;
+                    drop(silence);
+                    display.finish(&result);
+                    result
+                } else {
+                    qanvuli_app_commands::init::run(&db_url, args).await
+                }
+            }
+            Command::Update(args) => {
+                if args.use_progress() {
+                    let display = CliProgress::new("update");
+                    let silence = qanvuli_utils::logging::suppress();
+                    let result = qanvuli_app_commands::update::run_with_cli_progress(
+                        &db_url,
+                        args,
+                        display.callback(),
+                    )
+                    .await;
+                    drop(silence);
+                    display.finish(&result);
+                    result
+                } else {
+                    qanvuli_app_commands::update::run(&db_url, args).await
+                }
+            }
             Command::DownloadCve(args) => qanvuli_app_commands::download_cve::run(args).await,
             Command::Graph(args) => qanvuli_app_commands::graph::run(&db_url, args).await,
             Command::Query(args) => qanvuli_app_commands::query::run(&db_url, args).await,
@@ -57,6 +93,105 @@ fn run() -> Result<(), String> {
             Command::Mcp => Ok(()),
         }
     })
+}
+
+struct CliProgress {
+    operation: &'static str,
+    progress: Arc<MultiProgress>,
+    active: Arc<Mutex<ActiveProgress>>,
+}
+
+struct ActiveProgress {
+    bar: ProgressBar,
+    task: Option<String>,
+}
+
+impl CliProgress {
+    fn new(operation: &'static str) -> Self {
+        let progress = Arc::new(MultiProgress::new());
+        let bar = progress.add(ProgressBar::new_spinner());
+        bar.set_style(spinner_style());
+        bar.set_message(format!("{operation}: starting"));
+        bar.enable_steady_tick(std::time::Duration::from_millis(80));
+        Self {
+            operation,
+            progress,
+            active: Arc::new(Mutex::new(ActiveProgress { bar, task: None })),
+        }
+    }
+
+    fn callback(&self) -> IngestProgressCallback {
+        let progress_group = self.progress.clone();
+        let active = self.active.clone();
+        Arc::new(move |progress: IngestProgress| {
+            let asset = std::path::Path::new(&progress.asset)
+                .file_name()
+                .and_then(|name| name.to_str());
+            let task = match asset {
+                Some(asset) if progress.asset != "-" => {
+                    format!("{}: {} ({asset})", progress.label, progress.phase)
+                }
+                _ => format!("{}: {}", progress.label, progress.phase),
+            };
+            let Ok(mut active) = active.lock() else {
+                return;
+            };
+            if active.task.as_deref() != Some(&task) {
+                if let Some(previous) = active.task.take() {
+                    active.bar.finish_with_message(format!("✓ {previous}"));
+                    active.bar = progress_group.add(ProgressBar::new_spinner());
+                    active
+                        .bar
+                        .enable_steady_tick(std::time::Duration::from_millis(80));
+                }
+                active.task = Some(task.clone());
+            }
+            if progress.total_files > 0 {
+                active.bar.set_length(progress.total_files as u64);
+                active.bar.set_position(progress.written_files as u64);
+                active.bar.set_style(
+                    ProgressStyle::with_template(
+                        "{spinner:.cyan} {msg} [{bar:38.cyan/blue}] {pos}/{len} [{elapsed_precise}]",
+                    )
+                    .expect("valid progress bar template")
+                    .progress_chars("━━╸"),
+                );
+            } else {
+                active.bar.set_style(spinner_style());
+            }
+            active.bar.set_message(task);
+        })
+    }
+
+    fn finish(&self, result: &Result<(), String>) {
+        let Ok(mut active) = self.active.lock() else {
+            return;
+        };
+        let task = active
+            .task
+            .take()
+            .unwrap_or_else(|| format!("{}: starting", self.operation));
+        match result {
+            Ok(()) => {
+                active.bar.finish_with_message(format!("✓ {task}"));
+                let _ = self
+                    .progress
+                    .println(format!("✓ {} completed", self.operation));
+            }
+            Err(_) => {
+                active.bar.abandon_with_message(format!("✗ {task}"));
+                let _ = self
+                    .progress
+                    .println(format!("✗ {} failed", self.operation));
+            }
+        }
+    }
+}
+
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner:.cyan} {msg}  [{elapsed_precise}]")
+        .expect("valid progress spinner template")
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ")
 }
 
 #[derive(Debug, Parser)]

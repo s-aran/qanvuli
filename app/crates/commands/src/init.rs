@@ -16,6 +16,9 @@ use std::time::Instant;
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
+    /// Use the traditional detailed log output instead of a progress bar.
+    #[arg(long)]
+    no_progress: bool,
     #[arg(long, value_name = "PATH")]
     zip: Option<PathBuf>,
     #[arg(long, value_name = "N")]
@@ -32,9 +35,25 @@ pub struct Args {
     osv_prefixes: Vec<String>,
 }
 
+impl Args {
+    /// Returns whether the CLI should render modern progress output.
+    pub fn use_progress(&self) -> bool {
+        !self.no_progress
+    }
+}
+
 /// Builds and installs a replacement vulnerability database.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
+}
+
+/// Builds and installs a replacement database while reporting progress.
+pub async fn run_with_cli_progress(
+    db_url: &str,
+    args: Args,
+    progress: IngestProgressCallback,
+) -> Result<(), String> {
+    run_with_progress(db_url, args, Some(progress)).await
 }
 
 async fn run_with_progress(
@@ -109,7 +128,7 @@ async fn run_with_progress(
         emit_init_progress(
             &progress_for_build,
             &asset_for_build.display().to_string(),
-            "importing",
+            "importing CVE chunks",
         );
         db_for_build
             .initialize()
@@ -130,6 +149,7 @@ async fn run_with_progress(
             &asset_for_build,
             max_chunks,
             index_started_tx,
+            progress_for_build.clone(),
         )
         .await;
         let osv_download_result = osv_download_task
@@ -149,15 +169,40 @@ async fn run_with_progress(
                 .await
                 .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
         }
+        emit_init_progress(
+            &progress_for_build,
+            &asset_for_build.display().to_string(),
+            "synchronizing CWE catalog",
+        );
         sync_cwe_catalog(db_for_build.clone()).await?;
+        emit_init_progress(
+            &progress_for_build,
+            &asset_for_build.display().to_string(),
+            "synchronizing CAPEC catalog",
+        );
         sync_capec_catalog(db_for_build.clone()).await?;
+        emit_init_progress(
+            &progress_for_build,
+            &asset_for_build.display().to_string(),
+            "importing OSV advisories",
+        );
         import_downloaded_osv_selection(
             db_for_build.clone(),
             osv_download_result?,
             OsvImportMode::InitialReplacement,
         )
         .await?;
+        emit_init_progress(
+            &progress_for_build,
+            &asset_for_build.display().to_string(),
+            "synchronizing risk feeds",
+        );
         sync_risk_feeds(db_for_build.clone(), "init", false).await?;
+        emit_init_progress(
+            &progress_for_build,
+            &asset_for_build.display().to_string(),
+            "validating replacement database",
+        );
         validate_replacement_database(&db_for_build).await
     }
     .await;
@@ -282,6 +327,25 @@ mod tests {
     use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
     use sqlx::{Connection, Executor};
     use std::io::Write;
+
+    #[test]
+    fn only_no_progress_disables_modern_progress() {
+        assert!(Args::default().use_progress());
+        assert!(
+            Args {
+                keep: true,
+                ..Args::default()
+            }
+            .use_progress()
+        );
+        assert!(
+            !Args {
+                no_progress: true,
+                ..Args::default()
+            }
+            .use_progress()
+        );
+    }
 
     fn temporary_database(label: &str) -> (PathBuf, String) {
         let path = std::env::temp_dir().join(format!(

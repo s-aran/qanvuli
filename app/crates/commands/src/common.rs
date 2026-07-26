@@ -1464,8 +1464,28 @@ pub async fn apply_delta_updates(
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
+    apply_delta_updates_with_progress(db, zip, max_chunks, None).await
+}
+
+/// Applies local or downloaded CVE deltas and optionally reports import progress.
+pub async fn apply_delta_updates_with_progress(
+    db: &SqlxDatabase,
+    zip: Option<PathBuf>,
+    max_chunks: Option<usize>,
+    progress: Option<IngestProgressCallback>,
+) -> Result<Vec<PathBuf>, String> {
     if let Some(path) = zip {
-        import_cve_zip(db.clone(), "update", &path, max_chunks).await?;
+        import_cve_zip_with_mode(
+            db.clone(),
+            "update",
+            &path,
+            max_chunks,
+            false,
+            true,
+            None,
+            progress,
+        )
+        .await?;
         return Ok(vec![path]);
     }
 
@@ -1496,7 +1516,17 @@ pub async fn apply_delta_updates(
                 .await
                 .map_err(|error| format!("failed to download {}: {error}", asset.name))?;
             database_changed = true;
-            import_cve_zip_deferred(db.clone(), "update", &path, max_chunks).await?;
+            import_cve_zip_with_mode(
+                db.clone(),
+                "update",
+                &path,
+                max_chunks,
+                false,
+                false,
+                None,
+                progress.clone(),
+            )
+            .await?;
             db.mark_cve_asset_applied(&asset.name, &asset.url)
                 .await
                 .map_err(|error| format!("failed to record CVE delta {}: {error}", asset.name))?;
@@ -1556,16 +1586,28 @@ pub async fn import_cve_zip(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, true, None).await
+    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, true, None, None).await
 }
 
-async fn import_cve_zip_deferred(
+/// Imports CVE JSON from a ZIP archive while reporting progress.
+pub async fn import_cve_zip_with_progress(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
     max_chunks: Option<usize>,
+    progress: IngestProgressCallback,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, false, None).await
+    import_cve_zip_with_mode(
+        db,
+        label,
+        asset_path,
+        max_chunks,
+        false,
+        true,
+        None,
+        Some(progress),
+    )
+    .await
 }
 
 /// Imports a replacement archive with deferred indexes.
@@ -1575,7 +1617,7 @@ pub async fn import_cve_zip_bulk(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, true, true, None).await
+    import_cve_zip_with_mode(db, label, asset_path, max_chunks, true, true, None, None).await
 }
 
 pub(crate) async fn import_cve_zip_bulk_with_index_signal(
@@ -1584,6 +1626,7 @@ pub(crate) async fn import_cve_zip_bulk_with_index_signal(
     asset_path: &Path,
     max_chunks: Option<usize>,
     index_started: oneshot::Sender<()>,
+    progress: Option<IngestProgressCallback>,
 ) -> Result<usize, String> {
     import_cve_zip_with_mode(
         db,
@@ -1593,6 +1636,7 @@ pub(crate) async fn import_cve_zip_bulk_with_index_signal(
         true,
         true,
         Some(index_started),
+        progress,
     )
     .await
 }
@@ -1605,10 +1649,21 @@ async fn import_cve_zip_with_mode(
     bulk_replace: bool,
     rebuild_after: bool,
     index_started: Option<oneshot::Sender<()>>,
+    progress: Option<IngestProgressCallback>,
 ) -> Result<usize, String> {
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
     let entries = storage.entries();
+    let total_chunks = ingest_chunk_count(entries.len(), max_chunks);
+    emit_ingest_progress(
+        &progress,
+        label,
+        asset_path,
+        "importing CVE chunks",
+        total_chunks,
+        0,
+        0,
+    );
     eprintln!("{label}: enumerated {} CVE JSON entries", entries.len());
     // Keep the already parsed central directory and archive handle for every chunk. Reopening a
     // 360k-entry ZIP in Rayon task initializers repeatedly dominates decompression time.
@@ -1656,6 +1711,15 @@ async fn import_cve_zip_with_mode(
         })?;
         imported += count;
         changed_cve_ids.extend(cve_ids);
+        emit_ingest_progress(
+            &progress,
+            &label,
+            asset_path,
+            "importing CVE chunks",
+            total_chunks,
+            (chunk_index + 1).min(total_chunks),
+            0,
+        );
         eprintln!(
             "{label}: committed CVE chunk {chunk_index} in {:?}",
             write_started.elapsed()
@@ -1663,6 +1727,15 @@ async fn import_cve_zip_with_mode(
     }
     if !rebuild_after {
         if !bulk_replace {
+            emit_ingest_progress(
+                &progress,
+                label,
+                asset_path,
+                "refreshing CVE search data",
+                0,
+                0,
+                0,
+            );
             eprintln!(
                 "{label}: refreshing CVE search rows for {} changed CVE records",
                 changed_cve_ids.len()
@@ -1673,6 +1746,15 @@ async fn import_cve_zip_with_mode(
         }
         return Ok(imported);
     }
+    emit_ingest_progress(
+        &progress,
+        label,
+        asset_path,
+        "rebuilding CVE search indexes",
+        0,
+        0,
+        0,
+    );
     let fts_started = Instant::now();
     eprintln!("{label}: rebuilding CVE search indexes");
     if bulk_replace {
@@ -1700,6 +1782,34 @@ async fn import_cve_zip_with_mode(
         .await
         .map_err(|error| format!("{label}: database integrity check failed: {error}"))?;
     Ok(imported)
+}
+
+fn ingest_chunk_count(entry_count: usize, max_chunks: Option<usize>) -> usize {
+    let available_chunks = entry_count.div_ceil(INGEST_CHUNK_SIZE);
+    max_chunks
+        .map(|maximum| available_chunks.min(maximum))
+        .unwrap_or(available_chunks)
+}
+
+fn emit_ingest_progress(
+    progress: &Option<IngestProgressCallback>,
+    label: &str,
+    asset_path: &Path,
+    phase: &str,
+    total_files: usize,
+    written_files: usize,
+    failed_files: usize,
+) {
+    if let Some(progress) = progress {
+        progress(IngestProgress {
+            label: label.to_owned(),
+            asset: asset_path.display().to_string(),
+            phase: phase.to_owned(),
+            total_files,
+            written_files,
+            failed_files,
+        });
+    }
 }
 
 /// Reads one CVE ZIP chunk using the access strategy matching its backing store.
@@ -1736,6 +1846,14 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ingest_progress_uses_bounded_chunk_count() {
+        assert_eq!(ingest_chunk_count(0, None), 0);
+        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE, None), 1);
+        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE + 1, None), 2);
+        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE * 10, Some(3)), 3);
+    }
 
     #[test]
     fn full_cve_filename_provides_a_safe_delta_cursor() {

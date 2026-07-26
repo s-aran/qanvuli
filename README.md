@@ -58,6 +58,7 @@ Use an existing CVE archive or reduce peak disk use:
 ```bash
 qanvuli init --zip ./data/all-cves.zip
 qanvuli init --remove-existing-first
+qanvuli init --no-progress
 ```
 
 `init` normally builds and validates a candidate beside the active database, then installs it with rollback protection. A failed build leaves the active database unchanged. Run initialization while other qanvuli processes are stopped.
@@ -70,6 +71,7 @@ Apply current deltas and refresh enrichment feeds:
 qanvuli update
 qanvuli update --zip ./data/delta.zip
 qanvuli update --osv-refresh-all
+qanvuli update --no-progress
 ```
 
 `--osv-refresh-all` ignores the OSV cursor and upserts complete selected snapshots. Missing snapshot entries are not treated as deletions; withdrawn advisories remain available with their withdrawal timestamp.

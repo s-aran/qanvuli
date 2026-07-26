@@ -3,6 +3,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
 const STDOUT_TARGET: &str = "qanvuli::stdout";
@@ -17,6 +18,9 @@ impl Log for QanvuliLogger {
 
     fn log(&self, record: &Record<'_>) {
         if !self.enabled(record.metadata()) {
+            return;
+        }
+        if SILENCE_DEPTH.load(Ordering::Relaxed) > 0 {
             return;
         }
         if let Ok(mut output) = file_output().lock()
@@ -57,6 +61,7 @@ impl Log for QanvuliLogger {
 
 static LOGGER: QanvuliLogger = QanvuliLogger;
 static INIT: Once = Once::new();
+static SILENCE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 struct FileOutput {
     path: PathBuf,
     file: Option<File>,
@@ -84,6 +89,20 @@ pub fn stdout(args: fmt::Arguments<'_>) {
 pub fn stderr(args: fmt::Arguments<'_>) {
     init();
     log::info!(target: STDERR_TARGET, "{args}");
+}
+
+/// Suppresses logger output until the returned guard is dropped.
+pub fn suppress() -> SilenceGuard {
+    SILENCE_DEPTH.fetch_add(1, Ordering::Relaxed);
+    SilenceGuard
+}
+
+pub struct SilenceGuard;
+
+impl Drop for SilenceGuard {
+    fn drop(&mut self) {
+        SILENCE_DEPTH.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Redirects logs to `path` until the returned guard is dropped.

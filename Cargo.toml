@@ -25,6 +25,7 @@ qanvuli-app-tui = { version = "*", path = "app/crates/tui", default-features = f
 qanvuli-core = { version = "*", path = "core", default-features = false }
 qanvuli-utils = { version = "*", path = "utils" }
 clap = { version = "4.6", features = ["derive"] }
+indicatif = "0.18"
 tokio = { version = "1.53", features = ["io-std", "macros", "rt", "sync"] }
 
 
