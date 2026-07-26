@@ -21,7 +21,7 @@ pub async fn run(args: Args) -> Result<(), String> {
     let output_path = args.output_dir.join(filename);
 
     asset
-        .async_download_as(&output_path)
+        .download_to(&output_path)
         .await
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     println!("{}", output_path.display());

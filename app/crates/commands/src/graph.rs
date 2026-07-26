@@ -1,4 +1,4 @@
-use super::common::{connect_sqlx_db, print_json};
+use super::common::{connect_database, print_json};
 
 /// CLI arguments for `qanvuli graph`.
 #[derive(Debug, clap::Args)]
@@ -15,7 +15,7 @@ enum Command {
 
 /// Runs an identifier graph maintenance subcommand.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;

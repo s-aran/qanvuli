@@ -95,32 +95,32 @@ impl Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show help. This is also the default mode.
+    /// Show help.
     Help,
-    /// Build and install a complete replacement database from current vulnerability sources.
+    /// Build a replacement database from current vulnerability feeds.
     ///
     /// Full initialization downloads and imports the all-CVE archive, so it can take a while.
     Init(qanvuli_app_commands::init::Args),
-    /// Apply the latest delta CVE zip to the DB.
+    /// Apply CVE deltas and refresh enrichment feeds.
     Update(qanvuli_app_commands::update::Args),
-    /// Download a CVE zip only. It does not touch the DB.
+    /// Download a CVE archive without changing the database.
     DownloadCve(qanvuli_app_commands::download_cve::Args),
-    /// Build or rebuild cross-source vulnerability identifier graph data.
+    /// Rebuild cross-source identifier relationships.
     Graph(qanvuli_app_commands::graph::Args),
-    /// Run cross-source and enriched vulnerability queries.
+    /// Query identifiers, packages, and enrichment data.
     Query(qanvuli_app_commands::query::Args),
-    /// Inspect local database status.
+    /// Inspect and maintain the database.
     Db(qanvuli_app_commands::db::Args),
-    /// Search or fetch the local CWE catalog.
+    /// Search the CWE catalog.
     Cwe(qanvuli_app_commands::cwe::Args),
-    /// Search or fetch the local CAPEC catalog.
+    /// Search the CAPEC catalog.
     Capec(qanvuli_app_commands::capec::Args),
-    /// Search existing CVE DB records.
+    /// Search CVE and OSV records.
     Search(qanvuli_app_commands::search::Args),
-    /// Open an interactive terminal UI for free-word CVE search.
+    /// Open the terminal UI.
     #[cfg(feature = "tui")]
     Tui(qanvuli_app_tui::Args),
-    /// Read a GitHub SBOM JSON and report matching CVEs.
+    /// Scan a GitHub SBOM with local vulnerability data.
     Sbom(qanvuli_app_commands::sbom::Args),
     /// Run the MCP server over stdio.
     #[cfg(feature = "mcp")]

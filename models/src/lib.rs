@@ -228,7 +228,7 @@ mod tests {
     }"#;
 
     #[test]
-    fn test_parse_json_with_raw_json() {
+    fn parses_typed_and_raw_cve_data() {
         let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
 
         assert_eq!(parsed.raw_json()["cveMetadata"]["cveId"], "CVE-2024-0001");
@@ -236,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_json_getter_returns_original_json_value() {
+    fn raw_json_returns_original_value() {
         let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
         let expected_raw_json: Value = serde_json::from_str(CVE_JSON).unwrap();
 
@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn test_raw_parse_str_with_raw() {
+    fn into_parts_preserves_typed_and_raw_data() {
         let parsed = parse_str_with_raw::<PublishedCveRoot>(CVE_JSON).unwrap();
         let (content, raw_json) = parsed.into_parts();
 
@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_json_with_raw() {
+    fn parses_status_and_raw_data() {
         let parsed = parse_json_with_raw(CVE_JSON).unwrap();
 
         assert_eq!(parsed.raw_json()["cveMetadata"]["cveId"], "CVE-2024-0001");
@@ -265,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extracts_cna_child_raw_json_values() {
+    fn extracts_cna_child_values() {
         let src = r#"{
             "containers": {
                 "cna": {
@@ -318,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn test_json() {
+    fn parses_flat_delta_fixture_directory() {
         const DIR: &str = "deltaCves";
         let mut glob_options = MatchOptions::new();
         glob_options.case_sensitive = false;
@@ -329,16 +329,17 @@ mod tests {
         for path in files {
             let p = path.unwrap().to_string_lossy().to_string();
             println!("{}", p);
-            let mut file = File::open(p).expect("maybe not found");
+            let mut file = File::open(p).expect("fixture file should open");
             let mut buf = String::new();
-            let _ = file.read_to_string(&mut buf);
+            file.read_to_string(&mut buf)
+                .expect("fixture file should be readable");
 
             let _: cve::published::root::CveRoot = serde_json::from_str(&buf).unwrap();
         }
     }
 
     #[test]
-    fn test_json_2() {
+    fn parses_nested_cve_fixture_directory_by_state() {
         const DIR: &str = "cves";
         let mut glob_options = MatchOptions::new();
         glob_options.case_sensitive = false;
@@ -349,9 +350,10 @@ mod tests {
         for path in files {
             let p = path.unwrap().to_string_lossy().to_string();
             println!("{}", p);
-            let mut file = File::open(p).expect("maybe not found");
+            let mut file = File::open(p).expect("fixture file should open");
             let mut buf = String::new();
-            let _ = file.read_to_string(&mut buf);
+            file.read_to_string(&mut buf)
+                .expect("fixture file should be readable");
 
             let cve: CveRoot = serde_json::from_str(&buf).unwrap();
             match cve.cve_metadata.state {

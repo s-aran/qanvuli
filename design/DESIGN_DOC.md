@@ -1,108 +1,52 @@
-# Design Doc
+# qanvuli 設計概要
 
-Qanvuli
+![qanvuli logo](./logo.svg)
 
-![img](./logo.svg)
+- Status: Draft
+- Author: Sumiishi Aran
+- Last updated: 2026-07-26
 
+## 目的
 
-* Status: Draft
-* Author: Sumiishi Aran
-* Last Updated: 2026-04-19
+qanvuliは公開されている脆弱性フィードをSQLiteへ取り込み、ローカル検索を提供する。
+外部サービスのレート制限や可用性に依存せず、大量・反復検索を実行できることを目的とする。
 
+対象データはCVE、CWE、CAPEC、OSV、CISA KEV、FIRST EPSSである。CLI、TUI、Rust API、MCPサーバーから同じデータベースを利用する。
 
-## 概要
+## 責務
 
-"Qanvuli" はCVE.orgから発行されるCVE情報をローカルデータベースに保存して，検索を高速で検索することを実現するソフトウェアコンポーネントである。
+- 外部フィードとリリース資産の取得
+- 入力形式の検証と正規化
+- SQLiteデータベースの構築と差分更新
+- FTSと識別子グラフの生成
+- CVE、パッケージ、CWE、CAPEC、リスク情報の検索
+- 置換、更新、検索構造の整合性確認
 
-本ソフトウェアの責務は，CVEデータの取得，正規化，ローカルデータベースへの反映，検索APIの提供である。
+SaaSの運用、ベンダー固有の未公開情報の収集、OSVが対応しないバージョン方式の推測は責務に含めない。
 
-本ソフトウェアはアプリケーションやWebサービスとして提供されるものではない。ソフトウェアコンポーネントであり，ライブラリーとして他のアプリケーションに組込まれて使用されることを想定している。
+## 構成
 
-### 背景
+![high-level architecture](./diagram1.png)
 
-CVE.orgや関連サイトでは検索が行なえるが，
-* 検索機能が限定的である
-* レート制限や利用規約の影響を受ける
-* 大量の検索や定期的な検索用途には向かない
-* 外部サービスの可用性に依存する
+- `collector`: CVE、CWE、CAPEC、OSV、KEV、EPSSの取得
+- `models`: 外部形式のデシリアライズと検証
+- `db`: スキーマ、インポート、検索、DB置換
+- `core`: アプリケーション向け公開API
+- `app`: CLI、TUI、MCP
 
-一方でCVEのJSONデータはGitHubで公開されており，ローカルにDBを構築することで公式や関連サイトを参照することなく脆弱性情報が得られる。
+## データ更新
 
+初期化ではCVE Listの全件アーカイブと関連フィードから候補DBを構築する。候補DBのスキーマ、検索投影、インデックスを検証して接続を閉じた後、同一ファイルシステム上で既存DBと置き換える。
+失敗時は既存DBを維持する。
 
-## やること
+更新ではCVE差分を公開日時順に適用し、CWE、CAPEC、OSV、KEV、EPSSを同期する。OSVの同期カーソルは、投入と検証が完了した時点で更新する。
 
-1. 公式CVEをローカルデータベースに同期すること
-1. データベースの一括挿入と差分挿入の両方を扱えること
-1. GitHubからCVEのJSONファイルを取得してローカルDBを構築する
-1. ソフトウェアコンポーネント(e.g., ライブラリー、クレート)として提供する
+大容量の二重ZIPは、サイズに応じてメモリまたは一時ファイルから読み込む。ディスク上のZIPは順次読み込み、メモリ上のZIPのみ並列展開する。
 
-## やらないこと
+## 検索
 
-1. SaaSとして一般提供する
-1. SBOMや同等のソフトウェア部品表ないし構成表やそれに準ずるデータの読み取り
-1. CVE以外の脆弱性情報の取り込み
+検索値はSQLへ直接連結せず、バインド変数として渡す。FTSはCVEとOSVの自由文検索に使用し、構造化条件は正規化テーブルへ適用する。
 
+パッケージ検索はOSVの明示バージョンと対応済み範囲形式を評価する。名前が一致しただけの候補を脆弱と判定しない。別名グラフでは同一性を表すaliasだけを推移的に解決し、upstreamとrelatedは別の関係として保持する。
 
-## 詳細設計
-
-### 高レベルアーキテクチャー
-
-
-![img](./diagram1.png)
-
-#### 構成要素
-
-1. CVEのJSONファイルをGitHubから取得する
-1. SQLiteのデータベースに書き込む
-1. 指定されたクエリーに従ってSQLiteのデータベースを検索する
-
-
-
-### CVEのJSONファイルをGitHubから取得する
-
-CVE.orgが提供する脆弱性情報はGitHubの該当リポジトリのリリースページからダウンロードする機能を開発する。
-CVE公式のJSONファイルが格納されているリポジトリは以下のとおりである。
-https://github.com/CVEProject/cvelistV5
-
-このリポジトリは1時間毎に更新される。更新内容は以下の通りである:
-* 全期間の脆弱性データ: `*_all_CVEs_at_midnight.zip.zip`
-* 前回との差分: `*_delta_CVEs_at_*.zip`
-
-使い分けは以下の通りとする:
-* 全期間の脆弱性データ
-    * 初回
-    * ローカルデータベースの最終更新日時が24時間経過
-* 前回との差分
-    * ローカルデータベースの最終更新日時が24時間未満
-
-この使い分けが存在するため，データベース格納には2つのモードを設ける
-* 
-
-### SQLiteのデータベースに書き込む
-
-データベースは別資料に記載のテーブル構成とする。
-
-
-
-### 指定されたクエリーに従ってSQLiteのデータベースを検索する
-
-ORMライクな検索クエリーとする。
-例えば以下のような呼び出し方法である。
-
-```rust
-// 1件を引き当てる
-let id_q = qanvuli::model::query::id::new("CVE-YYYY-NNNNN");
-let cve = id_q.as_cve();
-
-// 期間で抽出する
-let published_q = qanvuli::model::query::published::new();
-let published_start_q = published_q.gte("2020-01-01");
-let published_end_q = published_q.lt("2021-01-01");
-let cve_list = qanvuli::model::query::filter(published_start_q).filter(published_end_q).as_list();
-
-// CVSSで抽出する+降順ソート
-let cvss_q = qanvuli::model::query::cvss_v4();
-let cve_list = qanvuli::model::query::filter(cvss_q).order_by(cvss_q.desc()).as_list();
-```
-
-
+DBの詳細は[データベース設計](../db/DESIGN.md)を参照する。

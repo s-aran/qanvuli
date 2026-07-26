@@ -6,8 +6,6 @@ pub(crate) struct CweArgs {
     /// CWE IDs to search for. Accepts numbers or strings such as 79, "CWE-79", or "CWE79".
     #[serde(default)]
     pub(crate) cwe_ids: Vec<CweArgValue>,
-    /// Single CWE ID to search for. Kept for clients that do not send arrays.
-    pub(crate) cwe_id: Option<CweArgValue>,
     /// Maximum number of results to return. Clamped to 1..=30; default is 10.
     pub(crate) limit: Option<u64>,
     /// Number of matching results to skip for pagination. Default is 0.
@@ -181,7 +179,7 @@ pub(crate) struct ProductVersionArgs {
     pub(crate) vendor: Option<String>,
     /// Affected product substring to search for. Can be combined with vendor.
     pub(crate) product: Option<String>,
-    /// Version string to look for in affected version entries. This returns candidate CVEs, not a definitive vulnerable/not-vulnerable verdict.
+    /// Version text used to find candidate affected records; ranges are not evaluated.
     pub(crate) version: Option<String>,
     /// Maximum number of results to return. Clamped to 1..=30; default is 10.
     pub(crate) limit: Option<u64>,
@@ -375,15 +373,10 @@ pub(crate) struct UpdateDbArgs {
 
 impl CweArgs {
     pub(crate) fn search_values(self) -> Vec<String> {
-        let mut values = self
-            .cwe_ids
+        self.cwe_ids
             .into_iter()
             .map(CweArgValue::into_search_value)
-            .collect::<Vec<_>>();
-        if let Some(cwe_id) = self.cwe_id {
-            values.push(cwe_id.into_search_value());
-        }
-        values
+            .collect()
     }
 }
 

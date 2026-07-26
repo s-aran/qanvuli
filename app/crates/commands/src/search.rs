@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, DateFilter, connect_sqlx_db, print_json};
+use super::common::{DEFAULT_LIMIT, DateFilter, connect_database, print_json};
 use qanvuli_core::database::{SqlxCveSearch, SqlxCvssSearch};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
@@ -44,7 +44,7 @@ pub struct Args {
     cvss_version: Option<String>,
     #[arg(long)]
     published_since: Option<String>,
-    #[arg(long, alias = "since")]
+    #[arg(long)]
     updated_since: Option<String>,
     #[arg(long)]
     limit: Option<u64>,
@@ -115,7 +115,7 @@ impl Args {
 
 /// Runs a CVE search and prints raw, summary, or enriched JSON results.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;

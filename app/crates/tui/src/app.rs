@@ -1342,7 +1342,7 @@ impl App {
             return;
         };
         self.capec_detail_task = Some(tokio::spawn(async move {
-            db.get_capec_detail(id)
+            db.find_capec(id)
                 .await
                 .map_err(|error| format!("failed to load CAPEC-{id} classifications: {error}"))
         }));

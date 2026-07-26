@@ -1,7 +1,4 @@
-//! Single-owner SQLite write connection.
-//!
-//! This is the foundation for the SQLx migration. Mutating operations are added here
-//! instead of relying on a pooled connection whose connection-scoped PRAGMAs may differ.
+//! Single-owner SQLite writer.
 
 use super::maintenance::{
     check_cve_search_full, check_foreign_key_integrity, check_osv_search_full,
@@ -28,7 +25,7 @@ impl SqliteWriter {
             .foreign_keys(true)
             .statement_cache_capacity(512);
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        // These are intentionally set on this physical connection only.
+        // These PRAGMAs are connection-scoped.
         sqlx::query("PRAGMA journal_mode = WAL")
             .execute(&mut connection)
             .await?;
@@ -52,7 +49,7 @@ impl SqliteWriter {
         operation(&mut connection).await
     }
 
-    /// Closes the physical connection. Replacement callers must not retain cloned handles.
+    /// Closes the writer before database replacement.
     pub(crate) async fn close(self) -> Result<(), sqlx::Error> {
         let mutex = Arc::try_unwrap(self.connection).map_err(|_| {
             sqlx::Error::Protocol(

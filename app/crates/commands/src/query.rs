@@ -1,4 +1,4 @@
-use super::common::{connect_sqlx_db, print_json};
+use super::common::{connect_database, print_json};
 
 /// CLI arguments for `qanvuli query`.
 #[derive(Debug, clap::Args)]
@@ -27,7 +27,7 @@ struct IdArgs {
 struct PackageArgs {
     #[arg(long)]
     ecosystem: String,
-    #[arg(long, alias = "package")]
+    #[arg(long)]
     name: String,
     #[arg(long)]
     version: String,
@@ -41,7 +41,7 @@ struct PackageArgs {
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     match args.command {
         Command::Resolve(args) => {
-            let db = connect_sqlx_db(db_url).await?;
+            let db = connect_database(db_url).await?;
             db.check_required_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
@@ -55,7 +55,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 .map_err(|error| format!("failed to close database: {error}"))?;
         }
         Command::EnrichedCve(args) => {
-            let db = connect_sqlx_db(db_url).await?;
+            let db = connect_database(db_url).await?;
             db.check_required_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
@@ -73,7 +73,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 .map_err(|error| format!("failed to close database: {error}"))?;
         }
         Command::Package(args) => {
-            let db = connect_sqlx_db(db_url).await?;
+            let db = connect_database(db_url).await?;
             db.check_required_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;

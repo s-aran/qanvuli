@@ -1,13 +1,9 @@
-//! Database API facade.
-//!
-//! The implementation is being migrated from the former monolithic module into
-//! `database/` components. Public exports remain here so callers do not depend on
-//! the internal layout.
+//! Vulnerability database API.
 
 pub mod database {
-    pub(crate) mod compat;
     pub(crate) mod maintenance;
     pub(crate) mod package_eval;
+    pub(crate) mod queries;
     pub mod replacement;
     pub(crate) mod schema;
     pub(crate) mod search;
@@ -37,7 +33,7 @@ pub use database::sqlx_database::{
     SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
     SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState,
 };
-/// Backward-compatible public database handle. The implementation is SQLx-only.
+/// Shared database handle used by application crates.
 pub type CveDatabase = SqlxDatabase;
 pub use epss::*;
 pub use identifiers::*;

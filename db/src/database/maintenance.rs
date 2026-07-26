@@ -29,7 +29,7 @@ async fn run_timed_stage(
     }
 }
 
-/// Applies the same SQLite bulk-load policy used by devel's full replacement import.
+/// Configures SQLite for bulk loading.
 pub(crate) async fn prepare_cve_bulk_load(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
@@ -251,7 +251,7 @@ pub(crate) async fn rebuild_osv_search(
     Ok(())
 }
 
-/// Rebuilds CVE FTS after a bulk transaction deliberately deferred trigger maintenance.
+/// Rebuilds CVE FTS after a bulk load with disabled triggers.
 pub(crate) async fn rebuild_cve_search(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
@@ -399,7 +399,7 @@ pub(crate) async fn refresh_cve_search_for_ids(
     Ok(())
 }
 
-/// Ensures the destructive SQLx schema contains the objects required by query paths.
+/// Verifies the schema objects required by queries.
 pub(crate) async fn check_required_schema(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
@@ -919,7 +919,7 @@ async fn require_no_mismatch(
 }
 
 /// Performs a fixed number of indexed sentinel checks suitable for routine health checks.
-/// These statements intentionally contain no COUNT, OFFSET, or full anti-join.
+/// The checks avoid scans such as `COUNT`, `OFFSET`, and full anti-joins.
 pub(crate) async fn check_search_integrity_quick(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {

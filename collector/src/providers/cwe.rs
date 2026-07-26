@@ -27,16 +27,16 @@ impl Default for CweCatalogFile {
 }
 
 impl CweCatalogFile {
-    pub async fn async_download_if_changed(
+    pub async fn download_if_changed(
         &self,
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<CweCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
-        self.async_download_if_changed_as(PathBuf::from(&self.name), etag, last_modified)
+        self.download_if_changed_to(PathBuf::from(&self.name), etag, last_modified)
             .await
     }
 
-    pub async fn async_download_if_changed_as(
+    pub async fn download_if_changed_to(
         &self,
         path: impl AsRef<Path>,
         etag: Option<&str>,
@@ -76,7 +76,7 @@ impl CweCatalogFile {
         })
     }
 
-    pub async fn async_download_as(
+    pub async fn download_to(
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -93,14 +93,14 @@ impl CweCatalogFile {
         Ok(())
     }
 
-    pub async fn async_download_as_file(
+    pub async fn download_to_default_path(
         &self,
     ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
         let path = PathBuf::from(&self.name);
         if path.is_file() {
             return Ok(path);
         }
-        self.async_download_as(&path).await?;
+        self.download_to(&path).await?;
         Ok(path)
     }
 }

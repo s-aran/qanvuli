@@ -86,8 +86,7 @@ pub fn stderr(args: fmt::Arguments<'_>) {
     log::info!(target: STDERR_TARGET, "{args}");
 }
 
-/// Sends qanvuli log output to `path` until the returned guard is dropped.
-/// This is used by the full-screen TUI so background maintenance does not corrupt the terminal.
+/// Redirects logs to `path` until the returned guard is dropped.
 pub fn redirect_to_file(path: &Path) -> io::Result<LogFileGuard> {
     init();
     let mut output = file_output()

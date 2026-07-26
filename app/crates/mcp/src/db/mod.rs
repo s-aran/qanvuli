@@ -292,7 +292,7 @@ pub(crate) async fn get_enriched_osv(
     osv_id: &str,
 ) -> Result<CallToolResult, McpError> {
     let result = db
-        .get_enriched_osv(osv_id)
+        .find_enriched_osv(osv_id)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     response::tool_result(json!(result))
@@ -479,7 +479,7 @@ pub(crate) async fn query_packages_enriched(
 
 fn coverage_notice(ecosystem: &str, no_osv_candidates: bool) -> Option<String> {
     no_osv_candidates.then(|| format!(
-        "No local OSV advisory covers {ecosystem} for this package. This is not evidence that the package has no known CVEs; cross-check critical or end-of-life packages with CVE List and vendor advisories."
+        "No local OSV advisory covers this {ecosystem} package. Check CVE List and vendor advisories for critical or end-of-life packages."
     ))
 }
 
@@ -862,7 +862,7 @@ pub(crate) async fn search_cwe_catalog(
 
 pub(crate) async fn get_cwe(db: &CveDatabase, cwe_id: i32) -> Result<CallToolResult, McpError> {
     let entry = db
-        .get_cwe_entry(cwe_id)
+        .find_cwe_entry(cwe_id)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     response::tool_result(json!(entry))
@@ -896,7 +896,7 @@ pub(crate) async fn get_capec(
 ) -> Result<CallToolResult, McpError> {
     let id = parse_catalog_id(args.capec_id, "CAPEC")?;
     let mut value = serde_json::to_value(
-        db.get_capec_detail(id)
+        db.find_capec(id)
             .await
             .map_err(|err| mcp_error(err.to_string()))?,
     )

@@ -1,7 +1,7 @@
 use qanvuli_core::database::CapecSearchFilters;
 
 use super::{
-    common::{DEFAULT_LIMIT, connect_sqlx_db, print_json},
+    common::{DEFAULT_LIMIT, connect_database, print_json},
     cwe::{catalog_query, parse_id},
 };
 
@@ -31,7 +31,7 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
@@ -39,7 +39,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     if let Some(id) = args.id {
         let id = parse_id(&id, "CAPEC")?;
         let detail = db
-            .get_capec_detail(id)
+            .find_capec(id)
             .await
             .map_err(|error| format!("failed to fetch CAPEC-{id}: {error}"))?;
         if args.detail {

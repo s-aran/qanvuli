@@ -598,7 +598,7 @@ impl SqlxDatabase {
             .await
     }
 
-    pub async fn get_capec_detail(&self, id: i32) -> Result<Option<CapecDetail>, sqlx::Error> {
+    pub async fn find_capec(&self, id: i32) -> Result<Option<CapecDetail>, sqlx::Error> {
         let mut entries = self
             .search_capec_entries(CapecSearchFilters {
                 query: Some(format!("CAPEC-{id}")),
@@ -1097,7 +1097,7 @@ mod tests {
         .unwrap();
 
         db.replace_capec_catalog(&catalog).await.unwrap();
-        let detail = db.get_capec_detail(1).await.unwrap().unwrap();
+        let detail = db.find_capec(1).await.unwrap().unwrap();
         assert_eq!(detail.references[0].reference_id, "REF-69");
         assert_eq!(detail.references[0].section.as_deref(), Some("Cheat Sheet"));
     }

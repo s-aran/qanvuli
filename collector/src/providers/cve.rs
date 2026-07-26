@@ -41,7 +41,7 @@ mod tests {
             .with_timezone(&Utc);
 
         let names = provider
-            .get_delta_files_published_after(cursor)
+            .delta_assets_after(cursor)
             .into_iter()
             .map(|(_, asset)| asset.name)
             .collect::<Vec<_>>();
@@ -69,9 +69,9 @@ impl CveRelease {
         }
     }
 
-    pub fn get(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub fn refresh_blocking(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let gh = github::GitHub::new(github::GITHUB_OWNER, github::GITHUB_REPO);
-        match gh.get_release_list() {
+        match gh.list_releases_blocking() {
             Ok(releases) => {
                 self.releases = releases;
                 Ok(())
@@ -80,15 +80,15 @@ impl CveRelease {
         }
     }
 
-    pub async fn async_get(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let gh = github::GitHub::new(github::GITHUB_OWNER, github::GITHUB_REPO);
-        self.releases = gh.async_get_release_list().await?;
+        self.releases = gh.list_releases().await?;
         Ok(())
     }
 
-    pub async fn async_get_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn refresh_all(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let gh = github::GitHub::new(github::GITHUB_OWNER, github::GITHUB_REPO);
-        self.releases = gh.async_get_all_release_list().await?;
+        self.releases = gh.list_all_releases().await?;
         Ok(())
     }
 
@@ -100,19 +100,19 @@ impl CveRelease {
         release.version.ends_with("_at_end_of_day")
     }
 
-    fn get_releases<T: Fn(&GitHubRelease) -> bool>(
+    fn select_releases<T: Fn(&GitHubRelease) -> bool>(
         releases: &[GitHubRelease],
         filter_func: T,
     ) -> Vec<&GitHubRelease> {
         releases.iter().filter(|r| filter_func(r)).collect()
     }
 
-    fn get_hourly_release(&self) -> Vec<&GitHubRelease> {
-        Self::get_releases(&self.releases, Self::is_hourly_release)
+    fn hourly_releases(&self) -> Vec<&GitHubRelease> {
+        Self::select_releases(&self.releases, Self::is_hourly_release)
     }
 
-    fn get_end_of_day_release(&self) -> Vec<&GitHubRelease> {
-        Self::get_releases(&self.releases, Self::is_end_of_day_release)
+    fn end_of_day_releases(&self) -> Vec<&GitHubRelease> {
+        Self::select_releases(&self.releases, Self::is_end_of_day_release)
     }
 
     fn is_delta_zip(asset: &GitHubReleaseFile) -> bool {
@@ -127,7 +127,7 @@ impl CveRelease {
         asset.name.contains("_all_") && asset.name.ends_with(".zip")
     }
 
-    fn get_latest_file<T: Fn(&GitHubReleaseFile) -> bool>(
+    fn latest_asset<T: Fn(&GitHubReleaseFile) -> bool>(
         releases: Vec<&GitHubRelease>,
         filter_func: T,
     ) -> Option<&GitHubReleaseFile> {
@@ -142,31 +142,31 @@ impl CveRelease {
             .copied()
     }
 
-    pub fn get_latest_all_file(&self) -> Option<&GitHubReleaseFile> {
-        let releases = self.get_hourly_release();
-        Self::get_latest_file(releases, Self::is_all_zip)
+    pub fn latest_full_asset(&self) -> Option<&GitHubReleaseFile> {
+        let releases = self.hourly_releases();
+        Self::latest_asset(releases, Self::is_all_zip)
     }
 
-    pub fn get_latest_all_file_with_published_at(
+    pub fn latest_full_asset_with_date(
         &self,
     ) -> Option<(&GitHubReleaseFile, Option<DateTime<Utc>>)> {
-        let release = self.get_hourly_release().into_iter().next()?;
+        let release = self.hourly_releases().into_iter().next()?;
         let file = release.files.iter().find(|file| Self::is_all_zip(file))?;
         Some((file, release.published_at))
     }
 
-    pub fn get_latest_delta_file(&self) -> Option<&GitHubReleaseFile> {
-        let releases = self.get_hourly_release();
-        Self::get_latest_file(releases, Self::is_delta_zip)
+    pub fn latest_delta_asset(&self) -> Option<&GitHubReleaseFile> {
+        let releases = self.hourly_releases();
+        Self::latest_asset(releases, Self::is_delta_zip)
     }
 
-    pub fn get_latest_delta_midnight_file(&self) -> Option<&GitHubReleaseFile> {
-        let releases = self.get_end_of_day_release();
-        Self::get_latest_file(releases, |_| true)
+    pub fn latest_end_of_day_asset(&self) -> Option<&GitHubReleaseFile> {
+        let releases = self.end_of_day_releases();
+        Self::latest_asset(releases, |_| true)
     }
 
-    pub fn get_delta_files_oldest_first(&self) -> Vec<GitHubReleaseFile> {
-        let mut releases = self.get_hourly_release();
+    pub fn delta_assets(&self) -> Vec<GitHubReleaseFile> {
+        let mut releases = self.hourly_releases();
         releases.reverse();
         releases
             .into_iter()
@@ -175,12 +175,12 @@ impl CveRelease {
             .collect()
     }
 
-    pub fn get_delta_files_published_after(
+    pub fn delta_assets_after(
         &self,
         cursor: DateTime<Utc>,
     ) -> Vec<(DateTime<Utc>, GitHubReleaseFile)> {
         let mut releases = self
-            .get_hourly_release()
+            .hourly_releases()
             .into_iter()
             .filter_map(|release| {
                 release
@@ -203,7 +203,7 @@ impl CveRelease {
             .collect()
     }
 
-    pub fn get_all_and_delta_files_oldest_first(&self) -> Vec<GitHubReleaseFile> {
+    pub fn all_assets(&self) -> Vec<GitHubReleaseFile> {
         let mut releases = self.releases.iter().collect::<Vec<_>>();
         releases.reverse();
         releases

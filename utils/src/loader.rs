@@ -8,22 +8,22 @@ use std::{
 use anyhow::{Context, Error, anyhow};
 use glob::{MatchOptions, glob_with};
 
-pub trait FileStorageTrait {
-    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error>;
+pub trait JsonStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error>;
 
-    fn get_json_entry_bytes(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
-        self.get_json_bytes(entry.path.clone())
+    fn read_entry(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        self.read_bytes(entry.path.clone())
     }
 
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
-        let bytes = self.get_json_bytes(path)?;
+    fn read_string(&mut self, path: impl Into<String>) -> Result<String, Error> {
+        let bytes = self.read_bytes(path)?;
         Ok(String::from_utf8(bytes)?)
     }
 
-    fn enum_json_list(&self) -> impl Iterator<Item = String>;
+    fn paths(&self) -> impl Iterator<Item = String>;
 
-    fn enum_json_entries(&self) -> Vec<JsonEntry> {
-        self.enum_json_list()
+    fn entries(&self) -> Vec<JsonEntry> {
+        self.paths()
             .map(|path| JsonEntry {
                 path,
                 index: None,
@@ -40,18 +40,18 @@ pub struct JsonEntry {
     pub filesystem_path: Option<PathBuf>,
 }
 
-pub struct ActualStorage {
+pub struct DirectoryStorage {
     base: PathBuf,
 }
 
-impl ActualStorage {
+impl DirectoryStorage {
     pub fn new(path: PathBuf) -> Self {
         Self { base: path }
     }
 }
 
-impl FileStorageTrait for ActualStorage {
-    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
+impl JsonStorage for DirectoryStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
         let p = PathBuf::from(path.into());
         let mut file =
             File::open(&p).with_context(|| format!("failed to open JSON file {}", p.display()))?;
@@ -62,7 +62,7 @@ impl FileStorageTrait for ActualStorage {
         Ok(buf)
     }
 
-    fn enum_json_list(&self) -> impl Iterator<Item = String> {
+    fn paths(&self) -> impl Iterator<Item = String> {
         let mut glob_options = MatchOptions::new();
         glob_options.case_sensitive = false;
 
@@ -89,8 +89,7 @@ const ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CVE_JSON_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_NESTED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const NESTED_ARCHIVE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
-// Small nested archives avoid a temporary disk copy. The all-CVE inner archive is over 600 MiB,
-// so keeping that archive in RAM would consume a large part of the importer's memory budget.
+// Large all-CVE archives must not consume the importer's memory budget.
 const IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 pub struct ZipStorage {
@@ -136,22 +135,22 @@ impl ZipStorage {
         })
     }
 
-    /// Keeps any temporary nested archive extraction directory after this storage is dropped.
+    /// Preserves the extracted archive after this value is dropped.
     pub fn retain_extracted_dir(&mut self) {
         self.cleanup_extracted_dir_on_drop = false;
     }
 
-    /// Returns the temporary nested archive extraction directory, if one was created.
+    /// Returns the extraction directory.
     pub fn extracted_dir(&self) -> Option<&std::path::Path> {
         self.extracted_dir.as_deref()
     }
 
-    /// Returns the immutable inner archive when it was safely spooled in RAM.
+    /// Returns the in-memory nested archive.
     pub fn in_memory_archive(&self) -> Option<Arc<[u8]>> {
         self.in_memory_archive.clone()
     }
 
-    /// Opens a new independent archive handle over an already validated in-memory ZIP.
+    /// Opens another reader for a validated in-memory ZIP.
     pub fn from_in_memory_archive(archive: Arc<[u8]>) -> Result<Self, Error> {
         let stream =
             zip::ZipArchive::new(Box::new(Cursor::new(archive.clone())) as Box<dyn ReadSeek>)
@@ -165,7 +164,7 @@ impl ZipStorage {
         })
     }
 
-    /// Deletes the temporary nested archive extraction directory, if one was created.
+    /// Deletes the extraction directory.
     pub fn cleanup_extracted_dir(&mut self) -> Result<(), Error> {
         let Some(path) = self.extracted_dir.take() else {
             return Ok(());
@@ -179,8 +178,8 @@ impl ZipStorage {
     }
 }
 
-impl FileStorageTrait for ZipStorage {
-    fn get_json_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
+impl JsonStorage for ZipStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
         let path = path.into();
         if let Some(filesystem_path) = self
             .extracted_entries
@@ -200,7 +199,7 @@ impl FileStorageTrait for ZipStorage {
         read_zip_entry_bytes(&mut f, &path)
     }
 
-    fn enum_json_list(&self) -> impl Iterator<Item = String> {
+    fn paths(&self) -> impl Iterator<Item = String> {
         let names: Vec<String> = if self.extracted_entries.is_empty() {
             self.stream.as_ref().map_or_else(Vec::new, |stream| {
                 stream
@@ -218,7 +217,7 @@ impl FileStorageTrait for ZipStorage {
         names.into_iter()
     }
 
-    fn enum_json_entries(&self) -> Vec<JsonEntry> {
+    fn entries(&self) -> Vec<JsonEntry> {
         if !self.extracted_entries.is_empty() {
             return self.extracted_entries.clone();
         }
@@ -242,7 +241,7 @@ impl FileStorageTrait for ZipStorage {
             .collect()
     }
 
-    fn get_json_entry_bytes(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+    fn read_entry(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
         if let Some(filesystem_path) = &entry.filesystem_path {
             return Ok(std::fs::read(filesystem_path)?);
         }
@@ -607,7 +606,7 @@ mod tests {
         let archive = storage.in_memory_archive().unwrap();
         assert!(storage.extracted_dir().is_none());
         let reader = ZipStorage::from_in_memory_archive(archive).unwrap();
-        assert_eq!(reader.enum_json_entries().len(), 1);
+        assert_eq!(reader.entries().len(), 1);
         std::fs::remove_file(outer_path).unwrap();
     }
 
@@ -626,8 +625,8 @@ mod tests {
     fn in_memory_nested_archive_can_read_cve_json() {
         let outer_path = nested_cve_zip_path("memory-read");
         let mut storage = ZipStorage::new(outer_path.to_string_lossy().to_string()).unwrap();
-        let entry = storage.enum_json_entries().pop().unwrap();
-        assert_eq!(storage.get_json_entry_bytes(&entry).unwrap(), b"{}");
+        let entry = storage.entries().pop().unwrap();
+        assert_eq!(storage.read_entry(&entry).unwrap(), b"{}");
         std::fs::remove_file(outer_path).unwrap();
     }
 }

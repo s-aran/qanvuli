@@ -1,7 +1,4 @@
-//! Stable public API for querying and maintaining qanvuli vulnerability data.
-//!
-//! Lower-level workspace crates are implementation details. This crate exposes
-//! only the types and operations required by API consumers.
+//! Public API for qanvuli vulnerability data.
 
 /// Database connection, query, and synchronization API.
 pub mod database {
@@ -38,7 +35,7 @@ pub mod ingest {
     };
     pub use qanvuli_utils::{
         github::GitHubReleaseFile,
-        loader::{FileStorageTrait, JsonEntry, ZipStorage},
+        loader::{JsonEntry, JsonStorage, ZipStorage},
     };
 }
 

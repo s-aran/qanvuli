@@ -124,7 +124,7 @@ enum ReplacementState {
     Committed,
 }
 
-/// Explicit state machine for installing a fully closed and validated database.
+/// Installs a closed, validated replacement database.
 #[derive(Debug)]
 pub struct DatabaseReplacement {
     target: PathBuf,
@@ -184,10 +184,7 @@ impl DatabaseReplacement {
             self.state = ReplacementState::BackedUp;
         }
 
-        // Old sidecars must never become associated with the newly installed main file. This is
-        // deliberately done after the backup rename, so a backup-rename failure leaves the target
-        // set untouched, and before candidate installation, so interruption cannot expose a new
-        // main file beside stale WAL contents.
+        // Remove old sidecars after backup and before install so they cannot attach to the new DB.
         for suffix in SQLITE_SIDECAR_SUFFIXES {
             let path = sidecar(&self.target, suffix);
             if let Err(source) = remove_if_present(&path) {
@@ -256,7 +253,7 @@ impl DatabaseReplacement {
         Ok(())
     }
 
-    /// Finalizes a successful install. Cleanup errors never roll back the new database.
+    /// Commits the install without rolling back for cleanup errors.
     pub fn commit(&mut self) -> Result<(), ReplacementError> {
         if self.state != ReplacementState::Installed {
             return Err(ReplacementError::InvalidState {

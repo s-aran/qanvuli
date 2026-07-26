@@ -1,4 +1,4 @@
-//! Compatibility API preserving devel callers while the implementation is SQLx-only.
+//! High-level vulnerability queries.
 
 use super::sqlx_database::{
     SqlxCveSearch, SqlxCveSummary, SqlxCvssSearch, SqlxDatabase, SqlxOsvSummary,
@@ -815,7 +815,7 @@ impl SqlxDatabase {
             .await
     }
 
-    pub async fn get_enriched_osv(&self, osv_id: &str) -> Result<Option<OsvSummary>, sqlx::Error> {
+    pub async fn find_enriched_osv(&self, osv_id: &str) -> Result<Option<OsvSummary>, sqlx::Error> {
         Ok(self.find_osv_summary(osv_id).await?.map(osv_summary))
     }
 
@@ -825,7 +825,7 @@ impl SqlxDatabase {
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
         let mut rows = Vec::new();
         for id in ids {
-            if let Some(row) = self.get_enriched_osv(id).await? {
+            if let Some(row) = self.find_enriched_osv(id).await? {
                 rows.push(row);
             }
         }
@@ -1041,7 +1041,7 @@ impl SqlxDatabase {
         self.writer.with_connection(|c| Box::pin(async move { let n:i64=sqlx::query_scalar("SELECT COUNT(DISTINCT a.osv_id) FROM osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (? IS NULL OR p.package_name=? COLLATE NOCASE)").bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&families).bind(&families).bind(&ecosystems).bind(&ecosystems).bind(&package).bind(&package).fetch_one(c).await?; Ok(n as u64) })).await
     }
 
-    pub async fn get_cwe_entry(&self, id: i32) -> Result<Option<CweEntry>, sqlx::Error> {
+    pub async fn find_cwe_entry(&self, id: i32) -> Result<Option<CweEntry>, sqlx::Error> {
         let row: Option<CompatCweRow> = self
             .writer
             .with_connection(|connection| {

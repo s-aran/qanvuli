@@ -1,4 +1,4 @@
-use super::common::{connect_sqlx_db, print_json};
+use super::common::{connect_database, print_json};
 use std::time::Instant;
 
 /// CLI arguments for `qanvuli db`.
@@ -30,7 +30,7 @@ struct CheckArgs {
 
 /// Runs a database inspection subcommand.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     match args.command {
         Command::Status => {
             db.check_required_schema()

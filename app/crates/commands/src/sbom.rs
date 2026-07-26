@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, DateFilter, close_db, connect_db, print_json};
+use super::common::{DEFAULT_LIMIT, DateFilter, close_database, connect_database, print_json};
 use qanvuli_core::database::{
     CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
 };
@@ -18,7 +18,7 @@ pub struct Args {
     #[arg(long)]
     published_since: Option<String>,
     /// Filter CVEs by CVE update time and OSV findings by OSV modification time.
-    #[arg(long, alias = "since")]
+    #[arg(long)]
     updated_since: Option<String>,
     /// Limit final findings per package and source (CVE, OSV, and optional name matches).
     #[arg(long)]
@@ -49,7 +49,7 @@ impl Args {
 
 /// Reads an SBOM JSON file and prints local vulnerability findings as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|err| format!("database rebuild required before SBOM search: {err}"))?;
@@ -193,7 +193,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         "unresolved_versions": unresolved_versions,
     }))?;
 
-    close_db(db).await?;
+    close_database(db).await?;
     Ok(())
 }
 

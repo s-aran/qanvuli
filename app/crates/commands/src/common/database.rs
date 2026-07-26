@@ -1,33 +1,28 @@
-//! Database connection, SQLite-path, and JSON-output helpers shared by commands.
+//! Database and JSON helpers shared by commands.
 
 use qanvuli_core::database::SqlxDatabase;
 use serde::Serialize;
 use std::path::PathBuf;
 use url::Url;
 
-/// Connects to the destructive SQLx schema used by new database files.
-pub async fn connect_sqlx_db(db_url: &str) -> Result<SqlxDatabase, String> {
+/// Opens the configured database.
+pub async fn connect_database(db_url: &str) -> Result<SqlxDatabase, String> {
     SqlxDatabase::connect(db_url).await.map_err(|err| {
         format!(
-            "failed to connect SQLx database `{}`: {err}",
+            "failed to connect to database `{}`: {err}",
             redact_database_url(db_url)
         )
     })
 }
 
-/// Connects to the SQLx-backed database through the legacy command helper name.
-pub async fn connect_db(db_url: &str) -> Result<SqlxDatabase, String> {
-    connect_sqlx_db(db_url).await
-}
-
-/// Closes the SQLx-backed database through the legacy command helper name.
-pub async fn close_db(db: SqlxDatabase) -> Result<(), String> {
+/// Closes the database.
+pub async fn close_database(db: SqlxDatabase) -> Result<(), String> {
     db.close()
         .await
         .map_err(|err| format!("failed to close database: {err}"))
 }
 
-/// Redacts database credentials before a connection string is shown to a user.
+/// Redacts credentials in a database URL.
 pub fn redact_database_url(db_url: &str) -> String {
     let Ok(mut url) = Url::parse(db_url) else {
         return db_url.to_owned();
@@ -40,7 +35,7 @@ pub fn redact_database_url(db_url: &str) -> String {
     url.to_string()
 }
 
-/// Builds the default SQLite URL in the process current working directory.
+/// Returns the default SQLite URL for the current directory.
 pub fn default_db_connection_string() -> Result<String, String> {
     let directory = std::env::current_dir()
         .map_err(|err| format!("failed to resolve current working directory: {err}"))?;

@@ -28,7 +28,7 @@ impl GitHubReleaseFile {
         safe_file_name(&self.name)
     }
 
-    pub async fn async_download(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub async fn download_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let content = reqwest::Client::new()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
@@ -40,7 +40,7 @@ impl GitHubReleaseFile {
         Ok(content.to_vec())
     }
 
-    pub fn download(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub fn download_bytes_blocking(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let content = reqwest::blocking::Client::new()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
@@ -50,7 +50,7 @@ impl GitHubReleaseFile {
         Ok(content.to_vec())
     }
 
-    pub async fn async_download_as(
+    pub async fn download_to(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -72,11 +72,10 @@ impl GitHubReleaseFile {
         Ok(())
     }
 
-    /// Downloads a large immutable release asset through independent HTTP/1.1 range requests.
+    /// Downloads an immutable asset with independent HTTP/1.1 range requests.
     ///
-    /// A `206` probe is required before creating the output file. Servers that ignore ranges,
-    /// change the object mid-download, or report inconsistent ranges safely fall back or fail
-    /// without presenting a completed partial file as success.
+    /// The probe must return `206` before the output file is created. A changed or inconsistent
+    /// asset fails without leaving a partial file.
     async fn parallel_range_download(
         &self,
         path: &Path,
@@ -160,7 +159,7 @@ impl GitHubReleaseFile {
         Ok(true)
     }
 
-    pub fn download_as(
+    pub fn download_to_blocking(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
@@ -175,7 +174,7 @@ impl GitHubReleaseFile {
         Ok(())
     }
 
-    pub async fn async_download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn download_to_default_path(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.safe_file_name()?;
         if self.size > 0
             && let Ok(metadata) = std::fs::metadata(filename)
@@ -183,10 +182,10 @@ impl GitHubReleaseFile {
         {
             return Ok(());
         }
-        self.async_download_as(filename).await
+        self.download_to(filename).await
     }
 
-    pub fn download_as_file(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn download_to_default_path_blocking(&self) -> Result<(), Box<dyn std::error::Error>> {
         let filename = self.safe_file_name()?;
         if self.size > 0
             && let Ok(metadata) = std::fs::metadata(filename)
@@ -194,7 +193,7 @@ impl GitHubReleaseFile {
         {
             return Ok(());
         }
-        self.download_as(filename)
+        self.download_to_blocking(filename)
     }
 }
 
@@ -339,11 +338,11 @@ impl GitHub {
         }
     }
 
-    pub fn get_url(&self) -> String {
+    pub fn url(&self) -> String {
         format!("https://github.com/{}/{}/", self.owner, self.repo)
     }
 
-    pub async fn async_get_release_list(
+    pub async fn list_releases(
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         let octocrab = octocrab::instance();
@@ -357,7 +356,7 @@ impl GitHub {
         release_items_to_sorted_releases(page.items)
     }
 
-    pub async fn async_get_all_release_list(
+    pub async fn list_all_releases(
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         let octocrab = octocrab::instance();
@@ -386,13 +385,13 @@ impl GitHub {
         release_items_to_sorted_releases(release_items)
     }
 
-    pub fn get_release_list(
+    pub fn list_releases_blocking(
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
-            .block_on(self.async_get_release_list())
+            .block_on(self.list_releases())
     }
 }
 

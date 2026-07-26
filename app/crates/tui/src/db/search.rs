@@ -404,9 +404,7 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
         || options.kev_only
 }
 
-/// A package verdict requires all three values. Partial input deliberately
-/// leaves F3 in ordinary CVE metadata-search mode rather than guessing a
-/// version scheme or returning a false vulnerability verdict.
+/// Package matching requires ecosystem, name, and version.
 fn package_version_query(options: &CveAdvancedSearch) -> Option<(String, String, String)> {
     let ecosystem = options.package_ecosystem.as_deref()?.trim();
     let package = options

@@ -1,4 +1,4 @@
-//! SQLx-only database handle for destructive rebuilds.
+//! SQLite database implementation.
 
 use super::{
     maintenance::rebuild_cve_search,
@@ -65,9 +65,7 @@ type BatchedOsvRow = (
 );
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
-/// PEP 503's package-name comparison rule.  Applying it to the lookup key also
-/// makes common `-`/`_`/`.` spellings resolve for feeds that did not normalize
-/// names when they were published.
+/// Applies PEP 503 normalization to published and queried package names.
 fn normalized_package_name(name: &str) -> String {
     let mut normalized = String::with_capacity(name.len());
     let mut previous_separator = false;
@@ -143,7 +141,7 @@ type AffectedInput = (
     String,
 );
 
-/// Public CVE projection. Internal SQLite row IDs never leave the database layer.
+/// CVE search result.
 #[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
 pub struct SqlxCveSummary {
     pub cve_id: String,
@@ -154,7 +152,7 @@ pub struct SqlxCveSummary {
     pub description_en: Option<String>,
 }
 
-/// Fully normalized CVE detail for SQLx query consumers.
+/// Normalized CVE details.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct SqlxCveDetail {
     pub cvss: Vec<SqlxCvss>,
@@ -166,7 +164,7 @@ pub struct SqlxCveDetail {
     pub osv_advisories: Vec<SqlxOsvSummary>,
 }
 
-/// SQLx-only CVE display record preserving the public external identifier.
+/// CVE result with normalized details.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct SqlxCveSummaryWithDetail {
     pub summary: SqlxCveSummary,
@@ -190,8 +188,7 @@ pub struct SqlxCvssSearch {
     pub version: Option<String>,
 }
 
-/// Composable CVE search filters. Every value is bound; this type only selects documented
-/// normalized predicates and never exposes SQLite internal keys.
+/// Bound filters for normalized CVE searches.
 #[derive(Clone, Debug, Default)]
 pub struct SqlxCveSearch {
     pub text: Option<String>,
@@ -398,9 +395,7 @@ impl From<SqlxCveSummaryWithDetail> for CveSummaryWithDetail {
     }
 }
 
-/// A database handle with one physical writer connection.
-///
-/// It is the sole database handle for imports, replacement databases, and queries.
+/// Database handle backed by one writer connection.
 #[derive(Clone, Debug)]
 pub struct SqlxDatabase {
     pub(crate) writer: SqliteWriter,
@@ -688,18 +683,6 @@ impl SqlxDatabase {
         })).await
     }
 
-    #[deprecated(note = "use query_package_matches; enrichment fields are not populated")]
-    pub async fn query_package_enriched(
-        &self,
-        ecosystem: &str,
-        package: &str,
-        version: &str,
-        purl: Option<&str>,
-    ) -> Result<Vec<EnrichedFinding>, sqlx::Error> {
-        self.query_package_matches(ecosystem, package, version, purl)
-            .await
-    }
-
     pub async fn find_cve_summary_with_detail_with_state_scope(
         &self,
         cve_id: &str,
@@ -711,7 +694,7 @@ impl SqlxDatabase {
             .map(CveSummaryWithDetail::from))
     }
 
-    /// Closes the dedicated physical connection before a database file is replaced.
+    /// Closes the writer before database replacement.
     pub async fn close(self) -> Result<(), sqlx::Error> {
         self.writer.close().await
     }
@@ -746,7 +729,7 @@ impl SqlxDatabase {
         self.writer.check_required_schema().await
     }
 
-    /// Prepares a replacement database for devel-compatible full CVE bulk loading.
+    /// Prepares a replacement database for bulk CVE loading.
     pub async fn prepare_cve_bulk_load(&self) -> Result<(), sqlx::Error> {
         self.writer.prepare_cve_bulk_load().await
     }
@@ -773,7 +756,7 @@ impl SqlxDatabase {
         self.writer.finish_osv_bulk_load().await
     }
 
-    /// Rebuilds derived identifier edges from the normalized OSV relation source of truth.
+    /// Rebuilds identifier edges from normalized OSV relations.
     pub async fn rebuild_identifier_graph(&self) -> Result<(), sqlx::Error> {
         self.writer
             .with_connection(|connection| {
@@ -829,7 +812,7 @@ impl SqlxDatabase {
         schema::SCHEMA_VERSION
     }
 
-    /// Looks up a CVE by its external identifier without exposing its internal row ID.
+    /// Finds a CVE by its public identifier.
     pub async fn find_cve_summary(
         &self,
         cve_id: &str,
@@ -841,7 +824,7 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Returns the preserved provider CVE JSON only when a caller explicitly requests it.
+    /// Returns the original provider JSON for a CVE.
     pub async fn cve_raw_json(&self, cve_id: &str) -> Result<Option<String>, sqlx::Error> {
         let cve_id = cve_id.to_owned();
         self.writer
@@ -856,7 +839,7 @@ impl SqlxDatabase {
             .await
     }
 
-    /// Searches external CVE identifiers by prefix without exposing internal keys.
+    /// Searches CVE identifiers by prefix.
     pub async fn search_cves_by_id_prefix(
         &self,
         prefix: &str,
@@ -1013,9 +996,9 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Searches affected records by vendor/product. Version expressions are deliberately not
-    /// filtered here: a CNA value such as `< 2.0.0` cannot be safely matched with SQL `LIKE` to
-    /// an installed version such as `1.5.0`. This is a candidate lookup, not a verdict.
+    /// Finds vendor/product candidates without evaluating version expressions.
+    ///
+    /// CNA expressions such as `< 2.0.0` cannot be compared to installed versions with `LIKE`.
     pub async fn search_cves_by_affected_version(
         &self,
         vendor: Option<String>,
@@ -1430,8 +1413,9 @@ impl SqlxDatabase {
             .await
     }
 
-    /// Resolves only alias-equivalent identifiers transitively. Upstream and related edges are
-    /// intentionally excluded because they do not establish vulnerability identity.
+    /// Resolves alias-equivalent identifiers transitively.
+    ///
+    /// Upstream and related edges do not establish vulnerability identity.
     pub async fn resolve_identifier(
         &self,
         identifier: &str,
@@ -1446,7 +1430,7 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Returns typed graph edges incident to a public identifier without exposing internal IDs.
+    /// Returns graph edges connected to a public identifier.
     pub async fn identifier_edges(
         &self,
         identifier: &str,
@@ -1539,8 +1523,9 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Replaces CWE catalog metadata, including status and the primary `ChildOf` relationship.
-    /// CVE records may create a placeholder row first; catalog data deliberately takes precedence.
+    /// Replaces CWE metadata and `ChildOf` relationships.
+    ///
+    /// Catalog data replaces placeholder rows created during CVE import.
     pub async fn upsert_cwe_catalog(
         &self,
         catalog: &WeaknessCatalog,
@@ -1716,10 +1701,9 @@ impl SqlxDatabase {
         })).await
     }
 
-    /// Marks an OSV synchronization as running and returns its last completed cursor.
+    /// Starts an OSV synchronization and returns its last completed cursor.
     ///
-    /// Import batches deliberately do not touch the cursor. Call `complete_osv_sync` only after
-    /// all batches, derived indexes, and integrity checks have succeeded.
+    /// The cursor advances only after imports, indexes, and checks succeed.
     pub async fn begin_osv_sync(&self) -> Result<Option<String>, sqlx::Error> {
         self.writer
             .with_connection(|connection| {
@@ -1828,7 +1812,7 @@ impl SqlxDatabase {
             .examined)
     }
 
-    /// Imports one current-schema OSV advisory atomically on the dedicated writer.
+    /// Imports one OSV advisory atomically.
     pub async fn import_osv_record(&self, record: OsvRawRecord) -> Result<(), sqlx::Error> {
         self.import_osv_record_with_search(record, true).await
     }
@@ -2865,7 +2849,7 @@ impl SqlxDatabase {
         })).await.map(|changed| (count, changed))
     }
 
-    /// Imports one EPSS current CSV snapshot without exposing internal CVE IDs.
+    /// Atomically replaces the current EPSS snapshot.
     pub async fn import_epss_csv(&self, csv: String) -> Result<usize, sqlx::Error> {
         Ok(self.import_epss_csv_with_status(csv, true).await?.0)
     }
@@ -2919,8 +2903,7 @@ impl SqlxDatabase {
             let raw_record_id: i64 = sqlx::query_scalar("SELECT id FROM epss_raw_records WHERE score_date=?")
                 .bind(&parsed.score_date)
                 .fetch_one(&mut *transaction).await?;
-            // epss_current represents exactly one current snapshot. Replacing it inside the
-            // same transaction removes CVEs absent from the new feed without exposing a gap.
+            // Replace the snapshot atomically so removed CVEs do not leave stale scores.
             sqlx::query("DELETE FROM epss_current").execute(&mut *transaction).await?;
             sqlx::query("INSERT INTO epss_current (cve_id, raw_record_id, epss, percentile, score_date, model_version, fetched_at) SELECT c.cve_id, ?, s.epss, s.percentile, ?, ?, ? FROM epss_import_stage s JOIN cve c ON c.cve_id=s.cve_id")
                 .bind(raw_record_id)
@@ -3022,8 +3005,7 @@ fn cve_references(cna: Option<&Value>, adp: Option<&Value>) -> Vec<SqlxCveRefere
 
 /// Rebuilds derived OSV graph edges from the normalized relation table.
 ///
-/// `osv_identifier_relations` is the source of truth. Rebuilding prevents stale graph edges
-/// when an advisory's aliases, upstream IDs, or related IDs change on a later feed import.
+/// Rebuilding removes edges left by changed OSV relationships.
 async fn rebuild_osv_identifier_edges(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     now: &str,
@@ -4586,7 +4568,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn combined_sqlx_search_keeps_cwe_affected_and_cvss_filters_as_and_conditions() {
+    async fn combined_search_joins_cwe_affected_and_cvss_filters_with_and() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-advanced","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"Advanced Example","affected":[{"vendor":"Acme","product":"widget"}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79"}]}]}}}"#.to_owned()).await.unwrap();

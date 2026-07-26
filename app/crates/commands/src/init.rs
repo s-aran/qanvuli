@@ -1,10 +1,9 @@
 use super::common::{
     CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
-    OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
+    OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_database, cve_full_asset_cursor,
     download_latest_asset_with_source, download_osv_selection_from_gcs,
-    import_downloaded_osv_selection, ingest_zip_sqlx_bulk_with_index_signal, redact_database_url,
-    remove_processed_zip, sync_capec_catalog_sqlx, sync_cwe_catalog_sqlx,
-    sync_kev_epss_snapshots_sqlx,
+    import_cve_zip_bulk_with_index_signal, import_downloaded_osv_selection, redact_database_url,
+    remove_processed_zip, sync_capec_catalog, sync_cwe_catalog, sync_risk_feeds,
 };
 use qanvuli_core::database::{
     DatabaseReplacement, RecoveryAction, candidate_database_path, recover_interrupted_replacement,
@@ -33,7 +32,7 @@ pub struct Args {
     osv_prefixes: Vec<String>,
 }
 
-/// Builds and installs a complete replacement vulnerability database.
+/// Builds and installs a replacement vulnerability database.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
@@ -95,7 +94,7 @@ async fn run_with_progress(
         "init: building replacement database beside {}",
         redact_database_url(db_url)
     );
-    let db = match connect_sqlx_db(&candidate_url).await {
+    let db = match connect_database(&candidate_url).await {
         Ok(db) => db,
         Err(error) => {
             return Err(with_candidate_cleanup(error, &candidate_path));
@@ -125,7 +124,7 @@ async fn run_with_progress(
             eprintln!("init: CVE index construction started; beginning OSV prefetch");
             download_osv_selection_from_gcs("init", osv_selection, None).await
         });
-        let cve_result = ingest_zip_sqlx_bulk_with_index_signal(
+        let cve_result = import_cve_zip_bulk_with_index_signal(
             db_for_build.clone(),
             "all",
             &asset_for_build,
@@ -150,15 +149,15 @@ async fn run_with_progress(
                 .await
                 .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
         }
-        sync_cwe_catalog_sqlx(db_for_build.clone()).await?;
-        sync_capec_catalog_sqlx(db_for_build.clone()).await?;
+        sync_cwe_catalog(db_for_build.clone()).await?;
+        sync_capec_catalog(db_for_build.clone()).await?;
         import_downloaded_osv_selection(
             db_for_build.clone(),
             osv_download_result?,
             OsvImportMode::InitialReplacement,
         )
         .await?;
-        sync_kev_epss_snapshots_sqlx(db_for_build.clone(), "init", false).await?;
+        sync_risk_feeds(db_for_build.clone(), "init", false).await?;
         validate_replacement_database(&db_for_build).await
     }
     .await;
@@ -223,10 +222,7 @@ async fn validate_replacement_database(
 ) -> Result<(), String> {
     let validation_started = Instant::now();
     eprintln!("init: checking replacement schema and search sentinels");
-    // Every build/index SQL statement has already completed successfully at this point. Keep
-    // init's final check bounded: this verifies the required schema plus fixed first/last search
-    // projection sentinels without rescanning the newly written database. Full SQLite, foreign-key,
-    // FTS5, and projection scans remain available through `db check --scan` and `db check --full`.
+    // Init uses bounded sentinels; full scans remain available through `db check`.
     db.check_search_integrity_quick().await.map_err(|error| {
         format!("replacement database schema/search validation failed: {error}")
     })?;
@@ -287,7 +283,7 @@ mod tests {
     use sqlx::{Connection, Executor};
     use std::io::Write;
 
-    fn test_database_path(label: &str) -> (PathBuf, String) {
+    fn temporary_database(label: &str) -> (PathBuf, String) {
         let path = std::env::temp_dir().join(format!(
             "qanvuli-init-{label}-{}-{}.sqlite",
             std::process::id(),
@@ -298,7 +294,7 @@ mod tests {
     }
 
     async fn initialized_database(label: &str) -> (PathBuf, String, SqlxDatabase) {
-        let (path, url) = test_database_path(label);
+        let (path, url) = temporary_database(label);
         let database = SqlxDatabase::connect(&url).await.unwrap();
         database.initialize().await.unwrap();
         (path, url, database)

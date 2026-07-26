@@ -1,4 +1,4 @@
-//! SQLx schema preserving devel's canonical table layout.
+//! SQLite schema.
 
 use sqlx::{Connection, SqliteConnection};
 

@@ -1,7 +1,7 @@
 use super::common::{
     IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, apply_delta_updates,
-    connect_sqlx_db, ingest_zip_sqlx, sync_capec_catalog_sqlx, sync_cwe_catalog_sqlx,
-    sync_kev_epss_snapshots_sqlx, sync_osv_selection_from_gcs_sqlx_with_refresh_all,
+    connect_database, import_cve_zip, sync_capec_catalog, sync_cwe_catalog, sync_osv_with_refresh,
+    sync_risk_feeds,
 };
 use std::path::PathBuf;
 
@@ -30,11 +30,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     run_with_progress(db_url, args, None).await
 }
 
-/// SQLx-only entry point for integrations that already own their argument parsing.
-///
-/// This deliberately does not reuse a caller-held database handle: update closes its dedicated
-/// writer before any file replacement or cleanup can occur.
-pub async fn run_sqlx_update(
+/// Runs an update from pre-parsed integration arguments.
+pub async fn run_update(
     db_url: &str,
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
@@ -62,12 +59,12 @@ async fn run_with_progress(
     _progress: Option<IngestProgressCallback>,
 ) -> Result<(), String> {
     if let Some(zip) = args.zip {
-        eprintln!("update: applying local SQLx delta {}", zip.display());
-        let db = connect_sqlx_db(db_url).await?;
+        eprintln!("update: applying local CVE delta {}", zip.display());
+        let db = connect_database(db_url).await?;
         db.check_required_schema()
             .await
             .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
-        let imported = ingest_zip_sqlx(db.clone(), "update", &zip, args.max_chunks).await?;
+        let imported = import_cve_zip(db.clone(), "update", &zip, args.max_chunks).await?;
         db.mark_cve_asset_applied(
             zip.file_name()
                 .and_then(|name| name.to_str())
@@ -85,7 +82,7 @@ async fn run_with_progress(
                 .map_err(|error| format!("failed to read OSV selection: {error}"))?;
             let current = OsvImportSelection::from_metadata(stored.as_deref())
                 .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
-            sync_osv_selection_from_gcs_sqlx_with_refresh_all(
+            sync_osv_with_refresh(
                 db.clone(),
                 "update",
                 current.merged_with(&additions),
@@ -105,13 +102,13 @@ async fn run_with_progress(
         );
         return Ok(());
     }
-    let sqlx_db = connect_sqlx_db(db_url).await?;
+    let sqlx_db = connect_database(db_url).await?;
     if sqlx_db.check_required_schema().await.is_ok() {
         eprintln!("update: applying CVE delta archives");
         let applied_paths = apply_delta_updates(&sqlx_db, None, args.max_chunks).await?;
         let cve_changed = !applied_paths.is_empty();
-        sync_cwe_catalog_sqlx(sqlx_db.clone()).await?;
-        sync_capec_catalog_sqlx(sqlx_db.clone()).await?;
+        sync_cwe_catalog(sqlx_db.clone()).await?;
+        sync_capec_catalog(sqlx_db.clone()).await?;
         let saved_selection = sqlx_db
             .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
             .await
@@ -122,14 +119,8 @@ async fn run_with_progress(
         let selection = additions.map_or(selection.clone(), |additions| {
             selection.merged_with(&additions)
         });
-        sync_osv_selection_from_gcs_sqlx_with_refresh_all(
-            sqlx_db.clone(),
-            "update",
-            selection,
-            args.osv_refresh_all,
-        )
-        .await?;
-        sync_kev_epss_snapshots_sqlx(sqlx_db.clone(), "update", cve_changed).await?;
+        sync_osv_with_refresh(sqlx_db.clone(), "update", selection, args.osv_refresh_all).await?;
+        sync_risk_feeds(sqlx_db.clone(), "update", cve_changed).await?;
         sqlx_db
             .check_search_integrity_quick()
             .await
@@ -188,7 +179,7 @@ mod tests {
     use std::io::Write;
 
     #[tokio::test]
-    async fn local_zip_update_uses_sqlx_schema_without_network() {
+    async fn local_zip_update_does_not_use_network() {
         let directory = std::env::temp_dir().join(format!(
             "qanvuli-sqlx-update-{}-{}",
             std::process::id(),

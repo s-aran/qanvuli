@@ -6,9 +6,9 @@ use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
 use qanvuli_core::{
     database::{OsvRawRecord, SqlxDatabase},
     ingest::{
-        CapecCatalogFile, CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile,
-        OSV_ALL_ZIP, OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv,
-        download_kev_json, parse_modified_id_csv,
+        CapecCatalogFile, CveRelease, CweCatalogFile, GitHubReleaseFile, JsonStorage, OSV_ALL_ZIP,
+        OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv, download_kev_json,
+        parse_modified_id_csv,
     },
     model::{is_known_osv_database_prefix, read_capec_catalog_xml, read_cwe_catalog_zip},
 };
@@ -23,8 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub mod database;
 pub use database::{
-    close_db, connect_db, connect_sqlx_db, default_db_connection_string, print_json,
-    redact_database_url,
+    close_database, connect_database, default_db_connection_string, print_json, redact_database_url,
 };
 
 /// Default row limit used by CLI search commands.
@@ -352,8 +351,8 @@ fn is_empty_osv_database_dir(database_dir: &str) -> bool {
     database_dir.is_empty() || database_dir.eq_ignore_ascii_case("empty")
 }
 
-/// Synchronizes KEV and EPSS snapshots through the SQLx-only schema.
-pub async fn sync_kev_epss_snapshots_sqlx(
+/// Synchronizes KEV and EPSS.
+pub async fn sync_risk_feeds(
     db: SqlxDatabase,
     label: &str,
     cve_changed: bool,
@@ -526,7 +525,7 @@ pub(crate) async fn import_downloaded_osv_selection(
         download.label,
         download.zip_paths.len()
     );
-    let result = import_osv_zip_files_sqlx_with_mode(
+    let result = import_osv_zips(
         db.clone(),
         &download.zip_paths,
         Some(&download.selection),
@@ -552,20 +551,18 @@ pub(crate) async fn import_downloaded_osv_selection(
 }
 
 /// Downloads the selected public OSV snapshot and imports it through the SQLx writer.
-pub async fn sync_osv_selection_from_gcs_sqlx(
+pub async fn sync_osv(
     db: SqlxDatabase,
     label: &str,
     selection: OsvImportSelection,
 ) -> Result<usize, String> {
-    sync_osv_selection_from_gcs_sqlx_with_refresh_all(db, label, selection, false).await
+    sync_osv_with_refresh(db, label, selection, false).await
 }
 
 /// Synchronizes OSV data, optionally ignoring the cursor and redownloading every selected ZIP.
 ///
-/// `refresh_all` is deliberately refresh/upsert semantics: an ID absent from a downloaded ZIP is
-/// not inferred to be deleted. Withdrawn advisories remain present as ordinary OSV records with a
-/// `withdrawn` timestamp.
-pub async fn sync_osv_selection_from_gcs_sqlx_with_refresh_all(
+/// `refresh_all` upserts snapshots; absence does not delete a local advisory.
+pub async fn sync_osv_with_refresh(
     db: SqlxDatabase,
     label: &str,
     selection: OsvImportSelection,
@@ -590,14 +587,14 @@ pub async fn sync_osv_selection_from_gcs_sqlx_with_refresh_all(
 
 /// Imports an OSV ZIP through the SQLx writer and advances the cursor only after every batch,
 /// FTS rebuild, and schema validation has succeeded.
-pub async fn import_osv_zip_file_sqlx(
+pub async fn import_osv_zip(
     db: SqlxDatabase,
     path: &Path,
     selection: Option<&OsvImportSelection>,
     completion_cursor: &str,
 ) -> Result<usize, String> {
     let paths = [path.to_path_buf()];
-    import_osv_zip_files_sqlx_with_mode(
+    import_osv_zips(
         db,
         &paths,
         selection,
@@ -608,7 +605,7 @@ pub async fn import_osv_zip_file_sqlx(
     .await
 }
 
-async fn import_osv_zip_files_sqlx_with_mode(
+async fn import_osv_zips(
     db: SqlxDatabase,
     paths: &[PathBuf],
     selection: Option<&OsvImportSelection>,
@@ -1087,7 +1084,7 @@ pub async fn download_latest_asset_with_source(
     })?;
     eprintln!("{kind}: download target {}", output_path.display());
     asset
-        .async_download_as(&output_path)
+        .download_to(&output_path)
         .await
         .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
     eprintln!("{kind}: ready {}", output_path.display());
@@ -1152,19 +1149,19 @@ pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
         )
     })?;
     catalog
-        .async_download_as(&path)
+        .download_to(&path)
         .await
         .map_err(|err| format!("failed to download {}: {err}", catalog.name))?;
     eprintln!("cwe: ready {}", path.display());
     Ok(path)
 }
 
-/// Synchronizes the CWE catalog into the SQLx schema.
-pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
+/// Synchronizes the CWE catalog.
+pub async fn sync_cwe_catalog(db: SqlxDatabase) -> Result<(), String> {
     #[cfg(test)]
     if let Some(path) = local_test_cwe_catalog_path() {
         eprintln!("cwe: using local {}", path.display());
-        let count = upsert_cwe_catalog_file_sqlx(db, &path).await?;
+        let count = import_cwe_catalog(db, &path).await?;
         eprintln!("cwe: upserted {count} CWE master rows");
         return Ok(());
     }
@@ -1211,7 +1208,7 @@ pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
             eprintln!("cwe: retrying download in {}", candidate.display());
         }
         match catalog_file
-            .async_download_if_changed_as(candidate, etag.as_deref(), last_modified.as_deref())
+            .download_if_changed_to(candidate, etag.as_deref(), last_modified.as_deref())
             .await
         {
             Ok(result) => {
@@ -1233,7 +1230,7 @@ pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
                     "cwe: remote update unavailable ({errors}); loading existing local catalog {}",
                     path.display()
                 );
-                let count = upsert_cwe_catalog_file_sqlx(db, &path).await?;
+                let count = import_cwe_catalog(db, &path).await?;
                 eprintln!("cwe: loaded {count} CWE master rows from local catalog");
                 return Ok(());
             }
@@ -1244,7 +1241,7 @@ pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
         eprintln!("cwe: catalog unchanged");
         return Ok(());
     };
-    let count = upsert_cwe_catalog_file_sqlx(db.clone(), &path).await?;
+    let count = import_cwe_catalog(db.clone(), &path).await?;
     let _ = std::fs::remove_file(&path);
     if let Some(etag) = download.etag {
         db.set_metadata_value(CWE_ETAG_METADATA_KEY, &etag)
@@ -1260,7 +1257,7 @@ pub async fn sync_cwe_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
     Ok(())
 }
 
-async fn upsert_cwe_catalog_file_sqlx(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
+async fn import_cwe_catalog(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
     let catalog = read_cwe_catalog_zip(path)
         .map_err(|error| format!("failed to read CWE catalog {}: {error}", path.display()))?;
     let count = db
@@ -1285,10 +1282,10 @@ fn local_cwe_catalog_path(filename: &str) -> Option<PathBuf> {
     executable_path.filter(|path| path.exists())
 }
 
-pub async fn sync_capec_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
+pub async fn sync_capec_catalog(db: SqlxDatabase) -> Result<(), String> {
     #[cfg(test)]
     if let Some(path) = local_test_capec_catalog_path() {
-        let count = replace_capec_catalog_file_sqlx(db, &path).await?;
+        let count = import_capec_catalog(db, &path).await?;
         eprintln!("capec: replaced {count} attack patterns");
         return Ok(());
     }
@@ -1330,7 +1327,7 @@ pub async fn sync_capec_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
                     "capec: remote update unavailable ({error}); loading {}",
                     local.display()
                 );
-                let count = replace_capec_catalog_file_sqlx(db, &local).await?;
+                let count = import_capec_catalog(db, &local).await?;
                 eprintln!("capec: replaced {count} attack patterns");
                 return Ok(());
             }
@@ -1352,7 +1349,7 @@ pub async fn sync_capec_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
         return Ok(());
     }
 
-    let count = replace_capec_catalog_file_sqlx(db.clone(), &path).await?;
+    let count = import_capec_catalog(db.clone(), &path).await?;
     let _ = std::fs::remove_file(&path);
     store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;
     db.set_metadata_value(CAPEC_STORAGE_VERSION_METADATA_KEY, CAPEC_STORAGE_VERSION)
@@ -1362,7 +1359,7 @@ pub async fn sync_capec_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
     Ok(())
 }
 
-async fn replace_capec_catalog_file_sqlx(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
+async fn import_capec_catalog(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
     let catalog = read_capec_catalog_xml(path)
         .map_err(|error| format!("failed to read CAPEC catalog {}: {error}", path.display()))?;
     db.replace_capec_catalog(&catalog)
@@ -1428,16 +1425,14 @@ async fn latest_asset_with_published_at(
     kind: ReleaseAssetKind,
 ) -> Result<(GitHubReleaseFile, Option<DateTime<Utc>>), String> {
     let mut cve = CveRelease::new();
-    cve.async_get()
+    cve.refresh()
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
 
     let asset = match kind {
-        ReleaseAssetKind::All => cve.get_latest_all_file_with_published_at(),
-        ReleaseAssetKind::Delta => cve.get_latest_delta_file().map(|asset| (asset, None)),
-        ReleaseAssetKind::DeltaMidnight => cve
-            .get_latest_delta_midnight_file()
-            .map(|asset| (asset, None)),
+        ReleaseAssetKind::All => cve.latest_full_asset_with_date(),
+        ReleaseAssetKind::Delta => cve.latest_delta_asset().map(|asset| (asset, None)),
+        ReleaseAssetKind::DeltaMidnight => cve.latest_end_of_day_asset().map(|asset| (asset, None)),
     };
 
     asset
@@ -1447,20 +1442,20 @@ async fn latest_asset_with_published_at(
 
 pub async fn delta_assets_oldest_first() -> Result<Vec<GitHubReleaseFile>, String> {
     let mut cve = CveRelease::new();
-    cve.async_get_all()
+    cve.refresh_all()
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
-    Ok(cve.get_delta_files_oldest_first())
+    Ok(cve.delta_assets())
 }
 
 pub async fn delta_assets_published_after(
     cursor: DateTime<Utc>,
 ) -> Result<Vec<(DateTime<Utc>, GitHubReleaseFile)>, String> {
     let mut cve = CveRelease::new();
-    cve.async_get_all()
+    cve.refresh_all()
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
-    Ok(cve.get_delta_files_published_after(cursor))
+    Ok(cve.delta_assets_after(cursor))
 }
 
 /// Applies local or downloaded CVE delta archives through the SQLx writer.
@@ -1470,7 +1465,7 @@ pub async fn apply_delta_updates(
     max_chunks: Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
     if let Some(path) = zip {
-        ingest_zip_sqlx(db.clone(), "update", &path, max_chunks).await?;
+        import_cve_zip(db.clone(), "update", &path, max_chunks).await?;
         return Ok(vec![path]);
     }
 
@@ -1497,11 +1492,11 @@ pub async fn apply_delta_updates(
                 .map_err(|error| format!("failed to prepare delta archive {filename}: {error}"))?;
             paths.push(path.clone());
             asset
-                .async_download_as(&path)
+                .download_to(&path)
                 .await
                 .map_err(|error| format!("failed to download {}: {error}", asset.name))?;
             database_changed = true;
-            ingest_zip_sqlx_deferred_search(db.clone(), "update", &path, max_chunks).await?;
+            import_cve_zip_deferred(db.clone(), "update", &path, max_chunks).await?;
             db.mark_cve_asset_applied(&asset.name, &asset.url)
                 .await
                 .map_err(|error| format!("failed to record CVE delta {}: {error}", asset.name))?;
@@ -1536,7 +1531,7 @@ pub async fn apply_delta_updates(
     Ok(paths)
 }
 
-/// Refreshes devel's enrichment sources using the SQLx-only import paths.
+/// Refreshes all enrichment sources.
 pub async fn sync_all_enrichment_sources_after_update(
     db: &SqlxDatabase,
     label: &str,
@@ -1550,49 +1545,47 @@ pub async fn sync_all_enrichment_sources_after_update(
         .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
     let selection =
         requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
-    sync_osv_selection_from_gcs_sqlx(db.clone(), label, selection).await?;
-    sync_kev_epss_snapshots_sqlx(db.clone(), label, true)
-        .await
-        .map(|_| ())
+    sync_osv(db.clone(), label, selection).await?;
+    sync_risk_feeds(db.clone(), label, true).await.map(|_| ())
 }
 
-/// Imports raw CVE JSON into the SQLx schema.
-pub async fn ingest_zip_sqlx(
+/// Imports CVE JSON from a ZIP archive.
+pub async fn import_cve_zip(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, true, None).await
+    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, true, None).await
 }
 
-async fn ingest_zip_sqlx_deferred_search(
+async fn import_cve_zip_deferred(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, false, false, None).await
+    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, false, None).await
 }
 
-/// Imports a full replacement archive with devel's deferred-index bulk-load policy.
-pub async fn ingest_zip_sqlx_bulk(
+/// Imports a replacement archive with deferred indexes.
+pub async fn import_cve_zip_bulk(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(db, label, asset_path, max_chunks, true, true, None).await
+    import_cve_zip_with_mode(db, label, asset_path, max_chunks, true, true, None).await
 }
 
-pub(crate) async fn ingest_zip_sqlx_bulk_with_index_signal(
+pub(crate) async fn import_cve_zip_bulk_with_index_signal(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
     max_chunks: Option<usize>,
     index_started: oneshot::Sender<()>,
 ) -> Result<usize, String> {
-    ingest_zip_sqlx_with_mode(
+    import_cve_zip_with_mode(
         db,
         label,
         asset_path,
@@ -1604,7 +1597,7 @@ pub(crate) async fn ingest_zip_sqlx_bulk_with_index_signal(
     .await
 }
 
-async fn ingest_zip_sqlx_with_mode(
+async fn import_cve_zip_with_mode(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
@@ -1615,7 +1608,7 @@ async fn ingest_zip_sqlx_with_mode(
 ) -> Result<usize, String> {
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
-    let entries = storage.enum_json_entries();
+    let entries = storage.entries();
     eprintln!("{label}: enumerated {} CVE JSON entries", entries.len());
     // Keep the already parsed central directory and archive handle for every chunk. Reopening a
     // 360k-entry ZIP in Rayon task initializers repeatedly dominates decompression time.
@@ -1711,9 +1704,9 @@ async fn ingest_zip_sqlx_with_mode(
 
 /// Reads one CVE ZIP chunk using the access strategy matching its backing store.
 ///
-/// Disk-backed ZIPs are fastest through one sequential archive handle; repeatedly seeking the
-/// same large archive from multiple workers defeats OS readahead. An in-memory inner archive has
-/// no seek penalty, so it can use independent Rayon readers safely.
+/// Reads disk-backed ZIPs sequentially to preserve OS readahead.
+///
+/// In-memory archives use independent Rayon readers.
 fn read_cve_zip_chunk(
     storage: &std::sync::Mutex<ZipStorage>,
     entries: &[qanvuli_core::ingest::JsonEntry],
@@ -1726,7 +1719,7 @@ fn read_cve_zip_chunk(
         .iter()
         .map(|entry| {
             let bytes = storage
-                .get_json_entry_bytes(entry)
+                .read_entry(entry)
                 .map_err(|error| format!("{label}: failed to read {}: {error}", entry.path))?;
             String::from_utf8(bytes)
                 .map_err(|error| format!("{label}: invalid UTF-8 in {}: {error}", entry.path))
@@ -1995,7 +1988,7 @@ mod tests {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         assert_eq!(
-            ingest_zip_sqlx(database.clone(), "test", &zip_path, None)
+            import_cve_zip(database.clone(), "test", &zip_path, None)
                 .await
                 .unwrap(),
             1
@@ -2013,7 +2006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlx_osv_zip_ingest_advances_cursor_only_after_complete_validation() {
+    async fn osv_zip_import_advances_cursor_after_validation() {
         use qanvuli_core::database::SqlxDatabase;
         use std::io::Write;
 
@@ -2037,7 +2030,7 @@ mod tests {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         assert_eq!(
-            import_osv_zip_file_sqlx(database.clone(), &zip_path, None, "2099-01-02T00:00:00Z")
+            import_osv_zip(database.clone(), &zip_path, None, "2099-01-02T00:00:00Z")
                 .await
                 .unwrap(),
             1
@@ -2077,11 +2070,11 @@ mod tests {
 
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        import_osv_zip_file_sqlx(database.clone(), &initial_zip, None, "2099-01-01T00:00:00Z")
+        import_osv_zip(database.clone(), &initial_zip, None, "2099-01-01T00:00:00Z")
             .await
             .unwrap();
         assert_eq!(
-            import_osv_zip_file_sqlx(database.clone(), &update_zip, None, "2099-01-02T00:00:00Z")
+            import_osv_zip(database.clone(), &update_zip, None, "2099-01-02T00:00:00Z")
                 .await
                 .unwrap(),
             2
@@ -2155,7 +2148,7 @@ mod tests {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
         assert!(
-            import_osv_zip_file_sqlx(database.clone(), &failing_zip, None, "2099-01-02T00:00:00Z")
+            import_osv_zip(database.clone(), &failing_zip, None, "2099-01-02T00:00:00Z")
                 .await
                 .is_err()
         );
@@ -2164,7 +2157,7 @@ mod tests {
         assert_eq!(state.last_cursor, None);
 
         assert_eq!(
-            import_osv_zip_file_sqlx(database.clone(), &retry_zip, None, "2099-01-02T00:00:00Z")
+            import_osv_zip(database.clone(), &retry_zip, None, "2099-01-02T00:00:00Z")
                 .await
                 .unwrap(),
             1

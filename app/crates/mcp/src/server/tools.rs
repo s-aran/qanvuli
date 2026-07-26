@@ -11,7 +11,7 @@ use simd_json::json;
 #[tool_router]
 impl CveSearchServer {
     #[tool(
-        description = "Search CVEs by vulnerability type using CWE IDs such as CWE-79, CWE79, or 79. List results include a 280-character description_preview by default; set full_description=true for complete English text."
+        description = "Search CVEs by CWE ID. Set full_description=true to replace previews with complete English descriptions."
     )]
     pub(crate) async fn search_by_cwe(
         &self,
@@ -34,7 +34,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search CVEs by affected vendor and/or product name. Use vendor/product for substring filters, or vendor_exact/product_exact in this same tool for exact affected field matches. Matching is ranked exact, word-boundary, then substring; set exclude_collection=true to exclude wordpress.org collection entries. List results use a 280-character description_preview by default; set full_description=true for complete text. A library CVE's affected product can be its implementation host (for example pdf.js may be Firefox), so substring search can miss it; use query_package_enriched (ecosystem/package) or resolve_identifier (alias graph) in that case."
+        description = "Search CVEs by affected vendor or product. Exact fields take precedence over substring fields; exclude_collection omits wordpress.org collections."
     )]
     pub(crate) async fn search_by_product(
         &self,
@@ -62,9 +62,7 @@ impl CveSearchServer {
         .await
     }
 
-    #[tool(
-        description = "Search CVEs by CVE ID, title, or English description text. List results include a 280-character description_preview by default; set full_description=true for complete English text."
-    )]
+    #[tool(description = "Search CVE IDs, titles, and English descriptions.")]
     pub(crate) async fn search_text(
         &self,
         Parameters(args): Parameters<TextArgs>,
@@ -87,9 +85,7 @@ impl CveSearchServer {
         .await
     }
 
-    #[tool(
-        description = "Search CVEs by CVSS score, severity, and/or CVSS version. List results include a 280-character description_preview by default; set full_description=true for complete English text."
-    )]
+    #[tool(description = "Search CVEs by CVSS score, severity, or version.")]
     pub(crate) async fn search_by_cvss(
         &self,
         Parameters(args): Parameters<CvssArgs>,
@@ -115,9 +111,7 @@ impl CveSearchServer {
         .await
     }
 
-    #[tool(
-        description = "Search high-risk CVEs for a specific affected vendor/product. Use vendor/product for substring filters, or vendor_exact/product_exact for exact affected field matches. List results include a 280-character description_preview by default; set full_description=true for complete English text."
-    )]
+    #[tool(description = "Search CVEs by affected vendor or product and minimum CVSS score.")]
     pub(crate) async fn search_product_by_cvss(
         &self,
         Parameters(args): Parameters<ProductCvssArgs>,
@@ -165,9 +159,7 @@ impl CveSearchServer {
         .await
     }
 
-    #[tool(
-        description = "Search recently published and/or recently updated CVEs using ISO-8601 timestamps. List results include a 280-character description_preview by default; set full_description=true for complete English text."
-    )]
+    #[tool(description = "Search CVEs by ISO-8601 publication or update time.")]
     pub(crate) async fn search_recent(
         &self,
         Parameters(args): Parameters<DateArgs>,
@@ -234,7 +226,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Search candidate CVEs by affected vendor/product and an optional version string. This returns investigation candidates, not a definitive vulnerable/not-vulnerable verdict."
+        description = "Find CVE candidates by affected vendor, product, and optional version text. Version ranges are not evaluated."
     )]
     pub(crate) async fn search_by_vendor_product_version(
         &self,
@@ -263,9 +255,7 @@ impl CveSearchServer {
         db::database_status(db).await
     }
 
-    #[tool(
-        description = "Resolve a CVE, OSV, GHSA, RUSTSEC, PYSEC, GO, or other vulnerability identifier through the local read-only alias graph and return related IDs plus edge evidence."
-    )]
+    #[tool(description = "Resolve a vulnerability identifier through the local alias graph.")]
     pub(crate) async fn resolve_identifier(
         &self,
         Parameters(args): Parameters<ResolveIdentifierArgs>,
@@ -317,7 +307,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Query local OSV records for an ecosystem/package/version, then attach CVE aliases, CISA KEV, FIRST EPSS, and priority signals. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence. This does not fetch URLs or run commands."
+        description = "Evaluate a package version against local OSV data and attach CVE, KEV, EPSS, and priority data. Set include_evidence=true for match details."
     )]
     pub(crate) async fn query_package_enriched(
         &self,
@@ -509,7 +499,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Fetch one exact CVE record by CVE ID. Returns the raw CVE JSON stored in the local database, including cveMetadata and containers, so this is token-heavy. Prefer search_* tools for triage, affected version checks, CVSS, CWE, descriptions, published_at, and updated_at; use get_cve only when raw CVE JSON fields not exposed by search_* are explicitly required."
+        description = "Return the original CVE JSON for an exact CVE ID. Prefer search tools unless provider-specific fields are required."
     )]
     pub(crate) async fn get_cve(
         &self,
@@ -521,7 +511,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Update the local database. With zip, applies that local CVE delta zip. Without zip, downloads and applies applicable CVE delta archives, refreshes OSV/KEV/EPSS enrichment, then rebuilds the identifier graph. Optional osv_all or osv_prefixes expand local OSV coverage by official OSV source DB prefix. This mutates the local database and may access GitHub, Google Cloud Storage, CISA, and FIRST."
+        description = "Apply a local CVE delta or download current updates, then refresh enrichment data. This changes the database and may access upstream feeds."
     )]
     pub(crate) async fn update_db(
         &self,

@@ -1,8 +1,8 @@
-use qanvuli_app_commands::common::connect_sqlx_db;
+use qanvuli_app_commands::common::connect_database;
 use qanvuli_core::database::SqlxDatabase;
 
 pub(crate) async fn connect(db_url: &str) -> Result<SqlxDatabase, String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required before opening TUI: {error}"))?;

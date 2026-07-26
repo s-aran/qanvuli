@@ -1,4 +1,4 @@
-use super::common::{DEFAULT_LIMIT, connect_sqlx_db, print_json};
+use super::common::{DEFAULT_LIMIT, connect_database, print_json};
 
 #[derive(Debug, clap::Args)]
 #[command(group(
@@ -24,7 +24,7 @@ pub struct Args {
 }
 
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let db = connect_sqlx_db(db_url).await?;
+    let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required or check failed: {error}"))?;
@@ -32,7 +32,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     if let Some(id) = args.id {
         let id = parse_id(&id, "CWE")?;
         let entry = db
-            .get_cwe_entry(id)
+            .find_cwe_entry(id)
             .await
             .map_err(|error| format!("failed to fetch CWE-{id}: {error}"))?;
         print_json(&entry)?;
@@ -123,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_positional_id_and_enforces_detail_selector() {
+    fn detail_lookup_requires_id_flag() {
         assert!(Command::try_parse_from(["cwe", "CWE-79"]).is_err());
         assert!(Command::try_parse_from(["cwe", "--detail"]).is_err());
         assert!(Command::try_parse_from(["cwe", "--id", "79", "--detail"]).is_ok());
