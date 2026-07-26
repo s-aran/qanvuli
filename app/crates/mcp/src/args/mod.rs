@@ -200,14 +200,48 @@ pub(crate) struct CweCatalogArgs {
     /// Optional CWE statuses to include, such as Draft, Stable, Deprecated, or Obsolete.
     #[serde(default)]
     pub(crate) statuses: Vec<String>,
+    /// Restrict CWE entries to those related to this CAPEC ID.
+    pub(crate) capec_id: Option<CweArgValue>,
     /// Maximum number of CWE entries to return. Clamped to 1..=30; default is 10.
     pub(crate) limit: Option<u64>,
+    /// Number of matching entries to skip.
+    pub(crate) offset: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GetCweArgs {
     /// CWE ID. Accepts a number or a string such as CWE-79.
     pub(crate) cwe_id: CweArgValue,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct CapecCatalogArgs {
+    /// CAPEC ID, name, or description query.
+    pub(crate) query: Option<String>,
+    /// Optional CAPEC statuses such as Stable, Draft, or Deprecated.
+    #[serde(default)]
+    pub(crate) statuses: Vec<String>,
+    /// Optional CAPEC abstraction types: Meta, Standard, or Detailed.
+    #[serde(default)]
+    pub(crate) types: Vec<String>,
+    /// Restrict entries to those related to this CWE ID.
+    pub(crate) cwe_id: Option<CweArgValue>,
+    /// Maximum number of entries to return. Clamped to 1..=30; default is 10.
+    pub(crate) limit: Option<u64>,
+    /// Number of matching entries to skip.
+    pub(crate) offset: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetCapecArgs {
+    /// CAPEC ID. Accepts a number or a string such as CAPEC-1.
+    pub(crate) capec_id: CweArgValue,
+    /// Include external references. Defaults to false.
+    pub(crate) include_references: Option<bool>,
+    /// Include category and view details. Defaults to false.
+    pub(crate) include_taxonomy: Option<bool>,
+    /// Include category and view history. Defaults to false.
+    pub(crate) include_history: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

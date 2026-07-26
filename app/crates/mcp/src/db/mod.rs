@@ -1,6 +1,13 @@
 #![allow(clippy::too_many_arguments)]
 
-use crate::{common::error::mcp_error, response};
+use crate::{
+    args::{CapecCatalogArgs, CweArgValue, GetCapecArgs},
+    common::{
+        error::mcp_error,
+        params::{limit, offset},
+    },
+    response,
+};
 use qanvuli_app_commands::common::{
     OsvImportSelection, apply_delta_updates, redact_database_url,
     sync_all_enrichment_sources_after_update,
@@ -822,6 +829,8 @@ pub(crate) async fn search_cwe_catalog(
     query: Option<&str>,
     limit: u64,
     statuses: &[String],
+    capec_id: Option<i32>,
+    offset: u64,
 ) -> Result<CallToolResult, McpError> {
     let statuses = if statuses.is_empty() {
         vec![
@@ -835,10 +844,19 @@ pub(crate) async fn search_cwe_catalog(
     } else {
         statuses.to_owned()
     };
-    let entries = db
-        .search_cwe_entries(query.unwrap_or_default(), limit, &statuses)
+    let mut entries = db
+        .search_cwe_entries_filtered(
+            query.unwrap_or_default(),
+            limit.saturating_add(offset),
+            &statuses,
+            capec_id,
+        )
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
+    let entries = entries
+        .drain(offset.min(entries.len() as u64) as usize..)
+        .take(limit as usize)
+        .collect::<Vec<_>>();
     response::tool_result(json!(entries))
 }
 
@@ -848,6 +866,84 @@ pub(crate) async fn get_cwe(db: &CveDatabase, cwe_id: i32) -> Result<CallToolRes
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     response::tool_result(json!(entry))
+}
+
+pub(crate) async fn search_capec_catalog(
+    db: &CveDatabase,
+    args: CapecCatalogArgs,
+) -> Result<CallToolResult, McpError> {
+    let cwe_id = args
+        .cwe_id
+        .map(|value| parse_catalog_id(value, "CWE"))
+        .transpose()?;
+    let entries = db
+        .search_capec_entries(qanvuli_core::database::CapecSearchFilters {
+            query: args.query,
+            statuses: args.statuses,
+            types: args.types,
+            cwe_id,
+            limit: limit(args.limit),
+            offset: offset(args.offset),
+        })
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!(entries))
+}
+
+pub(crate) async fn get_capec(
+    db: &CveDatabase,
+    args: GetCapecArgs,
+) -> Result<CallToolResult, McpError> {
+    let id = parse_catalog_id(args.capec_id, "CAPEC")?;
+    let mut value = serde_json::to_value(
+        db.get_capec_detail(id)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?,
+    )
+    .map_err(|err| mcp_error(err.to_string()))?;
+    if let Some(detail) = value.as_object_mut() {
+        let include_references = args.include_references.unwrap_or(false);
+        let include_history = args.include_history.unwrap_or(false);
+        if !include_references {
+            detail.remove("references");
+        }
+        if args.include_taxonomy.unwrap_or(false) {
+            for classification in ["categories", "views"] {
+                if let Some(items) = detail
+                    .get_mut(classification)
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for item in items {
+                        if let Some(item) = item.as_object_mut() {
+                            if !include_references {
+                                item.remove("references");
+                            }
+                            if !include_history {
+                                item.remove("history");
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            detail.remove("categories");
+            detail.remove("views");
+        }
+    }
+    response::tool_result(
+        simd_json::serde::to_owned_value(&value).map_err(|err| mcp_error(err.to_string()))?,
+    )
+}
+
+fn parse_catalog_id(value: CweArgValue, prefix: &str) -> Result<i32, McpError> {
+    let value = value.into_search_value();
+    let upper = value.trim().to_ascii_uppercase();
+    upper
+        .strip_prefix(prefix)
+        .unwrap_or(&upper)
+        .trim_start_matches('-')
+        .parse()
+        .map_err(|err| mcp_error(format!("invalid {prefix} ID `{value}`: {err}")))
 }
 
 pub(crate) async fn list_recent_updates(

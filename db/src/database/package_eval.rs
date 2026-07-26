@@ -204,11 +204,16 @@ mod tests {
         // Go module versions conventionally carry a leading v and may use a
         // semver prerelease-shaped pseudo-version.
         assert_eq!(
-            evaluate_version("Go", "v1.1.0-20240101120000-abcdef123456", &[range.clone()]).status,
+            evaluate_version(
+                "Go",
+                "v1.1.0-20240101120000-abcdef123456",
+                std::slice::from_ref(&range)
+            )
+            .status,
             "affected"
         );
         assert_eq!(
-            evaluate_version("Go", "v1.2.0", &[range.clone()]).status,
+            evaluate_version("Go", "v1.2.0", std::slice::from_ref(&range)).status,
             "not_affected"
         );
         assert_eq!(
@@ -227,7 +232,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            evaluate_version("PyPI", "2.0", &[range.clone()]).status,
+            evaluate_version("PyPI", "2.0", std::slice::from_ref(&range)).status,
             "affected"
         );
         assert_eq!(
@@ -246,7 +251,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            evaluate_version("Maven", "1.5.0", &[range.clone()]).status,
+            evaluate_version("Maven", "1.5.0", std::slice::from_ref(&range)).status,
             "unsupported_version_scheme"
         );
         assert_eq!(
@@ -276,11 +281,11 @@ mod tests {
             ],
         };
         assert_eq!(
-            evaluate_version("npm", "1.0.5", &[range.clone()]).status,
+            evaluate_version("npm", "1.0.5", std::slice::from_ref(&range)).status,
             "affected"
         );
         assert_eq!(
-            evaluate_version("npm", "1.1.5", &[range.clone()]).status,
+            evaluate_version("npm", "1.1.5", std::slice::from_ref(&range)).status,
             "not_affected"
         );
         assert_eq!(

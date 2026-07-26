@@ -201,6 +201,7 @@ mod tests {
             parent_count: usize::from(parent_id.is_some()),
             sibling_count: 0,
             child_count: 0,
+            capec_ids: Vec::new(),
         }
     }
 }

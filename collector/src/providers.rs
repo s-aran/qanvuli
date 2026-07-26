@@ -1,3 +1,4 @@
+pub mod capec;
 pub mod cve;
 pub mod cwe;
 pub mod epss;

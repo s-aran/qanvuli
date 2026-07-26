@@ -405,7 +405,19 @@ impl CveSearchServer {
         Parameters(args): Parameters<CweCatalogArgs>,
     ) -> Result<CallToolResult, McpError> {
         let db = self.db.get().await?;
-        db::search_cwe_catalog(db, args.query.as_deref(), limit(args.limit), &args.statuses).await
+        let capec_id = args
+            .capec_id
+            .map(|value| cwe_arg_to_i32_with_prefix(value, "CAPEC"))
+            .transpose()?;
+        db::search_cwe_catalog(
+            db,
+            args.query.as_deref(),
+            limit(args.limit),
+            &args.statuses,
+            capec_id,
+            offset(args.offset),
+        )
+        .await
     }
 
     #[tool(description = "Fetch one CWE catalog entry by CWE ID.")]
@@ -416,6 +428,28 @@ impl CveSearchServer {
         let db = self.db.get().await?;
         let cwe_id = cwe_arg_to_i32(args.cwe_id)?;
         db::get_cwe(db, cwe_id).await
+    }
+
+    #[tool(
+        description = "Search the local CAPEC catalog by ID, name, description, status, type, or related CWE."
+    )]
+    pub(crate) async fn search_capec_catalog(
+        &self,
+        Parameters(args): Parameters<CapecCatalogArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::search_capec_catalog(db, args).await
+    }
+
+    #[tool(
+        description = "Fetch one CAPEC entry with optional references, taxonomy details, and history."
+    )]
+    pub(crate) async fn get_capec(
+        &self,
+        Parameters(args): Parameters<GetCapecArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db = self.db.get().await?;
+        db::get_capec(db, args).await
     }
 
     #[tool(
@@ -516,14 +550,18 @@ impl ServerHandler for CveSearchServer {
 }
 
 fn cwe_arg_to_i32(value: CweArgValue) -> Result<i32, McpError> {
+    cwe_arg_to_i32_with_prefix(value, "CWE")
+}
+
+fn cwe_arg_to_i32_with_prefix(value: CweArgValue, prefix: &str) -> Result<i32, McpError> {
     let value = value.into_search_value();
     let number = value
         .trim()
-        .trim_start_matches("CWE-")
-        .trim_start_matches("CWE")
+        .trim_start_matches(&format!("{prefix}-"))
+        .trim_start_matches(prefix)
         .parse::<i32>()
         .map_err(|err| {
-            crate::common::error::mcp_error(format!("invalid CWE ID `{value}`: {err}"))
+            crate::common::error::mcp_error(format!("invalid {prefix} ID `{value}`: {err}"))
         })?;
     Ok(number)
 }

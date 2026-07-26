@@ -2228,6 +2228,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "simd-json",
  "sqlx",
  "tokio",
@@ -2243,6 +2244,7 @@ dependencies = [
  "qanvuli-core",
  "rmcp",
  "serde",
+ "serde_json",
  "simd-json",
  "tokio",
 ]

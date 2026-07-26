@@ -196,6 +196,7 @@ pub struct SqlxCvssSearch {
 pub struct SqlxCveSearch {
     pub text: Option<String>,
     pub cwe_ids: Vec<String>,
+    pub capec_ids: Vec<String>,
     pub vendor_like: Option<String>,
     pub product_like: Option<String>,
     pub vendor_exact: Option<String>,
@@ -289,6 +290,10 @@ pub struct SqlxDatabaseStatus {
     pub cve_count: i64,
     pub osv_count: i64,
     pub cwe_count: i64,
+    pub capec_count: i64,
+    pub capec_category_count: i64,
+    pub capec_view_count: i64,
+    pub capec_reference_count: i64,
     pub affected_count: i64,
     pub cvss_count: i64,
     pub latest_cve_updated_at: Option<String>,
@@ -982,6 +987,7 @@ impl SqlxDatabase {
     }
 
     /// Searches normalized affected vendor/product/package fields with bound LIKE predicates.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_cves_by_affected(
         &self,
         vendor: Option<String>,
@@ -1105,6 +1111,24 @@ impl SqlxDatabase {
             .then(|| serde_json::to_string(&cwe_ids))
             .transpose()
             .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CWE IDs: {error}")))?;
+        let capec_ids = filters
+            .capec_ids
+            .iter()
+            .filter_map(|value| {
+                value
+                    .trim()
+                    .strip_prefix("CAPEC-")
+                    .unwrap_or(value.trim())
+                    .parse::<i64>()
+                    .ok()
+            })
+            .collect::<Vec<_>>();
+        let capec_ids = (!capec_ids.is_empty())
+            .then(|| serde_json::to_string(&capec_ids))
+            .transpose()
+            .map_err(|error| {
+                sqlx::Error::Protocol(format!("failed to encode CAPEC IDs: {error}"))
+            })?;
         let text = filters.text.as_deref().and_then(fts_query);
         let use_published_index = matches!(
             filters.sort_order,
@@ -1143,6 +1167,9 @@ impl SqlxDatabase {
             }
             if let Some(value) = cwe_ids {
                 query.push(" AND EXISTS (SELECT 1 FROM cve_cwe WHERE cve_cwe.cve_db_id=c.id AND cve_cwe.cwe_id IN (SELECT value FROM json_each(").push_bind(value).push(")))");
+            }
+            if let Some(value) = capec_ids {
+                query.push(" AND EXISTS (SELECT 1 FROM cve_cwe JOIN capec_cwe ON capec_cwe.cwe_id=cve_cwe.cwe_id WHERE cve_cwe.cve_db_id=c.id AND capec_cwe.capec_id IN (SELECT value FROM json_each(").push_bind(value).push(")))");
             }
             if kev_only {
                 query.push(" AND EXISTS (SELECT 1 FROM kev_entries WHERE kev_entries.cve_id=c.cve_id)");
@@ -1326,7 +1353,7 @@ impl SqlxDatabase {
 
     pub async fn database_status(&self) -> Result<SqlxDatabaseStatus, sqlx::Error> {
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT (SELECT COUNT(*) FROM cve) AS cve_count, (SELECT COUNT(*) FROM osv_advisories) AS osv_count, (SELECT COUNT(*) FROM cwe) AS cwe_count, (SELECT COUNT(*) FROM cve_affected) AS affected_count, (SELECT COUNT(*) FROM cve_cvss) AS cvss_count, (SELECT MAX(updated_at) FROM cve) AS latest_cve_updated_at")
+            sqlx::query_as("SELECT (SELECT COUNT(*) FROM cve) AS cve_count, (SELECT COUNT(*) FROM osv_advisories) AS osv_count, (SELECT COUNT(*) FROM cwe) AS cwe_count, (SELECT COUNT(*) FROM capec) AS capec_count, (SELECT COUNT(*) FROM capec_category) AS capec_category_count, (SELECT COUNT(*) FROM capec_view) AS capec_view_count, (SELECT COUNT(*) FROM capec_external_reference) AS capec_reference_count, (SELECT COUNT(*) FROM cve_affected) AS affected_count, (SELECT COUNT(*) FROM cve_cvss) AS cvss_count, (SELECT MAX(updated_at) FROM cve) AS latest_cve_updated_at")
                 .fetch_one(connection).await
         })).await
     }
@@ -3039,7 +3066,7 @@ mod tests {
         database.check_full_foreign_keys().await.unwrap();
         database.check_full_cve_search().await.unwrap();
         database.check_full_osv_search().await.unwrap();
-        assert_eq!(SqlxDatabase::schema_version(), 9);
+        assert_eq!(SqlxDatabase::schema_version(), 10);
     }
 
     #[tokio::test]

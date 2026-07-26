@@ -10,6 +10,7 @@ macro_rules! eprintln {
     };
 }
 
+pub mod capec;
 pub mod common;
 pub mod cwe;
 pub mod db;

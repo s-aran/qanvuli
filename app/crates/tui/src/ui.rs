@@ -13,6 +13,7 @@ pub(super) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         ViewMode::Normal => modes::main::draw(frame, app, &detail_search),
         ViewMode::RawJson => modes::raw_json::draw(frame, app, &detail_search),
         ViewMode::CweList => modes::cwe::draw(frame, app, &detail_search),
+        ViewMode::CapecList => modes::capec::draw(frame, app, &detail_search),
     }
 
     if app.show_help {

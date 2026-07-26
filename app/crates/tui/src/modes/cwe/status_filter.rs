@@ -1,5 +1,5 @@
 use crate::{
-    app::{App, CWE_STATUSES},
+    app::{App, CWE_CAPEC_CURSOR, CWE_STATUSES},
     common::{
         centered_rect,
         components::{ActionButton, ButtonRow, Checkbox},
@@ -15,6 +15,16 @@ use ratatui::{
 pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = centered_rect(48, 34, frame.area());
     let mut lines = vec![Line::from("Select CWE Status values.")];
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "{}CAPEC ID: {}",
+        if app.cwe_status_cursor == CWE_CAPEC_CURSOR {
+            "> "
+        } else {
+            "  "
+        },
+        app.cwe_capec_filter
+    )));
     lines.push(Line::from(""));
     for (index, status) in CWE_STATUSES.iter().enumerate() {
         lines.push(

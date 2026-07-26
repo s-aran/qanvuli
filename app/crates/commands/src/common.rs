@@ -6,12 +6,13 @@ use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
 use qanvuli_core::{
     database::{OsvRawRecord, SqlxDatabase},
     ingest::{
-        CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile, OSV_ALL_ZIP,
-        OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv, download_kev_json,
-        parse_modified_id_csv,
+        CapecCatalogFile, CveRelease, CweCatalogFile, FileStorageTrait, GitHubReleaseFile,
+        OSV_ALL_ZIP, OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv,
+        download_kev_json, parse_modified_id_csv,
     },
-    model::{is_known_osv_database_prefix, read_cwe_catalog_zip},
+    model::{is_known_osv_database_prefix, read_capec_catalog_xml, read_cwe_catalog_zip},
 };
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -56,6 +57,11 @@ const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
 const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
 const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
 const CWE_STORAGE_VERSION: &str = "2";
+const CAPEC_ETAG_METADATA_KEY: &str = "capec_catalog:etag";
+const CAPEC_LAST_MODIFIED_METADATA_KEY: &str = "capec_catalog:last_modified";
+const CAPEC_HASH_METADATA_KEY: &str = "capec_catalog:sha256";
+const CAPEC_STORAGE_VERSION_METADATA_KEY: &str = "capec_catalog:storage_version";
+const CAPEC_STORAGE_VERSION: &str = "1";
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(crate) const CVE_DELTA_CURSOR_METADATA_KEY: &str = "cve_delta_cursor";
 
@@ -1277,6 +1283,131 @@ fn local_cwe_catalog_path(filename: &str) -> Option<PathBuf> {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(filename)));
     executable_path.filter(|path| path.exists())
+}
+
+pub async fn sync_capec_catalog_sqlx(db: SqlxDatabase) -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(path) = local_test_capec_catalog_path() {
+        let count = replace_capec_catalog_file_sqlx(db, &path).await?;
+        eprintln!("capec: replaced {count} attack patterns");
+        return Ok(());
+    }
+
+    let catalog = CapecCatalogFile::default();
+    let storage_is_current = db
+        .metadata_value(CAPEC_STORAGE_VERSION_METADATA_KEY)
+        .await
+        .map_err(|error| format!("failed to read CAPEC storage metadata: {error}"))?
+        .as_deref()
+        == Some(CAPEC_STORAGE_VERSION);
+    let (etag, last_modified, previous_hash) = if storage_is_current {
+        (
+            db.metadata_value(CAPEC_ETAG_METADATA_KEY)
+                .await
+                .map_err(|error| format!("failed to read CAPEC ETag: {error}"))?,
+            db.metadata_value(CAPEC_LAST_MODIFIED_METADATA_KEY)
+                .await
+                .map_err(|error| format!("failed to read CAPEC Last-Modified: {error}"))?,
+            db.metadata_value(CAPEC_HASH_METADATA_KEY)
+                .await
+                .map_err(|error| format!("failed to read CAPEC hash: {error}"))?,
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let path = temporary_zip_file_path(&catalog.name, None)?;
+    eprintln!("capec: checking {}", catalog.url);
+    let download = match catalog
+        .download_if_changed_as(&path, etag.as_deref(), last_modified.as_deref())
+        .await
+    {
+        Ok(download) => download,
+        Err(error) => {
+            let _ = std::fs::remove_file(&path);
+            if let Some(local) = local_catalog_path(&catalog.name) {
+                eprintln!(
+                    "capec: remote update unavailable ({error}); loading {}",
+                    local.display()
+                );
+                let count = replace_capec_catalog_file_sqlx(db, &local).await?;
+                eprintln!("capec: replaced {count} attack patterns");
+                return Ok(());
+            }
+            return Err(format!("failed to update {}: {error}", catalog.name));
+        }
+    };
+    let Some(path) = download.path else {
+        eprintln!("capec: catalog unchanged");
+        return Ok(());
+    };
+
+    let bytes = std::fs::read(&path)
+        .map_err(|error| format!("failed to hash {}: {error}", path.display()))?;
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    if previous_hash.as_deref() == Some(hash.as_str()) {
+        let _ = std::fs::remove_file(&path);
+        store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;
+        eprintln!("capec: downloaded content is unchanged");
+        return Ok(());
+    }
+
+    let count = replace_capec_catalog_file_sqlx(db.clone(), &path).await?;
+    let _ = std::fs::remove_file(&path);
+    store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;
+    db.set_metadata_value(CAPEC_STORAGE_VERSION_METADATA_KEY, CAPEC_STORAGE_VERSION)
+        .await
+        .map_err(|error| format!("failed to write CAPEC storage metadata: {error}"))?;
+    eprintln!("capec: replaced {count} attack patterns");
+    Ok(())
+}
+
+async fn replace_capec_catalog_file_sqlx(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
+    let catalog = read_capec_catalog_xml(path)
+        .map_err(|error| format!("failed to read CAPEC catalog {}: {error}", path.display()))?;
+    db.replace_capec_catalog(&catalog)
+        .await
+        .map_err(|error| format!("failed to write CAPEC catalog: {error}"))
+}
+
+async fn store_capec_download_metadata(
+    db: &SqlxDatabase,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    hash: &str,
+) -> Result<(), String> {
+    if let Some(etag) = etag {
+        db.set_metadata_value(CAPEC_ETAG_METADATA_KEY, &etag)
+            .await
+            .map_err(|error| format!("failed to write CAPEC ETag: {error}"))?;
+    }
+    if let Some(last_modified) = last_modified {
+        db.set_metadata_value(CAPEC_LAST_MODIFIED_METADATA_KEY, &last_modified)
+            .await
+            .map_err(|error| format!("failed to write CAPEC Last-Modified: {error}"))?;
+    }
+    db.set_metadata_value(CAPEC_HASH_METADATA_KEY, hash)
+        .await
+        .map_err(|error| format!("failed to write CAPEC hash: {error}"))
+}
+
+fn local_catalog_path(filename: &str) -> Option<PathBuf> {
+    let current = PathBuf::from(filename);
+    if current.exists() {
+        return Some(current);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(filename)))
+        .filter(|path| path.exists())
+}
+
+#[cfg(test)]
+fn local_test_capec_catalog_path() -> Option<PathBuf> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../..")
+        .join("capec_latest.xml");
+    path.exists().then_some(path)
 }
 
 #[cfg(test)]

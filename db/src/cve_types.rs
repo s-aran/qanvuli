@@ -84,6 +84,7 @@ pub struct CweEntry {
     pub parent_count: usize,
     pub sibling_count: usize,
     pub child_count: usize,
+    pub capec_ids: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Default)]

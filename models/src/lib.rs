@@ -1,5 +1,6 @@
 #![allow(clippy::large_enum_variant)]
 
+pub mod capec;
 pub mod cve;
 pub mod cwe;
 pub mod epss;

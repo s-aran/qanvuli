@@ -24,6 +24,7 @@ pub(crate) fn handle_key(
         KeyCode::Esc => app.toggle_raw_json_mode(None),
         KeyCode::F(8) => app.toggle_raw_json_mode(None),
         KeyCode::F(9) => app.toggle_cwe_list_mode(db),
+        KeyCode::F(10) => app.toggle_capec_list_mode(db),
         KeyCode::Char('/') => app.start_detail_search(),
         KeyCode::Char('c') if is_ctrl(key, 'c') => return true,
         KeyCode::Char('d') if is_ctrl(key, 'd') => app.move_raw_page_down(line_count, page_size),

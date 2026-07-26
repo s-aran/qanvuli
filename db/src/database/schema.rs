@@ -2,7 +2,7 @@
 
 use sqlx::{Connection, SqliteConnection};
 
-pub(crate) const SCHEMA_VERSION: i64 = 9;
+pub(crate) const SCHEMA_VERSION: i64 = 10;
 
 pub(crate) async fn suspend_cve_search_sync(
     _connection: &mut SqliteConnection,
@@ -77,6 +77,141 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             cve_db_id INTEGER NOT NULL REFERENCES cve(id) ON DELETE CASCADE,
             cwe_id INTEGER NOT NULL REFERENCES cwe(id) ON DELETE CASCADE,
             PRIMARY KEY(cve_db_id, cwe_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec (
+            id INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            extended_description TEXT,
+            status TEXT NOT NULL,
+            abstraction TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS capec_parent (
+            capec_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            parent_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            relation_order INTEGER NOT NULL,
+            PRIMARY KEY(capec_id, parent_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec_cwe (
+            capec_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            cwe_id INTEGER NOT NULL REFERENCES cwe(id) ON DELETE CASCADE,
+            relation_order INTEGER NOT NULL,
+            PRIMARY KEY(capec_id, cwe_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec_category (
+            id INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            summary TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS capec_category_member (
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            capec_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            member_order INTEGER NOT NULL,
+            PRIMARY KEY(category_id, capec_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec_view (
+            id INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            view_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            filter TEXT
+        );
+        CREATE TABLE IF NOT EXISTS capec_view_category (
+            view_id INTEGER NOT NULL REFERENCES capec_view(id) ON DELETE CASCADE,
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            member_order INTEGER NOT NULL,
+            PRIMARY KEY(view_id, category_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec_view_capec (
+            view_id INTEGER NOT NULL REFERENCES capec_view(id) ON DELETE CASCADE,
+            capec_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            member_order INTEGER NOT NULL,
+            PRIMARY KEY(view_id, capec_id)
+        );
+        CREATE TABLE IF NOT EXISTS capec_external_reference (
+            reference_id TEXT PRIMARY KEY NOT NULL,
+            title TEXT NOT NULL,
+            edition TEXT,
+            publication TEXT,
+            publication_year TEXT,
+            publication_month TEXT,
+            publication_day TEXT,
+            publisher TEXT,
+            url TEXT,
+            url_date TEXT
+        );
+        CREATE TABLE IF NOT EXISTS capec_external_reference_author (
+            reference_id TEXT NOT NULL REFERENCES capec_external_reference(reference_id) ON DELETE CASCADE,
+            author_order INTEGER NOT NULL,
+            author TEXT NOT NULL,
+            PRIMARY KEY(reference_id, author_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_reference (
+            capec_id INTEGER NOT NULL REFERENCES capec(id) ON DELETE CASCADE,
+            reference_id TEXT NOT NULL REFERENCES capec_external_reference(reference_id) ON DELETE CASCADE,
+            section TEXT,
+            reference_order INTEGER NOT NULL,
+            PRIMARY KEY(capec_id, reference_id, reference_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_category_reference (
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            reference_id TEXT NOT NULL REFERENCES capec_external_reference(reference_id) ON DELETE CASCADE,
+            section TEXT,
+            reference_order INTEGER NOT NULL,
+            PRIMARY KEY(category_id, reference_id, reference_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_view_reference (
+            view_id INTEGER NOT NULL REFERENCES capec_view(id) ON DELETE CASCADE,
+            reference_id TEXT NOT NULL REFERENCES capec_external_reference(reference_id) ON DELETE CASCADE,
+            section TEXT,
+            reference_order INTEGER NOT NULL,
+            PRIMARY KEY(view_id, reference_id, reference_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_category_history (
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            event_order INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            actor_name TEXT,
+            organization TEXT,
+            comment TEXT,
+            previous_name TEXT,
+            PRIMARY KEY(category_id, event_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_view_history (
+            view_id INTEGER NOT NULL REFERENCES capec_view(id) ON DELETE CASCADE,
+            event_order INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            actor_name TEXT,
+            organization TEXT,
+            comment TEXT,
+            previous_name TEXT,
+            PRIMARY KEY(view_id, event_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_category_note (
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            note_order INTEGER NOT NULL,
+            note_type TEXT NOT NULL,
+            note_text TEXT NOT NULL,
+            PRIMARY KEY(category_id, note_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_view_note (
+            view_id INTEGER NOT NULL REFERENCES capec_view(id) ON DELETE CASCADE,
+            note_order INTEGER NOT NULL,
+            note_type TEXT NOT NULL,
+            note_text TEXT NOT NULL,
+            PRIMARY KEY(view_id, note_order)
+        );
+        CREATE TABLE IF NOT EXISTS capec_category_taxonomy_mapping (
+            category_id INTEGER NOT NULL REFERENCES capec_category(id) ON DELETE CASCADE,
+            mapping_order INTEGER NOT NULL,
+            taxonomy TEXT NOT NULL,
+            entry_id TEXT,
+            entry_name TEXT,
+            PRIMARY KEY(category_id, mapping_order)
         );
         CREATE TABLE IF NOT EXISTS read_json_file (
             created_at TEXT NOT NULL,
@@ -238,6 +373,12 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE INDEX IF NOT EXISTS idx_cve_affected_cve_db_id ON cve_affected(cve_db_id);
         CREATE INDEX IF NOT EXISTS idx_cve_affected_vendor_product_cve_db_id ON cve_affected(vendor, product, cve_db_id);
         CREATE INDEX IF NOT EXISTS idx_cve_cwe_cwe_id_cve_db_id ON cve_cwe(cwe_id, cve_db_id);
+        CREATE INDEX IF NOT EXISTS idx_capec_status_type ON capec(status, abstraction, id);
+        CREATE INDEX IF NOT EXISTS idx_capec_parent_parent ON capec_parent(parent_id, capec_id);
+        CREATE INDEX IF NOT EXISTS idx_capec_cwe_cwe ON capec_cwe(cwe_id, capec_id);
+        CREATE INDEX IF NOT EXISTS idx_capec_category_member_capec ON capec_category_member(capec_id, category_id);
+        CREATE INDEX IF NOT EXISTS idx_capec_view_capec_capec ON capec_view_capec(capec_id, view_id);
+        CREATE INDEX IF NOT EXISTS idx_capec_view_category_category ON capec_view_category(category_id, view_id);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages(ecosystem COLLATE NOCASE, package_name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_osv_id ON osv_affected_packages(osv_id);
         CREATE INDEX IF NOT EXISTS idx_osv_raw_records_content_hash ON osv_raw_records(content_hash);
@@ -255,7 +396,7 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
             ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv');
 
-        INSERT INTO schema_meta(rowid, version) VALUES(1, 9);
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 10);
         "#,
     )
     .execute(&mut *transaction)

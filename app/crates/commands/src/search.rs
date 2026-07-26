@@ -32,6 +32,8 @@ pub struct Args {
     exact: bool,
     #[arg(long = "cwe", value_name = "CWE_ID")]
     cwe_ids: Vec<String>,
+    #[arg(long = "capec", value_name = "CAPEC_ID")]
+    capec_ids: Vec<String>,
     #[arg(long)]
     min_score: Option<f64>,
     #[arg(long)]
@@ -132,6 +134,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             || args.component.is_some()
             || args.exact
             || !args.cwe_ids.is_empty()
+            || !args.capec_ids.is_empty()
             || args.min_score.is_some()
             || args.max_score.is_some()
             || args.severity.is_some()
@@ -177,6 +180,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let filters = SqlxCveSearch {
         text: args.text.clone(),
         cwe_ids: args.cwe_ids.clone(),
+        capec_ids: args.capec_ids.clone(),
         vendor_like: args.vendor_like().map(|value| format!("%{value}%")),
         product_like: args
             .product_like()

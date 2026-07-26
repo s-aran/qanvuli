@@ -59,9 +59,13 @@ async fn run_loop(
         app.poll_count().await;
         app.poll_raw_json().await;
         app.poll_enrichment().await;
+        app.poll_metadata_capec().await;
         app.poll_cwe_search().await;
+        app.poll_capec_search().await;
+        app.poll_capec_detail().await;
         app.poll_scope_candidates().await;
         app.ensure_loaded_enrichment(db.as_ref().cloned());
+        app.ensure_loaded_metadata_capec(db.as_ref().cloned());
         if app.poll_maintenance().await {
             refresh_db_after_maintenance(db_url, db, app).await;
         }
@@ -283,15 +287,101 @@ async fn run_loop(
                 KeyCode::Esc => app.close_cwe_status_popup(),
                 KeyCode::Enter => {
                     if !app.activate_cwe_status_control(db.as_ref().cloned()) {
-                        app.close_cwe_status_popup();
+                        app.apply_cwe_filters(db.as_ref().cloned());
                     }
                 }
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Down | KeyCode::Tab => app.next_cwe_status(),
                 KeyCode::Up | KeyCode::BackTab => app.previous_cwe_status(),
+                KeyCode::Backspace if app.cwe_status_cursor == crate::app::CWE_CAPEC_CURSOR => {
+                    app.backspace_cwe_capec_filter()
+                }
+                KeyCode::Char(ch) if app.cwe_status_cursor == crate::app::CWE_CAPEC_CURSOR => {
+                    app.push_cwe_capec_filter(ch)
+                }
                 KeyCode::Char(' ') => app.toggle_current_cwe_status(db.as_ref().cloned()),
                 KeyCode::Char('a') => app.select_all_cwe_statuses(db.as_ref().cloned()),
                 KeyCode::Char('x') => app.clear_all_cwe_statuses(db.as_ref().cloned()),
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.show_capec_filter {
+            match key.code {
+                KeyCode::Esc => app.close_capec_filter(db.as_ref().cloned()),
+                KeyCode::Enter => app.close_capec_filter(db.as_ref().cloned()),
+                KeyCode::Tab | KeyCode::Down => {
+                    app.capec_filter_field = (app.capec_filter_field + 1) % 3;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    app.capec_filter_field = (app.capec_filter_field + 2) % 3;
+                }
+                KeyCode::Backspace => match app.capec_filter_field {
+                    0 => {
+                        app.capec_status_filter.pop();
+                    }
+                    1 => {
+                        app.capec_type_filter.pop();
+                    }
+                    _ => {
+                        app.capec_cwe_filter.pop();
+                    }
+                },
+                KeyCode::Char(ch) => match app.capec_filter_field {
+                    0 => app.capec_status_filter.push(ch),
+                    1 => app.capec_type_filter.push(ch),
+                    _ => app.capec_cwe_filter.push(ch),
+                },
+                _ => {}
+            }
+            continue;
+        }
+
+        if app.show_capec_taxonomy {
+            match key.code {
+                KeyCode::Esc => app.show_capec_taxonomy = false,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.capec_taxonomy_tab = (app.capec_taxonomy_tab + 1) % 2;
+                    app.capec_taxonomy_scroll = 0;
+                    app.capec_taxonomy_selected = 0;
+                }
+                KeyCode::Left => {
+                    app.capec_taxonomy_section = (app.capec_taxonomy_section + 3) % 4;
+                    app.capec_taxonomy_scroll = 0;
+                }
+                KeyCode::Right => {
+                    app.capec_taxonomy_section = (app.capec_taxonomy_section + 1) % 4;
+                    app.capec_taxonomy_scroll = 0;
+                }
+                KeyCode::Up => {
+                    app.capec_taxonomy_selected = app.capec_taxonomy_selected.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    let count = app.capec_taxonomy.as_ref().map_or(0, |detail| {
+                        if app.capec_taxonomy_tab == 0 {
+                            detail.categories.len()
+                        } else {
+                            detail.views.len()
+                        }
+                    });
+                    app.capec_taxonomy_selected = app
+                        .capec_taxonomy_selected
+                        .saturating_add(1)
+                        .min(count.saturating_sub(1));
+                }
+                KeyCode::PageUp => {
+                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_sub(10)
+                }
+                KeyCode::PageDown => {
+                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_add(10)
+                }
+                KeyCode::Char('u') if is_ctrl(&key, 'u') => {
+                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_sub(5)
+                }
+                KeyCode::Char('d') if is_ctrl(&key, 'd') => {
+                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_add(5)
+                }
                 _ => {}
             }
             continue;
@@ -311,6 +401,18 @@ async fn run_loop(
 
         if app.view_mode == ViewMode::CweList {
             if modes::cwe::handler::handle_key(
+                app,
+                db.as_ref().cloned(),
+                &key,
+                terminal.size().ok(),
+            ) {
+                break;
+            }
+            continue;
+        }
+
+        if app.view_mode == ViewMode::CapecList {
+            if modes::capec::handler::handle_key(
                 app,
                 db.as_ref().cloned(),
                 &key,

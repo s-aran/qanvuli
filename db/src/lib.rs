@@ -16,6 +16,7 @@ pub mod database {
     pub(crate) mod writer;
 }
 
+pub mod capec;
 mod common;
 mod cve_types;
 mod epss;
@@ -23,6 +24,7 @@ mod identifiers;
 mod kev;
 mod osv;
 
+pub use capec::*;
 pub use common::detect_identifier_type;
 pub use cve_types::*;
 pub use database::package_eval::{

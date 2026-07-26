@@ -41,7 +41,11 @@ pub(super) fn render(
             if let Some(osv) = app.selected_osv() {
                 metadata::osv_metadata_lines(osv, detail_search)
             } else {
-                metadata::metadata_lines(app.selected().map(|cve| &cve.detail), detail_search)
+                metadata::metadata_lines(
+                    app.selected().map(|cve| &cve.detail),
+                    app.selected_metadata_capec_ids(),
+                    detail_search,
+                )
             },
             rows[1],
         ),

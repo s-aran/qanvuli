@@ -3,7 +3,8 @@ use super::common::{
     OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_sqlx_db, cve_full_asset_cursor,
     download_latest_asset_with_source, download_osv_selection_from_gcs,
     import_downloaded_osv_selection, ingest_zip_sqlx_bulk_with_index_signal, redact_database_url,
-    remove_processed_zip, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
+    remove_processed_zip, sync_capec_catalog_sqlx, sync_cwe_catalog_sqlx,
+    sync_kev_epss_snapshots_sqlx,
 };
 use qanvuli_core::database::{
     DatabaseReplacement, RecoveryAction, candidate_database_path, recover_interrupted_replacement,
@@ -150,6 +151,7 @@ async fn run_with_progress(
                 .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
         }
         sync_cwe_catalog_sqlx(db_for_build.clone()).await?;
+        sync_capec_catalog_sqlx(db_for_build.clone()).await?;
         import_downloaded_osv_selection(
             db_for_build.clone(),
             osv_download_result?,

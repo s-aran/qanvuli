@@ -1,7 +1,7 @@
 use super::common::{
     IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection, apply_delta_updates,
-    connect_sqlx_db, ingest_zip_sqlx, sync_cwe_catalog_sqlx, sync_kev_epss_snapshots_sqlx,
-    sync_osv_selection_from_gcs_sqlx_with_refresh_all,
+    connect_sqlx_db, ingest_zip_sqlx, sync_capec_catalog_sqlx, sync_cwe_catalog_sqlx,
+    sync_kev_epss_snapshots_sqlx, sync_osv_selection_from_gcs_sqlx_with_refresh_all,
 };
 use std::path::PathBuf;
 
@@ -111,6 +111,7 @@ async fn run_with_progress(
         let applied_paths = apply_delta_updates(&sqlx_db, None, args.max_chunks).await?;
         let cve_changed = !applied_paths.is_empty();
         sync_cwe_catalog_sqlx(sqlx_db.clone()).await?;
+        sync_capec_catalog_sqlx(sqlx_db.clone()).await?;
         let saved_selection = sqlx_db
             .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
             .await

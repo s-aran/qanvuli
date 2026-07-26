@@ -78,6 +78,7 @@ fn cwe_entries_with_relation_counts(rows: Vec<CompatCweRow>) -> Vec<CweEntry> {
                 .unwrap_or_default()
                 .saturating_sub(1),
             child_count: child_counts.get(&id).copied().unwrap_or_default(),
+            capec_ids: Vec::new(),
         })
         .collect()
 }
@@ -1052,7 +1053,24 @@ impl SqlxDatabase {
                 })
             })
             .await?;
-        Ok(row.and_then(|row| cwe_entries_with_relation_counts(vec![row]).pop()))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut entry = cwe_entries_with_relation_counts(vec![row]).remove(0);
+        entry.capec_ids = self
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT capec_id FROM capec_cwe WHERE cwe_id=? ORDER BY capec_id",
+                    )
+                    .bind(id)
+                    .fetch_all(connection)
+                    .await
+                })
+            })
+            .await?;
+        Ok(Some(entry))
     }
 
     pub async fn search_cwe_entries(
@@ -1060,6 +1078,17 @@ impl SqlxDatabase {
         query: &str,
         limit: u64,
         statuses: &[String],
+    ) -> Result<Vec<CweEntry>, sqlx::Error> {
+        self.search_cwe_entries_filtered(query, limit, statuses, None)
+            .await
+    }
+
+    pub async fn search_cwe_entries_filtered(
+        &self,
+        query: &str,
+        limit: u64,
+        statuses: &[String],
+        capec_id: Option<i32>,
     ) -> Result<Vec<CweEntry>, sqlx::Error> {
         let query = query.trim();
         if statuses.is_empty() {
@@ -1076,22 +1105,48 @@ impl SqlxDatabase {
             .with_connection(|connection| {
                 Box::pin(async move {
                     sqlx::query_as(
-                        "SELECT id, description, status, parent_id FROM cwe WHERE (? OR status IN (SELECT value FROM json_each(?))) AND (?='' OR description LIKE ? OR id=?) ORDER BY id",
+                        "SELECT id, description, status, parent_id FROM cwe WHERE (? OR status IN (SELECT value FROM json_each(?))) AND (?='' OR description LIKE ? OR id=?) AND (? IS NULL OR EXISTS(SELECT 1 FROM capec_cwe link WHERE link.cwe_id=cwe.id AND link.capec_id=?)) ORDER BY id",
                     )
                     .bind(all_statuses)
                     .bind(status_json)
                     .bind(query)
                     .bind(pattern)
                     .bind(id)
+                    .bind(capec_id)
+                    .bind(capec_id)
                     .fetch_all(connection)
                     .await
                 })
             })
             .await?;
-        Ok(cwe_entries_tree_order(
+        let mut entries = cwe_entries_tree_order(
             cwe_entries_with_relation_counts(rows),
             limit.max(1) as usize,
-        ))
+        );
+        if !entries.is_empty() {
+            let ids = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+            let ids_json = serde_json::to_string(&ids)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+            let links: Vec<(i32, i32)> = self
+                .writer
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_as("SELECT cwe_id,capec_id FROM capec_cwe WHERE cwe_id IN (SELECT value FROM json_each(?)) ORDER BY capec_id")
+                            .bind(ids_json)
+                            .fetch_all(connection)
+                            .await
+                    })
+                })
+                .await?;
+            let mut by_cwe = HashMap::<i32, Vec<i32>>::new();
+            for (cwe_id, capec_id) in links {
+                by_cwe.entry(cwe_id).or_default().push(capec_id);
+            }
+            for entry in &mut entries {
+                entry.capec_ids = by_cwe.remove(&entry.id).unwrap_or_default();
+            }
+        }
+        Ok(entries)
     }
 
     pub async fn enriched_cve_summaries(

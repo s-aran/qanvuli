@@ -48,6 +48,7 @@ fn run() -> Result<(), String> {
             Command::Query(args) => qanvuli_app_commands::query::run(&db_url, args).await,
             Command::Db(args) => qanvuli_app_commands::db::run(&db_url, args).await,
             Command::Cwe(args) => qanvuli_app_commands::cwe::run(&db_url, args).await,
+            Command::Capec(args) => qanvuli_app_commands::capec::run(&db_url, args).await,
             Command::Search(args) => qanvuli_app_commands::search::run(&db_url, args).await,
             #[cfg(feature = "tui")]
             Command::Tui(args) => qanvuli_app_tui::run(&db_url, args).await,
@@ -110,8 +111,10 @@ enum Command {
     Query(qanvuli_app_commands::query::Args),
     /// Inspect local database status.
     Db(qanvuli_app_commands::db::Args),
-    /// Search CVEs by one CWE ID, such as CWE-42 or 42.
+    /// Search or fetch the local CWE catalog.
     Cwe(qanvuli_app_commands::cwe::Args),
+    /// Search or fetch the local CAPEC catalog.
+    Capec(qanvuli_app_commands::capec::Args),
     /// Search existing CVE DB records.
     Search(qanvuli_app_commands::search::Args),
     /// Open an interactive terminal UI for free-word CVE search.

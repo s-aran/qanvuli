@@ -43,6 +43,7 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
         KeyCode::F(5) => app.open_maintenance(),
         KeyCode::F(8) => app.toggle_raw_json_mode(db),
         KeyCode::F(9) => app.toggle_cwe_list_mode(db),
+        KeyCode::F(10) => app.toggle_capec_list_mode(db),
         KeyCode::Char('/') => app.start_detail_search(),
         KeyCode::Enter => {
             if let Some(db) = db {

@@ -7,6 +7,7 @@ use ratatui::text::Line;
 
 pub(super) fn metadata_lines(
     detail: Option<&CveDetail>,
+    capec_ids: Option<&[i32]>,
     detail_search: &DetailSearch,
 ) -> Vec<Line<'static>> {
     let Some(detail) = detail else {
@@ -25,6 +26,18 @@ pub(super) fn metadata_lines(
             highlighted_line(&format!("CWE-{} {}", cwe.id, description), detail_search)
         }));
     }
+    let capec = match capec_ids {
+        None => "CAPEC: Loading".to_owned(),
+        Some([]) => "CAPEC: -".to_owned(),
+        Some(ids) => format!(
+            "CAPEC: {}",
+            ids.iter()
+                .map(|id| format!("CAPEC-{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    lines.push(highlighted_line(&capec, detail_search));
     lines.push(Line::from(""));
     if detail.cvss.is_empty() {
         lines.push(Line::from("No CVSS"));
@@ -92,4 +105,29 @@ pub(super) fn osv_metadata_lines(
         value("Updated", osv.modified_at.as_deref()),
         value("Withdrawn", osv.withdrawn_at.as_deref()),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qanvuli_core::database::CveCweDetail;
+
+    #[test]
+    fn shows_capec_ids_below_cwes() {
+        let detail = CveDetail {
+            cwes: vec![CveCweDetail {
+                id: 79,
+                description: Some("Cross-site Scripting".to_owned()),
+            }],
+            cvss: Vec::new(),
+            affected: Vec::new(),
+        };
+        let lines = metadata_lines(Some(&detail), Some(&[63, 85]), &DetailSearch::new(""))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "CWE-79 Cross-site Scripting");
+        assert_eq!(lines[1], "CAPEC: CAPEC-63, CAPEC-85");
+    }
 }

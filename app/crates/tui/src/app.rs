@@ -1,6 +1,7 @@
 use super::{
     SEARCH_TIMEOUT, TUI_LOAD_MORE_LIMIT,
     db::{
+        capec::search_capec_entries,
         cwe::search_cwe_entries,
         raw_json::{load_cve_raw_json, load_osv_raw_json},
         search::{SearchRequest, SearchResult, run_count_request, run_search_request},
@@ -12,8 +13,8 @@ use super::{
 };
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_core::database::{
-    CveAdvancedSearch, CveDatabase, CveStateScope, CveSummarySortOrder, CveSummaryWithDetail,
-    CweEntry, EnrichedCveSummary, OsvSummary,
+    CapecDetail, CapecEntry, CapecSearchFilters, CveAdvancedSearch, CveDatabase, CveStateScope,
+    CveSummarySortOrder, CveSummaryWithDetail, CweEntry, EnrichedCveSummary, OsvSummary,
 };
 use ratatui::widgets::{ListState, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
@@ -23,9 +24,10 @@ use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
 const MIN_PAGE_SIZE: usize = 1;
 const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(super) const CWE_STATUS_COUNT: usize = 6;
-const CWE_STATUS_CONTROL_COUNT: usize = CWE_STATUS_COUNT + 2;
+const CWE_STATUS_CONTROL_COUNT: usize = CWE_STATUS_COUNT + 3;
 const CWE_STATUS_SELECT_ALL_CURSOR: usize = CWE_STATUS_COUNT;
 const CWE_STATUS_CLEAR_ALL_CURSOR: usize = CWE_STATUS_COUNT + 1;
+pub(super) const CWE_CAPEC_CURSOR: usize = CWE_STATUS_COUNT + 2;
 pub(super) const CWE_STATUSES: [CweStatus; CWE_STATUS_COUNT] = [
     CweStatus::Stable,
     CweStatus::Usable,
@@ -64,6 +66,27 @@ pub(super) struct App {
     pub(super) cwe_status_filter: [bool; CWE_STATUS_COUNT],
     pub(super) cwe_status_cursor: usize,
     pub(super) show_cwe_status: bool,
+    pub(super) cwe_capec_filter: String,
+    pub(super) capec_query: String,
+    capec_catalog: Vec<CapecEntry>,
+    pub(super) capec_results: Vec<CapecEntry>,
+    pub(super) capec_tree_paths: Vec<Vec<i32>>,
+    pub(super) capec_tree_prefixes: Vec<String>,
+    pub(super) capec_scroll: u16,
+    pub(super) capec_selected: usize,
+    pub(super) capec_detail_scroll: u16,
+    capec_relation_return_path: Option<Vec<i32>>,
+    pub(super) capec_status_filter: String,
+    pub(super) capec_type_filter: String,
+    pub(super) capec_cwe_filter: String,
+    pub(super) show_capec_filter: bool,
+    pub(super) capec_filter_field: usize,
+    pub(super) show_capec_taxonomy: bool,
+    pub(super) capec_taxonomy_tab: usize,
+    pub(super) capec_taxonomy_section: usize,
+    pub(super) capec_taxonomy_scroll: u16,
+    pub(super) capec_taxonomy_selected: usize,
+    pub(super) capec_taxonomy: Option<CapecDetail>,
     pub(super) detail_search_query: String,
     pub(super) detail_search_input: bool,
     pub(super) detail_search_error: Option<String>,
@@ -72,7 +95,11 @@ pub(super) struct App {
     raw_json_task: Option<JoinHandle<Result<String, String>>>,
     pub(super) enrichment: HashMap<String, EnrichedCveSummary>,
     enrichment_task: Option<PendingEnrichment>,
+    metadata_capec_ids: HashMap<String, Vec<i32>>,
+    metadata_capec_task: Option<PendingMetadataCapec>,
     cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
+    capec_task: Option<JoinHandle<Result<Vec<CapecEntry>, String>>>,
+    capec_detail_task: Option<JoinHandle<Result<Option<CapecDetail>, String>>>,
     scope_task: Option<JoinHandle<Result<Vec<String>, String>>>,
     search_started_at: Option<Instant>,
     search_timeout_at: Option<Instant>,
@@ -145,6 +172,7 @@ pub(super) enum ViewMode {
     Normal,
     RawJson,
     CweList,
+    CapecList,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +212,15 @@ struct PendingCount {
 
 struct PendingEnrichment {
     handle: JoinHandle<Result<Vec<EnrichedCveSummary>, String>>,
+}
+
+struct PendingMetadataCapec {
+    handle: JoinHandle<Result<Vec<MetadataCapec>, String>>,
+}
+
+struct MetadataCapec {
+    cve_id: String,
+    capec_ids: Vec<i32>,
 }
 
 struct PendingMaintenance {
@@ -266,6 +303,8 @@ impl App {
             raw_scroll: 0,
             enrichment: HashMap::new(),
             enrichment_task: None,
+            metadata_capec_ids: HashMap::new(),
+            metadata_capec_task: None,
             cwe_query: String::new(),
             cwe_results: Vec::new(),
             cwe_scroll: 0,
@@ -275,6 +314,27 @@ impl App {
             cwe_status_filter: default_cwe_status_filter(),
             cwe_status_cursor: 0,
             show_cwe_status: false,
+            cwe_capec_filter: String::new(),
+            capec_query: String::new(),
+            capec_catalog: Vec::new(),
+            capec_results: Vec::new(),
+            capec_tree_paths: Vec::new(),
+            capec_tree_prefixes: Vec::new(),
+            capec_scroll: 0,
+            capec_selected: 0,
+            capec_detail_scroll: 0,
+            capec_relation_return_path: None,
+            capec_status_filter: String::new(),
+            capec_type_filter: String::new(),
+            capec_cwe_filter: String::new(),
+            show_capec_filter: false,
+            capec_filter_field: 0,
+            show_capec_taxonomy: false,
+            capec_taxonomy_tab: 0,
+            capec_taxonomy_section: 0,
+            capec_taxonomy_scroll: 0,
+            capec_taxonomy_selected: 0,
+            capec_taxonomy: None,
             detail_search_query: String::new(),
             detail_search_input: false,
             detail_search_error: None,
@@ -282,6 +342,8 @@ impl App {
             count_task: None,
             raw_json_task: None,
             cwe_task: None,
+            capec_task: None,
+            capec_detail_task: None,
             scope_task: None,
             search_started_at: None,
             search_timeout_at: None,
@@ -676,6 +738,82 @@ impl App {
         });
     }
 
+    pub(super) async fn poll_metadata_capec(&mut self) {
+        let Some(task) = self.metadata_capec_task.as_ref() else {
+            return;
+        };
+        if !task.handle.is_finished() {
+            return;
+        }
+        let Some(task) = self.metadata_capec_task.take() else {
+            return;
+        };
+        match task.handle.await {
+            Ok(Ok(rows)) => {
+                self.metadata_capec_ids
+                    .extend(rows.into_iter().map(|row| (row.cve_id, row.capec_ids)));
+                self.clamp_metadata_scroll();
+            }
+            Ok(Err(err)) => {
+                self.status_message = Some(format!("failed to load CAPEC links: {err}"));
+            }
+            Err(err) => {
+                self.status_message = Some(format!("failed to join CAPEC link task: {err}"));
+            }
+        }
+    }
+
+    pub(super) fn ensure_loaded_metadata_capec(&mut self, db: Option<CveDatabase>) {
+        if self.metadata_capec_task.is_some() {
+            return;
+        }
+        let pending = self
+            .results
+            .iter()
+            .filter(|cve| !self.metadata_capec_ids.contains_key(&cve.summary.cve_id))
+            .map(|cve| {
+                (
+                    cve.summary.cve_id.clone(),
+                    cve.detail.cwes.iter().map(|cwe| cwe.id).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return;
+        }
+        let Some(db) = db else {
+            return;
+        };
+        self.metadata_capec_task = Some(PendingMetadataCapec {
+            handle: tokio::spawn(async move {
+                let cwe_ids = pending
+                    .iter()
+                    .flat_map(|(_, ids)| ids.iter().copied())
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let links = db
+                    .capec_ids_for_cwes(&cwe_ids)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                Ok(pending
+                    .into_iter()
+                    .map(|(cve_id, cwe_ids)| {
+                        let mut capec_ids = cwe_ids
+                            .iter()
+                            .filter_map(|cwe_id| links.get(cwe_id))
+                            .flatten()
+                            .copied()
+                            .collect::<Vec<_>>();
+                        capec_ids.sort_unstable();
+                        capec_ids.dedup();
+                        MetadataCapec { cve_id, capec_ids }
+                    })
+                    .collect())
+            }),
+        });
+    }
+
     pub(super) async fn poll_cwe_search(&mut self) {
         let Some(task) = self.cwe_task.as_ref() else {
             return;
@@ -715,6 +853,55 @@ impl App {
         }
     }
 
+    pub(super) async fn poll_capec_search(&mut self) {
+        let Some(task) = self.capec_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let Some(task) = self.capec_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(rows)) => {
+                self.capec_catalog = rows;
+                self.apply_capec_filters();
+            }
+            Ok(Err(err)) => {
+                self.status_message = Some(err);
+                self.capec_results.clear();
+                self.capec_tree_paths.clear();
+                self.capec_tree_prefixes.clear();
+            }
+            Err(err) => {
+                self.status_message = Some(format!("failed to join CAPEC task: {err}"));
+                self.capec_results.clear();
+                self.capec_tree_paths.clear();
+                self.capec_tree_prefixes.clear();
+            }
+        }
+    }
+
+    pub(super) async fn poll_capec_detail(&mut self) {
+        let Some(task) = self.capec_detail_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let Some(task) = self.capec_detail_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(detail)) => self.capec_taxonomy = detail,
+            Ok(Err(error)) => self.status_message = Some(error),
+            Err(error) => {
+                self.status_message = Some(format!("failed to join CAPEC detail task: {error}"))
+            }
+        }
+    }
+
     pub(super) fn searching(&self) -> bool {
         self.search.is_some()
     }
@@ -746,6 +933,8 @@ impl App {
             || self.raw_json_task.is_some()
             || self.enrichment_task.is_some()
             || self.cwe_task.is_some()
+            || self.capec_task.is_some()
+            || self.capec_detail_task.is_some()
             || self.scope_task.is_some()
             || self.maintenance.is_some()
     }
@@ -817,7 +1006,19 @@ impl App {
             task.handle.abort();
             let _ = task.handle.await;
         }
+        if let Some(task) = self.metadata_capec_task.take() {
+            task.handle.abort();
+            let _ = task.handle.await;
+        }
         if let Some(task) = self.cwe_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.capec_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        if let Some(task) = self.capec_detail_task.take() {
             task.abort();
             let _ = task.await;
         }
@@ -942,6 +1143,14 @@ impl App {
             .and_then(|index| self.results.get(index))
     }
 
+    pub(super) fn selected_metadata_capec_ids(&self) -> Option<&[i32]> {
+        self.selected().and_then(|cve| {
+            self.metadata_capec_ids
+                .get(&cve.summary.cve_id)
+                .map(Vec::as_slice)
+        })
+    }
+
     pub(super) fn selected_osv(&self) -> Option<&OsvSummary> {
         self.list_state
             .selected()
@@ -990,6 +1199,160 @@ impl App {
         self.start_cwe_search(db);
     }
 
+    pub(super) fn toggle_capec_list_mode(&mut self, db: Option<CveDatabase>) {
+        if self.view_mode == ViewMode::CapecList {
+            self.view_mode = ViewMode::Normal;
+            return;
+        }
+        self.view_mode = ViewMode::CapecList;
+        self.start_capec_search(db);
+    }
+
+    pub(super) fn selected_capec(&self) -> Option<&CapecEntry> {
+        self.capec_results.get(self.capec_selected)
+    }
+
+    pub(super) fn push_capec_query(&mut self, ch: char, db: Option<CveDatabase>) {
+        self.capec_query.push(ch);
+        self.start_capec_search(db);
+    }
+
+    pub(super) fn backspace_capec_query(&mut self, db: Option<CveDatabase>) {
+        self.capec_query.pop();
+        self.start_capec_search(db);
+    }
+
+    pub(super) fn move_capec(&mut self, down: bool, page_size: usize, step: usize) {
+        if self.capec_results.is_empty() {
+            return;
+        }
+        self.capec_selected = if down {
+            self.capec_selected
+                .saturating_add(step)
+                .min(self.capec_results.len() - 1)
+        } else {
+            self.capec_selected.saturating_sub(step)
+        };
+        let page_size = page_size.max(1);
+        if self.capec_selected < self.capec_scroll as usize {
+            self.capec_scroll = self.capec_selected as u16;
+        } else if self.capec_selected >= self.capec_scroll as usize + page_size {
+            self.capec_scroll = self.capec_selected.saturating_sub(page_size - 1) as u16;
+        }
+        self.capec_detail_scroll = 0;
+        self.capec_relation_return_path = None;
+    }
+
+    pub(super) fn move_capec_to_parent(&mut self, page_size: usize) {
+        let Some(path) = self.capec_tree_paths.get(self.capec_selected).cloned() else {
+            return;
+        };
+        if path.len() < 2 {
+            self.status_message = Some("selected CAPEC has no parent on this path".to_owned());
+            return;
+        }
+        let mut parent_path = path.clone();
+        parent_path.pop();
+        self.capec_relation_return_path = Some(path);
+        self.select_capec_path(&parent_path, page_size);
+    }
+
+    pub(super) fn move_capec_to_relation_return(&mut self, page_size: usize) {
+        let Some(path) = self.capec_relation_return_path.take() else {
+            self.status_message = Some("no CAPEC relation return target".to_owned());
+            return;
+        };
+        self.select_capec_path(&path, page_size);
+    }
+
+    pub(super) fn move_capec_sibling(&mut self, next: bool, page_size: usize) {
+        let Some(path) = self.capec_tree_paths.get(self.capec_selected).cloned() else {
+            return;
+        };
+        let parent = path.get(..path.len().saturating_sub(1)).unwrap_or_default();
+        let candidates = self
+            .capec_tree_paths
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.len() == path.len()
+                    && candidate
+                        .get(..candidate.len().saturating_sub(1))
+                        .unwrap_or_default()
+                        == parent
+            })
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let Some(position) = candidates
+            .iter()
+            .position(|index| *index == self.capec_selected)
+        else {
+            return;
+        };
+        let target = if next {
+            candidates.get(position + 1)
+        } else {
+            position
+                .checked_sub(1)
+                .and_then(|index| candidates.get(index))
+        };
+        if let Some(target) = target {
+            self.capec_selected = *target;
+            self.scroll_capec_selection_into_view(page_size);
+            self.capec_detail_scroll = 0;
+            self.capec_relation_return_path = None;
+        }
+    }
+
+    fn select_capec_path(&mut self, path: &[i32], page_size: usize) {
+        if let Some(index) = self
+            .capec_tree_paths
+            .iter()
+            .position(|candidate| candidate == path)
+        {
+            self.capec_selected = index;
+            self.scroll_capec_selection_into_view(page_size);
+            self.capec_detail_scroll = 0;
+            self.status_message = None;
+        }
+    }
+
+    fn scroll_capec_selection_into_view(&mut self, page_size: usize) {
+        let page_size = page_size.max(1);
+        if self.capec_selected < self.capec_scroll as usize {
+            self.capec_scroll = self.capec_selected as u16;
+        } else if self.capec_selected >= self.capec_scroll as usize + page_size {
+            self.capec_scroll = self.capec_selected.saturating_sub(page_size - 1) as u16;
+        }
+    }
+
+    pub(super) fn open_capec_filter(&mut self) {
+        self.show_capec_filter = true;
+    }
+
+    pub(super) fn open_capec_taxonomy(&mut self, db: Option<CveDatabase>) {
+        self.show_capec_taxonomy = true;
+        self.capec_taxonomy_scroll = 0;
+        self.capec_taxonomy_selected = 0;
+        self.capec_taxonomy = None;
+        if let Some(task) = self.capec_detail_task.take() {
+            task.abort();
+        }
+        let Some((db, id)) = db.zip(self.selected_capec().map(|entry| entry.id)) else {
+            return;
+        };
+        self.capec_detail_task = Some(tokio::spawn(async move {
+            db.get_capec_detail(id)
+                .await
+                .map_err(|error| format!("failed to load CAPEC-{id} classifications: {error}"))
+        }));
+    }
+
+    pub(super) fn close_capec_filter(&mut self, db: Option<CveDatabase>) {
+        self.show_capec_filter = false;
+        self.start_capec_search(db);
+    }
+
     pub(super) fn push_cwe_query(&mut self, ch: char, db: Option<CveDatabase>) {
         self.cwe_query.push(ch);
         self.start_cwe_search(db);
@@ -1023,6 +1386,11 @@ impl App {
 
     pub(super) fn close_cwe_status_popup(&mut self) {
         self.show_cwe_status = false;
+    }
+
+    pub(super) fn apply_cwe_filters(&mut self, db: Option<CveDatabase>) {
+        self.show_cwe_status = false;
+        self.start_cwe_search(db);
     }
 
     pub(super) fn next_cwe_status(&mut self) {
@@ -1072,6 +1440,14 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    pub(super) fn push_cwe_capec_filter(&mut self, ch: char) {
+        self.cwe_capec_filter.push(ch);
+    }
+
+    pub(super) fn backspace_cwe_capec_filter(&mut self) {
+        self.cwe_capec_filter.pop();
     }
 
     pub(super) fn selected_cwe(&self) -> Option<&CweEntry> {
@@ -1491,6 +1867,7 @@ impl App {
         self.linked_osv.clear();
         self.search_offset = 0;
         self.enrichment.clear();
+        self.metadata_capec_ids.clear();
         self.total_results = None;
         self.list_state.select(Some(0));
         self.focus = PaneFocus::Left;
@@ -1508,6 +1885,22 @@ impl App {
         self.cwe_status_filter = default_cwe_status_filter();
         self.cwe_status_cursor = 0;
         self.show_cwe_status = false;
+        self.cwe_capec_filter.clear();
+        self.capec_query.clear();
+        self.capec_catalog.clear();
+        self.capec_results.clear();
+        self.capec_tree_paths.clear();
+        self.capec_tree_prefixes.clear();
+        self.capec_scroll = 0;
+        self.capec_selected = 0;
+        self.capec_detail_scroll = 0;
+        self.capec_relation_return_path = None;
+        self.capec_status_filter.clear();
+        self.capec_type_filter.clear();
+        self.capec_cwe_filter.clear();
+        self.show_capec_filter = false;
+        self.show_capec_taxonomy = false;
+        self.capec_taxonomy = None;
         self.detail_search_query.clear();
         self.detail_search_input = false;
         self.detail_search_error = None;
@@ -1618,7 +2011,75 @@ impl App {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        self.cwe_task = Some(tokio::spawn(search_cwe_entries(db, query, statuses)));
+        let capec_id = self
+            .cwe_capec_filter
+            .trim()
+            .trim_start_matches("CAPEC-")
+            .parse()
+            .ok();
+        self.cwe_task = Some(tokio::spawn(search_cwe_entries(
+            db, query, statuses, capec_id,
+        )));
+    }
+
+    fn start_capec_search(&mut self, db: Option<CveDatabase>) {
+        if !self.capec_catalog.is_empty() {
+            self.apply_capec_filters();
+            return;
+        }
+        if self.capec_task.is_some() {
+            return;
+        }
+        let Some(db) = db else {
+            self.capec_results.clear();
+            self.capec_tree_paths.clear();
+            self.capec_tree_prefixes.clear();
+            return;
+        };
+        self.capec_task = Some(tokio::spawn(search_capec_entries(
+            db,
+            CapecSearchFilters::default(),
+        )));
+    }
+
+    fn apply_capec_filters(&mut self) {
+        let query = self.capec_query.trim().to_ascii_lowercase();
+        let status = self.capec_status_filter.trim();
+        let abstraction = self.capec_type_filter.trim();
+        let cwe_id = self
+            .capec_cwe_filter
+            .trim()
+            .trim_start_matches("CWE-")
+            .parse::<i32>()
+            .ok();
+        let matched = self
+            .capec_catalog
+            .iter()
+            .filter(|entry| {
+                (query.is_empty()
+                    || entry.id.to_string() == query
+                    || format!("capec-{}", entry.id) == query
+                    || entry.name.to_ascii_lowercase().contains(&query)
+                    || entry.description.to_ascii_lowercase().contains(&query)
+                    || entry
+                        .extended_description
+                        .as_deref()
+                        .is_some_and(|text| text.to_ascii_lowercase().contains(&query)))
+                    && (status.is_empty() || entry.status.eq_ignore_ascii_case(status))
+                    && (abstraction.is_empty()
+                        || entry.abstraction.eq_ignore_ascii_case(abstraction))
+                    && cwe_id.is_none_or(|id| entry.cwe_ids.contains(&id))
+            })
+            .map(|entry| entry.id)
+            .collect::<HashSet<_>>();
+        let tree = filter_capec_tree(project_capec_tree(self.capec_catalog.clone()), &matched);
+        self.capec_results = tree.entries;
+        self.capec_tree_paths = tree.paths;
+        self.capec_tree_prefixes = tree.prefixes;
+        self.capec_scroll = 0;
+        self.capec_selected = 0;
+        self.capec_detail_scroll = 0;
+        self.capec_relation_return_path = None;
     }
 
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
@@ -1730,7 +2191,13 @@ impl App {
             .line_count(self.metadata_content_width.min(u16::MAX as usize) as u16),
             RightPaneTab::Metadata => {
                 if let Some(cve) = self.selected() {
-                    metadata_line_count(cve, self.metadata_content_width)
+                    metadata_line_count(
+                        cve,
+                        self.metadata_capec_ids
+                            .get(&cve.summary.cve_id)
+                            .map(Vec::as_slice),
+                        self.metadata_content_width,
+                    )
                 } else if let Some(osv) = self.selected_osv() {
                     osv_metadata_line_count(osv, self.metadata_content_width)
                 } else {
@@ -1835,6 +2302,10 @@ impl App {
         if let Some(task) = self.enrichment_task.take() {
             task.handle.abort();
         }
+        self.metadata_capec_ids.clear();
+        if let Some(task) = self.metadata_capec_task.take() {
+            task.handle.abort();
+        }
     }
 
     fn select_candidate(&mut self, index: usize) {
@@ -1934,7 +2405,11 @@ fn append_summary_section(lines: &mut Vec<String>, title: &str, values: &[&str])
     }
 }
 
-fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
+fn metadata_line_count(
+    cve: &CveSummaryWithDetail,
+    capec_ids: Option<&[i32]>,
+    width: usize,
+) -> usize {
     let detail = &cve.detail;
     let cwe_lines = detail
         .cwes
@@ -1949,6 +2424,18 @@ fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
         })
         .sum::<usize>()
         .max(1);
+    let capec = match capec_ids {
+        None => "CAPEC: Loading".to_owned(),
+        Some([]) => "CAPEC: -".to_owned(),
+        Some(ids) => format!(
+            "CAPEC: {}",
+            ids.iter()
+                .map(|id| format!("CAPEC-{id}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let capec_lines = wrapped_line_count(&capec, width);
     let cvss_lines = detail
         .cvss
         .iter()
@@ -1997,7 +2484,7 @@ fn metadata_line_count(cve: &CveSummaryWithDetail, width: usize) -> usize {
         })
         .sum::<usize>()
         .max(1);
-    cwe_lines + cvss_lines + affected_lines + 2
+    cwe_lines + capec_lines + cvss_lines + affected_lines + 2
 }
 
 fn option_string(value: &str) -> Option<String> {
@@ -2013,6 +2500,156 @@ fn default_cwe_status_filter() -> [bool; CWE_STATUS_COUNT] {
     let mut filter = [false; CWE_STATUS_COUNT];
     filter[0] = true;
     filter
+}
+
+struct CapecTree {
+    entries: Vec<CapecEntry>,
+    paths: Vec<Vec<i32>>,
+    prefixes: Vec<String>,
+}
+
+fn project_capec_tree(entries: Vec<CapecEntry>) -> CapecTree {
+    let by_id = entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.id, entry))
+        .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<i32, Vec<i32>>::new();
+    let mut roots = Vec::new();
+    for entry in &entries {
+        if entry.parent_ids.is_empty() {
+            roots.push(entry.id);
+        }
+        for parent_id in &entry.parent_ids {
+            children.entry(*parent_id).or_default().push(entry.id);
+        }
+    }
+    roots.sort_unstable();
+    for child_ids in children.values_mut() {
+        child_ids.sort_unstable();
+    }
+    let mut tree = CapecTree {
+        entries: Vec::new(),
+        paths: Vec::new(),
+        prefixes: Vec::new(),
+    };
+    for root in roots {
+        append_capec_branch(
+            root,
+            &by_id,
+            &children,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            &mut tree,
+        );
+    }
+    let visible = tree
+        .entries
+        .iter()
+        .map(|entry| entry.id)
+        .collect::<HashSet<_>>();
+    for entry in entries {
+        if !visible.contains(&entry.id) {
+            append_capec_branch(
+                entry.id,
+                &by_id,
+                &children,
+                &mut HashSet::new(),
+                &mut Vec::new(),
+                &mut tree,
+            );
+        }
+    }
+    tree.prefixes = capec_tree_prefixes(&tree.paths);
+    tree
+}
+
+fn filter_capec_tree(tree: CapecTree, matched: &HashSet<i32>) -> CapecTree {
+    let mut visible_paths = HashSet::<Vec<i32>>::new();
+    for path in &tree.paths {
+        if path.last().is_some_and(|id| matched.contains(id)) {
+            for length in 1..=path.len() {
+                visible_paths.insert(path[..length].to_vec());
+            }
+        }
+    }
+    let mut filtered = CapecTree {
+        entries: Vec::new(),
+        paths: Vec::new(),
+        prefixes: Vec::new(),
+    };
+    for (entry, path) in tree.entries.into_iter().zip(tree.paths) {
+        if visible_paths.contains(&path) {
+            filtered.entries.push(entry);
+            filtered.paths.push(path);
+        }
+    }
+    filtered.prefixes = capec_tree_prefixes(&filtered.paths);
+    filtered
+}
+
+fn capec_tree_prefixes(paths: &[Vec<i32>]) -> Vec<String> {
+    let mut children = HashMap::<Vec<i32>, Vec<i32>>::new();
+    for path in paths {
+        if path.len() > 1 {
+            let parent = path[..path.len() - 1].to_vec();
+            let child = *path.last().expect("non-empty CAPEC path");
+            let siblings = children.entry(parent).or_default();
+            if !siblings.contains(&child) {
+                siblings.push(child);
+            }
+        }
+    }
+    paths
+        .iter()
+        .map(|path| {
+            if path.len() == 1 {
+                return String::new();
+            }
+            let mut prefix = String::new();
+            for depth in 1..path.len() - 1 {
+                let parent = path[..depth].to_vec();
+                let continues = children
+                    .get(&parent)
+                    .and_then(|siblings| siblings.last())
+                    .is_some_and(|last| *last != path[depth]);
+                prefix.push_str(if continues { "│  " } else { "   " });
+            }
+            let parent = path[..path.len() - 1].to_vec();
+            let is_last = children
+                .get(&parent)
+                .and_then(|siblings| siblings.last())
+                .is_some_and(|last| Some(last) == path.last());
+            prefix.push_str(if is_last { "└─ " } else { "├─ " });
+            prefix
+        })
+        .collect()
+}
+
+fn append_capec_branch(
+    id: i32,
+    entries: &HashMap<i32, CapecEntry>,
+    children: &HashMap<i32, Vec<i32>>,
+    seen: &mut HashSet<i32>,
+    path: &mut Vec<i32>,
+    tree: &mut CapecTree,
+) {
+    if !seen.insert(id) {
+        return;
+    }
+    if let Some(entry) = entries.get(&id) {
+        path.push(id);
+        tree.entries.push(entry.clone());
+        tree.paths.push(path.clone());
+        tree.prefixes.push(String::new());
+        if let Some(child_ids) = children.get(&id) {
+            for child_id in child_ids {
+                append_capec_branch(*child_id, entries, children, seen, path, tree);
+            }
+        }
+        path.pop();
+    }
+    seen.remove(&id);
 }
 
 #[cfg(test)]
@@ -2042,5 +2679,87 @@ mod tests {
             SearchRequest::Mode { .. } => panic!("empty Enter must browse CVEs"),
         }
         app.abort_search();
+    }
+
+    #[test]
+    fn capec_tree_projects_each_parent_path_and_stops_cycles() {
+        let entry = |id, parents| CapecEntry {
+            id,
+            name: format!("CAPEC-{id}"),
+            description: String::new(),
+            extended_description: None,
+            status: "Stable".to_owned(),
+            abstraction: "Standard".to_owned(),
+            parent_ids: parents,
+            cwe_ids: Vec::new(),
+            category_ids: Vec::new(),
+            view_ids: Vec::new(),
+            child_count: 0,
+        };
+        let rows = project_capec_tree(vec![
+            entry(1, Vec::new()),
+            entry(2, Vec::new()),
+            entry(3, vec![1, 2]),
+        ]);
+        assert_eq!(rows.entries.iter().filter(|row| row.id == 3).count(), 2);
+        assert!(rows.paths.contains(&vec![1, 3]));
+        assert!(rows.paths.contains(&vec![2, 3]));
+        assert_eq!(rows.prefixes, ["", "└─ ", "", "└─ "]);
+
+        let nested = project_capec_tree(vec![
+            entry(10, Vec::new()),
+            entry(20, vec![10]),
+            entry(30, vec![10]),
+            entry(40, vec![20]),
+        ]);
+        assert_eq!(nested.prefixes, ["", "├─ ", "│  └─ ", "└─ "]);
+        let filtered = filter_capec_tree(nested, &HashSet::from([40]));
+        assert_eq!(filtered.paths, [vec![10], vec![10, 20], vec![10, 20, 40]]);
+        assert_eq!(filtered.prefixes, ["", "└─ ", "   └─ "]);
+
+        let cyclic = project_capec_tree(vec![entry(4, vec![5]), entry(5, vec![4])]);
+        assert!(cyclic.entries.len() <= 4);
+    }
+
+    #[test]
+    fn switches_between_cwe_and_capec_catalogs() {
+        let mut app = App::new(String::new(), 25);
+        app.toggle_cwe_list_mode(None);
+        assert_eq!(app.view_mode, ViewMode::CweList);
+        app.toggle_capec_list_mode(None);
+        assert_eq!(app.view_mode, ViewMode::CapecList);
+        app.toggle_capec_list_mode(None);
+        assert_eq!(app.view_mode, ViewMode::Normal);
+    }
+
+    #[test]
+    fn capec_typing_filters_cached_catalog_and_keeps_ancestors() {
+        let entry = |id, name: &str, parents| CapecEntry {
+            id,
+            name: name.to_owned(),
+            description: String::new(),
+            extended_description: None,
+            status: "Stable".to_owned(),
+            abstraction: "Standard".to_owned(),
+            parent_ids: parents,
+            cwe_ids: Vec::new(),
+            category_ids: Vec::new(),
+            view_ids: Vec::new(),
+            child_count: 0,
+        };
+        let mut app = App::new(String::new(), 25);
+        app.capec_catalog = vec![
+            entry(1, "Root", Vec::new()),
+            entry(2, "Target child", vec![1]),
+            entry(3, "Other child", vec![1]),
+        ];
+
+        for ch in "target".chars() {
+            app.push_capec_query(ch, None);
+        }
+
+        assert!(app.capec_task.is_none());
+        assert_eq!(app.capec_tree_paths, [vec![1], vec![1, 2]]);
+        assert_eq!(app.capec_tree_prefixes, ["", "└─ "]);
     }
 }
