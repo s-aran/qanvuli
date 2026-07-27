@@ -25,10 +25,12 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
-    /// Discard interrupted replacement candidates and remove the existing database before building.
-    /// This reduces peak disk usage, but can disrupt another running init and leaves no usable database if initialization fails.
-    #[arg(short = 'r', long, verbatim_doc_comment)]
-    remove_existing_first: bool,
+    /// Delete the active database and interrupted replacement candidates before
+    /// downloading and building the replacement. This minimizes peak disk usage,
+    /// but can disrupt another running initialization and any later failure leaves
+    /// no usable database.
+    #[arg(short = 'D', long = "delete-existing", verbatim_doc_comment)]
+    delete_existing: bool,
     #[arg(long)]
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
@@ -81,13 +83,13 @@ async fn run_with_progress(
     let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
         "full database replacement requires a file-backed SQLite database".to_owned()
     })?;
-    if args.remove_existing_first {
+    if args.delete_existing {
         let candidates = remove_interrupted_replacement_candidates(&target).map_err(|error| {
             format!("failed to remove interrupted replacement candidates: {error}")
         })?;
         for candidate in candidates {
             eprintln!(
-                "init: removed interrupted replacement candidate {} because --remove-existing-first was specified",
+                "init: removed interrupted replacement candidate {} because --delete-existing was specified",
                 candidate.display()
             );
         }
@@ -101,17 +103,35 @@ async fn run_with_progress(
                 path.display(),
                 target.display()
             ),
-            RecoveryAction::StaleBackup(path) => eprintln!(
-                "init: warning: active database is present; leaving stale replacement backup {}",
-                path.display()
-            ),
+            RecoveryAction::StaleBackup(path) => {
+                if args.delete_existing {
+                    eprintln!(
+                        "init: warning: stale replacement backup remains at {}",
+                        path.display()
+                    );
+                    eprintln!("init: --delete-existing will still delete the active database");
+                    eprintln!(
+                        "init: inspect and remove the stale backup manually if it is no longer needed"
+                    );
+                    continue;
+                }
+                eprintln!("init: warning: active database is present and was left unchanged");
+                eprintln!(
+                    "init: stale replacement backup remains at {}",
+                    path.display()
+                );
+                eprintln!("init: inspect and remove it manually if it is no longer needed");
+            }
         }
     }
-    if args.remove_existing_first {
-        eprintln!("init: removing the existing database before replacement construction");
+    if args.delete_existing {
         eprintln!(
-            "init: this reduces peak disk usage but can disrupt another init and leaves no usable database if initialization fails"
+            "init: deleting the active database before downloading and building the replacement"
         );
+        eprintln!(
+            "init: this minimizes peak disk usage, but can disrupt another running initialization"
+        );
+        eprintln!("init: any subsequent failure leaves no usable database");
         remove_sqlite_database_files(&target)
             .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
     }
@@ -261,17 +281,21 @@ async fn run_with_progress(
         );
     }
     eprintln!("init: installing replacement database");
-    replacement
-        .install()
-        .map_err(|error| format!("failed to install validated replacement database: {error}"))?;
+    replacement.install().await.map_err(|error| {
+        format!("failed to install schema-validated replacement database: {error}")
+    })?;
     eprintln!("init: replacement installed successfully");
     if had_target {
         eprintln!("init: removing previous database backup");
     }
     if let Err(error) = replacement.commit() {
+        eprintln!("init: warning: replacement is active");
         eprintln!(
-            "init: warning: replacement is active, but previous database cleanup failed: {error}"
+            "init: previous database remains at {}",
+            replacement.backup_path().display()
         );
+        eprintln!("init: inspect and remove it manually after confirming the replacement");
+        eprintln!("init: cleanup error: {error}");
     }
     if !args.keep
         && let Err(error) = remove_processed_zip(&asset_path)
@@ -356,9 +380,45 @@ pub async fn run_default_with_progress_and_keep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
     use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
     use sqlx::{Connection, Executor};
     use std::io::Write;
+
+    #[derive(Parser)]
+    struct InitCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn destructive_option_uses_only_uppercase_d_and_delete_existing() {
+        assert!(
+            InitCli::try_parse_from(["init", "-D"])
+                .unwrap()
+                .args
+                .delete_existing
+        );
+        assert!(
+            InitCli::try_parse_from(["init", "--delete-existing"])
+                .unwrap()
+                .args
+                .delete_existing
+        );
+        assert!(InitCli::try_parse_from(["init", "-r"]).is_err());
+        assert!(InitCli::try_parse_from(["init", "--remove-existing-first"]).is_err());
+    }
+
+    #[test]
+    fn destructive_option_help_explains_order_and_failure_risk() {
+        let help = InitCli::command().render_long_help().to_string();
+        assert!(help.contains("-D, --delete-existing"));
+        assert!(help.contains("before\n          downloading and building the replacement"));
+        assert!(help.contains("minimizes peak disk usage"));
+        assert!(help.contains("disrupt another running initialization"));
+        assert!(help.contains("any later failure leaves"));
+        assert!(help.contains("no usable database"));
+    }
 
     #[test]
     fn only_no_progress_disables_modern_progress() {
@@ -551,7 +611,7 @@ mod tests {
             Args {
                 zip: Some(archive_path),
                 keep: true,
-                remove_existing_first: true,
+                delete_existing: true,
                 ..Args::default()
             },
             None,
@@ -598,7 +658,7 @@ mod tests {
             &url,
             Args {
                 zip: Some(archive_path),
-                remove_existing_first: true,
+                delete_existing: true,
                 ..Args::default()
             },
             None,

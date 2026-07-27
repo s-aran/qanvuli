@@ -1,6 +1,8 @@
 //! Same-directory, rollback-capable SQLite database replacement.
 
+use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SQLITE_SIDECAR_SUFFIXES: [&str; 3] = ["wal", "shm", "journal"];
 
@@ -114,6 +116,38 @@ pub enum ReplacementError {
     CandidateNotClosed { path: PathBuf },
     #[error("replacement database does not exist: {path}")]
     CandidateMissing { path: PathBuf },
+    #[error(
+        "refused to replace active database {path} because its WAL could not be checkpointed safely: {source}"
+    )]
+    TargetCheckpointFailed {
+        #[source]
+        source: sqlx::Error,
+        path: PathBuf,
+    },
+    #[error(
+        "refused to replace active database {path} because WAL checkpointing reported it is busy (busy={busy}, log_frames={log_frames}, checkpointed_frames={checkpointed_frames}); close other SQLite users and retry"
+    )]
+    TargetCheckpointBusy {
+        path: PathBuf,
+        busy: i64,
+        log_frames: i64,
+        checkpointed_frames: i64,
+    },
+    #[error(
+        "refused to replace active database {path} because the checkpoint connection could not be closed safely: {source}"
+    )]
+    TargetCloseFailed {
+        #[source]
+        source: sqlx::Error,
+        path: PathBuf,
+    },
+    #[error(
+        "refused to replace active database {path} to avoid losing WAL or journal data; SQLite sidecars remain after checkpoint and close: {sidecars:?}. Close other SQLite users and inspect these files before retrying"
+    )]
+    TargetNotClosed {
+        path: PathBuf,
+        sidecars: Vec<PathBuf>,
+    },
     #[error("failed to move active database {target} to backup {backup}: {source}")]
     BackupRename {
         #[source]
@@ -173,7 +207,7 @@ enum ReplacementState {
     Committed,
 }
 
-/// Installs a closed, validated replacement database.
+/// Installs a closed, schema-validated replacement database.
 #[derive(Debug)]
 pub struct DatabaseReplacement {
     target: PathBuf,
@@ -181,6 +215,12 @@ pub struct DatabaseReplacement {
     backup: PathBuf,
     state: ReplacementState,
     had_target: bool,
+    #[cfg(test)]
+    fail_candidate_install: bool,
+    #[cfg(test)]
+    fail_restore: bool,
+    #[cfg(test)]
+    fail_backup_cleanup: bool,
 }
 
 impl DatabaseReplacement {
@@ -198,6 +238,12 @@ impl DatabaseReplacement {
             backup,
             state: ReplacementState::Ready,
             had_target: false,
+            #[cfg(test)]
+            fail_candidate_install: false,
+            #[cfg(test)]
+            fail_restore: false,
+            #[cfg(test)]
+            fail_backup_cleanup: false,
         })
     }
 
@@ -205,7 +251,7 @@ impl DatabaseReplacement {
         &self.backup
     }
 
-    pub fn install(&mut self) -> Result<(), ReplacementError> {
+    pub async fn install(&mut self) -> Result<(), ReplacementError> {
         if self.state != ReplacementState::Ready {
             return Err(ReplacementError::InvalidState { state: "not ready" });
         }
@@ -223,6 +269,11 @@ impl DatabaseReplacement {
 
         self.had_target = self.target.exists();
         if self.had_target {
+            checkpoint_and_close_target(&self.target).await?;
+        }
+        ensure_target_has_no_sidecars(&self.target)?;
+
+        if self.had_target {
             std::fs::rename(&self.target, &self.backup).map_err(|source| {
                 ReplacementError::BackupRename {
                     source,
@@ -233,28 +284,17 @@ impl DatabaseReplacement {
             self.state = ReplacementState::BackedUp;
         }
 
-        // Remove old sidecars after backup and before install so they cannot attach to the new DB.
-        for suffix in SQLITE_SIDECAR_SUFFIXES {
-            let path = sidecar(&self.target, suffix);
-            if let Err(source) = remove_if_present(&path) {
-                if self.had_target
-                    && let Err(ReplacementError::Restore {
-                        source: restore, ..
-                    }) = self.rollback()
-                {
-                    return Err(ReplacementError::InstallAndRestore {
-                        install: source,
-                        restore,
-                        candidate: self.candidate.clone(),
-                        target: self.target.clone(),
-                        backup: self.backup.clone(),
-                    });
-                }
-                return Err(ReplacementError::Cleanup { source, path });
+        let install_result = {
+            #[cfg(test)]
+            if self.fail_candidate_install {
+                Err(std::io::Error::other("injected candidate install failure"))
+            } else {
+                std::fs::rename(&self.candidate, &self.target)
             }
-        }
-
-        if let Err(source) = std::fs::rename(&self.candidate, &self.target) {
+            #[cfg(not(test))]
+            std::fs::rename(&self.candidate, &self.target)
+        };
+        if let Err(source) = install_result {
             if self.had_target {
                 return match self.rollback() {
                     Ok(()) => Err(ReplacementError::CandidateInstall {
@@ -291,12 +331,20 @@ impl DatabaseReplacement {
                 state: "backup is not pending",
             });
         }
-        std::fs::rename(&self.backup, &self.target).map_err(|source| {
-            ReplacementError::Restore {
-                source,
-                target: self.target.clone(),
-                backup: self.backup.clone(),
+        let restore_result = {
+            #[cfg(test)]
+            if self.fail_restore {
+                Err(std::io::Error::other("injected backup restore failure"))
+            } else {
+                std::fs::rename(&self.backup, &self.target)
             }
+            #[cfg(not(test))]
+            std::fs::rename(&self.backup, &self.target)
+        };
+        restore_result.map_err(|source| ReplacementError::Restore {
+            source,
+            target: self.target.clone(),
+            backup: self.backup.clone(),
         })?;
         self.state = ReplacementState::Ready;
         Ok(())
@@ -310,15 +358,98 @@ impl DatabaseReplacement {
             });
         }
         if self.had_target {
-            remove_sqlite_database_files(&self.backup).map_err(|source| {
-                ReplacementError::Cleanup {
-                    source,
-                    path: self.backup.clone(),
+            let cleanup_result = {
+                #[cfg(test)]
+                if self.fail_backup_cleanup {
+                    Err(std::io::Error::other("injected backup cleanup failure"))
+                } else {
+                    remove_if_present(&self.backup)
                 }
+                #[cfg(not(test))]
+                remove_if_present(&self.backup)
+            };
+            cleanup_result.map_err(|source| ReplacementError::Cleanup {
+                source,
+                path: self.backup.clone(),
             })?;
         }
         self.state = ReplacementState::Committed;
         Ok(())
+    }
+}
+
+async fn checkpoint_and_close_target(path: &Path) -> Result<(), ReplacementError> {
+    let options = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .busy_timeout(Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|source| ReplacementError::TargetCheckpointFailed {
+            source,
+            path: path.to_path_buf(),
+        })?;
+    let checkpoint = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .fetch_one(&mut connection)
+        .await
+        .map_err(|source| ReplacementError::TargetCheckpointFailed {
+            source,
+            path: path.to_path_buf(),
+        });
+    let checkpoint = match checkpoint {
+        Ok(row) => {
+            let values = (
+                row.try_get::<i64, _>(0),
+                row.try_get::<i64, _>(1),
+                row.try_get::<i64, _>(2),
+            );
+            match values {
+                (Ok(busy), Ok(log_frames), Ok(checkpointed_frames)) => {
+                    Ok((busy, log_frames, checkpointed_frames))
+                }
+                _ => Err(ReplacementError::TargetCheckpointFailed {
+                    source: sqlx::Error::Protocol(
+                        "SQLite returned an invalid wal_checkpoint result".to_owned(),
+                    ),
+                    path: path.to_path_buf(),
+                }),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let close = connection
+        .close()
+        .await
+        .map_err(|source| ReplacementError::TargetCloseFailed {
+            source,
+            path: path.to_path_buf(),
+        });
+    let (busy, log_frames, checkpointed_frames) = checkpoint?;
+    close?;
+    if busy != 0 {
+        return Err(ReplacementError::TargetCheckpointBusy {
+            path: path.to_path_buf(),
+            busy,
+            log_frames,
+            checkpointed_frames,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_target_has_no_sidecars(path: &Path) -> Result<(), ReplacementError> {
+    let sidecars = SQLITE_SIDECAR_SUFFIXES
+        .iter()
+        .map(|suffix| sidecar(path, suffix))
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    if sidecars.is_empty() {
+        Ok(())
+    } else {
+        Err(ReplacementError::TargetNotClosed {
+            path: path.to_path_buf(),
+            sidecars,
+        })
     }
 }
 
@@ -418,17 +549,88 @@ mod tests {
         path
     }
 
-    #[test]
-    fn installs_and_commits_closed_replacement() {
+    async fn create_database(path: &Path, value: &str) {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO marker (value) VALUES (?)")
+            .bind(value)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+    }
+
+    async fn create_uncheckpointed_wal_database(path: &Path, value: &str) {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint = 0")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        {
+            let mut handle = connection.lock_handle().await.unwrap();
+            let mut enabled = 0;
+            // SAFETY: the SQLx handle is locked for this call and SQLite documents this
+            // configuration as accepting an integer flag plus an integer result pointer.
+            let result = unsafe {
+                libsqlite3_sys::sqlite3_db_config(
+                    handle.as_raw_handle().as_ptr(),
+                    libsqlite3_sys::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                    1,
+                    &mut enabled,
+                )
+            };
+            assert_eq!(result, libsqlite3_sys::SQLITE_OK);
+            assert_eq!(enabled, 1);
+        }
+        sqlx::query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO marker (value) VALUES (?)")
+            .bind(value)
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        assert!(std::fs::metadata(sidecar(path, "wal")).unwrap().len() > 32);
+    }
+
+    async fn read_marker(path: &Path) -> String {
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        let value = sqlx::query_scalar("SELECT value FROM marker")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        value
+    }
+
+    #[tokio::test]
+    async fn installs_and_commits_closed_replacement() {
         let directory = directory("success");
         let target = directory.join("database.sqlite");
         let candidate = candidate_database_path(&target).unwrap();
-        std::fs::write(&target, "old").unwrap();
-        std::fs::write(sidecar(&target, "wal"), "old wal").unwrap();
-        std::fs::write(&candidate, "new").unwrap();
+        create_uncheckpointed_wal_database(&target, "old").await;
+        create_database(&candidate, "new").await;
         let mut replacement = DatabaseReplacement::new(target.clone(), candidate).unwrap();
-        replacement.install().unwrap();
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        replacement.install().await.unwrap();
+        assert_eq!(read_marker(&target).await, "new");
         assert!(!sidecar(&target, "wal").exists());
         assert!(replacement.backup_path().exists());
         replacement.commit().unwrap();
@@ -436,36 +638,197 @@ mod tests {
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn missing_candidate_does_not_touch_target_or_create_backup() {
+    #[tokio::test]
+    async fn missing_candidate_does_not_touch_target_or_create_backup() {
         let directory = directory("missing");
         let target = directory.join("database.sqlite");
         let candidate = candidate_database_path(&target).unwrap();
-        std::fs::write(&target, "old").unwrap();
+        create_database(&target, "old").await;
         let mut replacement = DatabaseReplacement::new(target.clone(), candidate).unwrap();
         assert!(matches!(
-            replacement.install(),
+            replacement.install().await,
             Err(ReplacementError::CandidateMissing { .. })
         ));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(read_marker(&target).await, "old");
         assert!(!replacement.backup_path().exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn refuses_candidate_sidecars_without_touching_target() {
+    #[tokio::test]
+    async fn refuses_real_candidate_sidecars_without_touching_target() {
         let directory = directory("sidecar");
         let target = directory.join("database.sqlite");
         let candidate = candidate_database_path(&target).unwrap();
-        std::fs::write(&target, "old").unwrap();
-        std::fs::write(&candidate, "new").unwrap();
-        std::fs::write(sidecar(&candidate, "journal"), "open").unwrap();
+        create_database(&target, "old").await;
+        let options = SqliteConnectOptions::new()
+            .filename(&candidate)
+            .create_if_missing(true);
+        let mut candidate_connection = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut candidate_connection)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut candidate_connection)
+            .await
+            .unwrap();
+        assert!(sidecar(&candidate, "wal").exists());
         let mut replacement = DatabaseReplacement::new(target.clone(), candidate).unwrap();
         assert!(matches!(
-            replacement.install(),
+            replacement.install().await,
             Err(ReplacementError::CandidateNotClosed { .. })
         ));
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(read_marker(&target).await, "old");
+        candidate_connection.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_active_wal_target_without_deleting_real_sidecars() {
+        let directory = directory("active-target");
+        let target = directory.join("database.sqlite");
+        let candidate = candidate_database_path(&target).unwrap();
+        create_database(&candidate, "new").await;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&target)
+            .create_if_missing(true);
+        let mut active = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint = 0")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE marker (value TEXT NOT NULL)")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO marker (value) VALUES ('committed')")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        assert!(sidecar(&target, "wal").exists());
+
+        let mut replacement = DatabaseReplacement::new(target.clone(), candidate.clone()).unwrap();
+        assert!(matches!(
+            replacement.install().await,
+            Err(ReplacementError::TargetNotClosed { .. })
+        ));
+        assert!(target.exists());
+        assert!(candidate.exists());
+        assert!(!replacement.backup_path().exists());
+        assert!(sidecar(&target, "wal").exists());
+
+        active.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_active_rollback_journal_without_deleting_it() {
+        let directory = directory("active-journal");
+        let target = directory.join("database.sqlite");
+        let candidate = candidate_database_path(&target).unwrap();
+        create_database(&target, "old").await;
+        create_database(&candidate, "new").await;
+
+        let options = SqliteConnectOptions::new()
+            .filename(&target)
+            .create_if_missing(false);
+        let mut active = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("PRAGMA journal_mode = DELETE")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE marker SET value = 'uncommitted'")
+            .execute(&mut active)
+            .await
+            .unwrap();
+        let journal = sidecar(&target, "journal");
+        assert!(journal.exists());
+
+        let mut replacement = DatabaseReplacement::new(target.clone(), candidate.clone()).unwrap();
+        assert!(matches!(
+            replacement.install().await,
+            Err(ReplacementError::TargetNotClosed { .. })
+                | Err(ReplacementError::TargetCheckpointFailed { .. })
+                | Err(ReplacementError::TargetCheckpointBusy { .. })
+        ));
+        assert!(target.exists());
+        assert!(candidate.exists());
+        assert!(!replacement.backup_path().exists());
+        assert!(journal.exists());
+
+        sqlx::query("ROLLBACK").execute(&mut active).await.unwrap();
+        active.close().await.unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_install_restores_real_sqlite_target_and_preserves_candidate() {
+        let directory = directory("rollback");
+        let target = directory.join("database.sqlite");
+        let candidate = candidate_database_path(&target).unwrap();
+        create_uncheckpointed_wal_database(&target, "committed old data").await;
+        create_database(&candidate, "new").await;
+
+        let mut replacement = DatabaseReplacement::new(target.clone(), candidate.clone()).unwrap();
+        replacement.fail_candidate_install = true;
+        assert!(matches!(
+            replacement.install().await,
+            Err(ReplacementError::CandidateInstall { .. })
+        ));
+        assert_eq!(read_marker(&target).await, "committed old data");
+        assert!(candidate.exists());
+        assert!(!replacement.backup_path().exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_install_and_restore_failure_with_all_recovery_files_preserved() {
+        let directory = directory("double-failure");
+        let target = directory.join("database.sqlite");
+        let candidate = candidate_database_path(&target).unwrap();
+        create_database(&target, "old").await;
+        create_database(&candidate, "new").await;
+
+        let mut replacement = DatabaseReplacement::new(target.clone(), candidate.clone()).unwrap();
+        replacement.fail_candidate_install = true;
+        replacement.fail_restore = true;
+        let backup = replacement.backup_path().to_path_buf();
+        assert!(matches!(
+            replacement.install().await,
+            Err(ReplacementError::InstallAndRestore { .. })
+        ));
+        assert!(!target.exists());
+        assert!(candidate.exists());
+        assert!(backup.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn backup_cleanup_failure_keeps_active_replacement_and_backup() {
+        let directory = directory("cleanup-failure");
+        let target = directory.join("database.sqlite");
+        let candidate = candidate_database_path(&target).unwrap();
+        create_database(&target, "old").await;
+        create_database(&candidate, "new").await;
+
+        let mut replacement = DatabaseReplacement::new(target.clone(), candidate).unwrap();
+        replacement.install().await.unwrap();
+        replacement.fail_backup_cleanup = true;
+        assert!(matches!(
+            replacement.commit(),
+            Err(ReplacementError::Cleanup { .. })
+        ));
+        assert_eq!(read_marker(&target).await, "new");
+        assert!(replacement.backup_path().exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -961,26 +961,67 @@ fn zip_download_required_bytes(payload_bytes: u64) -> u64 {
     payload_bytes.saturating_add(ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TemporaryStorageChoice {
+    Primary,
+    Fallback,
+}
+
+fn choose_temporary_storage(
+    required: Option<u64>,
+    primary_available: Option<u64>,
+    fallback_available: Option<u64>,
+) -> Result<TemporaryStorageChoice, (u64, u64, u64)> {
+    let Some(required) = required else {
+        return Ok(TemporaryStorageChoice::Primary);
+    };
+    let Some(primary_available) = primary_available else {
+        return Ok(TemporaryStorageChoice::Primary);
+    };
+    if primary_available >= required {
+        return Ok(TemporaryStorageChoice::Primary);
+    }
+    if let Some(fallback_available) = fallback_available
+        && fallback_available < required
+    {
+        return Err((required, primary_available, fallback_available));
+    }
+    Ok(TemporaryStorageChoice::Fallback)
+}
+
 fn temporary_zip_file_path(filename: &str, payload_bytes: Option<u64>) -> Result<PathBuf, String> {
     let system_temp_root = std::env::temp_dir();
     let temp_root = system_temp_root.join("qanvuli");
-    if let Some((required, available)) = payload_bytes
-        .map(zip_download_required_bytes)
-        .zip(available_storage_bytes(&system_temp_root))
-        .filter(|(required, available)| available < required)
-    {
-        let fallback = binary_temporary_directory();
-        eprintln!(
-            "temporary storage {} has only {} bytes available; download needs at least {} bytes including safety margin, using {}",
-            system_temp_root.display(),
-            available,
-            required,
-            fallback.display()
-        );
-        return temporary_zip_file_path_in(fallback, filename);
+    let fallback = binary_temporary_directory();
+    let required = payload_bytes.map(zip_download_required_bytes);
+    match choose_temporary_storage(
+        required,
+        available_storage_bytes(&system_temp_root),
+        available_storage_bytes(&fallback),
+    ) {
+        Ok(TemporaryStorageChoice::Fallback) => {
+            eprintln!(
+                "temporary storage {} has insufficient capacity for a download requiring {} bytes including safety margin; using {}",
+                system_temp_root.display(),
+                required.unwrap_or_default(),
+                fallback.display()
+            );
+            return temporary_zip_file_path_in(fallback, filename);
+        }
+        Err((required, primary_available, fallback_available)) => {
+            return Err(format!(
+                "temporary storage capacity is insufficient: {} has {} bytes and fallback {} has {} bytes, but the download needs at least {} bytes including safety margin",
+                system_temp_root.display(),
+                primary_available,
+                fallback.display(),
+                fallback_available,
+                required
+            ));
+        }
+        Ok(TemporaryStorageChoice::Primary) => {}
     }
     temporary_zip_file_path_in(temp_root, filename)
-        .or_else(|_| temporary_zip_file_path_in(binary_temporary_directory(), filename))
+        .or_else(|_| temporary_zip_file_path_in(fallback, filename))
 }
 
 fn temporary_zip_file_path_in(dir: PathBuf, filename: &str) -> Result<PathBuf, String> {
@@ -1959,6 +2000,31 @@ mod tests {
             payload + ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES
         );
         assert!(zip_download_required_bytes(payload) > 722_000_000);
+        assert_eq!(zip_download_required_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn temporary_storage_selection_checks_known_fallback_capacity() {
+        assert_eq!(
+            choose_temporary_storage(Some(100), Some(200), Some(50)),
+            Ok(TemporaryStorageChoice::Primary)
+        );
+        assert_eq!(
+            choose_temporary_storage(Some(100), Some(50), Some(200)),
+            Ok(TemporaryStorageChoice::Fallback)
+        );
+        assert_eq!(
+            choose_temporary_storage(Some(100), Some(50), None),
+            Ok(TemporaryStorageChoice::Fallback)
+        );
+        assert_eq!(
+            choose_temporary_storage(Some(100), None, Some(50)),
+            Ok(TemporaryStorageChoice::Primary)
+        );
+        assert_eq!(
+            choose_temporary_storage(Some(100), Some(50), Some(75)),
+            Err((100, 50, 75))
+        );
     }
 
     #[test]

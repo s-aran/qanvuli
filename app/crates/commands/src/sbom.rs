@@ -3,7 +3,6 @@ use qanvuli_core::database::{
     CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
 };
 use serde::{Deserialize, Serialize};
-use simd_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -55,9 +54,9 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .map_err(|err| format!("database rebuild required before SBOM search: {err}"))?;
     let date_filter = args.date_filter()?;
     let packages = load_sbom_packages(args.path()?)?;
-    let package_count = packages.len();
+    let component_count = packages.len();
     let packages = deduplicate_sbom_packages(packages);
-    let unique_package_count = packages.len();
+    let unique_component_count = packages.len();
     let mut cve_findings = BTreeMap::<(String, String, String), SbomCveFinding>::new();
     let mut osv_findings = BTreeMap::<(String, String, String, String), SbomOsvFinding>::new();
     let mut unverified_name_matches = BTreeMap::<(String, String, String), SbomCveFinding>::new();
@@ -85,6 +84,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             });
         }
     }
+    let package_query_count = package_queries.len();
     let package_match_batches = db
         .query_package_matches_batch(&package_queries)
         .await
@@ -120,7 +120,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         .zip(global_cves)
         .collect::<BTreeMap<_, _>>();
     let mut prefetched_matches =
-        vec![BTreeMap::<String, Vec<EnrichedFinding>>::new(); unique_package_count];
+        vec![BTreeMap::<String, Vec<EnrichedFinding>>::new(); unique_component_count];
     for ((package_index, purl), findings) in
         package_query_owners.into_iter().zip(package_match_batches)
     {
@@ -128,13 +128,12 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     }
 
     eprintln!(
-        "sbom: searching {package_count} components as {unique_package_count} unique package queries"
+        "sbom: searching {component_count} components as {unique_component_count} unique components with {package_query_count} package queries"
     );
     for (index, package) in packages.into_iter().enumerate() {
         eprintln!(
-            "sbom: [{}/{}] searching {}",
-            index + 1,
-            package_count,
+            "sbom: {} searching {}",
+            sbom_progress(index + 1, unique_component_count),
             package.name
         );
         let result = search_package(
@@ -152,8 +151,8 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         )
         .await?;
         eprintln!(
-            "sbom: [{}/{package_count}] completed {} (CVE={}, OSV={})",
-            index + 1,
+            "sbom: {} completed {} (CVE={}, OSV={})",
+            sbom_progress(index + 1, unique_component_count),
             result.package_name,
             result.cve_findings.len(),
             result.osv_findings.len()
@@ -177,24 +176,30 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let osv_findings = osv_findings.into_values().collect::<Vec<_>>();
     let unverified_name_matches = unverified_name_matches.into_values().collect::<Vec<_>>();
     eprintln!(
-        "sbom: completed {package_count} packages; findings={}",
+        "sbom: completed {unique_component_count}/{unique_component_count} unique components from {component_count} components; package_queries={package_query_count}; findings={}",
         cve_findings.len() + osv_findings.len()
     );
-    print_json(&json!({
-        "vulnerable": !cve_findings.is_empty() || !osv_findings.is_empty(),
-        "package_count": package_count,
-        "unique_package_query_count": unique_package_count,
-        "count": cve_findings.len() + osv_findings.len(),
-        "cve_count": cve_findings.len(),
-        "osv_count": osv_findings.len(),
-        "findings": cve_findings,
-        "osv_findings": osv_findings,
-        "unverified_name_matches": if args.include_name_matches { Some(unverified_name_matches) } else { None },
-        "unresolved_versions": unresolved_versions,
-    }))?;
+    let report = SbomReport {
+        vulnerable: !cve_findings.is_empty() || !osv_findings.is_empty(),
+        component_count,
+        unique_component_count,
+        package_query_count,
+        count: cve_findings.len() + osv_findings.len(),
+        cve_count: cve_findings.len(),
+        osv_count: osv_findings.len(),
+        findings: cve_findings,
+        osv_findings,
+        unverified_name_matches: args.include_name_matches.then_some(unverified_name_matches),
+        unresolved_versions,
+    };
+    print_json(&report)?;
 
     close_database(db).await?;
     Ok(())
+}
+
+fn sbom_progress(position: usize, total: usize) -> String {
+    format!("[{position}/{total}]")
 }
 
 struct PackageSearchResult {
@@ -606,6 +611,21 @@ struct SbomCveFinding {
 }
 
 #[derive(Debug, Serialize)]
+struct SbomReport {
+    vulnerable: bool,
+    component_count: usize,
+    unique_component_count: usize,
+    package_query_count: usize,
+    count: usize,
+    cve_count: usize,
+    osv_count: usize,
+    findings: Vec<SbomCveFinding>,
+    osv_findings: Vec<SbomOsvFinding>,
+    unverified_name_matches: Option<Vec<SbomCveFinding>>,
+    unresolved_versions: BTreeSet<UnresolvedVersion>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum CveVersionMatch {
     /// The CVE is a component-name match; its version range was not evaluated.
@@ -986,6 +1006,56 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["1.0.0", "2.0.0"])
         );
+    }
+
+    #[test]
+    fn one_component_can_generate_multiple_package_queries() {
+        let package = SbomPackage {
+            name: "example".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            external_refs: vec![
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some("pkg:npm/example@1.0.0".to_owned()),
+                },
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some("pkg:cargo/example@1.0.0".to_owned()),
+                },
+            ],
+            package_url: None,
+        };
+
+        assert_eq!(package.package_refs().len(), 2);
+    }
+
+    #[test]
+    fn progress_reaches_unique_component_denominator() {
+        assert_eq!(sbom_progress(2, 2), "[2/2]");
+    }
+
+    #[test]
+    fn report_json_uses_distinct_component_and_query_counts() {
+        let report = SbomReport {
+            vulnerable: false,
+            component_count: 3,
+            unique_component_count: 2,
+            package_query_count: 4,
+            count: 0,
+            cve_count: 0,
+            osv_count: 0,
+            findings: Vec::new(),
+            osv_findings: Vec::new(),
+            unverified_name_matches: None,
+            unresolved_versions: BTreeSet::new(),
+        };
+        let value = serde_json::to_value(report).unwrap();
+
+        assert_eq!(value["component_count"], 3);
+        assert_eq!(value["unique_component_count"], 2);
+        assert_eq!(value["package_query_count"], 4);
+        assert!(value.get("package_count").is_none());
+        assert!(value.get("unique_package_query_count").is_none());
     }
 
     #[tokio::test]

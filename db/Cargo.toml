@@ -29,3 +29,6 @@ tracing = "0.1"
 
 qanvuli-models = { version = "*", path = "../models" }
 qanvuli-utils = { version = "*", path = "../utils" }
+
+[dev-dependencies]
+libsqlite3-sys = "0.37"

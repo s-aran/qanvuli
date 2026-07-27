@@ -57,13 +57,13 @@ Use an existing CVE archive or reduce peak disk use:
 
 ```bash
 qanvuli init --zip ./data/all-cves.zip
-qanvuli init --remove-existing-first
+qanvuli init --delete-existing
 qanvuli init --no-progress
 ```
 
-`init` normally builds and validates a candidate beside the active database, then installs it with rollback protection. A failed build leaves the active database unchanged. Run initialization while other qanvuli processes are stopped.
+`init` normally builds a candidate beside the active database, checks its required schema and bounded search sentinels, and closes it before installation. Before moving the active database to a rollback backup, qanvuli checkpoints its WAL and refuses replacement if the database cannot be closed safely. A failed build leaves the active database unchanged. Run initialization while other SQLite users are stopped.
 
-`--remove-existing-first` (`-r`) deletes stale `*.qanvuli-new-*` replacement candidates, then deletes the active database before the build. It uses less disk space but can disrupt another running initialization and leaves no usable database if initialization fails. Use it only after confirming no other `qanvuli init` is running.
+`--delete-existing` (`-D`) deletes stale `*.qanvuli-new-*` replacement candidates and the active database before downloading and building the replacement. This minimizes peak disk usage, but can disrupt another running initialization and any later failure leaves no usable database. Use it only after confirming no other `qanvuli init` is running.
 
 Apply current deltas and refresh enrichment feeds:
 

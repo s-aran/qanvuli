@@ -2343,6 +2343,7 @@ dependencies = [
  "ahash",
  "anyhow",
  "chrono",
+ "libsqlite3-sys",
  "md-5",
  "once_cell",
  "pep440_rs",
