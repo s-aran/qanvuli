@@ -4,6 +4,10 @@ use reqwest::{StatusCode, header};
 use std::{
     io::{self, SeekFrom, Write},
     path::{Component, Path},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
@@ -12,6 +16,7 @@ use tokio::{
 
 pub const GITHUB_OWNER: &str = "CVEProject";
 pub const GITHUB_REPO: &str = "cvelistV5";
+pub type DownloadProgressCallback = Arc<dyn Fn(u64) + Send + Sync>;
 
 const RANGE_DOWNLOAD_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const RANGE_DOWNLOAD_MAX_CONNECTIONS: u64 = 4;
@@ -54,8 +59,19 @@ impl GitHubReleaseFile {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.download_to_with_progress(path, None).await
+    }
+
+    /// Downloads an asset and reports the cumulative number of bytes received.
+    pub async fn download_to_with_progress(
+        &self,
+        path: impl AsRef<std::path::Path>,
+        progress: Option<DownloadProgressCallback>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let path = path.as_ref();
-        if self.size >= RANGE_DOWNLOAD_MIN_BYTES && self.parallel_range_download(path).await? {
+        if self.size >= RANGE_DOWNLOAD_MIN_BYTES
+            && self.parallel_range_download(path, progress.clone()).await?
+        {
             return Ok(());
         }
         let mut response = reqwest::Client::new()
@@ -65,8 +81,13 @@ impl GitHubReleaseFile {
             .await?
             .error_for_status()?;
         let mut file = std::fs::File::create(path)?;
+        let mut written = 0_u64;
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
+            written += chunk.len() as u64;
+            if let Some(progress) = &progress {
+                progress(written);
+            }
         }
         file.flush()?;
         Ok(())
@@ -79,6 +100,7 @@ impl GitHubReleaseFile {
     async fn parallel_range_download(
         &self,
         path: &Path,
+        progress: Option<DownloadProgressCallback>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
         let probe_client = reqwest::Client::builder().http1_only().build()?;
         let probe = probe_client
@@ -124,6 +146,7 @@ impl GitHubReleaseFile {
         drop(file);
 
         let mut tasks = JoinSet::new();
+        let written = Arc::new(AtomicU64::new(0));
         for index in 0..connection_count {
             let start = index * chunk_size;
             if start >= content_range.total {
@@ -137,6 +160,8 @@ impl GitHubReleaseFile {
                 end,
                 content_range.total,
                 validator.clone(),
+                written.clone(),
+                progress.clone(),
             ));
         }
         while let Some(result) = tasks.join_next().await {
@@ -221,6 +246,8 @@ async fn download_range(
     end: u64,
     total: u64,
     validator: Option<String>,
+    written_total: Arc<AtomicU64>,
+    progress: Option<DownloadProgressCallback>,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .http1_only()
@@ -271,6 +298,11 @@ async fn download_range(
             .await
             .map_err(|error| format!("failed to write range {start}-{end}: {error}"))?;
         written += chunk.len() as u64;
+        if let Some(progress) = &progress {
+            progress(
+                written_total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64,
+            );
+        }
     }
     file.flush()
         .await

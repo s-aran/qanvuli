@@ -1,7 +1,7 @@
 use super::common::{
     CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
     OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_database, cve_full_asset_cursor,
-    download_latest_asset_with_source, download_osv_selection_from_gcs,
+    download_latest_asset_with_source_with_progress, download_osv_selection_from_gcs,
     import_cve_zip_bulk_with_index_signal, import_downloaded_osv_selection, redact_database_url,
     remove_processed_zip, sync_capec_catalog, sync_cwe_catalog, sync_risk_feeds,
 };
@@ -39,6 +39,23 @@ impl Args {
     /// Returns whether the CLI should render modern progress output.
     pub fn use_progress(&self) -> bool {
         !self.no_progress
+    }
+
+    /// Returns the remote resources fetched during initialization.
+    pub fn download_targets(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        if self.zip.is_none() {
+            targets.push("CVE full archive".to_owned());
+        }
+        let selection = OsvImportSelection::default_init(self.osv_all, &self.osv_prefixes);
+        targets.push(format!("OSV snapshots ({})", selection.description()));
+        targets.extend([
+            "CWE catalog".to_owned(),
+            "CAPEC catalog".to_owned(),
+            "CISA KEV feed".to_owned(),
+            "FIRST EPSS feed".to_owned(),
+        ]);
+        targets
     }
 }
 
@@ -93,8 +110,12 @@ async fn run_with_progress(
         let cursor = cve_full_asset_cursor(&zip);
         (zip, cursor)
     } else {
-        emit_init_progress(&progress, "-", "downloading");
-        let asset = download_latest_asset_with_source(ReleaseAssetKind::All).await?;
+        let asset = download_latest_asset_with_source_with_progress(
+            ReleaseAssetKind::All,
+            progress.clone(),
+            "init".to_owned(),
+        )
+        .await?;
         let cursor = asset
             .published_at
             .or_else(|| cve_full_asset_cursor(&asset.path));
@@ -344,6 +365,29 @@ mod tests {
                 ..Args::default()
             }
             .use_progress()
+        );
+    }
+
+    #[test]
+    fn download_targets_describe_the_initialization_fetches() {
+        let targets = Args::default().download_targets();
+        assert!(targets.iter().any(|target| target == "CVE full archive"));
+        assert!(
+            targets
+                .iter()
+                .any(|target| target.starts_with("OSV snapshots"))
+        );
+        assert!(targets.iter().any(|target| target == "FIRST EPSS feed"));
+
+        let local_targets = Args {
+            zip: Some(PathBuf::from("cves.zip")),
+            ..Args::default()
+        }
+        .download_targets();
+        assert!(
+            !local_targets
+                .iter()
+                .any(|target| target == "CVE full archive")
         );
     }
 

@@ -47,7 +47,7 @@ fn run() -> Result<(), String> {
             Command::Help => Ok(()),
             Command::Init(args) => {
                 if args.use_progress() {
-                    let display = CliProgress::new("init");
+                    let display = CliProgress::new("init", args.download_targets());
                     let silence = qanvuli_utils::logging::suppress();
                     let result = qanvuli_app_commands::init::run_with_cli_progress(
                         &db_url,
@@ -64,7 +64,7 @@ fn run() -> Result<(), String> {
             }
             Command::Update(args) => {
                 if args.use_progress() {
-                    let display = CliProgress::new("update");
+                    let display = CliProgress::new("update", args.download_targets());
                     let silence = qanvuli_utils::logging::suppress();
                     let result = qanvuli_app_commands::update::run_with_cli_progress(
                         &db_url,
@@ -107,8 +107,16 @@ struct ActiveProgress {
 }
 
 impl CliProgress {
-    fn new(operation: &'static str) -> Self {
+    fn new(operation: &'static str, download_targets: Vec<String>) -> Self {
         let progress = Arc::new(MultiProgress::new());
+        if download_targets.is_empty() {
+            let _ = progress.println(format!("{operation}: no remote downloads"));
+        } else {
+            let _ = progress.println(format!(
+                "{operation}: downloads {}",
+                download_targets.join(", ")
+            ));
+        }
         let bar = progress.add(ProgressBar::new_spinner());
         bar.set_style(spinner_style());
         bar.set_message(format!("{operation}: starting"));
@@ -124,15 +132,7 @@ impl CliProgress {
         let progress_group = self.progress.clone();
         let active = self.active.clone();
         Arc::new(move |progress: IngestProgress| {
-            let asset = std::path::Path::new(&progress.asset)
-                .file_name()
-                .and_then(|name| name.to_str());
-            let task = match asset {
-                Some(asset) if progress.asset != "-" => {
-                    format!("{}: {} ({asset})", progress.label, progress.phase)
-                }
-                _ => format!("{}: {}", progress.label, progress.phase),
-            };
+            let task = format!("{}: {}", progress.label, progress.phase);
             let Ok(mut active) = active.lock() else {
                 return;
             };

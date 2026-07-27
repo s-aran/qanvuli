@@ -12,6 +12,7 @@ use qanvuli_core::{
     },
     model::{is_known_osv_database_prefix, read_capec_catalog_xml, read_cwe_catalog_zip},
 };
+use qanvuli_utils::github::DownloadProgressCallback;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1056,6 +1057,15 @@ pub struct DownloadedAsset {
 pub async fn download_latest_asset_with_source(
     kind: ReleaseAssetKind,
 ) -> Result<DownloadedAsset, String> {
+    download_latest_asset_with_source_with_progress(kind, None, kind.to_string()).await
+}
+
+/// Downloads the latest release asset and reports byte progress when requested.
+pub async fn download_latest_asset_with_source_with_progress(
+    kind: ReleaseAssetKind,
+    progress: Option<IngestProgressCallback>,
+    label: String,
+) -> Result<DownloadedAsset, String> {
     eprintln!("{kind}: fetching GitHub release metadata");
     let (asset, published_at) = match latest_asset_with_published_at(kind).await {
         Ok(asset) => asset,
@@ -1083,16 +1093,51 @@ pub async fn download_latest_asset_with_source(
         format!("failed to prepare temporary download path for {filename}: {err}")
     })?;
     eprintln!("{kind}: download target {}", output_path.display());
-    asset
-        .download_to(&output_path)
-        .await
-        .map_err(|err| format!("failed to download {}: {err}", asset.name))?;
+    download_release_asset_with_progress(&asset, &output_path, &label, progress).await?;
     eprintln!("{kind}: ready {}", output_path.display());
     Ok(DownloadedAsset {
         path: output_path,
         downloaded: true,
         published_at,
     })
+}
+
+pub(crate) async fn download_release_asset_with_progress(
+    asset: &GitHubReleaseFile,
+    output_path: &Path,
+    label: &str,
+    progress: Option<IngestProgressCallback>,
+) -> Result<(), String> {
+    let emit = |written_files| IngestProgress {
+        label: label.to_owned(),
+        asset: asset.name.clone(),
+        phase: "downloading CVE archive".to_owned(),
+        total_files: asset.size as usize,
+        written_files,
+        failed_files: 0,
+    };
+    if let Some(progress) = &progress {
+        progress(emit(0));
+    }
+    let byte_progress: Option<DownloadProgressCallback> = progress.map(|progress| {
+        let label = label.to_owned();
+        let asset_name = asset.name.clone();
+        let total = asset.size as usize;
+        Arc::new(move |written: u64| {
+            progress(IngestProgress {
+                label: label.clone(),
+                asset: asset_name.clone(),
+                phase: "downloading CVE archive".to_owned(),
+                total_files: total,
+                written_files: written as usize,
+                failed_files: 0,
+            });
+        }) as DownloadProgressCallback
+    });
+    asset
+        .download_to_with_progress(output_path, byte_progress)
+        .await
+        .map_err(|err| format!("failed to download {}: {err}", asset.name))
 }
 
 pub fn remove_processed_zip(path: &Path) -> Result<(), String> {
@@ -1511,10 +1556,7 @@ pub async fn apply_delta_updates_with_progress(
             let path = temporary_zip_file_path(filename, Some(asset.size))
                 .map_err(|error| format!("failed to prepare delta archive {filename}: {error}"))?;
             paths.push(path.clone());
-            asset
-                .download_to(&path)
-                .await
-                .map_err(|error| format!("failed to download {}: {error}", asset.name))?;
+            download_release_asset_with_progress(&asset, &path, "update", progress.clone()).await?;
             database_changed = true;
             import_cve_zip_with_mode(
                 db.clone(),

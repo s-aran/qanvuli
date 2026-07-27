@@ -34,6 +34,24 @@ impl Args {
     pub fn use_progress(&self) -> bool {
         !self.no_progress
     }
+
+    /// Returns the remote resources fetched during this update.
+    pub fn download_targets(&self) -> Vec<String> {
+        if self.zip.is_some() {
+            return OsvImportSelection::update_additions(self.osv_all, &self.osv_prefixes)
+                .map(|selection| vec![format!("OSV snapshots ({})", selection.description())])
+                .unwrap_or_default();
+        }
+
+        vec![
+            "CVE delta archives".to_owned(),
+            "CWE catalog".to_owned(),
+            "CAPEC catalog".to_owned(),
+            "configured OSV snapshots".to_owned(),
+            "CISA KEV feed".to_owned(),
+            "FIRST EPSS feed".to_owned(),
+        ]
+    }
 }
 
 /// Applies CVE deltas, refreshes enrichment sources, and rebuilds the graph.
@@ -256,6 +274,23 @@ mod tests {
             }
             .use_progress()
         );
+    }
+
+    #[test]
+    fn download_targets_omit_remote_cve_for_a_local_archive() {
+        assert!(
+            Args::default()
+                .download_targets()
+                .iter()
+                .any(|target| target == "CVE delta archives")
+        );
+
+        let local_targets = Args {
+            zip: Some(PathBuf::from("delta.zip")),
+            ..Args::default()
+        }
+        .download_targets();
+        assert!(local_targets.is_empty());
     }
 
     #[tokio::test]
