@@ -16,21 +16,22 @@ use std::time::Instant;
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
-    /// Use the traditional detailed log output instead of a progress bar.
+    /// Print detailed logs instead of progress bars.
     #[arg(long)]
     no_progress: bool,
+    /// Import this CVE archive instead of downloading one.
     #[arg(long, value_name = "PATH")]
     zip: Option<PathBuf>,
+    /// Import at most this many archive chunks.
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
+    /// Keep the CVE archive after import.
     #[arg(long)]
     keep: bool,
-    /// Delete the active database and interrupted replacement candidates before
-    /// downloading and building the replacement. This minimizes peak disk usage,
-    /// but can disrupt another running initialization and any later failure leaves
-    /// no usable database.
+    /// Delete existing database files before building. A failure then leaves no usable database.
     #[arg(short = 'D', long = "delete-existing", verbatim_doc_comment)]
     delete_existing: bool,
+    /// Import all OSV source databases.
     #[arg(long)]
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
@@ -410,14 +411,11 @@ mod tests {
     }
 
     #[test]
-    fn destructive_option_help_explains_order_and_failure_risk() {
+    fn destructive_option_help_states_order_and_failure_risk() {
         let help = InitCli::command().render_long_help().to_string();
         assert!(help.contains("-D, --delete-existing"));
-        assert!(help.contains("before\n          downloading and building the replacement"));
-        assert!(help.contains("minimizes peak disk usage"));
-        assert!(help.contains("disrupt another running initialization"));
-        assert!(help.contains("any later failure leaves"));
-        assert!(help.contains("no usable database"));
+        assert!(help.contains("Delete existing database files before building"));
+        assert!(help.contains("failure then leaves no usable database"));
     }
 
     #[test]

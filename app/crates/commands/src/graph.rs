@@ -9,7 +9,7 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Rebuild derived typed identifier edges from normalized OSV relations.
+    /// Rebuild identifier links from OSV relations.
     Rebuild,
 }
 

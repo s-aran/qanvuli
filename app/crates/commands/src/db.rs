@@ -10,20 +10,20 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Return CVE and enrichment database status.
+    /// Show database and source status.
     Status,
-    /// Run a low-latency health check; use --scan or --full for database-wide scans.
+    /// Check database integrity.
     Check(CheckArgs),
-    /// Rebuild derived CVE and OSV search indexes, then verify them.
+    /// Rebuild and verify search indexes.
     RebuildSearch,
 }
 
 #[derive(Debug, clap::Args)]
 struct CheckArgs {
-    /// Run SQLite quick_check and broader projection scans.
+    /// Scan SQLite and search projections.
     #[arg(long, conflicts_with = "full")]
     scan: bool,
-    /// Run expensive SQLite, foreign-key, and native FTS integrity scans.
+    /// Scan SQLite, foreign keys, and search indexes.
     #[arg(long, conflicts_with = "scan")]
     full: bool,
 }

@@ -32,8 +32,7 @@ pub const DEFAULT_LIMIT: u64 = 25;
 
 /// Help text for dynamic OSV source prefix flags such as `--osv-ghsa`.
 pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
-  Any official OSV source DB prefix can be selected with repeatable --osv-{prefix} flags.
-  Prefix matching is case-insensitive. Use hyphens as shown below.
+  Select sources with repeatable --osv-{prefix} flags. Prefixes are case-insensitive.
 
   --osv-alba --osv-alea --osv-alpine --osv-alsa --osv-asb-a --osv-bell --osv-bit
   --osv-cga --osv-cleanstart --osv-curl --osv-cve --osv-debian --osv-dhi --osv-dla
@@ -43,10 +42,6 @@ pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
   --osv-osv --osv-phsa --osv-psf --osv-pub-a --osv-pysec --osv-rhba --osv-rhea
   --osv-rhsa --osv-rlsa --osv-root --osv-rsec --osv-rustsec --osv-rxsa
   --osv-suse-fu --osv-suse-ou --osv-suse-ru --osv-suse-su --osv-ubuntu --osv-usn --osv-v8
-
-Examples:
-  qanvuli init --osv-ghsa --osv-pysec
-  qanvuli update --osv-rustsec --osv-go
 "#;
 
 const INGEST_CHUNK_SIZE: usize = 20_000;

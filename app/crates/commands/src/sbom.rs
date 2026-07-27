@@ -9,23 +9,25 @@ use std::path::{Path, PathBuf};
 /// CLI arguments for `qanvuli sbom`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
+    /// SBOM file path.
     #[arg(long = "file", value_name = "PATH")]
     file: Option<PathBuf>,
+    /// SBOM file path.
     #[arg(value_name = "PATH")]
     path: Option<PathBuf>,
-    /// Filter CVEs by CVE publication time and OSV findings by OSV publication time.
+    /// Include findings published on or after this date.
     #[arg(long)]
     published_since: Option<String>,
-    /// Filter CVEs by CVE update time and OSV findings by OSV modification time.
+    /// Include findings updated on or after this date.
     #[arg(long)]
     updated_since: Option<String>,
-    /// Limit final findings per package and source (CVE, OSV, and optional name matches).
+    /// Maximum findings per package and source.
     #[arg(long)]
     per_package_limit: Option<u64>,
-    /// Include rejected linked CVEs; OSV advisories have no CVE rejection state.
+    /// Include rejected CVEs.
     #[arg(long)]
     include_rejected: bool,
-    /// Include unverified text-name matches. These never affect vulnerability counts.
+    /// Include unverified name matches outside vulnerability counts.
     #[arg(long)]
     include_name_matches: bool,
 }

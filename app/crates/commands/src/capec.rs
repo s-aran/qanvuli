@@ -12,20 +12,28 @@ use super::{
         .multiple(false)
 ))]
 pub struct Args {
+    /// Text to search.
     #[arg(value_name = "QUERY", value_parser = catalog_query)]
     query: Option<String>,
+    /// Return one CAPEC entry.
     #[arg(long, value_name = "CAPEC_ID")]
     id: Option<String>,
+    /// Include this status. Repeat to include more.
     #[arg(long = "status", value_name = "STATUS")]
     statuses: Vec<String>,
+    /// Include this attack-pattern type. Repeat to include more.
     #[arg(long = "type", value_name = "TYPE")]
     types: Vec<String>,
+    /// Include entries linked to this CWE.
     #[arg(long, value_name = "CWE_ID")]
     cwe: Option<String>,
+    /// Maximum number of results.
     #[arg(long)]
     limit: Option<u64>,
+    /// Number of results to skip.
     #[arg(long)]
     offset: Option<u64>,
+    /// Include extended entry data for --id.
     #[arg(long, requires = "id")]
     detail: bool,
 }

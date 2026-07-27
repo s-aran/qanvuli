@@ -7,18 +7,25 @@ use super::common::{DEFAULT_LIMIT, connect_database, print_json};
         .multiple(false)
 ))]
 pub struct Args {
+    /// Text to search.
     #[arg(value_name = "QUERY", value_parser = catalog_query)]
     query: Option<String>,
+    /// Return one CWE entry.
     #[arg(long, value_name = "CWE_ID")]
     id: Option<String>,
+    /// Include this status. Repeat to include more.
     #[arg(long = "status", value_name = "STATUS")]
     statuses: Vec<String>,
+    /// Include entries linked to this CAPEC.
     #[arg(long, value_name = "CAPEC_ID")]
     capec: Option<String>,
+    /// Maximum number of results.
     #[arg(long)]
     limit: Option<u64>,
+    /// Number of results to skip.
     #[arg(long)]
     offset: Option<u64>,
+    /// Request detailed output for --id.
     #[arg(long, requires = "id")]
     detail: bool,
 }

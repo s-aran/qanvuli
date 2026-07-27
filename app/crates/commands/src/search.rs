@@ -11,47 +11,67 @@ enum SearchSource {
 /// CLI arguments for `qanvuli search`.
 #[derive(Debug, Default, clap::Args)]
 pub struct Args {
-    /// Select one vulnerability source; filters and pagination apply only to that source.
+    /// Vulnerability source to search.
     #[arg(long, value_enum, default_value_t = SearchSource::Cve)]
     source: SearchSource,
+    /// Return one CVE by identifier.
     #[arg(long = "cve", value_name = "ID")]
     cve_id: Option<String>,
+    /// Text to search. Required for OSV.
     #[arg(long, value_name = "QUERY")]
     text: Option<String>,
+    /// Match CVE vendors by substring.
     #[arg(long)]
     vendor: Option<String>,
+    /// Match a CVE vendor exactly.
     #[arg(long)]
     vendor_exact: Option<String>,
+    /// Match CVE products by substring.
     #[arg(long)]
     product: Option<String>,
+    /// Match a CVE product exactly.
     #[arg(long)]
     product_exact: Option<String>,
+    /// Match CVE components by substring.
     #[arg(long)]
     component: Option<String>,
+    /// Make --vendor, --product, and --component exact.
     #[arg(long)]
     exact: bool,
+    /// Include CVEs linked to this CWE. Repeat to include more.
     #[arg(long = "cwe", value_name = "CWE_ID")]
     cwe_ids: Vec<String>,
+    /// Include CVEs linked to this CAPEC. Repeat to include more.
     #[arg(long = "capec", value_name = "CAPEC_ID")]
     capec_ids: Vec<String>,
+    /// Minimum CVSS score.
     #[arg(long)]
     min_score: Option<f64>,
+    /// Maximum CVSS score.
     #[arg(long)]
     max_score: Option<f64>,
+    /// CVSS severity.
     #[arg(long)]
     severity: Option<String>,
+    /// CVSS version.
     #[arg(long = "cvss-version")]
     cvss_version: Option<String>,
+    /// Include records published on or after this date.
     #[arg(long)]
     published_since: Option<String>,
+    /// Include records updated on or after this date.
     #[arg(long)]
     updated_since: Option<String>,
+    /// Maximum number of results.
     #[arg(long)]
     limit: Option<u64>,
+    /// Number of results to skip.
     #[arg(long)]
     offset: Option<u64>,
+    /// Include rejected CVEs.
     #[arg(long)]
     include_rejected: bool,
+    /// Include OSV, KEV, and EPSS data.
     #[arg(long)]
     enriched: bool,
 }

@@ -18,8 +18,10 @@ use std::io;
 /// CLI arguments for `qanvuli tui`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
+    /// Initial CVE search text.
     #[arg(value_name = "QUERY")]
     query: Option<String>,
+    /// Maximum number of search results.
     #[arg(long, default_value_t = TUI_LIMIT)]
     limit: u64,
 }

@@ -197,20 +197,18 @@ fn spinner_style() -> ProgressStyle {
 #[derive(Debug, Parser)]
 #[command(
     name = "qanvuli",
-    about = "CVE DB maintenance and search tool",
+    about = "Maintain and query a local vulnerability database",
     disable_help_subcommand = true,
     disable_version_flag = true
 )]
 struct Cli {
+    /// Print version information.
     #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     version: bool,
-    #[arg(
-        long = "db-url",
-        global = true,
-        value_name = "URL",
-        help = "Database URL (default: ./db.sqlite in the current working directory)"
-    )]
+    /// Use this database instead of ./db.sqlite.
+    #[arg(long = "db-url", global = true, value_name = "URL")]
     db_url: Option<String>,
+    /// Pretty-print JSON output.
     #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
     pretty: bool,
     #[command(subcommand)]
@@ -230,21 +228,19 @@ impl Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show help.
+    /// Print command help.
     Help,
-    /// Build a replacement database from current vulnerability feeds.
-    ///
-    /// Full initialization downloads and imports the all-CVE archive, so it can take a while.
+    /// Build a new database from vulnerability feeds.
     Init(qanvuli_app_commands::init::Args),
-    /// Apply CVE deltas and refresh enrichment feeds.
+    /// Apply CVE updates and refresh enrichment data.
     Update(qanvuli_app_commands::update::Args),
-    /// Download a CVE archive without changing the database.
+    /// Download a CVE archive.
     DownloadCve(qanvuli_app_commands::download_cve::Args),
-    /// Rebuild cross-source identifier relationships.
+    /// Maintain cross-source identifier links.
     Graph(qanvuli_app_commands::graph::Args),
-    /// Query identifiers, packages, and enrichment data.
+    /// Query identifiers and packages.
     Query(qanvuli_app_commands::query::Args),
-    /// Inspect and maintain the database.
+    /// Check and maintain the database.
     Db(qanvuli_app_commands::db::Args),
     /// Search the CWE catalog.
     Cwe(qanvuli_app_commands::cwe::Args),
@@ -255,7 +251,7 @@ enum Command {
     /// Open the terminal UI.
     #[cfg(feature = "tui")]
     Tui(qanvuli_app_tui::Args),
-    /// Scan a GitHub SBOM with local vulnerability data.
+    /// Scan a GitHub SBOM for vulnerabilities.
     Sbom(qanvuli_app_commands::sbom::Args),
     /// Run the MCP server over stdio.
     #[cfg(feature = "mcp")]
@@ -393,5 +389,32 @@ mod tests {
         )
         .unwrap();
         Cli::try_parse_from(normalized).unwrap();
+    }
+
+    #[test]
+    fn every_visible_command_and_option_has_help() {
+        fn check(command: &clap::Command) {
+            for argument in command
+                .get_arguments()
+                .filter(|argument| !argument.is_hide_set())
+            {
+                assert!(
+                    argument.get_help().is_some(),
+                    "{}: `{}` has no help",
+                    command.get_name(),
+                    argument.get_id()
+                );
+            }
+            for subcommand in command.get_subcommands() {
+                assert!(
+                    subcommand.get_about().is_some(),
+                    "`{}` has no help",
+                    subcommand.get_name()
+                );
+                check(subcommand);
+            }
+        }
+
+        check(&Cli::command());
     }
 }

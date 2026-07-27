@@ -9,30 +9,36 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
-    /// Resolve a CVE/GHSA/RUSTSEC/PYSEC/OSV identifier through the local alias graph.
+    /// Resolve an identifier to its linked advisories.
     Resolve(IdArgs),
-    /// Fetch one CVE with OSV/KEV/EPSS enrichment.
+    /// Return a CVE with OSV, KEV, and EPSS data.
     EnrichedCve(IdArgs),
-    /// Query OSV by package/version and attach CVE enrichment.
+    /// Find advisories affecting a package version.
     Package(PackageArgs),
 }
 
 #[derive(Debug, clap::Args)]
 struct IdArgs {
+    /// CVE, GHSA, RustSec, PySEC, or OSV identifier.
     #[arg(long)]
     id: String,
 }
 
 #[derive(Debug, clap::Args)]
 struct PackageArgs {
+    /// OSV ecosystem name.
     #[arg(long)]
     ecosystem: String,
+    /// Package name.
     #[arg(long)]
     name: String,
+    /// Installed package version.
     #[arg(long)]
     version: String,
+    /// Package URL used to refine matching.
     #[arg(long)]
     purl: Option<String>,
+    /// Include CVE, KEV, and EPSS data.
     #[arg(long)]
     enriched: bool,
 }

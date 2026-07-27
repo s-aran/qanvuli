@@ -10,21 +10,24 @@ use std::path::PathBuf;
 #[derive(Debug, Default, clap::Args)]
 #[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
-    /// Use the traditional detailed log output instead of a progress bar.
+    /// Print detailed logs instead of progress bars.
     #[arg(long)]
     no_progress: bool,
+    /// Import this CVE archive instead of downloading updates.
     #[arg(long, value_name = "PATH")]
     zip: Option<PathBuf>,
+    /// Import at most this many archive chunks.
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
+    /// Keep the CVE archive after import.
     #[arg(long)]
     keep: bool,
+    /// Update all OSV source databases.
     #[arg(long)]
     osv_all: bool,
     #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
     osv_prefixes: Vec<String>,
-    /// Ignore the OSV cursor, redownload selected snapshots, and upsert all records.
-    /// Missing snapshot entries are not treated as deletions.
+    /// Redownload selected OSV snapshots and upsert every record. Absent records are not deleted.
     #[arg(long)]
     osv_refresh_all: bool,
 }

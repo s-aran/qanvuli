@@ -4,8 +4,10 @@ use std::path::PathBuf;
 /// CLI arguments for `qanvuli download-cve`.
 #[derive(Debug, clap::Args)]
 pub struct Args {
+    /// CVE archive type.
     #[arg(long, value_enum, default_value_t = ReleaseAssetKind::Delta)]
     kind: ReleaseAssetKind,
+    /// Destination directory.
     #[arg(long, value_name = "DIR", default_value = ".")]
     output_dir: PathBuf,
 }
