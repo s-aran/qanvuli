@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
+use simd_json::OwnedValue as Value;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

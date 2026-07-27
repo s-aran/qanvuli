@@ -1,16 +1,41 @@
-mod entity;
+//! Vulnerability database API.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+pub mod database {
+    pub(crate) mod maintenance;
+    pub(crate) mod package_eval;
+    pub(crate) mod queries;
+    pub mod replacement;
+    pub(crate) mod schema;
+    pub(crate) mod search;
+    pub mod sqlx_database;
+    pub(crate) mod timestamps;
+    pub(crate) mod writer;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod capec;
+mod common;
+mod cve_types;
+mod epss;
+mod identifiers;
+mod kev;
+mod osv;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use capec::*;
+pub use common::detect_identifier_type;
+pub use cve_types::*;
+pub use database::package_eval::{
+    OsvRange as SqlxOsvRange, VersionMatch as SqlxVersionMatch,
+    evaluate_version as evaluate_sqlx_osv_version,
+};
+pub use database::sqlx_database::{
+    OsvImportStats, SqlxAffected, SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary,
+    SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase, SqlxDatabaseStatus,
+    SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
+    SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState,
+};
+/// Shared database handle used by application crates.
+pub type CveDatabase = SqlxDatabase;
+pub use epss::*;
+pub use identifiers::*;
+pub use kev::*;
+pub use osv::*;

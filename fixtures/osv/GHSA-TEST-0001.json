@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.7.5",
+  "id": "GHSA-TEST-0001",
+  "modified": "2099-01-04T00:00:00Z",
+  "published": "2099-01-02T00:00:00Z",
+  "withdrawn": "2099-01-05T00:00:00Z",
+  "aliases": [
+    "CVE-2099-0001"
+  ],
+  "summary": "Withdrawn duplicate fixture",
+  "details": "Withdrawn records remain in the alias graph.",
+  "affected": [],
+  "references": []
+}

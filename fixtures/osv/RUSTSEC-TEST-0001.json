@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.7.5",
+  "id": "RUSTSEC-TEST-0001",
+  "modified": "2099-01-03T00:00:00Z",
+  "published": "2099-01-01T00:00:00Z",
+  "aliases": [
+    "CVE-2099-0001",
+    "GHSA-TEST-0001"
+  ],
+  "summary": "Test advisory for foo",
+  "details": "Fixture advisory text.",
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "crates.io",
+        "name": "foo",
+        "purl": "pkg:cargo/foo"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "1.0.0"
+            },
+            {
+              "fixed": "1.2.5"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "1.2.3"
+      ]
+    }
+  ],
+  "references": [
+    {
+      "type": "ADVISORY",
+      "url": "https://example.invalid/RUSTSEC-TEST-0001"
+    }
+  ],
+  "database_specific": {
+    "fixture": true
+  }
+}

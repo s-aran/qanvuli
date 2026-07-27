@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use serde_json::Value;
+use simd_json::OwnedValue as Value;
 use strum::{AsRefStr, EnumString};
 
 use crate::cve::published::{program_routine::ProgramRoutine, version::Version};

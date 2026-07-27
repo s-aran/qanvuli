@@ -1,16 +1,30 @@
 use chrono::{DateTime, FixedOffset};
-use once_cell::sync::Lazy;
-use regex::Regex;
 use serde::{Deserialize, Deserializer};
 
 fn add_timezone_if_missing(s: String) -> String {
-    static TZ_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(Z|[+-][0-9]{2}:[0-9]{2})$").unwrap());
-
-    if TZ_RE.is_match(s.as_str()) {
+    if has_timezone_suffix(&s) {
         s
     } else {
         format!("{s}Z")
     }
+}
+
+fn has_timezone_suffix(value: &str) -> bool {
+    if value.ends_with('Z') {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+    if len < 6 {
+        return false;
+    }
+    let suffix = &bytes[len - 6..];
+    matches!(suffix[0], b'+' | b'-')
+        && suffix[1].is_ascii_digit()
+        && suffix[2].is_ascii_digit()
+        && suffix[3] == b':'
+        && suffix[4].is_ascii_digit()
+        && suffix[5].is_ascii_digit()
 }
 
 pub fn deserialize_cve_timestamp<'de, D>(
@@ -36,5 +50,5 @@ where
     D: Deserializer<'de>,
 {
     let s = add_timezone_if_missing(String::deserialize(deserializer)?);
-    Ok(DateTime::parse_from_rfc3339(&s).map_err(serde::de::Error::custom)?)
+    DateTime::parse_from_rfc3339(&s).map_err(serde::de::Error::custom)
 }

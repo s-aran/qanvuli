@@ -1,3 +1,5 @@
+#![allow(clippy::derivable_impls)]
+
 use serde::Deserialize;
 use strum::{AsRefStr, EnumString};
 

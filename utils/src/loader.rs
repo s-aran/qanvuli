@@ -1,168 +1,632 @@
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::{BufWriter, Cursor, Read, Seek, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
-use anyhow::Error;
+use anyhow::{Context, Error, anyhow};
 use glob::{MatchOptions, glob_with};
-use regex::Regex;
 
-pub trait FileStorageTrait {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error>;
-    fn enum_json_list(&self) -> impl Iterator<Item = String>;
+pub trait JsonStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error>;
+
+    fn read_entry(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        self.read_bytes(entry.path.clone())
+    }
+
+    fn read_string(&mut self, path: impl Into<String>) -> Result<String, Error> {
+        let bytes = self.read_bytes(path)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    fn paths(&self) -> impl Iterator<Item = String>;
+
+    fn entries(&self) -> Vec<JsonEntry> {
+        self.paths()
+            .map(|path| JsonEntry {
+                path,
+                index: None,
+                filesystem_path: None,
+            })
+            .collect()
+    }
 }
 
-pub struct ActualStorage {
+#[derive(Clone, Debug)]
+pub struct JsonEntry {
+    pub path: String,
+    pub index: Option<usize>,
+    pub filesystem_path: Option<PathBuf>,
+}
+
+pub struct DirectoryStorage {
     base: PathBuf,
 }
 
-impl ActualStorage {
+impl DirectoryStorage {
     pub fn new(path: PathBuf) -> Self {
         Self { base: path }
     }
 }
 
-impl FileStorageTrait for ActualStorage {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
-        // TODO: error handling
+impl JsonStorage for DirectoryStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
         let p = PathBuf::from(path.into());
-        let mut file = File::open(p).expect("maybe not found");
-        let mut buf = String::new();
-        let _ = file.read_to_string(&mut buf);
+        let mut file =
+            File::open(&p).with_context(|| format!("failed to open JSON file {}", p.display()))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .with_context(|| format!("failed to read JSON file {}", p.display()))?;
 
         Ok(buf)
     }
 
-    fn enum_json_list(&self) -> impl Iterator<Item = String> {
+    fn paths(&self) -> impl Iterator<Item = String> {
         let mut glob_options = MatchOptions::new();
         glob_options.case_sensitive = false;
 
-        let base_path = format!("{}/**/CVE-*.json", self.base.to_string_lossy().to_string());
-        let files = glob_with(base_path.as_str(), glob_options).unwrap();
+        let base_path = format!("{}/**/CVE-*.json", self.base.to_string_lossy());
+        let files = glob_with(base_path.as_str(), glob_options)
+            .map(|paths| {
+                paths
+                    .filter_map(Result::ok)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
-        files.map(|e| e.unwrap().to_string_lossy().to_owned().to_string())
+        files.into_iter()
     }
 }
 
+trait ReadSeek: Read + Seek + Send {}
+
+impl<T> ReadSeek for T where T: Read + Seek + Send {}
+
+const ZIP_EXTRACTION_EXPANSION_FACTOR: u64 = 8;
+const ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CVE_JSON_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_NESTED_ARCHIVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const NESTED_ARCHIVE_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+// Large all-CVE archives must not consume the importer's memory budget.
+const IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 pub struct ZipStorage {
-    stream: zip::ZipArchive<std::io::BufReader<File>>,
+    stream: Option<zip::ZipArchive<Box<dyn ReadSeek>>>,
+    extracted_dir: Option<PathBuf>,
+    in_memory_archive: Option<Arc<[u8]>>,
+    extracted_entries: Vec<JsonEntry>,
+    cleanup_extracted_dir_on_drop: bool,
 }
 
 impl ZipStorage {
-    pub fn new(filename: impl Into<String>) -> Self {
-        // TODO: error handling
-        let file = std::fs::File::open(filename.into()).unwrap();
+    pub fn new(filename: impl Into<String>) -> Result<Self, Error> {
+        let filename = filename.into();
+        let file = std::fs::File::open(&filename)
+            .with_context(|| format!("failed to open zip archive {filename}"))?;
         let reader = std::io::BufReader::new(file);
-        Self {
-            stream: zip::ZipArchive::new(reader).unwrap(),
+        let mut stream = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>)
+            .with_context(|| format!("failed to read zip archive {filename}"))?;
+        if stream.len() == 1 {
+            let name = stream
+                .by_index(0)
+                .with_context(|| format!("failed to inspect first zip entry in {filename}"))?
+                .name()
+                .to_owned();
+            if name.ends_with(".zip") && !archive_has_cve_json(&stream) {
+                let nested = extract_nested_cve_zip(&mut stream, &name)?;
+                return Ok(Self {
+                    stream: Some(nested.stream),
+                    extracted_dir: nested.extracted_dir,
+                    in_memory_archive: nested.in_memory_archive,
+                    extracted_entries: Vec::new(),
+                    cleanup_extracted_dir_on_drop: true,
+                });
+            }
+        }
+
+        Ok(Self {
+            stream: Some(stream),
+            extracted_dir: None,
+            in_memory_archive: None,
+            extracted_entries: Vec::new(),
+            cleanup_extracted_dir_on_drop: true,
+        })
+    }
+
+    /// Preserves the extracted archive after this value is dropped.
+    pub fn retain_extracted_dir(&mut self) {
+        self.cleanup_extracted_dir_on_drop = false;
+    }
+
+    /// Returns the extraction directory.
+    pub fn extracted_dir(&self) -> Option<&std::path::Path> {
+        self.extracted_dir.as_deref()
+    }
+
+    /// Returns the in-memory nested archive.
+    pub fn in_memory_archive(&self) -> Option<Arc<[u8]>> {
+        self.in_memory_archive.clone()
+    }
+
+    /// Opens another reader for a validated in-memory ZIP.
+    pub fn from_in_memory_archive(archive: Arc<[u8]>) -> Result<Self, Error> {
+        let stream =
+            zip::ZipArchive::new(Box::new(Cursor::new(archive.clone())) as Box<dyn ReadSeek>)
+                .context("failed to read in-memory nested zip archive")?;
+        Ok(Self {
+            stream: Some(stream),
+            extracted_dir: None,
+            in_memory_archive: Some(archive),
+            extracted_entries: Vec::new(),
+            cleanup_extracted_dir_on_drop: true,
+        })
+    }
+
+    /// Deletes the extraction directory.
+    pub fn cleanup_extracted_dir(&mut self) -> Result<(), Error> {
+        let Some(path) = self.extracted_dir.take() else {
+            return Ok(());
+        };
+        std::fs::remove_dir_all(&path).with_context(|| {
+            format!(
+                "failed to remove temporary extraction directory {}",
+                path.display()
+            )
+        })
+    }
+}
+
+impl JsonStorage for ZipStorage {
+    fn read_bytes(&mut self, path: impl Into<String>) -> Result<Vec<u8>, Error> {
+        let path = path.into();
+        if let Some(filesystem_path) = self
+            .extracted_entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .and_then(|entry| entry.filesystem_path.as_ref())
+        {
+            return Ok(std::fs::read(filesystem_path)?);
+        }
+
+        let mut f = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("zip stream is unavailable for {path}"))?
+            .by_name(path.as_str())
+            .with_context(|| format!("failed to find {path} in zip archive"))?;
+        read_zip_entry_bytes(&mut f, &path)
+    }
+
+    fn paths(&self) -> impl Iterator<Item = String> {
+        let names: Vec<String> = if self.extracted_entries.is_empty() {
+            self.stream.as_ref().map_or_else(Vec::new, |stream| {
+                stream
+                    .file_names()
+                    .filter(|path| is_cve_json_path(path))
+                    .map(|e| e.to_owned())
+                    .collect()
+            })
+        } else {
+            self.extracted_entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+        names.into_iter()
+    }
+
+    fn entries(&self) -> Vec<JsonEntry> {
+        if !self.extracted_entries.is_empty() {
+            return self.extracted_entries.clone();
+        }
+
+        let Some(stream) = self.stream.as_ref() else {
+            return Vec::new();
+        };
+        (0..stream.len())
+            .filter_map(|index| {
+                let path = stream.name_for_index(index)?;
+                if is_cve_json_path(path) {
+                    Some(JsonEntry {
+                        path: path.to_owned(),
+                        index: Some(index),
+                        filesystem_path: None,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn read_entry(&mut self, entry: &JsonEntry) -> Result<Vec<u8>, Error> {
+        if let Some(filesystem_path) = &entry.filesystem_path {
+            return Ok(std::fs::read(filesystem_path)?);
+        }
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| anyhow!("zip stream is unavailable for {}", entry.path))?;
+        let mut f = if let Some(index) = entry.index {
+            stream
+                .by_index(index)
+                .with_context(|| format!("failed to find zip entry index {index}"))?
+        } else {
+            stream
+                .by_name(entry.path.as_str())
+                .with_context(|| format!("failed to find {} in zip archive", entry.path))?
+        };
+        read_zip_entry_bytes(&mut f, &entry.path)
+    }
+}
+
+impl Drop for ZipStorage {
+    fn drop(&mut self) {
+        if self.cleanup_extracted_dir_on_drop
+            && let Some(path) = &self.extracted_dir
+        {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
 
-impl FileStorageTrait for ZipStorage {
-    fn get_json(&mut self, path: impl Into<String>) -> Result<String, Error> {
-        // TODO: error handling
-        let mut f = self.stream.by_name(path.into().as_str()).unwrap();
-        let mut buf = String::new();
-        let _ = f.read_to_string(&mut buf);
+struct NestedArchive {
+    extracted_dir: Option<PathBuf>,
+    in_memory_archive: Option<Arc<[u8]>>,
+    stream: zip::ZipArchive<Box<dyn ReadSeek>>,
+}
 
-        Ok(buf)
+fn extract_nested_cve_zip(
+    stream: &mut zip::ZipArchive<Box<dyn ReadSeek>>,
+    nested_name: &str,
+) -> Result<NestedArchive, Error> {
+    let nested_zip_size = stream
+        .by_index(0)
+        .with_context(|| format!("failed to inspect nested zip entry {nested_name}"))?
+        .size();
+    if nested_zip_size > MAX_NESTED_ARCHIVE_BYTES {
+        return Err(anyhow!(
+            "nested zip entry {nested_name} is {nested_zip_size} bytes; maximum is {MAX_NESTED_ARCHIVE_BYTES} bytes"
+        ));
+    }
+    if nested_archive_fits_memory(nested_zip_size) {
+        eprintln!("loading nested zip into memory: {nested_name} ({nested_zip_size} bytes)");
+        let load_started = std::time::Instant::now();
+        let mut entry = stream
+            .by_index(0)
+            .with_context(|| format!("failed to open nested zip entry {nested_name}"))?;
+        let mut bytes = Vec::with_capacity(nested_zip_size as usize);
+        entry
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to load nested zip entry {nested_name}"))?;
+        let archive: Arc<[u8]> = bytes.into();
+        let inner =
+            zip::ZipArchive::new(Box::new(Cursor::new(archive.clone())) as Box<dyn ReadSeek>)
+                .with_context(|| format!("failed to read in-memory nested zip {nested_name}"))?;
+        eprintln!(
+            "loaded nested zip into memory: {nested_name} in {:?}",
+            load_started.elapsed()
+        );
+        return Ok(NestedArchive {
+            extracted_dir: None,
+            in_memory_archive: Some(archive),
+            stream: inner,
+        });
+    }
+    let required_bytes = nested_zip_size
+        .saturating_mul(ZIP_EXTRACTION_EXPANSION_FACTOR)
+        .saturating_add(ZIP_EXTRACTION_FREE_SPACE_MARGIN_BYTES);
+    let temp_dir = unique_temp_dir(required_bytes);
+    std::fs::create_dir_all(&temp_dir).with_context(|| {
+        format!(
+            "failed to create temporary extraction directory {}",
+            temp_dir.display()
+        )
+    })?;
+    let inner_path = temp_dir.join("inner.zip");
+
+    eprintln!(
+        "extracting nested zip: {nested_name} -> {}",
+        temp_dir.display()
+    );
+    let extraction_started = std::time::Instant::now();
+    {
+        let extracted = std::fs::File::create(&inner_path).with_context(|| {
+            format!("failed to create nested zip copy {}", inner_path.display())
+        })?;
+        let mut extracted = BufWriter::with_capacity(NESTED_ARCHIVE_COPY_BUFFER_BYTES, extracted);
+        let mut entry = stream
+            .by_index(0)
+            .with_context(|| format!("failed to open nested zip entry {nested_name}"))?;
+        let mut buffer = vec![0_u8; NESTED_ARCHIVE_COPY_BUFFER_BYTES];
+        loop {
+            let read = entry
+                .read(&mut buffer)
+                .with_context(|| format!("failed to read nested zip entry {nested_name}"))?;
+            if read == 0 {
+                break;
+            }
+            extracted
+                .write_all(&buffer[..read])
+                .with_context(|| format!("failed to extract nested zip entry {nested_name}"))?;
+        }
+        extracted
+            .flush()
+            .with_context(|| format!("failed to flush nested zip copy {}", inner_path.display()))?;
+    }
+    eprintln!(
+        "extracted nested zip: {nested_name} ({nested_zip_size} bytes) in {:?}",
+        extraction_started.elapsed()
+    );
+
+    let open_started = std::time::Instant::now();
+    let file = std::fs::File::open(&inner_path).with_context(|| {
+        format!(
+            "failed to open extracted nested zip {}",
+            inner_path.display()
+        )
+    })?;
+    let reader = std::io::BufReader::new(file);
+    let inner = zip::ZipArchive::new(Box::new(reader) as Box<dyn ReadSeek>).with_context(|| {
+        format!(
+            "failed to read extracted nested zip {}",
+            inner_path.display()
+        )
+    })?;
+    eprintln!(
+        "opened extracted nested zip: {nested_name} in {:?}",
+        open_started.elapsed()
+    );
+
+    Ok(NestedArchive {
+        extracted_dir: Some(temp_dir),
+        in_memory_archive: None,
+        stream: inner,
+    })
+}
+
+fn nested_archive_fits_memory(size: u64) -> bool {
+    size <= IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES
+}
+
+fn read_zip_entry_bytes(reader: &mut impl Read, path: &str) -> Result<Vec<u8>, Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_CVE_JSON_ENTRY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read {path} from zip archive"))?;
+    if bytes.len() as u64 > MAX_CVE_JSON_ENTRY_BYTES {
+        return Err(anyhow!(
+            "zip entry {path} exceeds the {MAX_CVE_JSON_ENTRY_BYTES}-byte limit"
+        ));
+    }
+    Ok(bytes)
+}
+
+fn unique_temp_dir(required_bytes: u64) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    temporary_extraction_root(required_bytes)
+        .join(format!("qanvuli-cve-zip-{}-{nanos}", std::process::id()))
+}
+
+fn temporary_extraction_root(required_bytes: u64) -> PathBuf {
+    let temp_root = std::env::temp_dir();
+    match available_storage_bytes(&temp_root) {
+        Some(available) if available >= required_bytes => temp_root,
+        Some(available) => {
+            let binary_root = binary_directory();
+            eprintln!(
+                "temporary storage {} has only {} bytes available; need about {} bytes, using {}",
+                temp_root.display(),
+                available,
+                required_bytes,
+                binary_root.display()
+            );
+            binary_root
+        }
+        None => temp_root,
+    }
+}
+
+fn binary_directory() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+#[cfg(target_os = "linux")]
+fn available_storage_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_int, c_ulong};
+    use std::os::unix::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct Statvfs {
+        f_bsize: c_ulong,
+        f_frsize: c_ulong,
+        f_blocks: c_ulong,
+        f_bfree: c_ulong,
+        f_bavail: c_ulong,
+        f_files: c_ulong,
+        f_ffree: c_ulong,
+        f_favail: c_ulong,
+        f_fsid: c_ulong,
+        f_flag: c_ulong,
+        f_namemax: c_ulong,
+        __f_spare: [c_int; 6],
     }
 
-    fn enum_json_list(&self) -> impl Iterator<Item = String> {
-        let re = Regex::new(".*/CVE-[0-9]{4}-[0-9]+.json$").unwrap();
-        self.stream
-            .file_names()
-            .filter(move |e| {
-                if let Some(r) = re.find(e) {
-                    !r.is_empty()
-                } else {
-                    false
-                }
-            })
-            .map(|e| e.to_owned())
+    unsafe extern "C" {
+        fn statvfs(path: *const c_char, buf: *mut Statvfs) -> c_int;
     }
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<Statvfs>::uninit();
+    let result = unsafe { statvfs(path.as_ptr(), stat.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+
+    let stat = unsafe { stat.assume_init() };
+    let fragment_size = if stat.f_frsize == 0 {
+        stat.f_bsize
+    } else {
+        stat.f_frsize
+    };
+    Some(stat.f_bavail.saturating_mul(fragment_size))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_storage_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
+fn archive_has_cve_json(stream: &zip::ZipArchive<Box<dyn ReadSeek>>) -> bool {
+    stream.file_names().any(is_cve_json_path)
+}
+
+fn is_cve_json_path(path: &str) -> bool {
+    let Some(filename) = path.rsplit('/').next() else {
+        return false;
+    };
+    let Some(stem) = filename.strip_suffix(".json") else {
+        return false;
+    };
+    let Some(rest) = stem.strip_prefix("CVE-") else {
+        return false;
+    };
+    let Some((year, number)) = rest.split_once('-') else {
+        return false;
+    };
+    year.len() == 4
+        && year.bytes().all(|byte| byte.is_ascii_digit())
+        && !number.is_empty()
+        && number.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 #[cfg(test)]
 mod tests {
-    // use qanvuli_models::cve::base::cve_metadata::CveState;
-    // use qanvuli_models::cve::base::root::CveRoot;
-    // use qanvuli_models::cve::published::root::CveRoot as PublishedCveRoot;
-    // use qanvuli_models::cve::rejected::root::CveRoot as RejectedCveRoot;
+    use super::*;
+    use std::io::Write;
 
-    // use super::*;
+    fn nested_cve_zip_path(label: &str) -> PathBuf {
+        let suffix = format!(
+            "{label}-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let inner_path = std::env::temp_dir().join(format!("qanvuli-inner-{suffix}.zip"));
+        let outer_path = std::env::temp_dir().join(format!("qanvuli-outer-{suffix}.zip"));
 
-    // #[test]
-    // fn test_zipfile() {
-    //     const FILENAME: &str = "2025-12-14_all_CVEs_at_midnight.zip";
-    //     const INNER_FILENAME: &str = "cve.zip";
+        let inner_file = std::fs::File::create(&inner_path).unwrap();
+        let mut inner = zip::ZipWriter::new(inner_file);
+        inner
+            .start_file("CVE-2024-1.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        inner.write_all(b"{}").unwrap();
+        inner.finish().unwrap();
 
-    //     let file = std::fs::File::open(FILENAME).unwrap();
-    //     let outer_reader = std::io::BufReader::new(file);
-    //     let mut outer_archive = zip::ZipArchive::new(outer_reader).unwrap();
+        let outer_file = std::fs::File::create(&outer_path).unwrap();
+        let mut outer = zip::ZipWriter::new(outer_file);
+        outer
+            .start_file("cves.zip", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        outer
+            .write_all(&std::fs::read(&inner_path).unwrap())
+            .unwrap();
+        outer.finish().unwrap();
+        std::fs::remove_file(inner_path).unwrap();
+        outer_path
+    }
 
-    //     if outer_archive.len() != 1 {
-    //         panic!("no cve list zip");
-    //     }
+    #[test]
+    fn zip_storage_new_returns_error_for_missing_zip() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-missing-zip-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
 
-    //     let mut extracted = std::fs::File::create(INNER_FILENAME).unwrap();
-    //     std::io::copy(&mut outer_archive.by_index(0).unwrap(), &mut extracted).unwrap();
+        let err = match ZipStorage::new(path.to_string_lossy().to_string()) {
+            Ok(_) => panic!("missing zip unexpectedly opened"),
+            Err(err) => err,
+        };
 
-    //     let mut storage = ZipStorage::new(INNER_FILENAME);
-    //     let files = storage.enum_json_list().collect::<Vec<String>>();
-    //     for f in files.iter() {
-    //         assert!(storage.load_cve_json(f).is_ok());
-    //     }
+        assert!(err.to_string().contains("failed to open zip archive"));
+    }
 
-    //     assert!(files.len() > 0);
+    #[test]
+    fn zip_storage_new_returns_error_for_invalid_zip() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-invalid-zip-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, b"not a zip").unwrap();
 
-    //     // for i in 0..inner_archive.len() {
-    //     //     let content = inner_archive.by_index(i).unwrap();
-    //     //     let path = match content.enclosed_name() {
-    //     //         Some(p) => p,
-    //     //         None => {
-    //     //             println!("path is none, {}", content.name());
-    //     //             continue;
-    //     //         }
-    //     //     };
+        let err = match ZipStorage::new(path.to_string_lossy().to_string()) {
+            Ok(_) => panic!("invalid zip unexpectedly opened"),
+            Err(err) => err,
+        };
 
-    //     //     if content.is_dir() {
-    //     //         // println!("{}/", path.to_string_lossy());
-    //     //         continue;
-    //     //     } else {
-    //     //         println!("{}", path.to_string_lossy());
-    //     //     }
-    //     // }
-    // }
+        assert!(err.to_string().contains("failed to read zip archive"));
+        let _ = std::fs::remove_file(path);
+    }
 
-    // #[test]
-    // fn test_json() {
-    //     const DIR: &str = "deltaCves";
-    //     let mut glob_options = MatchOptions::new();
-    //     glob_options.case_sensitive = false;
+    #[test]
+    fn cve_json_path_filter_matches_only_cve_json_filenames() {
+        assert!(is_cve_json_path("nested/CVE-2024-12345.json"));
+        assert!(is_cve_json_path("CVE-1999-1.json"));
+        assert!(!is_cve_json_path("nested/GHSA-xxxx.json"));
+        assert!(!is_cve_json_path("nested/CVE-20X4-12345.json"));
+        assert!(!is_cve_json_path("nested/CVE-2024-.json"));
+        assert!(!is_cve_json_path("nested/CVE-2024-12345.JSON"));
+    }
 
-    //     let base_path = format!("{}/*.json", DIR);
-    //     let files = glob_with(base_path.as_str(), glob_options).unwrap();
+    #[test]
+    fn zip_entry_reader_rejects_oversized_json() {
+        let mut reader = std::io::Cursor::new(vec![b'x'; MAX_CVE_JSON_ENTRY_BYTES as usize + 1]);
 
-    //     for path in files {
-    //         let p = path.unwrap().to_string_lossy().to_string();
-    //         println!("{}", p);
-    //         let mut file = File::open(p).expect("maybe not found");
-    //         let mut buf = String::new();
-    //         let _ = file.read_to_string(&mut buf);
+        let err = read_zip_entry_bytes(&mut reader, "CVE-2024-1.json").unwrap_err();
 
-    //         let _: qanvuli_models::cve::published::root::CveRoot =
-    //             serde_json::from_str(&buf).unwrap();
-    //     }
-    // }
+        assert!(err.to_string().contains("exceeds"));
+    }
 
-    // #[test]
-    // fn test_json_2() {
-    //     let mut storage = ActualStorage::new(PathBuf::from("deltaCves"));
-    //     let files = storage.enum_json_list().collect::<Vec<String>>();
-    //     for p in files.iter() {
-    //         println!("{}", p);
-    //         assert!(storage.load_cve_json(p).is_ok());
-    //     }
+    #[test]
+    fn small_nested_archives_stay_in_memory() {
+        let outer_path = nested_cve_zip_path("memory");
+        let storage = ZipStorage::new(outer_path.to_string_lossy().to_string()).unwrap();
+        let archive = storage.in_memory_archive().unwrap();
+        assert!(storage.extracted_dir().is_none());
+        let reader = ZipStorage::from_in_memory_archive(archive).unwrap();
+        assert_eq!(reader.entries().len(), 1);
+        std::fs::remove_file(outer_path).unwrap();
+    }
 
-    //     assert!(files.len() > 0);
-    // }
+    #[test]
+    fn large_nested_archives_are_spooled_to_disk() {
+        assert!(nested_archive_fits_memory(
+            IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES
+        ));
+        assert!(!nested_archive_fits_memory(
+            IN_MEMORY_NESTED_ARCHIVE_MAX_BYTES + 1
+        ));
+        assert!(!nested_archive_fits_memory(615_520_774));
+    }
+
+    #[test]
+    fn in_memory_nested_archive_can_read_cve_json() {
+        let outer_path = nested_cve_zip_path("memory-read");
+        let mut storage = ZipStorage::new(outer_path.to_string_lossy().to_string()).unwrap();
+        let entry = storage.entries().pop().unwrap();
+        assert_eq!(storage.read_entry(&entry).unwrap(), b"{}");
+        std::fs::remove_file(outer_path).unwrap();
+    }
 }

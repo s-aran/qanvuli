@@ -1,0 +1,207 @@
+use crate::{
+    app::{App, PaneFocus},
+    common::focus_style,
+    traits::list::ResultList,
+    utils::text::normalize_spaces,
+};
+use qanvuli_core::database::CweEntry;
+use ratatui::{
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+};
+use std::collections::{HashMap, HashSet};
+
+pub(super) struct CweList;
+
+struct CweTreePrefixes {
+    by_id: HashMap<i32, CweTreePrefixEntry>,
+}
+
+struct CweTreePrefixEntry {
+    prefix: String,
+}
+
+impl ResultList for CweList {
+    fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
+        let block = Block::default()
+            .title(format!("CWE ({})", app.cwe_results.len()))
+            .borders(Borders::ALL)
+            .border_style(focus_style(app.focus == PaneFocus::Left));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let items = if app.cwe_searching() {
+            vec![Line::from("Loading")]
+        } else if app.cwe_results.is_empty() {
+            vec![Line::from("No CWE")]
+        } else {
+            let prefixes = CweTreePrefixes::new(&app.cwe_results);
+            let start = (app.cwe_scroll as usize).min(app.cwe_results.len());
+            let end = start
+                .saturating_add(inner.height as usize)
+                .min(app.cwe_results.len());
+            app.cwe_results
+                .get(start..end)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(index, cwe)| {
+                    let index = start + index;
+                    let description = cwe
+                        .description
+                        .as_deref()
+                        .map(normalize_spaces)
+                        .unwrap_or_default();
+                    let status = cwe.status.as_deref().unwrap_or("-");
+                    let prefix = prefixes.prefix(cwe);
+                    let style = if index == app.cwe_selected {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(Span::styled(
+                        format!("{prefix}CWE-{} [{status}] {description}", cwe.id),
+                        style,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+        frame.render_widget(Paragraph::new(items), inner);
+    }
+}
+
+impl CweTreePrefixes {
+    fn new(cwes: &[CweEntry]) -> Self {
+        let parent_by_id = cwes
+            .iter()
+            .map(|cwe| (cwe.id, cwe.parent_id))
+            .collect::<HashMap<_, _>>();
+        let mut last_sibling_id_by_parent = HashMap::<Option<i32>, i32>::new();
+        for cwe in cwes {
+            last_sibling_id_by_parent.insert(cwe.parent_id, cwe.id);
+        }
+
+        let by_id = cwes
+            .iter()
+            .map(|cwe| {
+                (
+                    cwe.id,
+                    CweTreePrefixEntry {
+                        prefix: Self::build_prefix(cwe, &parent_by_id, &last_sibling_id_by_parent),
+                    },
+                )
+            })
+            .collect();
+
+        Self { by_id }
+    }
+
+    fn prefix(&self, cwe: &CweEntry) -> &str {
+        self.by_id
+            .get(&cwe.id)
+            .map(|entry| entry.prefix.as_str())
+            .unwrap_or("")
+    }
+
+    fn build_prefix(
+        cwe: &CweEntry,
+        parent_by_id: &HashMap<i32, Option<i32>>,
+        last_sibling_id_by_parent: &HashMap<Option<i32>, i32>,
+    ) -> String {
+        let ancestors = Self::ancestor_ids(cwe, parent_by_id);
+        if ancestors.is_empty() {
+            return String::new();
+        }
+
+        let mut prefix = String::new();
+        for ancestor_id in ancestors.iter().skip(1) {
+            let continues = parent_by_id.get(ancestor_id).is_some_and(|parent_id| {
+                Self::has_later_sibling(*parent_id, *ancestor_id, last_sibling_id_by_parent)
+            });
+            prefix.push_str(if continues { "│  " } else { "   " });
+        }
+        prefix.push_str(
+            if Self::has_later_sibling(cwe.parent_id, cwe.id, last_sibling_id_by_parent) {
+                "├─ "
+            } else {
+                "└─ "
+            },
+        );
+        prefix
+    }
+
+    fn ancestor_ids(cwe: &CweEntry, parent_by_id: &HashMap<i32, Option<i32>>) -> Vec<i32> {
+        let mut ancestors = Vec::new();
+        let mut current_parent_id = cwe.parent_id;
+        let mut seen = HashSet::new();
+        while let Some(parent_id) = current_parent_id {
+            let Some(grandparent_id) = parent_by_id.get(&parent_id) else {
+                break;
+            };
+            if !seen.insert(parent_id) {
+                break;
+            }
+            ancestors.push(parent_id);
+            current_parent_id = *grandparent_id;
+        }
+        ancestors.reverse();
+        ancestors
+    }
+
+    fn has_later_sibling(
+        parent_id: Option<i32>,
+        id: i32,
+        last_sibling_id_by_parent: &HashMap<Option<i32>, i32>,
+    ) -> bool {
+        last_sibling_id_by_parent
+            .get(&parent_id)
+            .is_some_and(|last_id| id != *last_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixes_follow_visible_order_not_numeric_id_order() {
+        let cwes = vec![
+            cwe(10, None),
+            cwe(20, Some(10)),
+            cwe(30, Some(20)),
+            cwe(15, Some(10)),
+        ];
+
+        let prefixes = CweTreePrefixes::new(&cwes);
+
+        assert_eq!(prefixes.prefix(&cwes[0]), "");
+        assert_eq!(prefixes.prefix(&cwes[1]), "├─ ");
+        assert_eq!(prefixes.prefix(&cwes[2]), "│  └─ ");
+        assert_eq!(prefixes.prefix(&cwes[3]), "└─ ");
+    }
+
+    #[test]
+    fn prefixes_treat_filtered_visible_siblings_as_tree_boundaries() {
+        let cwes = vec![cwe(10, None), cwe(30, Some(10)), cwe(40, Some(30))];
+
+        let prefixes = CweTreePrefixes::new(&cwes);
+
+        assert_eq!(prefixes.prefix(&cwes[1]), "└─ ");
+        assert_eq!(prefixes.prefix(&cwes[2]), "   └─ ");
+    }
+
+    fn cwe(id: i32, parent_id: Option<i32>) -> CweEntry {
+        CweEntry {
+            id,
+            description: None,
+            status: None,
+            parent_id,
+            parent_count: usize::from(parent_id.is_some()),
+            sibling_count: 0,
+            child_count: 0,
+            capec_ids: Vec::new(),
+        }
+    }
+}
