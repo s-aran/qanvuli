@@ -187,6 +187,8 @@ pub struct PackageQuery {
 #[derive(Clone, Debug, Serialize)]
 /// Vulnerability finding for one package/version lookup.
 pub struct EnrichedFinding {
+    /// Originating advisory corpus: `osv` or `cve-list`.
+    pub source: String,
     pub primary_id: String,
     pub cve_ids: Vec<String>,
     pub aliases: Vec<String>,

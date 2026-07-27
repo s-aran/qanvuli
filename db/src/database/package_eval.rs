@@ -9,6 +9,15 @@ pub struct OsvRange {
     pub events: Vec<(String, String)>,
 }
 
+/// A single version constraint from a CVE List affected record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CveVersionRange {
+    pub version: Option<String>,
+    pub status: Option<String>,
+    pub less_than: Option<String>,
+    pub less_than_or_equal: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct VersionMatch {
     pub status: String,
@@ -23,6 +32,55 @@ pub fn evaluate_version(ecosystem: &str, installed: &str, ranges: &[OsvRange]) -
         return evaluate_pep440(installed, ranges);
     }
     evaluate_semver(ecosystem, installed, ranges)
+}
+
+/// Evaluates the CVE List forms that can be represented as a bounded version interval.
+///
+/// CNA records use a lower `version` plus `lessThan`/`lessThanOrEqual`, whereas
+/// OSV stores introduced/fixed events. Translate the former to the latter so
+/// both package query sources share ecosystem-specific comparison semantics.
+pub fn evaluate_cve_version_ranges(
+    ecosystem: &str,
+    installed: &str,
+    default_status: Option<&str>,
+    versions: &[CveVersionRange],
+) -> VersionMatch {
+    let ranges = versions
+        .iter()
+        .filter(|version| {
+            version
+                .status
+                .as_deref()
+                .or(default_status)
+                .is_none_or(|status| status.eq_ignore_ascii_case("affected"))
+        })
+        .filter_map(|version| {
+            let mut events = Vec::new();
+            match version.version.as_deref().map(str::trim) {
+                Some(value) if let Some(value) = value.strip_prefix(">=") => {
+                    events.push(("introduced".to_owned(), value.trim().to_owned()));
+                }
+                Some(value) if !value.is_empty() => {
+                    events.push(("introduced".to_owned(), value.to_owned()));
+                }
+                _ => events.push(("introduced".to_owned(), "0".to_owned())),
+            }
+            if let Some(value) = version.less_than.as_deref() {
+                events.push(("fixed".to_owned(), value.to_owned()));
+            } else if let Some(value) = version.less_than_or_equal.as_deref() {
+                events.push(("last_affected".to_owned(), value.to_owned()));
+            } else if let Some(value) = version.version.as_deref()
+                && !value.trim_start().starts_with(">=")
+            {
+                events.push(("last_affected".to_owned(), value.trim().to_owned()));
+            }
+            Some(OsvRange {
+                range_type: "SEMVER".to_owned(),
+                events,
+            })
+        })
+        .collect::<Vec<_>>();
+    evaluate_version(ecosystem, installed, &ranges)
 }
 
 fn evaluate_semver(ecosystem: &str, installed: &str, ranges: &[OsvRange]) -> VersionMatch {
@@ -238,6 +296,35 @@ mod tests {
         assert_eq!(
             evaluate_version("PyPI", "2.0.post1", &[range]).status,
             "not_affected"
+        );
+    }
+
+    #[test]
+    fn cve_list_versions_share_package_version_evaluation() {
+        let bounded = CveVersionRange {
+            version: Some("1.0.0".to_owned()),
+            status: Some("affected".to_owned()),
+            less_than: Some("2.0.0".to_owned()),
+            less_than_or_equal: None,
+        };
+        assert_eq!(
+            evaluate_cve_version_ranges("npm", "1.5.0", None, std::slice::from_ref(&bounded))
+                .status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_cve_version_ranges("npm", "2.0.0", None, &[bounded]).status,
+            "not_affected"
+        );
+        let all_versions = CveVersionRange {
+            version: Some(">=0.0.0".to_owned()),
+            status: Some("affected".to_owned()),
+            less_than: None,
+            less_than_or_equal: None,
+        };
+        assert_eq!(
+            evaluate_cve_version_ranges("npm", "1.5.0", None, &[all_versions]).status,
+            "affected"
         );
     }
 

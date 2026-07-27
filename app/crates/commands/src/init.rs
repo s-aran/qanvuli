@@ -7,7 +7,7 @@ use super::common::{
 };
 use qanvuli_core::database::{
     DatabaseReplacement, RecoveryAction, candidate_database_path, recover_interrupted_replacement,
-    remove_sqlite_database_files,
+    remove_interrupted_replacement_candidates, remove_sqlite_database_files,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -25,8 +25,8 @@ pub struct Args {
     max_chunks: Option<usize>,
     #[arg(long)]
     keep: bool,
-    /// Remove the existing database before building the replacement.
-    /// This reduces peak disk usage, but no usable database remains if initialization fails.
+    /// Discard interrupted replacement candidates and remove the existing database before building.
+    /// This reduces peak disk usage, but can disrupt another running init and leaves no usable database if initialization fails.
     #[arg(short = 'r', long, verbatim_doc_comment)]
     remove_existing_first: bool,
     #[arg(long)]
@@ -81,6 +81,17 @@ async fn run_with_progress(
     let target = super::common::database::sqlite_file_path(db_url).ok_or_else(|| {
         "full database replacement requires a file-backed SQLite database".to_owned()
     })?;
+    if args.remove_existing_first {
+        let candidates = remove_interrupted_replacement_candidates(&target).map_err(|error| {
+            format!("failed to remove interrupted replacement candidates: {error}")
+        })?;
+        for candidate in candidates {
+            eprintln!(
+                "init: removed interrupted replacement candidate {} because --remove-existing-first was specified",
+                candidate.display()
+            );
+        }
+    }
     for action in recover_interrupted_replacement(&target)
         .map_err(|error| format!("failed to inspect interrupted database replacements: {error}"))?
     {
@@ -99,7 +110,7 @@ async fn run_with_progress(
     if args.remove_existing_first {
         eprintln!("init: removing the existing database before replacement construction");
         eprintln!(
-            "init: this reduces peak disk usage but leaves no usable database if initialization fails"
+            "init: this reduces peak disk usage but can disrupt another init and leaves no usable database if initialization fails"
         );
         remove_sqlite_database_files(&target)
             .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
@@ -555,6 +566,48 @@ mod tests {
                 .to_string_lossy()
                 .contains(".qanvuli-new-")
         }));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn destructive_init_discards_an_interrupted_candidate_before_rebuilding() {
+        let directory = std::env::temp_dir().join(format!(
+            "qanvuli-init-discard-candidate-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("database.sqlite");
+        let archive_path = directory.join("broken.zip");
+        let candidate = candidate_database_path(&database_path).unwrap();
+        std::fs::write(&database_path, b"old database").unwrap();
+        std::fs::write(&candidate, b"interrupted replacement").unwrap();
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut archive = zip::ZipWriter::new(archive_file);
+        archive
+            .start_file(
+                "cves/2099/CVE-2099-0001.json",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.write_all(b"{not valid JSON").unwrap();
+        archive.finish().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", database_path.display());
+
+        run_with_progress(
+            &url,
+            Args {
+                zip: Some(archive_path),
+                remove_existing_first: true,
+                ..Args::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!candidate.exists());
+        assert!(!database_path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 }

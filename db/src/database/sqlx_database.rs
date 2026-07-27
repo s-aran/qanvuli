@@ -2,7 +2,7 @@
 
 use super::{
     maintenance::rebuild_cve_search,
-    package_eval::{OsvRange, evaluate_version},
+    package_eval::{CveVersionRange, OsvRange, evaluate_cve_version_ranges, evaluate_version},
     schema,
     search::fts_query,
     timestamps::{canonical_cve_utc, canonical_utc},
@@ -59,6 +59,13 @@ type BatchedOsvRow = (
     String,
     String,
     String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+type CveAffectedVersionTuple = (
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -569,7 +576,7 @@ impl SqlxDatabase {
                 let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
                     "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=input.package_name OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
                 )
-                .bind(input_json)
+                .bind(&input_json)
                 .fetch_all(&mut *connection)
                 .await?;
 
@@ -675,7 +682,95 @@ impl SqlxDatabase {
                         .into_iter()
                         .collect::<Vec<_>>();
                     output[output_index].push(EnrichedFinding {
-                        primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions_status: "available".to_owned(), priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: !fixed_versions.is_empty(), affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, fixed_versions, enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                        source: "osv".to_owned(), primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions_status: "available".to_owned(), priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: !fixed_versions.is_empty(), affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, fixed_versions, enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                    });
+                }
+
+                // CVE List supplements OSV for package advisories that have not
+                // been mirrored into OSV. package_name is authoritative when it
+                // exists; product is the documented fallback for older records.
+                let cve_candidates: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json FROM input JOIN cve_affected AS affected ON replace(replace(lower(COALESCE(NULLIF(affected.package_name, ''), affected.product)), '_', '-'), '.', '-')=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id",
+                )
+                .bind(&input_json)
+                .fetch_all(&mut *connection)
+                .await?;
+                for (query_index, cve_id, default_status, raw_json) in cve_candidates {
+                    let local_index = usize::try_from(query_index).map_err(|_| {
+                        sqlx::Error::Protocol("invalid CVE package query index".to_owned())
+                    })?;
+                    let output_index = query_offset + local_index;
+                    let query = packages.get(output_index).ok_or_else(|| {
+                        sqlx::Error::Protocol("CVE package query index is out of bounds".to_owned())
+                    })?;
+                    let versions = serde_json::from_str::<Vec<CveAffectedVersionTuple>>(&raw_json)
+                        .map_err(|error| {
+                            sqlx::Error::Protocol(format!("failed to parse cve_affected.raw_json for {cve_id}: {error}"))
+                        })?
+                        .into_iter()
+                        .map(|(version, status, _version_type, less_than, less_than_or_equal)| CveVersionRange {
+                            version,
+                            status,
+                            less_than,
+                            less_than_or_equal,
+                        })
+                        .collect::<Vec<_>>();
+                    let matched = evaluate_cve_version_ranges(
+                        &query.ecosystem,
+                        &query.version,
+                        default_status.as_deref(),
+                        &versions,
+                    );
+                    if matched.status == "not_affected" {
+                        continue;
+                    }
+                    let fixed_versions = versions
+                        .iter()
+                        .filter(|version| {
+                            version
+                                .status
+                                .as_deref()
+                                .or(default_status.as_deref())
+                                .is_none_or(|status| status.eq_ignore_ascii_case("affected"))
+                        })
+                        .filter_map(|version| {
+                            version.less_than.clone().or(version.less_than_or_equal.clone())
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let has_fixed_version = !fixed_versions.is_empty();
+                    let affected = AffectedStatus {
+                        status: matched.status,
+                        confidence: matched.confidence,
+                    };
+                    output[output_index].push(EnrichedFinding {
+                        source: "cve-list".to_owned(),
+                        primary_id: cve_id.clone(),
+                        cve_ids: vec![cve_id],
+                        aliases: Vec::new(),
+                        aliases_status: "not_queried".to_owned(),
+                        package: query.clone(),
+                        affected: affected.clone(),
+                        fixed_versions,
+                        fixed_versions_status: "available".to_owned(),
+                        enrichment: FindingEnrichment {
+                            kev: None,
+                            kev_status: "not_queried".to_owned(),
+                            epss: None,
+                            epss_status: "not_queried".to_owned(),
+                        },
+                        priority_signals: PrioritySignals {
+                            known_exploited: false,
+                            epss_percentile: None,
+                            has_fixed_version,
+                            affected_confidence: affected.confidence,
+                            suggested_priority: "unknown".to_owned(),
+                            reasons: Vec::new(),
+                            enrichment_status: "not_queried".to_owned(),
+                        },
+                        evidence: Vec::new(),
+                        evidence_status: "not_queried".to_owned(),
                     });
                 }
             }
@@ -992,30 +1087,6 @@ impl SqlxDatabase {
                 .bind(&product).bind(exact).bind(&product).bind(&product).bind(&product).bind(&product)
                 .bind(&product_rank).bind(&product_rank).bind(&product_rank)
                 .bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank)
-                .bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
-        })).await
-    }
-
-    /// Finds vendor/product candidates without evaluating version expressions.
-    ///
-    /// CNA expressions such as `< 2.0.0` cannot be compared to installed versions with `LIKE`.
-    pub async fn search_cves_by_affected_version(
-        &self,
-        vendor: Option<String>,
-        product: Option<String>,
-        version: Option<String>,
-        include_rejected: bool,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
-        let vendor = vendor.map(|value| format!("%{value}%"));
-        let product = product.map(|value| format!("%{value}%"));
-        let _version = version;
-        self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR affected.vendor LIKE ?) AND (? IS NULL OR affected.product LIKE ? OR affected.package_name LIKE ?) ORDER BY c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
-                .bind(include_rejected)
-                .bind(&vendor).bind(&vendor)
-                .bind(&product).bind(&product).bind(&product)
                 .bind(limit.max(1)).bind(offset.max(0)).fetch_all(connection).await
         })).await
     }
@@ -3449,7 +3520,7 @@ mod tests {
         database.initialize().await.unwrap();
         database
             .import_cve_raw_jsons(vec![
-                r#"{"cveMetadata":{"cveId":"CVE-2099-7101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"First overview fixture","affected":[{"vendor":"Acme","product":"widget","description":"Widget deployment is affected."}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-7101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"First overview fixture","affected":[{"vendor":"Acme","product":"widget","description":"Widget deployment is affected.","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned(),
                 r#"{"cveMetadata":{"cveId":"CVE-2099-7102","state":"PUBLISHED","datePublished":"2099-01-02T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"Second overview fixture","affected":[{"vendor":"Example","product":"service","description":"Service deployment is affected."}],"metrics":[{"cvssV4_0":{"version":"4.0","baseScore":7.2,"baseSeverity":"HIGH"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-89","description":"SQL injection"}]}]}}}"#.to_owned(),
             ])
             .await
@@ -3489,9 +3560,16 @@ mod tests {
                 .as_deref()
                 .is_some_and(|description| description.ends_with("deployment is affected."))
         }));
-        assert!(
+        assert_eq!(
             rows.iter()
-                .all(|row| row.detail.affected[0].versions.is_empty())
+                .find(|row| row.summary.cve_id == "CVE-2099-7101")
+                .expect("first fixture")
+                .detail
+                .affected[0]
+                .versions[0]
+                .less_than
+                .as_deref(),
+            Some("2.0")
         );
     }
 
@@ -4364,6 +4442,15 @@ mod tests {
             "CVE-2099-1"
         );
         assert_eq!(detail.cvss.len(), 1);
+        let package_findings = database
+            .query_package_matches("PyPI", "widget", "1.0", None)
+            .await
+            .unwrap();
+        assert_eq!(package_findings.len(), 1);
+        assert_eq!(package_findings[0].source, "cve-list");
+        assert_eq!(package_findings[0].primary_id, "CVE-2099-1");
+        assert_eq!(package_findings[0].affected.status, "affected");
+        assert_eq!(package_findings[0].fixed_versions, vec!["2.0"]);
         assert_eq!(
             detail.affected[0].description.as_deref(),
             Some("Affected widget description.")
@@ -4402,21 +4489,6 @@ mod tests {
                     Some("widget".to_owned()),
                     true,
                     false,
-                    false,
-                    10,
-                    0,
-                )
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            database
-                .search_cves_by_affected_version(
-                    Some("Acme".to_owned()),
-                    Some("widget".to_owned()),
-                    Some("1.0".to_owned()),
                     false,
                     10,
                     0,

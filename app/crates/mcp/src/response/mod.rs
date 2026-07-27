@@ -58,6 +58,19 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         return Some(compact);
     }
 
+    // Package batches are audit-oriented: preserve every package summary before
+    // considering pagination. Full findings and enrichment are optional detail.
+    if is_package_batch(&compact) {
+        for field in ["findings", "cve_risk"] {
+            remove_result_field(&mut compact, field)?;
+            if encoded_len(&compact).ok()? <= budget {
+                mark_detail_reduced(&mut compact)?;
+                return Some(compact);
+            }
+        }
+    }
+
+    let package_batch = is_package_batch(&compact);
     loop {
         let returned = {
             let Value::Object(object) = &mut compact else {
@@ -66,7 +79,11 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
             let Value::Array(items) = object.get_mut(array_key)? else {
                 return None;
             };
-            items.pop();
+            if package_batch {
+                drop_last_non_vulnerable_package(items).or_else(|| items.pop());
+            } else {
+                items.pop();
+            }
             items.len()
         };
         let Value::Object(object) = &mut compact else {
@@ -75,7 +92,14 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         object.insert("response_truncated".into(), json!(true));
         object.insert("returned".into(), json!(returned));
         object.insert("total".into(), json!(total));
-        object.insert("hint".into(), json!("narrow query or page with offset"));
+        object.insert(
+            "hint".into(),
+            json!(if package_batch {
+                "use verbosity=summary for large package batches"
+            } else {
+                "narrow query or page with offset"
+            }),
+        );
         if encoded_len(&compact).ok()? <= budget {
             return Some(compact);
         }
@@ -84,6 +108,48 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         }
     }
     (encoded_len(&compact).ok()? <= budget).then_some(compact)
+}
+
+fn is_package_batch(value: &Value) -> bool {
+    matches!(value, Value::Object(object) if object.contains_key("coverage_notice"))
+}
+
+fn remove_result_field(value: &mut Value, field: &str) -> Option<()> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    let Value::Array(items) = object.get_mut("results")? else {
+        return None;
+    };
+    for item in items.iter_mut() {
+        if let Value::Object(item) = item {
+            item.remove(field);
+        }
+    }
+    Some(())
+}
+
+fn mark_detail_reduced(value: &mut Value) -> Option<()> {
+    let Value::Object(object) = value else {
+        return None;
+    };
+    object.insert("response_detail_reduced".into(), json!(true));
+    object.insert(
+        "hint".into(),
+        json!("full findings or CVE enrichment omitted to preserve all package summaries"),
+    );
+    Some(())
+}
+
+fn drop_last_non_vulnerable_package(items: &mut Vec<Value>) -> Option<Value> {
+    let index = items.iter().rposition(|item| {
+        matches!(
+            item,
+            Value::Object(item)
+                if matches!(item.get("summary"), Some(Value::Object(summary)) if summary.get("vulnerable") == Some(&json!(false)))
+        )
+    })?;
+    Some(items.remove(index))
 }
 
 pub(crate) fn summaries_with_detail(cves: Vec<CveSummaryWithDetail>) -> Vec<Value> {
@@ -319,5 +385,60 @@ mod tests {
         assert_eq!(object.get("response_truncated"), Some(&json!(true)));
         assert!(object.get("returned").is_some());
         assert!(object.get("total").is_some());
+    }
+
+    #[test]
+    fn package_batch_drops_optional_detail_before_package_results() {
+        let results = (0..20)
+            .map(|index| {
+                json!({
+                    "package": format!("package-{index}"),
+                    "summary": {"vulnerable": false},
+                    "findings": ["x".repeat(500)],
+                    "cve_risk": ["x".repeat(500)],
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = json!({"coverage_notice": "coverage", "results": results});
+        let shrunk = shrink_over_budget(&value, 2_000).expect("summary batch fits");
+        let Value::Object(object) = shrunk else {
+            panic!("object result")
+        };
+        let Value::Array(results) = object.get("results").expect("results") else {
+            panic!("results array")
+        };
+        assert_eq!(results.len(), 20);
+        assert_eq!(object.get("response_detail_reduced"), Some(&json!(true)));
+        assert!(
+            results
+                .iter()
+                .all(|item| matches!(item, Value::Object(item) if !item.contains_key("findings")))
+        );
+    }
+
+    #[test]
+    fn package_batch_drops_non_vulnerable_results_before_vulnerable_ones() {
+        let results = (0..25)
+            .map(|index| {
+                json!({
+                    "package": format!("package-{index}"),
+                    "summary": {
+                        "vulnerable": index < 5,
+                        "padding": "x".repeat(100),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        let value = json!({"coverage_notice": "coverage", "results": results});
+        let shrunk = shrink_over_budget(&value, 1_000).expect("batch can be truncated");
+        let Value::Object(object) = shrunk else {
+            panic!("object result")
+        };
+        let Value::Array(results) = object.get("results").expect("results") else {
+            panic!("results array")
+        };
+        assert!(results.len() < 25);
+        assert!(results.iter().any(|item| matches!(item, Value::Object(item) if item.get("package") == Some(&json!("package-0")))));
+        assert!(results.iter().all(|item| matches!(item, Value::Object(item) if matches!(item.get("summary"), Some(Value::Object(summary)) if summary.get("vulnerable") == Some(&json!(true))))));
     }
 }

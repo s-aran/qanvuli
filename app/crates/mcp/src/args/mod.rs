@@ -174,24 +174,6 @@ pub(crate) struct IdPrefixArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct ProductVersionArgs {
-    /// Affected vendor substring to search for. Can be combined with product.
-    pub(crate) vendor: Option<String>,
-    /// Affected product substring to search for. Can be combined with vendor.
-    pub(crate) product: Option<String>,
-    /// Version text used to find candidate affected records; ranges are not evaluated.
-    pub(crate) version: Option<String>,
-    /// Maximum number of results to return. Clamped to 1..=30; default is 10.
-    pub(crate) limit: Option<u64>,
-    /// Number of matching results to skip for pagination. Default is 0.
-    pub(crate) offset: Option<u64>,
-    /// Include rejected CVE records when true. Default returns only published CVEs.
-    pub(crate) include_rejected: Option<bool>,
-    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
-    pub(crate) full_description: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CweCatalogArgs {
     /// CWE ID or text query. Empty query returns the first entries in tree order.
     pub(crate) query: Option<String>,

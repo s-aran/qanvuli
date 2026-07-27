@@ -359,13 +359,13 @@ impl SqlxDatabase {
                     }
 
                     let affected: Vec<CompatAffectedRow> = sqlx::query_as(
-                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status, version_text FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, id",
+                        "SELECT cve_db_id, vendor, product, package_name, collection_url, default_status, raw_json FROM cve_affected WHERE cve_db_id IN (SELECT value FROM json_each(?)) ORDER BY cve_db_id, id",
                     )
                     .bind(db_ids_json)
                     .fetch_all(&mut *connection)
                     .await?;
                     let mut affected_indexes = HashMap::<i64, usize>::new();
-                    for (db_id, vendor, product, package_name, collection_url, default_status, version_text) in affected {
+                    for (db_id, vendor, product, package_name, collection_url, default_status, raw_json) in affected {
                         if let Some(cve_id) = cve_id_by_db_id.get(&db_id)
                             && let Some(detail) = details.get_mut(cve_id)
                         {
@@ -376,8 +376,11 @@ impl SqlxDatabase {
                                 .cloned()
                                 .flatten();
                             *affected_index += 1;
-                            let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&version_text)
-                                .unwrap_or_default()
+                            let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
+                                .unwrap_or_else(|error| {
+                                    tracing::warn!(cve_id = %cve_id, %error, "failed to parse cve_affected.raw_json");
+                                    Vec::new()
+                                })
                                 .into_iter()
                                 .map(|(version, status, version_type, less_than, less_than_or_equal)| CveAffectedVersionDetail {
                                     version,
@@ -1375,30 +1378,6 @@ impl SqlxDatabase {
         Ok(self
             .search_cves_advanced(
                 filters,
-                include_rejected(scope),
-                limit as i64,
-                offset as i64,
-            )
-            .await?
-            .into_iter()
-            .map(summary)
-            .collect())
-    }
-
-    pub async fn search_cve_summaries_by_vendor_product_version(
-        &self,
-        vendor: Option<&str>,
-        product: Option<&str>,
-        version: Option<&str>,
-        scope: CveStateScope,
-        limit: u64,
-        offset: u64,
-    ) -> Result<Vec<CveSummary>, sqlx::Error> {
-        Ok(self
-            .search_cves_by_affected_version(
-                vendor.map(str::to_owned),
-                product.map(str::to_owned),
-                version.map(str::to_owned),
                 include_rejected(scope),
                 limit as i64,
                 offset as i64,

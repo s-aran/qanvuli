@@ -63,7 +63,7 @@ qanvuli init --no-progress
 
 `init` normally builds and validates a candidate beside the active database, then installs it with rollback protection. A failed build leaves the active database unchanged. Run initialization while other qanvuli processes are stopped.
 
-`--remove-existing-first` deletes the active database before the build. It uses less disk space but leaves no usable database if initialization fails.
+`--remove-existing-first` (`-r`) deletes stale `*.qanvuli-new-*` replacement candidates, then deletes the active database before the build. It uses less disk space but can disrupt another running initialization and leaves no usable database if initialization fails. Use it only after confirming no other `qanvuli init` is running.
 
 Apply current deltas and refresh enrichment feeds:
 

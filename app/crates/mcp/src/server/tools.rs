@@ -226,28 +226,6 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Find CVE candidates by affected vendor, product, and optional version text. Version ranges are not evaluated."
-    )]
-    pub(crate) async fn search_by_vendor_product_version(
-        &self,
-        Parameters(args): Parameters<ProductVersionArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
-        let limit = limit(args.limit);
-        let cves = db::search_product_version(
-            db,
-            args.vendor.as_deref(),
-            args.product.as_deref(),
-            args.version.as_deref(),
-            state_scope(args.include_rejected),
-            limit + 1,
-            offset(args.offset),
-        )
-        .await?;
-        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
-    }
-
-    #[tool(
         description = "Return local database status including CVE/CWE counts, OSV/KEV/EPSS counts, identifier graph counts, and source sync state."
     )]
     pub(crate) async fn get_database_status(&self) -> Result<CallToolResult, McpError> {

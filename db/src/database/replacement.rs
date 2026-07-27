@@ -53,6 +53,55 @@ pub fn remove_sqlite_database_files(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Removes unfinished replacement candidates for `target` and their SQLite sidecars.
+///
+/// Callers must obtain explicit user confirmation before using this: a candidate may
+/// belong to an initialization process that is still running.
+pub fn remove_interrupted_replacement_candidates(
+    target: &Path,
+) -> Result<Vec<PathBuf>, ReplacementError> {
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ReplacementError::InvalidPath {
+            path: target.to_path_buf(),
+            reason: "database file name is not valid UTF-8".to_owned(),
+        })?;
+    let candidate_prefix = format!("{file_name}.qanvuli-new-");
+    let mut candidates = Vec::new();
+    let entries = std::fs::read_dir(parent).map_err(|source| ReplacementError::Cleanup {
+        source,
+        path: parent.to_path_buf(),
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| ReplacementError::Cleanup {
+            source,
+            path: parent.to_path_buf(),
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&candidate_prefix)
+            && !SQLITE_SIDECAR_SUFFIXES
+                .iter()
+                .any(|suffix| name.ends_with(&format!("-{suffix}")))
+        {
+            candidates.push(entry.path());
+        }
+    }
+    candidates.sort();
+    for candidate in &candidates {
+        remove_sqlite_database_files(candidate).map_err(|source| ReplacementError::Cleanup {
+            source,
+            path: candidate.clone(),
+        })?;
+    }
+    Ok(candidates)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReplacementError {
     #[error("invalid database path {path}: {reason}")]
@@ -455,6 +504,26 @@ mod tests {
             recover_interrupted_replacement(&target),
             Err(ReplacementError::AmbiguousState { .. })
         ));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn explicitly_removes_all_interrupted_candidates_and_sidecars() {
+        let directory = directory("discard-candidates");
+        let target = directory.join("database.sqlite");
+        let first = sibling_path(&target, "qanvuli-new", "1-1").unwrap();
+        let second = sibling_path(&target, "qanvuli-new", "1-2").unwrap();
+        std::fs::write(&first, "incomplete").unwrap();
+        std::fs::write(sidecar(&first, "wal"), "wal").unwrap();
+        std::fs::write(&second, "incomplete").unwrap();
+
+        assert_eq!(
+            remove_interrupted_replacement_candidates(&target).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        assert!(!first.exists());
+        assert!(!sidecar(&first, "wal").exists());
+        assert!(!second.exists());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

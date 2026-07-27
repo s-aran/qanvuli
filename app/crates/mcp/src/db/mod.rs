@@ -415,26 +415,35 @@ pub(crate) async fn query_packages_enriched(
             .into_iter()
             .filter(|finding| status == "all" || finding.affected.status == "affected")
             .collect::<Vec<_>>();
-        let cve_ids = findings
+        let candidate_cve_ids = findings
             .iter()
             .flat_map(|finding| finding.cve_ids.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let source_conflicts = cna_explicit_version_conflicts(&package, &cve_ids, &details_by_cve);
+        let source_conflicts =
+            cna_explicit_version_conflicts(&package, &candidate_cve_ids, &details_by_cve);
         downgrade_conflicting_findings(&mut findings, &source_conflicts);
-        let risk = cve_ids
+        let confirmed_findings = findings
+            .iter()
+            .filter(|finding| finding.affected.status == "affected")
+            .collect::<Vec<_>>();
+        let confirmed_cve_ids = confirmed_findings
+            .iter()
+            .flat_map(|finding| finding.cve_ids.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let risk = confirmed_cve_ids
             .iter()
             .filter_map(|cve_id| risks_by_cve.get(cve_id).cloned())
             .collect::<Vec<_>>();
         let summary = batch_summary(
             &package,
-            cve_ids,
+            confirmed_cve_ids,
             &risk,
-            findings
-                .iter()
-                .any(|finding| finding.affected.status == "affected"),
-            include_fixed.then(|| fixed_versions(&findings)),
+            !confirmed_findings.is_empty(),
+            include_fixed.then(|| fixed_versions_from_refs(&confirmed_findings)),
         );
         let mut result = json!({
             "package": package,
@@ -521,7 +530,7 @@ fn batch_summary(
     }
 }
 
-fn fixed_versions(findings: &[EnrichedFinding]) -> Vec<String> {
+fn fixed_versions_from_refs(findings: &[&EnrichedFinding]) -> Vec<String> {
     findings
         .iter()
         .flat_map(|finding| finding.fixed_versions.iter().cloned())
@@ -603,10 +612,11 @@ fn downgrade_conflicting_findings(
         .map(|conflict| conflict.cve_id.as_str())
         .collect::<BTreeSet<_>>();
     for finding in findings {
-        if finding
-            .cve_ids
-            .iter()
-            .any(|cve_id| conflicting_cves.contains(cve_id.as_str()))
+        if finding.source == "osv"
+            && finding
+                .cve_ids
+                .iter()
+                .any(|cve_id| conflicting_cves.contains(cve_id.as_str()))
         {
             finding.affected.status = "conflicting_sources".to_owned();
             finding.affected.confidence = "low".to_owned();
@@ -801,27 +811,6 @@ pub(crate) async fn search_id_prefix(
     db.search_cve_summaries_by_cve_id_prefix_with_state_scope(prefix, state_scope, limit, offset)
         .await
         .map_err(|err| mcp_error(err.to_string()))
-}
-
-pub(crate) async fn search_product_version(
-    db: &CveDatabase,
-    vendor: Option<&str>,
-    product: Option<&str>,
-    version: Option<&str>,
-    state_scope: CveStateScope,
-    limit: u64,
-    offset: u64,
-) -> Result<Vec<CveSummary>, McpError> {
-    db.search_cve_summaries_by_vendor_product_version(
-        vendor,
-        product,
-        version,
-        state_scope,
-        limit,
-        offset,
-    )
-    .await
-    .map_err(|err| mcp_error(err.to_string()))
 }
 
 pub(crate) async fn search_cwe_catalog(

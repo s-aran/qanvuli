@@ -4,7 +4,8 @@
 pub mod database {
     pub use qanvuli_db::database::replacement::{
         DatabaseReplacement, RecoveryAction, ReplacementError, candidate_database_path,
-        recover_interrupted_replacement, remove_sqlite_database_files,
+        recover_interrupted_replacement, remove_interrupted_replacement_candidates,
+        remove_sqlite_database_files,
     };
     pub use qanvuli_db::{
         AffectedStatus, CapecCategory, CapecCategoryDetail, CapecDetail, CapecEntry, CapecHistory,
