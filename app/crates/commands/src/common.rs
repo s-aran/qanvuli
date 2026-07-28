@@ -749,9 +749,23 @@ async fn import_osv_zips(
             "osv: index/search maintenance completed in {:?}",
             index_started.elapsed()
         );
-        db.check_search_integrity_quick()
-            .await
-            .map_err(|error| format!("failed OSV database check: {error}"))?;
+        if let Err(error) = db.check_search_integrity_quick().await {
+            // Older incremental imports assigned a fresh FTS rowid on every OSV
+            // update. Rebuild once to repair that stale projection; current writes
+            // preserve the advisory rowid and no longer require this recovery.
+            if !error.to_string().contains("OSV text FTS") {
+                return Err(format!("failed OSV database check: {error}"));
+            }
+            eprintln!("osv: repairing stale OSV search projection");
+            db.rebuild_osv_search().await.map_err(|repair_error| {
+                format!("failed to repair OSV search projection: {repair_error}")
+            })?;
+            db.check_search_integrity_quick()
+                .await
+                .map_err(|repair_error| {
+                    format!("failed OSV database check after repair: {repair_error}")
+                })?;
+        }
         db.complete_osv_sync(&completion_cursor)
             .await
             .map_err(|error| format!("failed to advance OSV cursor: {error}"))?;
@@ -1533,7 +1547,7 @@ pub async fn delta_assets_published_after(
     cursor: DateTime<Utc>,
 ) -> Result<Vec<(DateTime<Utc>, GitHubReleaseFile)>, String> {
     let mut cve = CveRelease::new();
-    cve.refresh_all()
+    cve.refresh_after(cursor)
         .await
         .map_err(|err| format!("failed to fetch CVE release list: {err}"))?;
     Ok(cve.delta_assets_after(cursor))
@@ -1582,7 +1596,6 @@ pub async fn apply_delta_updates_with_progress(
         .with_timezone(&Utc);
     let assets = delta_assets_published_after(cursor).await?;
     let mut paths = Vec::with_capacity(assets.len());
-    let mut completed_cursor = cursor;
     let mut database_changed = false;
     let apply_result = async {
         for (published_at, asset) in assets {
@@ -1608,7 +1621,14 @@ pub async fn apply_delta_updates_with_progress(
             db.mark_cve_asset_applied(&asset.name, &asset.url)
                 .await
                 .map_err(|error| format!("failed to record CVE delta {}: {error}", asset.name))?;
-            completed_cursor = completed_cursor.max(published_at);
+            // Persist progress per archive. If a subsequent download or enrichment
+            // source fails, the next update resumes here instead of reimporting every
+            // already-applied delta.
+            if max_chunks.is_none() {
+                db.set_metadata_value(CVE_DELTA_CURSOR_METADATA_KEY, &published_at.to_rfc3339())
+                    .await
+                    .map_err(|error| format!("failed to advance CVE delta cursor: {error}"))?;
+            }
         }
         Ok::<(), String>(())
     }
@@ -1627,14 +1647,6 @@ pub async fn apply_delta_updates_with_progress(
             let _ = std::fs::remove_file(path);
         }
         return Err(error);
-    }
-    if database_changed && max_chunks.is_none() {
-        db.set_metadata_value(
-            CVE_DELTA_CURSOR_METADATA_KEY,
-            &completed_cursor.to_rfc3339(),
-        )
-        .await
-        .map_err(|error| format!("failed to advance CVE delta cursor: {error}"))?;
     }
     Ok(paths)
 }

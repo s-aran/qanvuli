@@ -244,7 +244,7 @@ pub(crate) async fn rebuild_osv_search(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
-        "DELETE FROM osv_text_fts; INSERT INTO osv_text_fts(osv_id, summary, details, aliases, packages) SELECT advisory.osv_id, COALESCE(advisory.summary, ''), COALESCE(advisory.details, ''), COALESCE((SELECT group_concat(alias_id, ' ') FROM osv_aliases WHERE osv_aliases.osv_id=advisory.osv_id), ''), COALESCE((SELECT group_concat(COALESCE(ecosystem, '') || ' ' || COALESCE(package_name, '') || ' ' || COALESCE(purl, ''), ' ') FROM osv_affected_packages WHERE osv_affected_packages.osv_id=advisory.osv_id), '') FROM osv_advisories advisory;",
+        "DELETE FROM osv_text_fts; INSERT INTO osv_text_fts(rowid, osv_id, summary, details, aliases, packages) SELECT advisory.rowid, advisory.osv_id, COALESCE(advisory.summary, ''), COALESCE(advisory.details, ''), COALESCE((SELECT group_concat(alias_id, ' ') FROM osv_aliases WHERE osv_aliases.osv_id=advisory.osv_id), ''), COALESCE((SELECT group_concat(COALESCE(ecosystem, '') || ' ' || COALESCE(package_name, '') || ' ' || COALESCE(purl, ''), ' ') FROM osv_affected_packages WHERE osv_affected_packages.osv_id=advisory.osv_id), '') FROM osv_advisories advisory;",
     )
     .execute(&mut *connection)
     .await?;

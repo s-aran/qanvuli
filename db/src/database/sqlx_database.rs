@@ -2026,8 +2026,8 @@ impl SqlxDatabase {
                     }
                     if update_search {
                         sqlx::query("DELETE FROM osv_text_fts WHERE osv_id=?").bind(&advisory.id).execute(&mut *transaction).await?;
-                        sqlx::query("INSERT INTO osv_text_fts(osv_id, summary, details, aliases, packages) VALUES (?, ?, ?, ?, ?)")
-                            .bind(&advisory.id).bind(advisory.summary.as_deref().unwrap_or_default()).bind(advisory.details.as_deref().unwrap_or_default()).bind(search_aliases).bind(search_packages).execute(&mut *transaction).await?;
+                        sqlx::query("INSERT INTO osv_text_fts(rowid, osv_id, summary, details, aliases, packages) VALUES ((SELECT rowid FROM osv_advisories WHERE osv_id=?), ?, ?, ?, ?, ?)")
+                            .bind(&advisory.id).bind(&advisory.id).bind(advisory.summary.as_deref().unwrap_or_default()).bind(advisory.details.as_deref().unwrap_or_default()).bind(search_aliases).bind(search_packages).execute(&mut *transaction).await?;
                     }
                     transaction.commit().await
                 })
@@ -2346,7 +2346,8 @@ impl SqlxDatabase {
                 .bind(&advisory.id)
                 .execute(&mut **transaction)
                 .await?;
-            sqlx::query("INSERT INTO osv_text_fts(osv_id, summary, details, aliases, packages) VALUES (?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO osv_text_fts(rowid, osv_id, summary, details, aliases, packages) VALUES ((SELECT rowid FROM osv_advisories WHERE osv_id=?), ?, ?, ?, ?, ?)")
+                .bind(&advisory.id)
                 .bind(&advisory.id)
                 .bind(advisory.summary.as_deref().unwrap_or_default())
                 .bind(advisory.details.as_deref().unwrap_or_default())
@@ -3999,9 +4000,20 @@ mod tests {
                 && !aliases.contains("old")
                 && !packages.contains("old.example")
         }));
-        // An updated FTS document is deleted and reinserted, so its FTS rowid no longer
-        // matches the advisory table's insertion order. The routine health check must not
-        // mistake that normal condition for a projection mismatch.
+        let changed_rowids: (i64, i64) = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_as(
+                        "SELECT advisory.rowid, fts.rowid FROM osv_advisories advisory JOIN osv_text_fts fts USING(osv_id) WHERE advisory.osv_id='GO-2099-changed'",
+                    )
+                    .fetch_one(connection)
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(changed_rowids.0, changed_rowids.1);
         database.check_search_integrity_quick().await.unwrap();
         database.rebuild_osv_search().await.unwrap();
         let rebuilt_rows: Vec<(String, String, String)> = database

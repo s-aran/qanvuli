@@ -403,16 +403,47 @@ impl GitHub {
         let mut page = page;
         release_items.append(&mut page.items);
         while page.next.is_some() {
-            let next = match octocrab.get_page(&page.next).await {
-                Ok(Some(next)) => next,
-                Ok(None) => break,
-                Err(err) => {
-                    eprintln!("GitHub release pagination stopped early: {err}");
-                    break;
-                }
+            let Some(next) = octocrab.get_page(&page.next).await? else {
+                break;
             };
             page = next;
             release_items.append(&mut page.items);
+        }
+        release_items_to_sorted_releases(release_items)
+    }
+
+    /// Lists release pages only until the supplied cursor is reached.
+    ///
+    /// GitHub returns releases newest first, so a routine update need not enumerate
+    /// the whole (and very large) release history.
+    pub async fn list_releases_published_after(
+        &self,
+        cursor: DateTime<Utc>,
+    ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
+        let octocrab = octocrab::instance();
+        let mut page = octocrab
+            .repos(&self.owner, &self.repo)
+            .releases()
+            .list()
+            .per_page(100)
+            .send()
+            .await?;
+        let mut release_items = Vec::new();
+
+        loop {
+            let reached_cursor = page
+                .items
+                .iter()
+                .filter_map(|release| release.published_at)
+                .any(|published_at| published_at <= cursor);
+            release_items.append(&mut page.items);
+            if reached_cursor || page.next.is_none() {
+                break;
+            }
+            let Some(next) = octocrab.get_page(&page.next).await? else {
+                break;
+            };
+            page = next;
         }
         release_items_to_sorted_releases(release_items)
     }

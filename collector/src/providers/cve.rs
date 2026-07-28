@@ -92,6 +92,16 @@ impl CveRelease {
         Ok(())
     }
 
+    /// Loads just enough newest release pages to find deltas after `cursor`.
+    pub async fn refresh_after(
+        &mut self,
+        cursor: DateTime<Utc>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let gh = github::GitHub::new(github::GITHUB_OWNER, github::GITHUB_REPO);
+        self.releases = gh.list_releases_published_after(cursor).await?;
+        Ok(())
+    }
+
     fn is_hourly_release(release: &GitHubRelease) -> bool {
         !Self::is_end_of_day_release(release)
     }
