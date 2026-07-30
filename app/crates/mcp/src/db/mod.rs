@@ -411,7 +411,12 @@ pub(crate) async fn query_packages_enriched(
     for ((package, findings), has_osv_advisory) in
         packages.into_iter().zip(findings_by_package).zip(coverage)
     {
-        let mut findings = findings
+        let uncertain_cve_ids = findings
+            .iter()
+            .filter(|finding| finding.affected.status == "unknown")
+            .flat_map(|finding| finding.cve_ids.iter().cloned())
+            .collect::<BTreeSet<_>>();
+        let findings = findings
             .into_iter()
             .filter(|finding| status == "all" || finding.affected.status == "affected")
             .collect::<Vec<_>>();
@@ -423,7 +428,13 @@ pub(crate) async fn query_packages_enriched(
             .collect::<Vec<_>>();
         let source_conflicts =
             cna_explicit_version_conflicts(&package, &candidate_cve_ids, &details_by_cve);
-        downgrade_conflicting_findings(&mut findings, &source_conflicts);
+        let review_cve_ids = source_conflicts
+            .iter()
+            .map(|conflict| conflict.cve_id.clone())
+            .chain(uncertain_cve_ids)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let confirmed_findings = findings
             .iter()
             .filter(|finding| finding.affected.status == "affected")
@@ -444,6 +455,7 @@ pub(crate) async fn query_packages_enriched(
             &risk,
             !confirmed_findings.is_empty(),
             include_fixed.then(|| fixed_versions_from_refs(&confirmed_findings)),
+            review_cve_ids,
         );
         let mut result = json!({
             "package": package,
@@ -501,6 +513,11 @@ struct BatchPackageSummary {
     max_cvss: Option<f64>,
     max_epss: Option<f64>,
     kev: bool,
+    /// A source disagrees with, or cannot establish, the package identity.
+    /// This never negates an otherwise affected OSV finding.
+    needs_review: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    review_cve_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fixed_versions: Option<Vec<String>>,
 }
@@ -511,6 +528,7 @@ fn batch_summary(
     risk: &[CveRiskSummary],
     vulnerable: bool,
     fixed_versions: Option<Vec<String>>,
+    review_cve_ids: Vec<String>,
 ) -> BatchPackageSummary {
     BatchPackageSummary {
         package: package.package.clone(),
@@ -526,6 +544,8 @@ fn batch_summary(
             .filter_map(|summary| summary.epss)
             .max_by(f64::total_cmp),
         kev: risk.iter().any(|summary| summary.kev_listed),
+        needs_review: !review_cve_ids.is_empty(),
+        review_cve_ids,
         fixed_versions,
     }
 }
@@ -580,13 +600,16 @@ fn cna_explicit_version_conflicts_for_detail(
         .filter_map(|affected| {
             let versions = &affected.versions;
             (!versions.is_empty()
-                && versions
-                    .iter()
-                    .all(|version| version.less_than.is_none() && version.less_than_or_equal.is_none()))
+                && versions.iter().all(|version| {
+                    version_is_affected(version, affected.default_status.as_deref())
+                        && version.less_than.is_none()
+                        && version.less_than_or_equal.is_none()
+                        && version.version.as_deref().is_some_and(is_bare_version_literal)
+                }))
             .then(|| {
                 versions
                     .iter()
-                    .filter_map(|version| version.version.clone())
+                    .filter_map(|version| version.version.as_deref().map(decode_html_entities))
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect::<Vec<_>>()
@@ -598,35 +621,44 @@ fn cna_explicit_version_conflicts_for_detail(
             package_name: package.package.clone(),
             queried_version: package.version.clone(),
             cna_versions,
-            reason: "OSV matched, but CNA lists only explicit versions that exclude the queried version",
+            reason: "OSV matched, while CNA's affected-version enumeration does not include the queried version; review the source disagreement",
         })
         .collect()
 }
 
-fn downgrade_conflicting_findings(
-    findings: &mut [EnrichedFinding],
-    conflicts: &[CnaExplicitVersionConflict],
-) {
-    let conflicting_cves = conflicts
-        .iter()
-        .map(|conflict| conflict.cve_id.as_str())
-        .collect::<BTreeSet<_>>();
-    for finding in findings {
-        if finding.source == "osv"
-            && finding
-                .cve_ids
-                .iter()
-                .any(|cve_id| conflicting_cves.contains(cve_id.as_str()))
-        {
-            finding.affected.status = "conflicting_sources".to_owned();
-            finding.affected.confidence = "low".to_owned();
-            finding.priority_signals.affected_confidence = "low".to_owned();
-            finding
-                .priority_signals
-                .reasons
-                .push("CNA explicit versions exclude the queried version".to_owned());
-        }
-    }
+fn version_is_affected(
+    version: &qanvuli_core::database::CveAffectedVersionDetail,
+    default_status: Option<&str>,
+) -> bool {
+    version
+        .status
+        .as_deref()
+        .or(default_status)
+        .is_none_or(|status| status.eq_ignore_ascii_case("affected"))
+}
+
+/// CVE 5 records sometimes put a constraint expression in `version` rather
+/// than in `lessThan`.  Only an unadorned version token is safe to treat as an
+/// enumerated version.
+fn is_bare_version_literal(value: &str) -> bool {
+    let value = decode_html_entities(value);
+    !value.is_empty()
+        && !value.chars().any(|character| {
+            character.is_whitespace()
+                || matches!(character, '<' | '>' | '=' | ',' | '*' | '~' | '^')
+        })
+        && !["before", "after", "through", "and", "or", "to"]
+            .iter()
+            .any(|keyword| {
+                value.eq_ignore_ascii_case(keyword) || value.to_ascii_lowercase().contains(keyword)
+            })
+}
+
+fn decode_html_entities(value: &str) -> String {
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn normalized_package_name(name: &str) -> String {
@@ -1045,6 +1077,7 @@ mod tests {
             &risk,
             true,
             None,
+            Vec::new(),
         );
 
         assert!(summary.vulnerable);
@@ -1105,5 +1138,85 @@ mod tests {
 
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].cna_versions, ["2.19.0", "2.19.1"]);
+    }
+
+    #[test]
+    fn cna_constraint_strings_are_not_treated_as_explicit_versions() {
+        use qanvuli_core::database::{CveAffectedDetail, CveAffectedVersionDetail, CveDetail};
+
+        let package = crate::args::PackageQueryArgs {
+            ecosystem: "PyPI".to_owned(),
+            package: "aiohttp".to_owned(),
+            version: "3.12.13".to_owned(),
+            purl: None,
+        };
+        for version in ["< 3.12.14", ">= 2.2.0, < 2.5.0", "&lt; 3.12.14"] {
+            let detail = CveSummaryWithDetail {
+                summary: CveSummary {
+                    cve_id: "CVE-2099-0001".to_owned(),
+                    state: 0,
+                    published_at: String::new(),
+                    updated_at: String::new(),
+                    title: String::new(),
+                    description_en: None,
+                },
+                detail: CveDetail {
+                    affected: vec![CveAffectedDetail {
+                        vendor: None,
+                        product: Some("aiohttp".to_owned()),
+                        package_name: None,
+                        description: None,
+                        collection_url: None,
+                        default_status: Some("affected".to_owned()),
+                        versions: vec![CveAffectedVersionDetail {
+                            version: Some(version.to_owned()),
+                            ..Default::default()
+                        }],
+                    }],
+                    ..Default::default()
+                },
+            };
+            assert!(
+                cna_explicit_version_conflicts_for_detail(&package, &detail).is_empty(),
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn unaffected_cna_versions_are_not_an_explicit_affected_enumeration() {
+        use qanvuli_core::database::{CveAffectedDetail, CveAffectedVersionDetail, CveDetail};
+        let package = crate::args::PackageQueryArgs {
+            ecosystem: "PyPI".to_owned(),
+            package: "aiohttp".to_owned(),
+            version: "3.12.13".to_owned(),
+            purl: None,
+        };
+        let detail = CveSummaryWithDetail {
+            summary: CveSummary {
+                cve_id: "CVE-2099-0001".to_owned(),
+                state: 0,
+                published_at: String::new(),
+                updated_at: String::new(),
+                title: String::new(),
+                description_en: None,
+            },
+            detail: CveDetail {
+                affected: vec![CveAffectedDetail {
+                    vendor: None,
+                    product: Some("aiohttp".to_owned()),
+                    package_name: None,
+                    description: None,
+                    collection_url: None,
+                    default_status: Some("unaffected".to_owned()),
+                    versions: vec![CveAffectedVersionDetail {
+                        version: Some("2.19.0".to_owned()),
+                        ..Default::default()
+                    }],
+                }],
+                ..Default::default()
+            },
+        };
+        assert!(cna_explicit_version_conflicts_for_detail(&package, &detail).is_empty());
     }
 }

@@ -90,6 +90,54 @@ fn normalized_package_name(name: &str) -> String {
     normalized
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CvePackageIdentity {
+    /// The CNA supplied a package name and its collection identifies the queried ecosystem.
+    Confirmed,
+    /// Product-only CVE records cannot distinguish a library from a same-named product.
+    Ambiguous,
+    /// The collection positively identifies a different package ecosystem or product catalog.
+    Excluded,
+}
+
+fn cve_package_identity(
+    ecosystem: &str,
+    _package_name: Option<&str>,
+    _product: Option<&str>,
+    collection_url: Option<&str>,
+) -> CvePackageIdentity {
+    let Some(collection_url) = collection_url else {
+        // `packageName` is more useful than product, but is not a purl and
+        // does not itself state an ecosystem.  Retain it for review without
+        // presenting it as a verified package vulnerability.
+        return CvePackageIdentity::Ambiguous;
+    };
+    let collection_url = collection_url.to_ascii_lowercase();
+    let ecosystem_matches = match ecosystem.to_ascii_lowercase().as_str() {
+        "pypi" => collection_url.contains("pypi.org"),
+        "npm" => {
+            collection_url.contains("npmjs.com") || collection_url.contains("registry.npmjs.org")
+        }
+        "crates.io" => collection_url.contains("crates.io"),
+        "maven" => {
+            collection_url.contains("maven.apache.org")
+                || collection_url.contains("repo.maven.apache.org")
+        }
+        "rubygems" => collection_url.contains("rubygems.org"),
+        "packagist" => collection_url.contains("packagist.org"),
+        "nuget" => collection_url.contains("nuget.org"),
+        _ => false,
+    };
+    if ecosystem_matches {
+        CvePackageIdentity::Confirmed
+    } else {
+        // A collection is affirmative identity evidence. Do not reinterpret a
+        // WordPress/theme marketplace record as a package merely because its
+        // product has the same name.
+        CvePackageIdentity::Excluded
+    }
+}
+
 struct CveParentInput {
     cve_id: String,
     state: i64,
@@ -689,13 +737,13 @@ impl SqlxDatabase {
                 // CVE List supplements OSV for package advisories that have not
                 // been mirrored into OSV. package_name is authoritative when it
                 // exists; product is the documented fallback for older records.
-                let cve_candidates: Vec<(i64, String, Option<String>, String)> = sqlx::query_as(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json FROM input JOIN cve_affected AS affected ON replace(replace(lower(COALESCE(NULLIF(affected.package_name, ''), affected.product)), '_', '-'), '.', '-')=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id",
+                let cve_candidates: Vec<(i64, String, Option<String>, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON replace(replace(lower(COALESCE(NULLIF(affected.package_name, ''), affected.product)), '_', '-'), '.', '-')=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id",
                 )
                 .bind(&input_json)
                 .fetch_all(&mut *connection)
                 .await?;
-                for (query_index, cve_id, default_status, raw_json) in cve_candidates {
+                for (query_index, cve_id, default_status, raw_json, package_name, product, collection_url) in cve_candidates {
                     let local_index = usize::try_from(query_index).map_err(|_| {
                         sqlx::Error::Protocol("invalid CVE package query index".to_owned())
                     })?;
@@ -703,6 +751,15 @@ impl SqlxDatabase {
                     let query = packages.get(output_index).ok_or_else(|| {
                         sqlx::Error::Protocol("CVE package query index is out of bounds".to_owned())
                     })?;
+                    let identity = cve_package_identity(
+                        &query.ecosystem,
+                        package_name.as_deref(),
+                        product.as_deref(),
+                        collection_url.as_deref(),
+                    );
+                    if identity == CvePackageIdentity::Excluded {
+                        continue;
+                    }
                     let versions = serde_json::from_str::<Vec<CveAffectedVersionTuple>>(&raw_json)
                         .map_err(|error| {
                             sqlx::Error::Protocol(format!("failed to parse cve_affected.raw_json for {cve_id}: {error}"))
@@ -715,12 +772,16 @@ impl SqlxDatabase {
                             less_than_or_equal,
                         })
                         .collect::<Vec<_>>();
-                    let matched = evaluate_cve_version_ranges(
+                    let mut matched = evaluate_cve_version_ranges(
                         &query.ecosystem,
                         &query.version,
                         default_status.as_deref(),
                         &versions,
                     );
+                    if identity == CvePackageIdentity::Ambiguous && matched.status == "affected" {
+                        matched.status = "unknown".to_owned();
+                        matched.confidence = "low".to_owned();
+                    }
                     if matched.status == "not_affected" {
                         continue;
                     }
@@ -4539,6 +4600,52 @@ mod tests {
                 .unwrap(),
             vec![None, Some(detail.clone()), Some(detail)]
         );
+    }
+
+    #[tokio::test]
+    async fn cve_list_package_supplement_requires_ecosystem_identity_for_confirmed_findings() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-wordpress","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"theme","affected":[{"vendor":"rascals","product":"Pendulum","packageName":"pendulum","collectionURL":"https://themeforest.net","versions":[{"version":"0","status":"affected","lessThan":"4.0.0"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-redis-server","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"server","affected":[{"vendor":"Redis","product":"Redis","versions":[{"version":"0","status":"affected","lessThan":"8.0.0"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-elasticsearch-server","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"server","affected":[{"vendor":"Elastic","product":"Elasticsearch","versions":[{"version":"0","status":"affected","lessThan":"9.0.0"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-pypi","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"library","affected":[{"vendor":"example","product":"example","packageName":"example","collectionURL":"https://pypi.org/project/example","versions":[{"version":"0","status":"affected","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-httplib2","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"library","affected":[{"vendor":"httplib2","product":"httplib2","versions":[{"version":"0","status":"affected","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+
+        assert!(
+            database
+                .query_package_matches("PyPI", "pendulum", "3.0.0", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let redis = database
+            .query_package_matches("PyPI", "redis", "4.6.0", None)
+            .await
+            .unwrap();
+        assert_eq!(redis[0].affected.status, "unknown");
+        assert_eq!(redis[0].affected.confidence, "low");
+        let elasticsearch = database
+            .query_package_matches("PyPI", "elasticsearch", "8.15.0", None)
+            .await
+            .unwrap();
+        assert_eq!(elasticsearch[0].affected.status, "unknown");
+        assert_eq!(elasticsearch[0].affected.confidence, "low");
+        let confirmed = database
+            .query_package_matches("PyPI", "example", "1.0.0", None)
+            .await
+            .unwrap();
+        assert_eq!(confirmed[0].affected.status, "affected");
+        let httplib2 = database
+            .query_package_matches("PyPI", "httplib2", "1.0.0", None)
+            .await
+            .unwrap();
+        assert_eq!(httplib2[0].affected.status, "unknown");
     }
 
     #[tokio::test]
