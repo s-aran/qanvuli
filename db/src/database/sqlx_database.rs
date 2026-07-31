@@ -4433,7 +4433,7 @@ mod tests {
     async fn imports_cve_with_stable_fts_rowid() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","description":"Affected widget description.","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0","lessThanOrEqual":"1.9"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
+        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","collectionURL":"https://pypi.org/project/widget","description":"Affected widget description.","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0","lessThanOrEqual":"1.9"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
         let rowid: i64 = database
             .writer
             .with_connection(|connection| {
