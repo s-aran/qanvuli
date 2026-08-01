@@ -19,7 +19,7 @@ fn run() -> Result<(), String> {
     qanvuli_core::runtime::init_tls_provider();
 
     let cli = Cli::parse_from(normalize_osv_prefix_flags(std::env::args_os())?);
-    if cli.version {
+    if cli.print_version {
         print_version();
         return Ok(());
     }
@@ -203,8 +203,8 @@ fn spinner_style() -> ProgressStyle {
 )]
 struct Cli {
     /// Print version information.
-    #[arg(long, global = true, action = clap::ArgAction::SetTrue)]
-    version: bool,
+    #[arg(long = "version", action = clap::ArgAction::SetTrue)]
+    print_version: bool,
     /// Use this database instead of ./db.sqlite.
     #[arg(long = "db-url", global = true, value_name = "URL")]
     db_url: Option<String>,
@@ -389,6 +389,24 @@ mod tests {
         )
         .unwrap();
         Cli::try_parse_from(normalized).unwrap();
+    }
+
+    #[test]
+    fn package_version_does_not_conflict_with_application_version_flag() {
+        let cli = Cli::try_parse_from([
+            "qanvuli",
+            "query",
+            "package",
+            "--ecosystem",
+            "npm",
+            "--name",
+            "lodash",
+            "--version",
+            "4.17.20",
+        ])
+        .unwrap();
+
+        assert!(!cli.print_version);
     }
 
     #[test]

@@ -121,6 +121,55 @@ impl OsvAdvisory {
         }
         for (affected_index, affected) in self.affected.iter().enumerate() {
             for (range_index, range) in affected.ranges.iter().enumerate() {
+                let range_type = range
+                    .range_type
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or(OsvSchemaError::InvalidRange {
+                        affected_index,
+                        range_index,
+                        reason: "missing required range type",
+                    })?;
+                if !matches!(range_type, "SEMVER" | "ECOSYSTEM" | "GIT") {
+                    return Err(OsvSchemaError::InvalidRange {
+                        affected_index,
+                        range_index,
+                        reason: "unsupported range type",
+                    });
+                }
+                if range_type == "GIT"
+                    && range
+                        .repo
+                        .as_deref()
+                        .map(str::trim)
+                        .is_none_or(str::is_empty)
+                {
+                    return Err(OsvSchemaError::InvalidRange {
+                        affected_index,
+                        range_index,
+                        reason: "GIT range is missing required repo",
+                    });
+                }
+                if !range.events.iter().any(|event| event.introduced.is_some()) {
+                    return Err(OsvSchemaError::InvalidRange {
+                        affected_index,
+                        range_index,
+                        reason: "range must contain at least one introduced event",
+                    });
+                }
+                if range.events.iter().any(|event| event.fixed.is_some())
+                    && range
+                        .events
+                        .iter()
+                        .any(|event| event.last_affected.is_some())
+                {
+                    return Err(OsvSchemaError::InvalidRange {
+                        affected_index,
+                        range_index,
+                        reason: "fixed and last_affected cannot be mixed",
+                    });
+                }
                 for (event_index, event) in range.events.iter().enumerate() {
                     event
                         .validate_oneof()
@@ -149,6 +198,12 @@ pub enum OsvSchemaError {
         range_index: usize,
         event_index: usize,
         reason: OsvRangeEventError,
+    },
+    #[error("OSV affected[{affected_index}].ranges[{range_index}] is invalid: {reason}")]
+    InvalidRange {
+        affected_index: usize,
+        range_index: usize,
+        reason: &'static str,
     },
 }
 
@@ -238,7 +293,8 @@ impl OsvRangeEvent {
     }
 
     pub fn validate_oneof(&self) -> Result<(), OsvRangeEventError> {
-        let known = self.event_pairs().len();
+        let pairs = self.event_pairs();
+        let known = pairs.len();
         if known != 1 {
             return Err(OsvRangeEventError::ExpectedExactlyOneKnownKey { actual: known });
         }
@@ -246,6 +302,9 @@ impl OsvRangeEvent {
             return Err(OsvRangeEventError::UnknownEventKeys {
                 keys: self.extra.keys().cloned().collect(),
             });
+        }
+        if pairs[0].1.trim().is_empty() {
+            return Err(OsvRangeEventError::EmptyValue);
         }
         Ok(())
     }
@@ -257,6 +316,8 @@ pub enum OsvRangeEventError {
     ExpectedExactlyOneKnownKey { actual: usize },
     #[error("unknown event keys are not valid in OSV range events: {keys:?}")]
     UnknownEventKeys { keys: Vec<String> },
+    #[error("range event version value must not be empty")]
+    EmptyValue,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -389,5 +450,20 @@ mod tests {
             advisory.validate_schema_shape(),
             Err(OsvSchemaError::MissingRequiredField("modified"))
         ));
+    }
+
+    #[test]
+    fn rejects_ranges_missing_required_semantics() {
+        for raw in [
+            r#"{"id":"OSV-2099-1","modified":"2099-01-01T00:00:00Z","affected":[{"ranges":[{"events":[{"introduced":"0"}]}]}]}"#,
+            r#"{"id":"OSV-2099-2","modified":"2099-01-01T00:00:00Z","affected":[{"ranges":[{"type":"SEMVER","events":[{"fixed":"2.0.0"}]}]}]}"#,
+            r#"{"id":"OSV-2099-3","modified":"2099-01-01T00:00:00Z","affected":[{"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"},{"last_affected":"1.9.0"}]}]}]}"#,
+        ] {
+            let advisory = OsvAdvisory::parse_json(raw.as_bytes()).unwrap();
+            assert!(matches!(
+                advisory.validate_schema_shape(),
+                Err(OsvSchemaError::InvalidRange { .. })
+            ));
+        }
     }
 }

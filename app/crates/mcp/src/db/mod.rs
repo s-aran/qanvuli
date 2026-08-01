@@ -14,12 +14,15 @@ use qanvuli_app_commands::common::{
 };
 use qanvuli_core::database::{
     CveDatabase, CveRiskSummary, CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding,
-    PackageQuery,
+    PackageQuery, normalize_package_name, versions_equivalent,
 };
 use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
 use serde::Serialize;
-use simd_json::{OwnedValue as Value, json};
+use simd_json::{
+    OwnedValue as Value, json,
+    prelude::{ValueAsArray, ValueAsObject, ValueAsScalar},
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -325,6 +328,15 @@ pub(crate) async fn query_package_enriched(
         .iter()
         .filter(|finding| finding.affected.status == "affected")
         .count();
+    let review_count = result
+        .iter()
+        .filter(|finding| {
+            !matches!(
+                finding.affected.status.as_str(),
+                "affected" | "not_affected"
+            )
+        })
+        .count();
     let mut result = result
         .into_iter()
         .filter(|finding| status == "all" || finding.affected.status == "affected")
@@ -341,6 +353,8 @@ pub(crate) async fn query_package_enriched(
     response::tool_result(json!({
         "vulnerable": confirmed_count > 0,
         "confirmed_count": confirmed_count,
+        "review_count": review_count,
+        "evaluation_notice": (review_count > 0).then_some("One or more advisories use a version scheme that could not be evaluated; request status='all' to inspect them."),
         "coverage_notice": coverage_notice(ecosystem, !has_osv_advisory),
         "status": status,
         "has_more": has_more,
@@ -411,11 +425,25 @@ pub(crate) async fn query_packages_enriched(
     for ((package, findings), has_osv_advisory) in
         packages.into_iter().zip(findings_by_package).zip(coverage)
     {
-        let uncertain_cve_ids = findings
+        let uncertain_findings = findings
             .iter()
-            .filter(|finding| finding.affected.status == "unknown")
+            .filter(|finding| {
+                !matches!(
+                    finding.affected.status.as_str(),
+                    "affected" | "not_affected"
+                )
+            })
+            .collect::<Vec<_>>();
+        let uncertain_cve_ids = uncertain_findings
+            .iter()
             .flat_map(|finding| finding.cve_ids.iter().cloned())
             .collect::<BTreeSet<_>>();
+        let review_advisory_ids = uncertain_findings
+            .iter()
+            .map(|finding| finding.primary_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let findings = findings
             .into_iter()
             .filter(|finding| status == "all" || finding.affected.status == "affected")
@@ -456,6 +484,7 @@ pub(crate) async fn query_packages_enriched(
             !confirmed_findings.is_empty(),
             include_fixed.then(|| fixed_versions_from_refs(&confirmed_findings)),
             review_cve_ids,
+            review_advisory_ids,
         );
         let mut result = json!({
             "package": package,
@@ -518,6 +547,8 @@ struct BatchPackageSummary {
     needs_review: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     review_cve_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    review_advisory_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fixed_versions: Option<Vec<String>>,
 }
@@ -529,6 +560,7 @@ fn batch_summary(
     vulnerable: bool,
     fixed_versions: Option<Vec<String>>,
     review_cve_ids: Vec<String>,
+    review_advisory_ids: Vec<String>,
 ) -> BatchPackageSummary {
     BatchPackageSummary {
         package: package.package.clone(),
@@ -544,8 +576,9 @@ fn batch_summary(
             .filter_map(|summary| summary.epss)
             .max_by(f64::total_cmp),
         kev: risk.iter().any(|summary| summary.kev_listed),
-        needs_review: !review_cve_ids.is_empty(),
+        needs_review: !review_cve_ids.is_empty() || !review_advisory_ids.is_empty(),
         review_cve_ids,
+        review_advisory_ids,
         fixed_versions,
     }
 }
@@ -594,7 +627,8 @@ fn cna_explicit_version_conflicts_for_detail(
                 .as_deref()
                 .or(affected.product.as_deref())
                 .is_some_and(|name| {
-                    normalized_package_name(name) == normalized_package_name(&package.package)
+                    normalize_package_name(&package.ecosystem, name)
+                        == normalize_package_name(&package.ecosystem, &package.package)
                 })
         })
         .filter_map(|affected| {
@@ -615,7 +649,12 @@ fn cna_explicit_version_conflicts_for_detail(
                     .collect::<Vec<_>>()
             })
         })
-        .filter(|versions| !versions.is_empty() && !versions.iter().any(|version| version == &package.version))
+        .filter(|versions| {
+            !versions.is_empty()
+                && !versions.iter().any(|version| {
+                    versions_equivalent(&package.ecosystem, version, &package.version)
+                })
+        })
         .map(|cna_versions| CnaExplicitVersionConflict {
             cve_id: detail.summary.cve_id.clone(),
             package_name: package.package.clone(),
@@ -661,23 +700,6 @@ fn decode_html_entities(value: &str) -> String {
         .replace("&amp;", "&")
 }
 
-fn normalized_package_name(name: &str) -> String {
-    let mut normalized = String::with_capacity(name.len());
-    let mut previous_separator = false;
-    for character in name.chars() {
-        if matches!(character, '-' | '_' | '.') {
-            if !previous_separator {
-                normalized.push('-');
-            }
-            previous_separator = true;
-        } else {
-            normalized.push(character.to_ascii_lowercase());
-            previous_separator = false;
-        }
-    }
-    normalized
-}
-
 fn serialize_findings(
     findings: &[EnrichedFinding],
     include_evidence: bool,
@@ -694,6 +716,94 @@ fn serialize_findings(
         };
         if !include_evidence {
             object.remove("evidence");
+        } else if object
+            .get("evidence")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty)
+        {
+            // Batch package queries use the bounded matcher directly. Supply
+            // the same compact match evidence as the single-query path.
+            let source = object
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let primary_id = object
+                .get("primary_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let package = object
+                .get("package")
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            let affected = object
+                .get("affected")
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            let fixed_versions = object
+                .get("fixed_versions")
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let cve_id = object
+                .get("cve_ids")
+                .and_then(Value::as_array)
+                .and_then(|ids| ids.first())
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let osv_id = (source == "osv").then(|| primary_id.clone());
+            let from = package.as_object().map(|package| {
+                format!(
+                    "{}:{}@{}",
+                    package
+                        .get("ecosystem")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    package
+                        .get("package")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    package
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                )
+            });
+            let purl = package
+                .as_object()
+                .and_then(|package| package.get("purl"))
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            let status = affected
+                .as_object()
+                .and_then(|affected| affected.get("status"))
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            let confidence = affected
+                .as_object()
+                .and_then(|affected| affected.get("confidence"))
+                .cloned()
+                .unwrap_or_else(|| json!(null));
+            let detail = json!({
+                "status": status,
+                "confidence": confidence,
+                "purl": purl,
+                "fixed_versions": fixed_versions,
+            })
+            .to_string();
+            object.insert(
+                "evidence".to_owned(),
+                json!([{
+                    "kind": "package_version_evaluation",
+                    "source": source,
+                    "from": from,
+                    "to": primary_id,
+                    "cve_id": cve_id,
+                    "osv_id": osv_id,
+                    "detail": detail,
+                }]),
+            );
+            object.insert("evidence_status".to_owned(), json!("available"));
         }
         if !include_fixed {
             object.remove("fixed_versions");
@@ -1024,6 +1134,51 @@ mod tests {
         assert_eq!(result.content.len(), 1);
     }
 
+    #[tokio::test]
+    async fn package_query_resolves_native_maven_ranges_and_match_evidence() {
+        use qanvuli_core::database::OsvRawRecord;
+
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-maven-review","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"Maven","name":"org.example:core"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"1.0-final"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+
+        let result = query_package_enriched(
+            &db,
+            "Maven",
+            "org.example:core",
+            "1.5-final",
+            None,
+            Some("all"),
+            30,
+            0,
+            true,
+        )
+        .await
+        .unwrap();
+        let value = serde_json::to_value(result).unwrap();
+        let text = value
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(payload["vulnerable"], true);
+        assert_eq!(payload["confirmed_count"], 1);
+        assert_eq!(payload["review_count"], 0);
+        assert!(payload["evaluation_notice"].is_null());
+        assert_eq!(payload["findings"][0]["affected"]["status"], "affected");
+        assert_eq!(payload["findings"][0]["evidence_status"], "available");
+        assert_eq!(
+            payload["findings"][0]["evidence"].as_array().unwrap().len(),
+            1
+        );
+    }
+
     #[test]
     fn batch_summary_aggregates_all_related_cves() {
         let package = crate::args::PackageQueryArgs {
@@ -1078,12 +1233,35 @@ mod tests {
             true,
             None,
             Vec::new(),
+            Vec::new(),
         );
 
         assert!(summary.vulnerable);
         assert!(summary.kev);
         assert_eq!(summary.max_cvss, Some(9.8));
         assert_eq!(summary.max_epss, Some(0.91));
+    }
+
+    #[test]
+    fn batch_summary_flags_an_uncertain_advisory_without_a_cve_alias() {
+        let package = crate::args::PackageQueryArgs {
+            ecosystem: "Maven".to_owned(),
+            package: "org.example:core".to_owned(),
+            version: "1.0-final".to_owned(),
+            purl: None,
+        };
+        let summary = batch_summary(
+            &package,
+            Vec::new(),
+            &[],
+            false,
+            None,
+            Vec::new(),
+            vec!["GHSA-2099-needs-review".to_owned()],
+        );
+
+        assert!(summary.needs_review);
+        assert_eq!(summary.review_advisory_ids, ["GHSA-2099-needs-review"]);
     }
 
     #[test]

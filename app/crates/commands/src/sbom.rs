@@ -1,6 +1,7 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_database, connect_database, print_json};
 use qanvuli_core::database::{
     CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
+    ecosystem_identity_key, normalize_package_name, parse_package_purl,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,7 +83,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
                 ecosystem: package_ref.ecosystem,
                 package: package_ref.name,
                 version: version.to_owned(),
-                purl: Some(package_ref.purl),
+                purl: Some(package_ref.query_purl),
             });
         }
     }
@@ -263,8 +264,25 @@ async fn search_package(
         }
     }
 
+    for purl in package.purls() {
+        if package_ref_from_purl(purl, package.version.as_deref()).is_none() {
+            unresolved_versions.push(UnresolvedVersion {
+                package: package.name.clone(),
+                version: package.version.clone().unwrap_or_default(),
+                matched_purl: purl.to_owned(),
+                reason: "PURL is malformed or uses an unsupported package type".to_owned(),
+            });
+        }
+    }
+
     for package_ref in package.package_refs() {
         let Some(version) = package_ref.version.as_deref() else {
+            unresolved_versions.push(UnresolvedVersion {
+                package: package.name.clone(),
+                version: String::new(),
+                matched_purl: package_ref.purl.clone(),
+                reason: "installed version is missing".to_owned(),
+            });
             continue;
         };
         if !is_concrete_version(version) {
@@ -287,7 +305,7 @@ async fn search_package(
                 &package_ref.ecosystem,
                 &package_ref.name,
                 version,
-                Some(&package_ref.purl),
+                Some(&package_ref.query_purl),
             )
             .await
             .map_err(|err| format!("failed to query package `{}`: {err}", package.name))?
@@ -334,8 +352,27 @@ async fn search_package(
                     matches_since(published.as_deref(), date_filter.published_since.as_deref())
                         && matches_since(modified.as_deref(), date_filter.updated_since.as_deref())
                 });
+            let cve_matches_dates = cves
+                .get(&finding.primary_id)
+                .and_then(Option::as_ref)
+                .is_some_and(|cve| {
+                    matches_since(
+                        Some(&cve.summary.published_at),
+                        date_filter.published_since.as_deref(),
+                    ) && matches_since(
+                        Some(&cve.summary.updated_at),
+                        date_filter.updated_since.as_deref(),
+                    )
+                });
+            let advisory_matches_dates = match finding.source.as_str() {
+                "osv" => osv_matches_dates,
+                "cve-list" => cve_matches_dates,
+                _ => osv_matches_dates || cve_matches_dates,
+            };
             if finding.affected.status != "affected" {
-                if osv_matches_dates {
+                if version_evaluation_needs_review(&finding.affected.status)
+                    && advisory_matches_dates
+                {
                     unresolved_versions.push(UnresolvedVersion {
                         package: package.name.clone(),
                         version: version.to_owned(),
@@ -471,15 +508,30 @@ fn load_sbom_packages_from_slice(json: &mut [u8]) -> Result<Vec<SbomPackage>, St
     let mut packages = Vec::new();
     if let Some(document) = sbom.sbom {
         packages.extend(document.packages);
-        packages.extend(document.components);
+        append_cyclonedx_components(&mut packages, document.components);
     }
     packages.extend(sbom.packages);
-    packages.extend(sbom.components);
+    append_cyclonedx_components(&mut packages, sbom.components);
 
     Ok(packages
         .into_iter()
         .filter(|package| !package.name.is_empty())
         .collect())
+}
+
+fn append_cyclonedx_components(
+    packages: &mut Vec<SbomPackage>,
+    components: Vec<CycloneDxComponent>,
+) {
+    let mut pending = components.into_iter().rev().collect::<Vec<_>>();
+    while let Some(CycloneDxComponent {
+        package,
+        components,
+    }) = pending.pop()
+    {
+        packages.push(package);
+        pending.extend(components.into_iter().rev());
+    }
 }
 
 fn deduplicate_sbom_packages(packages: Vec<SbomPackage>) -> Vec<SbomPackage> {
@@ -489,17 +541,18 @@ fn deduplicate_sbom_packages(packages: Vec<SbomPackage>) -> Vec<SbomPackage> {
             .purls()
             .into_iter()
             .filter_map(|purl| package_ref_from_purl(purl, package.version.as_deref()))
-            .map(|package_ref| {
-                format!(
-                    "{}\u{1f}{}\u{1f}{}",
-                    package_ref.ecosystem.to_ascii_lowercase(),
-                    package_ref.name.to_ascii_lowercase(),
-                    package_ref.version.unwrap_or_default()
-                )
-            })
+            .map(|package_ref| package_ref_identity_key(&package_ref))
             .collect::<BTreeSet<_>>();
+        // A PURL is authoritative for package identity. Without one, preserve
+        // the component name exactly because its ecosystem (and therefore its
+        // case rules) is unknown.
+        let component_name = if normalized_purls.is_empty() {
+            package.name.clone()
+        } else {
+            String::new()
+        };
         let key = (
-            package.name.to_ascii_lowercase(),
+            component_name,
             package.version.clone().unwrap_or_default(),
             normalized_purls,
         );
@@ -514,7 +567,7 @@ struct GitHubSbom {
     #[serde(default)]
     packages: Vec<SbomPackage>,
     #[serde(default)]
-    components: Vec<SbomPackage>,
+    components: Vec<CycloneDxComponent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -522,7 +575,15 @@ struct SbomDocument {
     #[serde(default)]
     packages: Vec<SbomPackage>,
     #[serde(default)]
-    components: Vec<SbomPackage>,
+    components: Vec<CycloneDxComponent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CycloneDxComponent {
+    #[serde(flatten)]
+    package: SbomPackage,
+    #[serde(default)]
+    components: Vec<CycloneDxComponent>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -570,15 +631,26 @@ impl SbomPackage {
             .into_iter()
             .filter_map(|purl| package_ref_from_purl(purl, self.version.as_deref()))
         {
-            let key = (
-                package_ref.ecosystem.to_ascii_lowercase(),
-                package_ref.name.to_ascii_lowercase(),
-                package_ref.version.clone().unwrap_or_default(),
-            );
+            let key = package_ref_identity_key(&package_ref);
             normalized.entry(key).or_insert(package_ref);
         }
         normalized.into_values().collect()
     }
+}
+
+fn package_ref_identity_key(package_ref: &PackageRef) -> String {
+    let suffix = package_ref
+        .query_purl
+        .find(['?', '#'])
+        .map(|index| &package_ref.query_purl[index..])
+        .unwrap_or_default();
+    format!(
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        ecosystem_identity_key(&package_ref.ecosystem),
+        normalize_package_name(&package_ref.ecosystem, &package_ref.name),
+        package_ref.version.as_deref().unwrap_or_default(),
+        suffix
+    )
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -670,79 +742,32 @@ fn is_concrete_version(version: &str) -> bool {
         })
 }
 
+fn version_evaluation_needs_review(status: &str) -> bool {
+    !matches!(status, "affected" | "not_affected")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PackageRef {
     ecosystem: String,
     name: String,
     version: Option<String>,
     purl: String,
+    query_purl: String,
 }
 
 fn package_ref_from_purl(purl: &str, fallback_version: Option<&str>) -> Option<PackageRef> {
-    let body = purl.strip_prefix("pkg:").unwrap_or(purl);
-    let without_qualifiers = body.split(['?', '#']).next().unwrap_or(body);
-    let (package_path, purl_version) = without_qualifiers.rsplit_once('@').map_or(
-        (without_qualifiers, None),
-        |(package, version)| {
-            if package.is_empty() {
-                (without_qualifiers, None)
-            } else {
-                (package, Some(version))
-            }
-        },
-    );
-    let (purl_type, name_path) = package_path.split_once('/')?;
-    let ecosystem = osv_ecosystem_from_purl_type(purl_type)?;
-    let name = percent_decode(name_path);
-    if name.is_empty() {
-        return None;
-    }
-
+    let parsed = parse_package_purl(purl)?;
     Some(PackageRef {
-        ecosystem: ecosystem.to_owned(),
-        name,
-        version: purl_version
-            .or(fallback_version)
-            .map(percent_decode)
-            .filter(|version| !version.is_empty()),
+        ecosystem: parsed.ecosystem,
+        name: parsed.name,
+        version: parsed.version.or_else(|| {
+            fallback_version
+                .filter(|version| !version.is_empty())
+                .map(str::to_owned)
+        }),
         purl: purl.to_owned(),
+        query_purl: parsed.identity_purl,
     })
-}
-
-fn osv_ecosystem_from_purl_type(purl_type: &str) -> Option<&'static str> {
-    match purl_type.to_ascii_lowercase().as_str() {
-        "cargo" => Some("crates.io"),
-        "gem" => Some("RubyGems"),
-        "github" => Some("GitHub Actions"),
-        "golang" => Some("Go"),
-        "maven" => Some("Maven"),
-        "npm" => Some("npm"),
-        "nuget" => Some("NuGet"),
-        "pypi" => Some("PyPI"),
-        "pub" => Some("Pub"),
-        _ => None,
-    }
-}
-
-/// Decodes percent-encoded UTF-8 while leaving malformed values unchanged.
-fn percent_decode(value: &str) -> String {
-    let mut decoded = Vec::with_capacity(value.len());
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3])
-            && let Ok(byte) = u8::from_str_radix(hex, 16)
-        {
-            decoded.push(byte);
-            index += 3;
-            continue;
-        }
-        decoded.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8(decoded).unwrap_or_else(|_| value.to_owned())
 }
 
 #[cfg(test)]
@@ -782,6 +807,7 @@ mod tests {
                 name: "mlua".to_owned(),
                 version: Some("0.11.1".to_owned()),
                 purl: "pkg:cargo/mlua@0.11.1".to_owned(),
+                query_purl: "pkg:cargo/mlua".to_owned(),
             })
         );
         assert_eq!(
@@ -790,22 +816,205 @@ mod tests {
                 .name,
             "@scope/name"
         );
+        let maven =
+            package_ref_from_purl("pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1", None)
+                .unwrap();
+        assert_eq!(maven.name, "org.apache.logging.log4j:log4j-core");
+        assert_eq!(
+            maven.query_purl,
+            "pkg:maven/org.apache.logging.log4j/log4j-core"
+        );
+
+        let scoped = package_ref_from_purl(
+            "pkg://npm/%40scope/name@1.2.3%2Bbuild?download_url=https%3A%2F%2Fexample.invalid#lib",
+            None,
+        )
+        .unwrap();
+        assert_eq!(scoped.ecosystem, "npm");
+        assert_eq!(scoped.name, "@scope/name");
+        assert_eq!(scoped.version.as_deref(), Some("1.2.3+build"));
+        assert_eq!(
+            scoped.query_purl,
+            "pkg:npm/%40scope/name?download_url=https:%2F%2Fexample.invalid#lib"
+        );
+
+        let remote_maven = package_ref_from_purl(
+            "pkg:maven/org.example/core@1.0.0?repository_url=https%3A%2F%2Frepo.example%2Fmaven",
+            None,
+        )
+        .unwrap();
+        assert_eq!(remote_maven.ecosystem, "Maven:https://repo.example/maven");
+
+        assert_eq!(
+            package_ref_from_purl("pkg:npm/example?arch=x64", Some("2.0.0"))
+                .unwrap()
+                .version
+                .as_deref(),
+            Some("2.0.0")
+        );
+        assert!(package_ref_from_purl("pkg:npm/example@?arch=x64", Some("2.0.0")).is_none());
+        assert!(package_ref_from_purl("npm/example@1.0.0", None).is_none());
+        assert!(package_ref_from_purl("pkg:maven/org.example%2Fcore@1.0.0", None).is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_versions_and_invalid_purls_are_reported_for_review() {
+        use qanvuli_core::database::SqlxDatabase;
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        let missing = search_package(
+            database.clone(),
+            SbomPackage {
+                name: "example".to_owned(),
+                version: None,
+                external_refs: Vec::new(),
+                package_url: Some("pkg:npm/example".to_owned()),
+            },
+            DateFilter::new(None, None).unwrap(),
+            CveStateScope::PublishedOnly,
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing.unresolved_versions.len(), 1);
+        assert_eq!(
+            missing.unresolved_versions[0].reason,
+            "installed version is missing"
+        );
+
+        let invalid = search_package(
+            database.clone(),
+            SbomPackage {
+                name: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:unknown/example@1.0.0".to_owned()),
+            },
+            DateFilter::new(None, None).unwrap(),
+            CveStateScope::PublishedOnly,
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid.unresolved_versions.len(), 1);
+        assert!(invalid.unresolved_versions[0].reason.contains("PURL"));
+
+        let malformed = search_package(
+            database,
+            SbomPackage {
+                name: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:npm/ex%ZZample@1.0.0".to_owned()),
+            },
+            DateFilter::new(None, None).unwrap(),
+            CveStateScope::PublishedOnly,
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(malformed.unresolved_versions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn maven_sbom_purl_matches_osv_coordinate_and_version_range() {
+        use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-maven","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"Maven","name":"org.example:core","purl":"pkg:maven/org.example/core"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        let package = package_ref_from_purl("pkg:maven/org.example/core@1.5.0", None).unwrap();
+
+        let findings = database
+            .query_package_matches(
+                &package.ecosystem,
+                &package.name,
+                package.version.as_deref().unwrap(),
+                Some(&package.query_purl),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].affected.status, "affected");
+    }
+
+    #[tokio::test]
+    async fn cve_list_unsupported_version_is_reported_for_review() {
+        use qanvuli_core::database::SqlxDatabase;
+
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_json(
+                r#"{"cveMetadata":{"cveId":"CVE-2099-sbom-review","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"review","affected":[{"vendor":"example","product":"example","packageName":"example","collectionURL":"https://pypi.org/project/example","versions":[{"version":"0","status":"affected","lessThan":"2.0.0"}]}]}}}"#
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let result = search_package(
+            database,
+            SbomPackage {
+                name: "example".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:pypi/example@1.0.0".to_owned()),
+            },
+            DateFilter::new(None, None).unwrap(),
+            CveStateScope::PublishedOnly,
+            10,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.cve_findings.is_empty());
+        assert!(result.osv_findings.is_empty());
+        assert_eq!(result.unresolved_versions.len(), 1);
+        assert!(
+            result.unresolved_versions[0]
+                .reason
+                .contains("CVE-2099-sbom-review")
+        );
+        assert!(
+            result.unresolved_versions[0]
+                .reason
+                .contains("unsupported_version_scheme")
+        );
     }
 
     #[test]
     fn maps_every_advertised_purl_ecosystem() {
-        for (purl_type, ecosystem) in [
-            ("cargo", "crates.io"),
-            ("gem", "RubyGems"),
-            ("github", "GitHub Actions"),
-            ("golang", "Go"),
-            ("maven", "Maven"),
-            ("npm", "npm"),
-            ("nuget", "NuGet"),
-            ("pypi", "PyPI"),
-            ("pub", "Pub"),
+        for (purl, ecosystem) in [
+            ("pkg:cargo/example", "crates.io"),
+            ("pkg:gem/example", "RubyGems"),
+            ("pkg:github/owner/repository", "GitHub Actions"),
+            ("pkg:golang/example.com/module", "Go"),
+            ("pkg:maven/org.example/artifact", "Maven"),
+            ("pkg:npm/example", "npm"),
+            ("pkg:nuget/example", "NuGet"),
+            ("pkg:pypi/example", "PyPI"),
+            ("pkg:pub/example", "Pub"),
         ] {
-            assert_eq!(osv_ecosystem_from_purl_type(purl_type), Some(ecosystem));
+            assert_eq!(
+                package_ref_from_purl(purl, None).map(|package| package.ecosystem),
+                Some(ecosystem.to_owned())
+            );
         }
     }
 
@@ -817,7 +1026,7 @@ mod tests {
                 .name,
             "あ"
         );
-        assert_eq!(percent_decode("%FF"), "%FF");
+        assert!(package_ref_from_purl("pkg:npm/%FF@1.2.3", None).is_none());
     }
 
     #[test]
@@ -826,6 +1035,16 @@ mod tests {
         assert!(is_concrete_version("7.25.9"));
         assert!(!is_concrete_version(">= 2.2.1,< 3"));
         assert!(!is_concrete_version(">= 0.9.1"));
+    }
+
+    #[test]
+    fn fixed_versions_are_not_reported_as_unresolved() {
+        assert!(!version_evaluation_needs_review("affected"));
+        assert!(!version_evaluation_needs_review("not_affected"));
+        assert!(version_evaluation_needs_review("unknown"));
+        assert!(version_evaluation_needs_review(
+            "unsupported_version_scheme"
+        ));
     }
 
     #[test]
@@ -978,6 +1197,38 @@ mod tests {
     }
 
     #[test]
+    fn loads_nested_cyclonedx_components_recursively() {
+        let mut json = br#"{
+            "bomFormat": "CycloneDX",
+            "components": [{
+                "name": "application",
+                "version": "1.0.0",
+                "purl": "pkg:npm/application@1.0.0",
+                "components": [{
+                    "name": "dependency",
+                    "version": "2.0.0",
+                    "purl": "pkg:npm/dependency@2.0.0",
+                    "components": [{
+                        "name": "transitive",
+                        "version": "3.0.0",
+                        "purl": "pkg:npm/transitive@3.0.0"
+                    }]
+                }]
+            }]
+        }"#
+        .to_vec();
+
+        let packages = load_sbom_packages_from_slice(&mut json).unwrap();
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["application", "dependency", "transitive"]
+        );
+    }
+
+    #[test]
     fn deduplicates_equivalent_normalized_package_entries_without_merging_versions() {
         let packages = vec![
             SbomPackage {
@@ -1008,6 +1259,81 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["1.0.0", "2.0.0"])
         );
+    }
+
+    #[test]
+    fn deduplication_respects_each_ecosystems_name_and_variant_rules() {
+        let packages = vec![
+            SbomPackage {
+                name: "Friendly_Bard".to_owned(),
+                version: Some("1.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:pypi/Friendly_Bard@1.0".to_owned()),
+            },
+            SbomPackage {
+                name: "friendly-bard".to_owned(),
+                version: Some("1.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:pypi/friendly-bard@1.0".to_owned()),
+            },
+            SbomPackage {
+                name: "org.example:Core".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:maven/org.example/Core@1.0.0".to_owned()),
+            },
+            SbomPackage {
+                name: "org.example:core".to_owned(),
+                version: Some("1.0.0".to_owned()),
+                external_refs: Vec::new(),
+                package_url: Some("pkg:maven/org.example/core@1.0.0".to_owned()),
+            },
+        ];
+
+        let unique = deduplicate_sbom_packages(packages);
+        assert_eq!(
+            unique.len(),
+            3,
+            "PyPI aliases merge; Maven case variants do not"
+        );
+
+        let variants = SbomPackage {
+            name: "example".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            external_refs: vec![
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some("pkg:gem/example@1.0.0?platform=ruby".to_owned()),
+                },
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some("pkg:gem/example@1.0.0?platform=java".to_owned()),
+                },
+            ],
+            package_url: None,
+        };
+        assert_eq!(variants.package_refs().len(), 2);
+
+        let equivalent_spellings = SbomPackage {
+            name: "example".to_owned(),
+            version: Some("1.0.0".to_owned()),
+            external_refs: vec![
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some(
+                        "pkg://NPM/example@1.0.0?OS=linux&arch=x64#/lib/".to_owned(),
+                    ),
+                },
+                SbomExternalRef {
+                    reference_type: Some("purl".to_owned()),
+                    reference_locator: Some(
+                        "pkg:npm/example@1.0.0?arch=x64&os=linux#lib".to_owned(),
+                    ),
+                },
+            ],
+            package_url: None,
+        };
+        assert_eq!(equivalent_spellings.package_refs().len(), 1);
     }
 
     #[test]
@@ -1095,7 +1421,7 @@ mod tests {
                     ecosystem: package.ecosystem,
                     package: package.name,
                     version: package.version.unwrap(),
-                    purl: Some(package.purl),
+                    purl: Some(package.query_purl),
                 })
                 .collect::<Vec<_>>();
             let baseline_queries = (0..input_count)
