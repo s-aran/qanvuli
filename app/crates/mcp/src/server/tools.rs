@@ -307,7 +307,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Batch-query up to 200 package/version tuples. Set verbosity='summary' to omit verbose findings. Set include_fixed=true for OSV fixed-version candidates and include_enrichment=true for per-CVE KEV/EPSS/CVSS rows. Status defaults to affected. PyPI names follow PEP 503 normalization. Evidence is omitted by default; set include_evidence=true for verbose match evidence."
+        description = "Batch-query up to 200 package/version tuples. Compact summaries are the default and retain vulnerability, review, CVE, CVSS, EPSS, KEV, coverage, and optional fixed-version signals. Set verbosity='full' only for packages that need findings. Evidence is omitted by default."
     )]
     pub(crate) async fn query_packages_enriched(
         &self,
@@ -440,7 +440,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "List CVEs updated on or after an optional ISO-8601 timestamp, ordered by publication date for triage."
+        description = "List CVEs updated on or after an optional ISO-8601 timestamp. Compact triage rows with CVSS, EPSS, and KEV are the default; set verbosity='full' for CWE, CVSS vectors, and affected details."
     )]
     pub(crate) async fn list_recent_updates(
         &self,
@@ -456,7 +456,14 @@ impl CveSearchServer {
             offset(args.offset),
         )
         .await?;
-        db::paged_search_result(db, cves, limit, args.full_description.unwrap_or(false)).await
+        db::paged_recent_updates_result(
+            db,
+            cves,
+            limit,
+            args.verbosity.as_deref(),
+            args.full_description.unwrap_or(false),
+        )
+        .await
     }
 
     #[tool(

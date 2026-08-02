@@ -46,6 +46,14 @@ pub fn versions_equivalent(ecosystem: &str, left: &str, right: &str) -> bool {
     policy_for_ecosystem(ecosystem).versions_equivalent(left, right)
 }
 
+/// Returns whether `version` is a concrete installed version supported by the
+/// ecosystem's existing version policy rather than a constraint or range.
+pub fn is_concrete_package_version(ecosystem: &str, version: &str) -> bool {
+    !version.is_empty()
+        && version.trim() == version
+        && policy_for_ecosystem(ecosystem).is_concrete_version(version)
+}
+
 /// Returns the canonical versionless identity of a supported purl.
 ///
 /// Callers that need to distinguish malformed input should use
@@ -673,6 +681,56 @@ mod tests {
             normalize_package_name("crates.io", "example_crate"),
             "example-crate"
         );
+    }
+
+    #[test]
+    fn concrete_installed_versions_use_ecosystem_parsers() {
+        for (ecosystem, version) in [
+            ("crates.io", "1.2.3-alpha.1"),
+            ("Go", "v1.2.3-20240101120000-abcdef123456"),
+            ("GitHub Actions", "v4.1.2"),
+            ("Maven", "1.0-SNAPSHOT"),
+            ("npm", "v1.5.0"),
+            ("NuGet", "1.0.0-ALPHA.2"),
+            ("PyPI", "1!2.0"),
+            ("Pub", "1.0.0+3"),
+            ("RubyGems", "1.0.pre.2"),
+        ] {
+            assert!(
+                is_concrete_package_version(ecosystem, version),
+                "{ecosystem} should accept {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn package_constraints_are_never_concrete_installed_versions() {
+        for ecosystem in [
+            "crates.io",
+            "Go",
+            "GitHub Actions",
+            "Maven",
+            "npm",
+            "NuGet",
+            "PyPI",
+            "Pub",
+            "RubyGems",
+        ] {
+            for constraint in [
+                ">=2.0",
+                "!=2.1",
+                "^1.2",
+                "~1.2",
+                "1.2.*",
+                ">=1.0,<2.0",
+                "1.0 || 2.0",
+            ] {
+                assert!(
+                    !is_concrete_package_version(ecosystem, constraint),
+                    "{ecosystem} should reject {constraint}"
+                );
+            }
+        }
     }
 
     #[test]

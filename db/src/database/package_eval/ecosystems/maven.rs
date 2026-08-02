@@ -29,6 +29,10 @@ impl EcosystemPolicy for MavenPolicy {
             .is_some_and(|(left, right)| compare_items(&left, &right) == Ordering::Equal)
     }
 
+    fn is_concrete_version(&self, version: &str) -> bool {
+        maven_version(version).is_some()
+    }
+
     fn evaluate_ecosystem_range(&self, installed: &str, range: &OsvRange) -> RangeEvaluation {
         evaluate_parsed_range(installed, range, maven_version, |left, right| {
             compare_items(left, right)

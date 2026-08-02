@@ -1,6 +1,6 @@
 use super::{
     CveRangeKind, EcosystemPolicy, OsvRange, RangeEvaluation, default_cve_range_kind,
-    strip_conventional_v,
+    is_semver_version, strip_conventional_v,
 };
 
 pub(super) static POLICY: NpmPolicy = NpmPolicy;
@@ -24,6 +24,10 @@ impl EcosystemPolicy for NpmPolicy {
 
     fn versions_equivalent(&self, left: &str, right: &str) -> bool {
         strip_conventional_v(left) == strip_conventional_v(right)
+    }
+
+    fn is_concrete_version(&self, version: &str) -> bool {
+        is_semver_version(version, true)
     }
 
     fn allows_semver_v_prefix(&self) -> bool {

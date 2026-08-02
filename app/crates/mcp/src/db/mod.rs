@@ -14,7 +14,7 @@ use qanvuli_app_commands::common::{
 };
 use qanvuli_core::database::{
     CveDatabase, CveRiskSummary, CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding,
-    PackageQuery, normalize_package_name, versions_equivalent,
+    PackageQuery, cve_state_label, normalize_package_name, versions_equivalent,
 };
 use qanvuli_core::model::RawCveStatusRecord;
 use rmcp::{ErrorData as McpError, model::CallToolResult};
@@ -83,6 +83,62 @@ pub(crate) async fn paged_search_result(
         } else {
             response::summaries_with_detail_compact(cves)
         },
+    }))
+}
+
+pub(crate) async fn paged_recent_updates_result(
+    db: &CveDatabase,
+    mut cves: Vec<CveSummary>,
+    requested_limit: u64,
+    verbosity: Option<&str>,
+    full_description: bool,
+) -> Result<CallToolResult, McpError> {
+    let verbosity = verbosity.unwrap_or(if full_description { "full" } else { "summary" });
+    if !matches!(verbosity, "full" | "summary") {
+        return Err(mcp_error("verbosity must be either 'full' or 'summary'"));
+    }
+    if verbosity == "full" {
+        return paged_search_result(db, cves, requested_limit, full_description).await;
+    }
+
+    let has_more = cves.len() > requested_limit as usize;
+    cves.truncate(requested_limit as usize);
+    let cve_ids = cves
+        .iter()
+        .map(|cve| cve.cve_id.clone())
+        .collect::<Vec<_>>();
+    let mut risk_by_cve = db
+        .cve_risk_summaries(&cve_ids)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?
+        .into_iter()
+        .map(|risk| (risk.cve_id.clone(), risk))
+        .collect::<BTreeMap<_, _>>();
+    let results = cves
+        .into_iter()
+        .map(|cve| {
+            let risk = risk_by_cve.remove(&cve.cve_id);
+            json!({
+                "cve_id": cve.cve_id,
+                "state": cve_state_label(cve.state),
+                "published_at": cve.published_at,
+                "updated_at": cve.updated_at,
+                "title": cve.title,
+                "description_preview": cve.description_en.as_deref().map(|value| response::preview(value, response::DESC_PREVIEW_CHARS)),
+                "max_cvss_version": risk.as_ref().and_then(|risk| risk.max_cvss_version.clone()),
+                "max_cvss_severity": risk.as_ref().and_then(|risk| risk.max_cvss_severity.clone()),
+                "max_cvss_score": risk.as_ref().and_then(|risk| risk.max_cvss_score),
+                "kev_listed": risk.as_ref().is_some_and(|risk| risk.kev_listed),
+                "epss": risk.as_ref().and_then(|risk| risk.epss),
+                "epss_percentile": risk.as_ref().and_then(|risk| risk.epss_percentile),
+                "epss_score_date": risk.as_ref().and_then(|risk| risk.epss_score_date.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    response::tool_result(json!({
+        "has_more": has_more,
+        "verbosity": verbosity,
+        "results": results,
     }))
 }
 
@@ -375,7 +431,7 @@ pub(crate) async fn query_packages_enriched(
     if !matches!(status, "affected" | "all") {
         return Err(mcp_error("status must be either 'affected' or 'all'"));
     }
-    let verbosity = verbosity.unwrap_or("full");
+    let verbosity = verbosity.unwrap_or("summary");
     if !matches!(verbosity, "full" | "summary") {
         return Err(mcp_error("verbosity must be either 'full' or 'summary'"));
     }
@@ -1124,6 +1180,15 @@ pub(crate) async fn apply_updates(
 mod tests {
     use super::*;
 
+    fn call_result_payload(result: CallToolResult) -> (serde_json::Value, usize) {
+        let value = serde_json::to_value(result).unwrap();
+        let text = value
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        (serde_json::from_str(text).unwrap(), text.len())
+    }
+
     #[tokio::test]
     async fn database_status_returns_tool_result_without_panicking() {
         let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
@@ -1132,6 +1197,85 @@ mod tests {
         let result = database_status(&db).await.unwrap();
 
         assert_eq!(result.content.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recent_updates_default_to_compact_risk_triage_with_full_details_available() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"compact recent fixture","descriptions":[{"lang":"en","value":"description for compact recent update testing"}],"problemTypes":[{"descriptions":[{"lang":"en","description":"CWE-79","cweId":"CWE-79"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","vectorString":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"affected":[{"vendor":"example","product":"widget","versions":[{"version":"1.0.0","status":"affected"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+        let cve: CveSummary = db
+            .find_cve_summary("CVE-2099-0101")
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+
+        let compact = paged_recent_updates_result(&db, vec![cve.clone()], 10, None, false)
+            .await
+            .unwrap();
+        let full = paged_recent_updates_result(&db, vec![cve], 10, Some("full"), false)
+            .await
+            .unwrap();
+        let (compact, compact_len) = call_result_payload(compact);
+        let (full, full_len) = call_result_payload(full);
+
+        assert_eq!(compact["verbosity"], "summary");
+        assert_eq!(compact["results"][0]["cve_id"], "CVE-2099-0101");
+        assert_eq!(compact["results"][0]["max_cvss_score"], 9.8);
+        assert_eq!(compact["results"][0]["max_cvss_severity"], "CRITICAL");
+        assert_eq!(compact["results"][0]["kev_listed"], false);
+        assert!(compact["results"][0].get("affected").is_none());
+        assert!(compact["results"][0].get("cwe").is_none());
+        assert!(full["results"][0]["affected"].is_array());
+        assert!(full["results"][0]["cwe"].is_array());
+        assert!(full["results"][0]["cvss"].is_array());
+        assert!(compact_len < full_len);
+    }
+
+    #[tokio::test]
+    async fn package_batches_default_to_decision_preserving_summaries() {
+        use qanvuli_core::database::OsvRawRecord;
+
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-compact-batch","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"example"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+        let package = || crate::args::PackageQueryArgs {
+            ecosystem: "npm".to_owned(),
+            package: "example".to_owned(),
+            version: "1.0.0".to_owned(),
+            purl: Some("pkg:npm/example".to_owned()),
+        };
+
+        let compact = query_packages_enriched(&db, vec![package()], None, false, None, true, false)
+            .await
+            .unwrap();
+        let full =
+            query_packages_enriched(&db, vec![package()], None, false, Some("full"), true, false)
+                .await
+                .unwrap();
+        let (compact, compact_len) = call_result_payload(compact);
+        let (full, full_len) = call_result_payload(full);
+
+        assert_eq!(compact["verbosity"], "summary");
+        assert_eq!(compact["results"][0]["summary"]["vulnerable"], true);
+        assert_eq!(compact["results"][0]["summary"]["needs_review"], false);
+        assert_eq!(
+            compact["results"][0]["summary"]["fixed_versions"][0],
+            "2.0.0"
+        );
+        assert!(compact["results"][0].get("findings").is_none());
+        assert!(full["results"][0]["findings"].is_array());
+        assert!(compact_len < full_len);
     }
 
     #[tokio::test]

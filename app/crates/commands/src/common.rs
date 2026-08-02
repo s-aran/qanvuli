@@ -1204,6 +1204,24 @@ pub fn remove_processed_zip(path: &Path) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CveArchiveOwnership {
+    UserSupplied,
+    Downloaded,
+}
+
+pub(crate) fn cleanup_processed_cve_archive(
+    path: &Path,
+    ownership: CveArchiveOwnership,
+    keep_downloads: bool,
+) -> Result<(), String> {
+    if ownership == CveArchiveOwnership::Downloaded && !keep_downloads {
+        remove_processed_zip(path)
+    } else {
+        Ok(())
+    }
+}
+
 fn latest_local_asset(kind: ReleaseAssetKind) -> Option<PathBuf> {
     let mut candidates = local_assets(kind);
     candidates.pop()
@@ -1959,6 +1977,35 @@ mod tests {
             "2026-07-18T00:00:00+00:00"
         );
         assert!(cve_full_asset_cursor(Path::new("delta.zip")).is_none());
+    }
+
+    #[test]
+    fn cve_archive_cleanup_respects_ownership_and_keep() {
+        let directory = std::env::temp_dir().join(format!(
+            "qanvuli-cve-archive-ownership-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+
+        let local = directory.join("local.zip");
+        std::fs::write(&local, b"local").unwrap();
+        cleanup_processed_cve_archive(&local, CveArchiveOwnership::UserSupplied, false).unwrap();
+        assert!(local.exists());
+
+        let kept_download = directory.join("kept.zip");
+        std::fs::write(&kept_download, b"download").unwrap();
+        cleanup_processed_cve_archive(&kept_download, CveArchiveOwnership::Downloaded, true)
+            .unwrap();
+        assert!(kept_download.exists());
+
+        let removed_download = directory.join("removed.zip");
+        std::fs::write(&removed_download, b"download").unwrap();
+        cleanup_processed_cve_archive(&removed_download, CveArchiveOwnership::Downloaded, false)
+            .unwrap();
+        assert!(!removed_download.exists());
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use super::{
     CveRangeKind, EcosystemPolicy, OsvRange, RangeEvaluation, canonical_single_segment,
-    default_cve_range_kind,
+    default_cve_range_kind, is_semver_version,
 };
 
 pub(super) static POLICY: CargoPolicy = CargoPolicy;
@@ -14,6 +14,10 @@ impl EcosystemPolicy for CargoPolicy {
 
     fn canonical_purl_name(&self, segments: Vec<String>) -> Option<(String, Vec<String>)> {
         canonical_single_segment(self, segments)
+    }
+
+    fn is_concrete_version(&self, version: &str) -> bool {
+        is_semver_version(version, false)
     }
 
     fn evaluate_ecosystem_range(&self, installed: &str, range: &OsvRange) -> RangeEvaluation {

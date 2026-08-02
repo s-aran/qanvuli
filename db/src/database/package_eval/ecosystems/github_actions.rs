@@ -1,4 +1,4 @@
-use super::{EcosystemPolicy, OsvRange, RangeEvaluation, strip_conventional_v};
+use super::{EcosystemPolicy, OsvRange, RangeEvaluation, is_semver_version, strip_conventional_v};
 
 pub(super) static POLICY: GitHubActionsPolicy = GitHubActionsPolicy;
 
@@ -26,6 +26,10 @@ impl EcosystemPolicy for GitHubActionsPolicy {
 
     fn versions_equivalent(&self, left: &str, right: &str) -> bool {
         strip_conventional_v(left) == strip_conventional_v(right)
+    }
+
+    fn is_concrete_version(&self, version: &str) -> bool {
+        is_semver_version(version, true)
     }
 
     fn allows_semver_v_prefix(&self) -> bool {

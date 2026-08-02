@@ -1,7 +1,8 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_database, connect_database, print_json};
 use qanvuli_core::database::{
     CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
-    ecosystem_identity_key, normalize_package_name, parse_package_purl,
+    ecosystem_identity_key, is_concrete_package_version, normalize_package_name,
+    parse_package_purl,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,7 +75,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             let Some(version) = package_ref
                 .version
                 .as_deref()
-                .filter(|value| is_concrete_version(value))
+                .filter(|value| is_concrete_package_version(&package_ref.ecosystem, value))
             else {
                 continue;
             };
@@ -285,7 +286,7 @@ async fn search_package(
             });
             continue;
         };
-        if !is_concrete_version(version) {
+        if !is_concrete_package_version(&package_ref.ecosystem, version) {
             unresolved_versions.push(UnresolvedVersion {
                 package: package.name.clone(),
                 version: version.to_owned(),
@@ -508,15 +509,26 @@ fn load_sbom_packages_from_slice(json: &mut [u8]) -> Result<Vec<SbomPackage>, St
     let mut packages = Vec::new();
     if let Some(document) = sbom.sbom {
         packages.extend(document.packages);
+        append_cyclonedx_metadata_component(&mut packages, document.metadata);
         append_cyclonedx_components(&mut packages, document.components);
     }
     packages.extend(sbom.packages);
+    append_cyclonedx_metadata_component(&mut packages, sbom.metadata);
     append_cyclonedx_components(&mut packages, sbom.components);
 
     Ok(packages
         .into_iter()
         .filter(|package| !package.name.is_empty())
         .collect())
+}
+
+fn append_cyclonedx_metadata_component(
+    packages: &mut Vec<SbomPackage>,
+    metadata: Option<CycloneDxMetadata>,
+) {
+    if let Some(component) = metadata.and_then(|metadata| metadata.component) {
+        append_cyclonedx_components(packages, vec![component]);
+    }
 }
 
 fn append_cyclonedx_components(
@@ -568,6 +580,7 @@ struct GitHubSbom {
     packages: Vec<SbomPackage>,
     #[serde(default)]
     components: Vec<CycloneDxComponent>,
+    metadata: Option<CycloneDxMetadata>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -576,6 +589,12 @@ struct SbomDocument {
     packages: Vec<SbomPackage>,
     #[serde(default)]
     components: Vec<CycloneDxComponent>,
+    metadata: Option<CycloneDxMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CycloneDxMetadata {
+    component: Option<CycloneDxComponent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -728,18 +747,6 @@ struct UnresolvedVersion {
     version: String,
     matched_purl: String,
     reason: String,
-}
-
-/// Constraints such as `>= 2.2.1,< 3` are not installed versions and must not
-/// be sent through the exact-version OSV matcher.
-fn is_concrete_version(version: &str) -> bool {
-    !version.is_empty()
-        && !version.chars().any(|character| {
-            matches!(
-                character,
-                '<' | '>' | '=' | '!' | '~' | '^' | '*' | ',' | ' ' | '|'
-            )
-        })
 }
 
 fn version_evaluation_needs_review(status: &str) -> bool {
@@ -1031,10 +1038,10 @@ mod tests {
 
     #[test]
     fn distinguishes_concrete_versions_from_constraints() {
-        assert!(is_concrete_version("2.10"));
-        assert!(is_concrete_version("7.25.9"));
-        assert!(!is_concrete_version(">= 2.2.1,< 3"));
-        assert!(!is_concrete_version(">= 0.9.1"));
+        assert!(is_concrete_package_version("PyPI", "1!2.0"));
+        assert!(is_concrete_package_version("npm", "7.25.9"));
+        assert!(!is_concrete_package_version("PyPI", "!=2.0"));
+        assert!(!is_concrete_package_version("npm", ">=2.2.1,<3"));
     }
 
     #[test]
@@ -1225,6 +1232,96 @@ mod tests {
                 .map(|package| package.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["application", "dependency", "transitive"]
+        );
+    }
+
+    #[test]
+    fn loads_cyclonedx_metadata_root_and_unknown_fields() {
+        let mut json = br#"{
+            "bomFormat": "CycloneDX",
+            "specVersion": "1.6",
+            "unknownRootField": {"harmless": true},
+            "metadata": {
+                "unknownMetadataField": [1, 2, 3],
+                "component": {
+                    "name": "application",
+                    "version": "1.0.0",
+                    "purl": "pkg:npm/application@1.0.0",
+                    "unknownComponentField": "ignored"
+                }
+            }
+        }"#
+        .to_vec();
+
+        let packages = load_sbom_packages_from_slice(&mut json).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "application");
+    }
+
+    #[test]
+    fn loads_nested_components_below_cyclonedx_metadata_root() {
+        let mut json = br#"{
+            "bomFormat": "CycloneDX",
+            "metadata": {
+                "component": {
+                    "name": "application",
+                    "version": "1.0.0",
+                    "purl": "pkg:npm/application@1.0.0",
+                    "components": [{
+                        "name": "dependency",
+                        "version": "2.0.0",
+                        "purl": "pkg:npm/dependency@2.0.0"
+                    }]
+                }
+            }
+        }"#
+        .to_vec();
+
+        let packages = load_sbom_packages_from_slice(&mut json).unwrap();
+        assert_eq!(
+            packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["application", "dependency"]
+        );
+    }
+
+    #[test]
+    fn cyclonedx_metadata_and_top_level_duplicates_share_one_query() {
+        let mut json = br#"{
+            "bomFormat": "CycloneDX",
+            "metadata": {
+                "component": {
+                    "name": "application",
+                    "version": "1.0.0",
+                    "purl": "pkg:npm/application@1.0.0"
+                }
+            },
+            "components": [{
+                "name": "application duplicate",
+                "version": "1.0.0",
+                "purl": "pkg:npm/application@1.0.0"
+            }]
+        }"#
+        .to_vec();
+
+        let packages = load_sbom_packages_from_slice(&mut json).unwrap();
+        assert_eq!(packages.len(), 2, "component_count");
+        let packages = deduplicate_sbom_packages(packages);
+        assert_eq!(packages.len(), 1, "unique_component_count");
+        assert_eq!(
+            packages
+                .iter()
+                .flat_map(SbomPackage::package_refs)
+                .filter(|package_ref| {
+                    package_ref.version.as_deref().is_some_and(|version| {
+                        is_concrete_package_version(&package_ref.ecosystem, version)
+                    })
+                })
+                .count(),
+            1,
+            "package_query_count"
         );
     }
 
