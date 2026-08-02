@@ -2232,7 +2232,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "indicatif",
@@ -2247,7 +2247,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-commands"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "chrono",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qanvuli-app-commands",
  "qanvuli-core",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-tui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-collector"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-db"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2361,7 +2361,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-models"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2380,7 +2380,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-utils"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
