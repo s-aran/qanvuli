@@ -2,7 +2,11 @@
 
 use super::{
     maintenance::rebuild_cve_search,
-    package_eval::{CveVersionRange, OsvRange, evaluate_cve_version_ranges, evaluate_version},
+    package_eval::{
+        CveVersionChange, CveVersionRange, OsvRange, ecosystem_identity_key,
+        evaluate_cve_version_ranges, evaluate_version, normalize_package_name,
+        package_identity_from_purl, package_identity_purl, parse_package_purl, versions_equivalent,
+    },
     schema,
     search::fts_query,
     timestamps::{canonical_cve_utc, canonical_utc},
@@ -32,6 +36,173 @@ const PACKAGE_ID_BATCH_SIZE: usize = 2_000;
 const OSV_ID_BATCH_SIZE: usize = 2_000;
 /// Maximum number of OSV IDs used by one advisory-date statement.
 const OSV_DATE_BATCH_SIZE: usize = 2_000;
+/// Builds SQLite-side package normalization for already-imported rows.
+/// Repeating `replace('--', '-')` 16 times collapses separator runs up to
+/// 65,536 characters, well beyond practical package-name limits.
+pub(super) fn sql_normalized_package_name(name: &str, ecosystem: &str) -> String {
+    let mut pypi = format!("replace(replace(lower({name}), '_', '-'), '.', '-')");
+    for _ in 0..16 {
+        pypi = format!("replace({pypi}, '--', '-')");
+    }
+    let pub_name =
+        format!("replace(replace(replace(lower({name}), '-', '_'), '.', '_'), ' ', '_')");
+    format!(
+        "CASE lower({ecosystem}) WHEN 'pypi' THEN {pypi} WHEN 'nuget' THEN lower({name}) WHEN 'github actions' THEN lower({name}) WHEN 'pub' THEN {pub_name} ELSE {name} END"
+    )
+}
+
+fn sql_ecosystem_matches(left: &str, right: &str) -> String {
+    // Ecosystem names are ASCII case-insensitive, but an OSV ecosystem suffix
+    // can contain a Maven repository URL whose path is case-sensitive.  Build
+    // the same key as `ecosystem_identity_key`: lowercase only the base name.
+    let left_key = format!(
+        "CASE WHEN instr({left}, ':')=0 THEN lower({left}) ELSE lower(substr({left}, 1, instr({left}, ':')-1)) || ':' || substr({left}, instr({left}, ':')+1) END"
+    );
+    format!("({left_key}={right} COLLATE BINARY)")
+}
+
+fn canonical_stored_ecosystem(ecosystem: &str) -> String {
+    let key = ecosystem_identity_key(ecosystem);
+    if key == "maven" {
+        "Maven".to_owned()
+    } else if let Some(repository) = key.strip_prefix("maven:") {
+        format!("Maven:{repository}")
+    } else {
+        ecosystem.to_owned()
+    }
+}
+
+fn canonical_imported_package_ecosystem(
+    source_ecosystem: Option<&str>,
+    purl_ecosystem: Option<&str>,
+) -> Option<String> {
+    match source_ecosystem {
+        Some(source) => {
+            let source_key = ecosystem_identity_key(source);
+            let purl_key = purl_ecosystem.map(ecosystem_identity_key);
+            // OSV uses a scoped Maven ecosystem for non-Central repositories,
+            // while purl carries the same scope as `repository_url`. Prefer
+            // that more specific locator when the feed's ecosystem is the
+            // otherwise-unscoped Maven value.
+            if source_key == "maven"
+                && purl_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with("maven:"))
+            {
+                purl_ecosystem.map(canonical_stored_ecosystem)
+            } else {
+                Some(canonical_stored_ecosystem(source))
+            }
+        }
+        None => purl_ecosystem.map(canonical_stored_ecosystem),
+    }
+}
+
+fn purl_base_identity(purl: &str) -> &str {
+    let qualifier = purl.find('?').unwrap_or(purl.len());
+    let subpath = purl.find('#').unwrap_or(purl.len());
+    &purl[..qualifier.min(subpath)]
+}
+
+fn package_queries_json(packages: &[PackageQuery]) -> Result<String, sqlx::Error> {
+    let input = packages
+        .iter()
+        .map(|package| {
+            serde_json::json!({
+                "ecosystem": package.ecosystem,
+                "ecosystem_key": ecosystem_identity_key(&package.ecosystem),
+                "package": package.package,
+                "version": package.version,
+                "purl": package.purl,
+                "purl_base": package.purl.as_deref().map(purl_base_identity),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&input).map_err(|error| {
+        sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
+    })
+}
+
+fn validate_package_query_identity(
+    ecosystem: &str,
+    package: &str,
+    purl: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    let Some(purl) = purl else {
+        return Ok(());
+    };
+    let Some((purl_ecosystem, purl_package)) = package_identity_from_purl(purl) else {
+        return Err(sqlx::Error::Protocol(
+            "purl is malformed or uses an unsupported package type".to_owned(),
+        ));
+    };
+    let ecosystems_match =
+        ecosystem_identity_key(ecosystem) == ecosystem_identity_key(&purl_ecosystem);
+    if !ecosystems_match
+        || normalize_package_name(ecosystem, package)
+            != normalize_package_name(&purl_ecosystem, &purl_package)
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "package identity `{ecosystem}:{package}` conflicts with purl `{purl}`"
+        )));
+    }
+    Ok(())
+}
+
+fn consolidate_package_findings(findings: Vec<EnrichedFinding>) -> Vec<EnrichedFinding> {
+    let mut indexes = BTreeMap::<(String, String), usize>::new();
+    let mut consolidated: Vec<EnrichedFinding> = Vec::new();
+    for finding in findings {
+        let key = (finding.source.clone(), finding.primary_id.clone());
+        let Some(index) = indexes.get(&key).copied() else {
+            indexes.insert(key, consolidated.len());
+            consolidated.push(finding);
+            continue;
+        };
+        let existing = &mut consolidated[index];
+        if package_status_rank(&finding.affected.status)
+            > package_status_rank(&existing.affected.status)
+        {
+            existing.affected = finding.affected.clone();
+            existing.priority_signals.affected_confidence = finding.affected.confidence.clone();
+        }
+        for cve_id in finding.cve_ids {
+            if !existing.cve_ids.contains(&cve_id) {
+                existing.cve_ids.push(cve_id);
+            }
+        }
+        for alias in finding.aliases {
+            if !existing.aliases.contains(&alias) {
+                existing.aliases.push(alias);
+            }
+        }
+        for fixed_version in finding.fixed_versions {
+            if !existing.fixed_versions.contains(&fixed_version) {
+                existing.fixed_versions.push(fixed_version);
+            }
+        }
+        existing.priority_signals.has_fixed_version |= finding.priority_signals.has_fixed_version;
+        existing.priority_signals.known_exploited |= finding.priority_signals.known_exploited;
+        existing.priority_signals.epss_percentile = match (
+            existing.priority_signals.epss_percentile,
+            finding.priority_signals.epss_percentile,
+        ) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (left, right) => left.or(right),
+        };
+        existing.evidence.extend(finding.evidence);
+    }
+    consolidated
+}
+
+fn package_status_rank(status: &str) -> u8 {
+    match status {
+        "affected" => 3,
+        "unknown" => 2,
+        "unsupported_version_scheme" => 1,
+        _ => 0,
+    }
+}
 /// Above this FTS candidate count, walking the published-date index can stop at the requested
 /// page and is substantially cheaper than sorting every FTS match.
 const FTS_PUBLISHED_INDEX_MIN_CANDIDATES: i64 = 128;
@@ -63,32 +234,99 @@ type BatchedOsvRow = (
     Option<String>,
     Option<String>,
 );
-type CveAffectedVersionTuple = (
+type CvePackageCandidate = (
+    i64,
+    String,
     Option<String>,
-    Option<String>,
+    String,
     Option<String>,
     Option<String>,
     Option<String>,
 );
-const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
-
-/// Applies PEP 503 normalization to published and queried package names.
-fn normalized_package_name(name: &str) -> String {
-    let mut normalized = String::with_capacity(name.len());
-    let mut previous_separator = false;
-    for character in name.chars() {
-        if matches!(character, '-' | '_' | '.') {
-            if !previous_separator {
-                normalized.push('-');
-            }
-            previous_separator = true;
-        } else {
-            normalized.push(character.to_ascii_lowercase());
-            previous_separator = false;
-        }
-    }
-    normalized
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct CveStoredVersion {
+    pub(crate) version: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) version_type: Option<String>,
+    pub(crate) less_than: Option<String>,
+    pub(crate) less_than_or_equal: Option<String>,
+    pub(crate) changes: Vec<CveStoredVersionChange>,
 }
+
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub(crate) struct CveStoredVersionChange {
+    pub(crate) at: String,
+    pub(crate) status: String,
+}
+
+/// Reads both the current object representation and the legacy five-element
+/// tuple representation already present in existing databases.
+pub(crate) fn cve_stored_versions(raw_json: &str) -> Result<Vec<CveStoredVersion>, String> {
+    let values = serde_json::from_str::<Vec<Value>>(raw_json).map_err(|error| error.to_string())?;
+    values
+        .into_iter()
+        .map(|value| {
+            if let Some(object) = value.as_object() {
+                let changes = object
+                    .get("changes")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|change| {
+                        Some(CveStoredVersionChange {
+                            at: change.get("at")?.as_str()?.to_owned(),
+                            status: change.get("status")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect();
+                return Ok(CveStoredVersion {
+                    version: object
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    status: object
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    version_type: object
+                        .get("version_type")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    less_than: object
+                        .get("less_than")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    less_than_or_equal: object
+                        .get("less_than_or_equal")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    changes,
+                });
+            }
+            let Some(values) = value.as_array() else {
+                return Err("affected version is neither an object nor a tuple".to_owned());
+            };
+            if values.len() < 5 {
+                return Err("affected version tuple has fewer than five fields".to_owned());
+            }
+            let string_at = |index: usize| {
+                values
+                    .get(index)
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            };
+            Ok(CveStoredVersion {
+                version: string_at(0),
+                status: string_at(1),
+                version_type: string_at(2),
+                less_than: string_at(3),
+                less_than_or_equal: string_at(4),
+                changes: Vec::new(),
+            })
+        })
+        .collect()
+}
+const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum CvePackageIdentity {
@@ -98,6 +336,60 @@ enum CvePackageIdentity {
     Ambiguous,
     /// The collection positively identifies a different package ecosystem or product catalog.
     Excluded,
+}
+
+fn collection_url_host(collection_url: &str) -> Option<&str> {
+    let collection_url = collection_url.trim();
+    let (scheme, remainder) = collection_url.split_once("://")?;
+    let mut scheme_chars = scheme.chars();
+    if !scheme_chars.next()?.is_ascii_alphabetic()
+        || !scheme_chars.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+        })
+    {
+        return None;
+    }
+
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_and_port.is_empty() || host_and_port.starts_with('[') {
+        return None;
+    }
+
+    let host = if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        if host.contains(':') || port.parse::<u16>().is_err() {
+            return None;
+        }
+        host
+    } else {
+        host_and_port
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || !host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+    {
+        return None;
+    }
+    Some(host)
+}
+
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host.eq_ignore_ascii_case(domain)
+        || host
+            .get(..host.len().saturating_sub(domain.len()))
+            .is_some_and(|prefix| {
+                prefix.len() > 1
+                    && prefix.ends_with('.')
+                    && host[prefix.len()..].eq_ignore_ascii_case(domain)
+            })
 }
 
 fn cve_package_identity(
@@ -112,20 +404,26 @@ fn cve_package_identity(
         // presenting it as a verified package vulnerability.
         return CvePackageIdentity::Ambiguous;
     };
-    let collection_url = collection_url.to_ascii_lowercase();
-    let ecosystem_matches = match ecosystem.to_ascii_lowercase().as_str() {
-        "pypi" => collection_url.contains("pypi.org"),
+    let Some(collection_host) = collection_url_host(collection_url) else {
+        return CvePackageIdentity::Excluded;
+    };
+    let ecosystem_base = ecosystem
+        .split_once(':')
+        .map_or(ecosystem, |(base, _)| base);
+    let ecosystem_matches = match ecosystem_base.to_ascii_lowercase().as_str() {
+        "pypi" => host_matches_domain(collection_host, "pypi.org"),
         "npm" => {
-            collection_url.contains("npmjs.com") || collection_url.contains("registry.npmjs.org")
+            host_matches_domain(collection_host, "npmjs.com")
+                || host_matches_domain(collection_host, "registry.npmjs.org")
         }
-        "crates.io" => collection_url.contains("crates.io"),
+        "crates.io" => host_matches_domain(collection_host, "crates.io"),
         "maven" => {
-            collection_url.contains("maven.apache.org")
-                || collection_url.contains("repo.maven.apache.org")
+            host_matches_domain(collection_host, "maven.apache.org")
+                || host_matches_domain(collection_host, "repo.maven.apache.org")
         }
-        "rubygems" => collection_url.contains("rubygems.org"),
-        "packagist" => collection_url.contains("packagist.org"),
-        "nuget" => collection_url.contains("nuget.org"),
+        "rubygems" => host_matches_domain(collection_host, "rubygems.org"),
+        "packagist" => host_matches_domain(collection_host, "packagist.org"),
+        "nuget" => host_matches_domain(collection_host, "nuget.org"),
         _ => false,
     };
     if ecosystem_matches {
@@ -541,17 +839,30 @@ impl SqlxDatabase {
         package: &str,
         purl: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
+        validate_package_query_identity(ecosystem, package, purl)?;
         let ecosystem = ecosystem.to_owned();
-        let package = normalized_package_name(package);
-        let purl = purl.map(str::to_owned);
+        let ecosystem_key = ecosystem_identity_key(&ecosystem);
+        let package = normalize_package_name(&ecosystem, package);
+        let purl = purl.map(package_identity_purl);
+        let purl_base = purl.as_deref().map(purl_base_identity).map(str::to_owned);
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    let exists: i64 = sqlx::query_scalar(
-                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=? OR (? IS NOT NULL AND package.purl=?)))",
-                    )
-                    .bind(ecosystem)
+                    let normalized_name =
+                        sql_normalized_package_name("package.package_name", "?");
+                    let ecosystem_matches = sql_ecosystem_matches("package.ecosystem", "?");
+                    let statement = format!(
+                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=? AND (? IS NULL OR package.purl IS NULL OR package.purl=? OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=?))) OR (? IS NOT NULL AND package.purl=?)))"
+                    );
+                    // The statement shape is generated solely from fixed local
+                    // SQL fragments; all caller data remains bound parameters.
+                    let exists: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+                    .bind(&ecosystem_key)
+                    .bind(&ecosystem)
                     .bind(package)
+                    .bind(&purl)
+                    .bind(&purl)
+                    .bind(&purl_base)
                     .bind(&purl)
                     .bind(&purl)
                     .fetch_one(connection)
@@ -572,17 +883,29 @@ impl SqlxDatabase {
         }
         let mut packages = packages.to_vec();
         for package in &mut packages {
-            package.package = normalized_package_name(&package.package);
+            validate_package_query_identity(
+                &package.ecosystem,
+                &package.package,
+                package.purl.as_deref(),
+            )?;
+            package.package = normalize_package_name(&package.ecosystem, &package.package);
+            package.purl = package.purl.as_deref().map(package_identity_purl);
         }
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    let input = serde_json::to_string(&packages).map_err(|error| {
-                        sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
-                    })?;
-                    let rows: Vec<(i64, i64)> = sqlx::query_as(
-                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=input.ecosystem COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=input.package_name OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index",
-                    )
+                    let input = package_queries_json(&packages)?;
+                    let normalized_name = sql_normalized_package_name(
+                        "package.package_name",
+                        "input.ecosystem",
+                    );
+                    let ecosystem_matches =
+                        sql_ecosystem_matches("package.ecosystem", "input.ecosystem_key");
+                    let statement = format!(
+                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.ecosystem_key') AS ecosystem_key, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl, json_extract(value, '$.purl_base') AS purl_base FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=input.package_name AND (input.purl IS NULL OR package.purl IS NULL OR package.purl=input.purl OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=input.purl_base))) OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index"
+                    );
+                    let rows: Vec<(i64, i64)> =
+                        sqlx::query_as(sqlx::AssertSqlSafe(statement))
                     .bind(input)
                     .fetch_all(connection)
                     .await?;
@@ -611,19 +934,29 @@ impl SqlxDatabase {
         }
         let mut packages = packages.to_vec();
         for package in &mut packages {
-            package.package = normalized_package_name(&package.package);
+            validate_package_query_identity(
+                &package.ecosystem,
+                &package.package,
+                package.purl.as_deref(),
+            )?;
+            package.package = normalize_package_name(&package.ecosystem, &package.package);
+            package.purl = package.purl.as_deref().map(package_identity_purl);
         }
         self.writer.with_connection(|connection| Box::pin(async move {
             let mut output = vec![Vec::new(); packages.len()];
             for (query_batch_index, package_batch) in
                 packages.chunks(PACKAGE_QUERY_BATCH_SIZE).enumerate()
             {
-                let input_json = serde_json::to_string(package_batch).map_err(|error| {
-                    sqlx::Error::Protocol(format!("failed to encode package queries: {error}"))
-                })?;
-                let candidates: Vec<(i64, i64, String)> = sqlx::query_as(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON package.ecosystem=input.ecosystem COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=input.package_name OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id",
-                )
+                let input_json = package_queries_json(package_batch)?;
+                let normalized_name =
+                    sql_normalized_package_name("package.package_name", "input.ecosystem");
+                let ecosystem_matches =
+                    sql_ecosystem_matches("package.ecosystem", "input.ecosystem_key");
+                let candidate_statement = format!(
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.ecosystem_key') AS ecosystem_key, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl, json_extract(value, '$.purl_base') AS purl_base FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON {ecosystem_matches} AND (({normalized_name}=input.package_name AND (input.purl IS NULL OR package.purl IS NULL OR package.purl=input.purl OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=input.purl_base))) OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id"
+                );
+                let candidates: Vec<(i64, i64, String)> =
+                    sqlx::query_as(sqlx::AssertSqlSafe(candidate_statement))
                 .bind(&input_json)
                 .fetch_all(&mut *connection)
                 .await?;
@@ -697,23 +1030,29 @@ impl SqlxDatabase {
                     let query = packages.get(output_index).ok_or_else(|| {
                         sqlx::Error::Protocol("package query index is out of bounds".to_owned())
                     })?;
-                    let matched = if versions_by_package
+                    let explicit_versions = versions_by_package.get(&package_id);
+                    let ranges = ranges_by_package
                         .get(&package_id)
-                        .is_some_and(|versions| versions.contains(&query.version))
-                    {
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let matched = if explicit_versions.is_some_and(|versions| {
+                        versions.iter().any(|version| {
+                            versions_equivalent(&query.ecosystem, version, &query.version)
+                        })
+                    }) {
                         super::package_eval::VersionMatch {
                             status: "affected".to_owned(),
                             confidence: "high".to_owned(),
                         }
+                    } else if explicit_versions.is_some_and(|versions| !versions.is_empty())
+                        && ranges.is_empty()
+                    {
+                        super::package_eval::VersionMatch {
+                            status: "not_affected".to_owned(),
+                            confidence: "high".to_owned(),
+                        }
                     } else {
-                        evaluate_version(
-                            &query.ecosystem,
-                            &query.version,
-                            ranges_by_package
-                                .get(&package_id)
-                                .map(Vec::as_slice)
-                                .unwrap_or_default(),
-                        )
+                        evaluate_version(&query.ecosystem, &query.version, ranges)
                     };
                     if matched.status == "not_affected" {
                         continue;
@@ -737,9 +1076,14 @@ impl SqlxDatabase {
                 // CVE List supplements OSV for package advisories that have not
                 // been mirrored into OSV. package_name is authoritative when it
                 // exists; product is the documented fallback for older records.
-                let cve_candidates: Vec<(i64, String, Option<String>, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON replace(replace(lower(COALESCE(NULLIF(affected.package_name, ''), affected.product)), '_', '-'), '.', '-')=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id",
-                )
+                let normalized_cve_name = sql_normalized_package_name(
+                    "COALESCE(NULLIF(affected.package_name, ''), affected.product)",
+                    "input.ecosystem",
+                );
+                let cve_statement = format!(
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON {normalized_cve_name}=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id"
+                );
+                let cve_candidates: Vec<CvePackageCandidate> = sqlx::query_as(sqlx::AssertSqlSafe(cve_statement))
                 .bind(&input_json)
                 .fetch_all(&mut *connection)
                 .await?;
@@ -760,16 +1104,25 @@ impl SqlxDatabase {
                     if identity == CvePackageIdentity::Excluded {
                         continue;
                     }
-                    let versions = serde_json::from_str::<Vec<CveAffectedVersionTuple>>(&raw_json)
+                    let versions = cve_stored_versions(&raw_json)
                         .map_err(|error| {
                             sqlx::Error::Protocol(format!("failed to parse cve_affected.raw_json for {cve_id}: {error}"))
                         })?
                         .into_iter()
-                        .map(|(version, status, _version_type, less_than, less_than_or_equal)| CveVersionRange {
-                            version,
-                            status,
-                            less_than,
-                            less_than_or_equal,
+                        .map(|version| CveVersionRange {
+                            version: version.version,
+                            status: version.status,
+                            version_type: version.version_type,
+                            less_than: version.less_than,
+                            less_than_or_equal: version.less_than_or_equal,
+                            changes: version
+                                .changes
+                                .into_iter()
+                                .map(|change| CveVersionChange {
+                                    at: change.at,
+                                    status: change.status,
+                                })
+                                .collect(),
                         })
                         .collect::<Vec<_>>();
                     let mut matched = evaluate_cve_version_ranges(
@@ -778,7 +1131,9 @@ impl SqlxDatabase {
                         default_status.as_deref(),
                         &versions,
                     );
-                    if identity == CvePackageIdentity::Ambiguous && matched.status == "affected" {
+                    if identity == CvePackageIdentity::Ambiguous
+                        && matched.status != "not_affected"
+                    {
                         matched.status = "unknown".to_owned();
                         matched.confidence = "low".to_owned();
                     }
@@ -834,6 +1189,9 @@ impl SqlxDatabase {
                         evidence_status: "not_queried".to_owned(),
                     });
                 }
+            }
+            for findings in &mut output {
+                *findings = consolidate_package_findings(std::mem::take(findings));
             }
             Ok(output)
         })).await
@@ -1338,10 +1696,16 @@ impl SqlxDatabase {
             let affected_rows: Vec<AffectedRow> = sqlx::query_as("SELECT id, vendor, product, package_name, raw_json FROM cve_affected WHERE cve_db_id=? ORDER BY id").bind(id).fetch_all(&mut *connection).await?;
             let mut affected = Vec::with_capacity(affected_rows.len());
             for (affected_index, (_affected_id, vendor, product, package_name, raw_json)) in affected_rows.into_iter().enumerate() {
-                let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
+                let versions = cve_stored_versions(&raw_json)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(version, status, version_type, less_than, less_than_or_equal)| SqlxAffectedVersion { version, status, version_type, less_than, less_than_or_equal })
+                    .map(|version| SqlxAffectedVersion {
+                        version: version.version,
+                        status: version.status,
+                        version_type: version.version_type,
+                        less_than: version.less_than,
+                        less_than_or_equal: version.less_than_or_equal,
+                    })
                     .collect();
                 let description = affected_descriptions.get(affected_index).cloned().flatten();
                 affected.push(SqlxAffected { vendor, product, package_name, description, versions });
@@ -1421,9 +1785,15 @@ impl SqlxDatabase {
                     .bind(&parent_ids_json).fetch_all(&mut *connection).await?;
             let mut affected_indexes = BTreeMap::<i64, usize>::new();
             for (id, vendor, product, package_name, raw_json) in affected_rows {
-                let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
+                let versions = cve_stored_versions(&raw_json)
                     .unwrap_or_default().into_iter()
-                    .map(|(version, status, version_type, less_than, less_than_or_equal)| SqlxAffectedVersion { version, status, version_type, less_than, less_than_or_equal })
+                    .map(|version| SqlxAffectedVersion {
+                        version: version.version,
+                        status: version.status,
+                        version_type: version.version_type,
+                        less_than: version.less_than,
+                        less_than_or_equal: version.less_than_or_equal,
+                    })
                     .collect();
                 if let Some(detail) = details.get_mut(&id) {
                     let affected_index = affected_indexes.entry(id).or_default();
@@ -1596,13 +1966,20 @@ impl SqlxDatabase {
         version: &str,
         purl: Option<&str>,
     ) -> Result<Vec<SqlxPackageFinding>, sqlx::Error> {
+        validate_package_query_identity(ecosystem, package_name, purl)?;
         let ecosystem = ecosystem.to_owned();
-        let package_name = normalized_package_name(package_name);
+        let ecosystem_key = ecosystem_identity_key(&ecosystem);
+        let package_name = normalize_package_name(&ecosystem, package_name);
         let version = version.to_owned();
-        let purl = purl.map(str::to_owned);
+        let purl = purl.map(package_identity_purl);
+        let purl_base = purl.as_deref().map(purl_base_identity).map(str::to_owned);
         self.writer.with_connection(|connection| Box::pin(async move {
-            let packages: Vec<(i64, String)> = sqlx::query_as("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND package.ecosystem=? COLLATE NOCASE AND (replace(replace(lower(package.package_name), '_', '-'), '.', '-')=? OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id")
-                .bind(&ecosystem).bind(&package_name).bind(&purl).bind(&purl).fetch_all(&mut *connection).await?;
+            let normalized_name = sql_normalized_package_name("package.package_name", "?");
+            let ecosystem_matches = sql_ecosystem_matches("package.ecosystem", "?");
+            let statement = format!("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=? AND (? IS NULL OR package.purl IS NULL OR package.purl=? OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=?))) OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id");
+            let packages: Vec<(i64, String)> =
+                sqlx::query_as(sqlx::AssertSqlSafe(statement))
+                .bind(&ecosystem_key).bind(&ecosystem).bind(&package_name).bind(&purl).bind(&purl).bind(&purl_base).bind(&purl).bind(&purl).fetch_all(&mut *connection).await?;
             let package_ids_json = serde_json::to_string(&packages.iter().map(|(id, _)| id).collect::<Vec<_>>())
                 .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}")))?;
             let osv_ids_json = serde_json::to_string(&packages.iter().map(|(_, id)| id).collect::<BTreeSet<_>>())
@@ -1619,8 +1996,17 @@ impl SqlxDatabase {
                 }
                 ranges.last_mut().expect("range was inserted").events.push((event_type, value));
             }
-            let explicit_versions: BTreeSet<i64> = sqlx::query_scalar("SELECT affected_package_id FROM osv_versions WHERE version=? AND affected_package_id IN (SELECT value FROM json_each(?))")
-                .bind(&version).bind(&package_ids_json).fetch_all(&mut *connection).await?.into_iter().collect();
+            let explicit_version_rows: Vec<(i64, String)> = sqlx::query_as("SELECT affected_package_id, version FROM osv_versions WHERE affected_package_id IN (SELECT value FROM json_each(?))")
+                .bind(&package_ids_json).fetch_all(&mut *connection).await?;
+            let explicit_version_packages = explicit_version_rows
+                .iter()
+                .map(|(package_id, _)| *package_id)
+                .collect::<BTreeSet<_>>();
+            let explicit_versions = explicit_version_rows
+                .into_iter()
+                .filter(|(_, candidate)| versions_equivalent(&ecosystem, candidate, &version))
+                .map(|(package_id, _)| package_id)
+                .collect::<BTreeSet<_>>();
             let alias_rows: Vec<(String, String)> = sqlx::query_as("SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id")
                 .bind(&osv_ids_json).fetch_all(&mut *connection).await?;
             let mut aliases_by_osv = BTreeMap::<String, Vec<String>>::new();
@@ -1633,6 +2019,11 @@ impl SqlxDatabase {
                 let matched = if explicit_versions.contains(&package_id) {
                     super::package_eval::VersionMatch {
                         status: "affected".to_owned(),
+                        confidence: "high".to_owned(),
+                    }
+                } else if explicit_version_packages.contains(&package_id) && ranges.is_empty() {
+                    super::package_eval::VersionMatch {
+                        status: "not_affected".to_owned(),
                         confidence: "high".to_owned(),
                     }
                 } else {
@@ -2055,12 +2446,33 @@ impl SqlxDatabase {
                     }
                     for (affected_order, affected) in advisory.affected.iter().enumerate() {
                         let package = affected.package.as_ref();
+                        let source_ecosystem =
+                            package.and_then(|value| value.ecosystem.as_deref());
+                        let parsed_package_purl = package
+                            .and_then(|value| value.purl.as_deref())
+                            .and_then(parse_package_purl);
+                        let package_ecosystem = canonical_imported_package_ecosystem(
+                            source_ecosystem,
+                            parsed_package_purl
+                                .as_ref()
+                                .map(|parsed| parsed.ecosystem.as_str()),
+                        );
+                        let package_name = package
+                            .and_then(|value| value.name.as_deref())
+                            .map(|name| {
+                                package_ecosystem.as_deref().or(source_ecosystem).map_or_else(
+                                    || name.to_owned(),
+                                    |ecosystem| normalize_package_name(ecosystem, name),
+                                )
+                            });
+                        let package_purl =
+                            parsed_package_purl.map(|parsed| parsed.identity_purl);
                         sqlx::query("INSERT INTO osv_affected_packages (osv_id, affected_order, ecosystem, package_name, purl) VALUES (?, ?, ?, ?, ?)")
                             .bind(&advisory.id)
                             .bind(i64::try_from(affected_order).unwrap_or(i64::MAX))
-                            .bind(package.and_then(|value| value.ecosystem.as_deref()))
-                            .bind(package.and_then(|value| value.name.as_deref()))
-                            .bind(package.and_then(|value| value.purl.as_deref()))
+                            .bind(package_ecosystem)
+                            .bind(package_name)
+                            .bind(package_purl)
                             .execute(&mut *transaction).await?;
                         let package_id: i64 = sqlx::query_scalar("SELECT last_insert_rowid()").fetch_one(&mut *transaction).await?;
                         for (range_order, range) in affected.ranges.iter().enumerate() {
@@ -2353,12 +2765,32 @@ impl SqlxDatabase {
         }
         for (affected_order, affected) in advisory.affected.iter().enumerate() {
             let package = affected.package.as_ref();
+            let source_ecosystem = package.and_then(|value| value.ecosystem.as_deref());
+            let parsed_package_purl = package
+                .and_then(|value| value.purl.as_deref())
+                .and_then(parse_package_purl);
+            let package_ecosystem = canonical_imported_package_ecosystem(
+                source_ecosystem,
+                parsed_package_purl
+                    .as_ref()
+                    .map(|parsed| parsed.ecosystem.as_str()),
+            );
+            let package_name = package.and_then(|value| value.name.as_deref()).map(|name| {
+                package_ecosystem
+                    .as_deref()
+                    .or(source_ecosystem)
+                    .map_or_else(
+                        || name.to_owned(),
+                        |ecosystem| normalize_package_name(ecosystem, name),
+                    )
+            });
+            let package_purl = parsed_package_purl.map(|parsed| parsed.identity_purl);
             let package_result = sqlx::query("INSERT INTO osv_affected_packages (osv_id, affected_order, ecosystem, package_name, purl) VALUES (?, ?, ?, ?, ?)")
                 .bind(&advisory.id)
                 .bind(i64::try_from(affected_order).unwrap_or(i64::MAX))
-                .bind(package.and_then(|value| value.ecosystem.as_deref()))
-                .bind(package.and_then(|value| value.name.as_deref()))
-                .bind(package.and_then(|value| value.purl.as_deref()))
+                .bind(package_ecosystem)
+                .bind(package_name)
+                .bind(package_purl)
                 .execute(&mut **transaction)
                 .await?;
             let package_id = package_result.last_insert_rowid();
@@ -2807,36 +3239,46 @@ impl SqlxDatabase {
                         .map(|versions| {
                             versions
                                 .iter()
-                                .map(|version| {
-                                    (
-                                        version
-                                            .get("version")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned),
-                                        version
-                                            .get("status")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned),
-                                        version
-                                            .get("versionType")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned),
-                                        version
-                                            .get("lessThan")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned),
-                                        version
-                                            .get("lessThanOrEqual")
-                                            .and_then(Value::as_str)
-                                            .map(ToOwned::to_owned),
-                                    )
+                                .map(|version| CveStoredVersion {
+                                    version: version
+                                        .get("version")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    status: version
+                                        .get("status")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    version_type: version
+                                        .get("versionType")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    less_than: version
+                                        .get("lessThan")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    less_than_or_equal: version
+                                        .get("lessThanOrEqual")
+                                        .and_then(Value::as_str)
+                                        .map(ToOwned::to_owned),
+                                    changes: version
+                                        .get("changes")
+                                        .and_then(Value::as_array)
+                                        .into_iter()
+                                        .flatten()
+                                        .filter_map(|change| {
+                                            Some(CveStoredVersionChange {
+                                                at: change.get("at")?.as_str()?.to_owned(),
+                                                status: change.get("status")?.as_str()?.to_owned(),
+                                            })
+                                        })
+                                        .collect(),
                                 })
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
                     let version_text = versions
                         .iter()
-                        .filter_map(|version| version.0.as_deref())
+                        .filter_map(|version| version.version.as_deref())
                         .collect::<Vec<_>>()
                         .join(" ");
                     let versions_json = serde_json::to_string(&versions).map_err(|error| {
@@ -3167,6 +3609,41 @@ mod tests {
     fn database_handle_is_send_and_sync_for_spawned_command_tasks() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SqlxDatabase>();
+    }
+
+    #[test]
+    fn cve_package_identity_uses_collection_url_host_boundaries() {
+        for (ecosystem, collection_url) in [
+            ("PyPI", "https://pypi.org/project/example"),
+            ("PyPI", "https://files.PyPI.org/packages/example"),
+            ("PyPI", "https://user:password@pypi.org/project/example"),
+            ("PyPI", "https://pypi.org:443/project/example"),
+            ("PyPI", "https://pypi.org./project/example"),
+            ("npm", "https://www.npmjs.com/package/example"),
+            ("Maven", "https://repo.maven.apache.org/maven2/example"),
+        ] {
+            assert!(
+                cve_package_identity(ecosystem, None, None, Some(collection_url))
+                    == CvePackageIdentity::Confirmed,
+                "expected collection host to match: {collection_url}"
+            );
+        }
+
+        for collection_url in [
+            "https://pypi.org.evil.invalid/project/example",
+            "https://evilpypi.org/project/example",
+            "https://evil.invalid/project/pypi.org",
+            "https://pypi.org@evil.invalid/project/example",
+            "https://evil.invalid?collection=https://pypi.org",
+            "pypi.org/project/example",
+            "https://pypi.org:not-a-port/project/example",
+        ] {
+            assert!(
+                cve_package_identity("PyPI", None, None, Some(collection_url))
+                    == CvePackageIdentity::Excluded,
+                "expected collection host not to match: {collection_url}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4433,7 +4910,7 @@ mod tests {
     async fn imports_cve_with_stable_fts_rowid() {
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
         database.initialize().await.unwrap();
-        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","collectionURL":"https://pypi.org/project/widget","description":"Affected widget description.","versions":[{"version":"1.0","status":"affected","versionType":"semver","lessThan":"2.0","lessThanOrEqual":"1.9"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
+        database.import_cve_raw_json(r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Example CVE","affected":[{"vendor":"Acme","product":"widget","collectionURL":"https://pypi.org/project/widget","description":"Affected widget description.","versions":[{"version":"1.0","status":"affected","versionType":"python","lessThan":"2.0"}]}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL","vectorString":"CVSS:3.1/AV:N"}}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79","description":"XSS"}]}]}}}"#.to_owned()).await.unwrap();
         let rowid: i64 = database
             .writer
             .with_connection(|connection| {
@@ -4611,7 +5088,7 @@ mod tests {
                 r#"{"cveMetadata":{"cveId":"CVE-2099-wordpress","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"theme","affected":[{"vendor":"rascals","product":"Pendulum","packageName":"pendulum","collectionURL":"https://themeforest.net","versions":[{"version":"0","status":"affected","lessThan":"4.0.0"}]}]}}}"#.to_owned(),
                 r#"{"cveMetadata":{"cveId":"CVE-2099-redis-server","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"server","affected":[{"vendor":"Redis","product":"Redis","versions":[{"version":"0","status":"affected","lessThan":"8.0.0"}]}]}}}"#.to_owned(),
                 r#"{"cveMetadata":{"cveId":"CVE-2099-elasticsearch-server","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"server","affected":[{"vendor":"Elastic","product":"Elasticsearch","versions":[{"version":"0","status":"affected","lessThan":"9.0.0"}]}]}}}"#.to_owned(),
-                r#"{"cveMetadata":{"cveId":"CVE-2099-pypi","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"library","affected":[{"vendor":"example","product":"example","packageName":"example","collectionURL":"https://pypi.org/project/example","versions":[{"version":"0","status":"affected","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-pypi","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"library","affected":[{"vendor":"example","product":"example","packageName":"example","collectionURL":"https://pypi.org/project/example","versions":[{"version":"0","status":"affected","versionType":"python","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
                 r#"{"cveMetadata":{"cveId":"CVE-2099-httplib2","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"library","affected":[{"vendor":"httplib2","product":"httplib2","versions":[{"version":"0","status":"affected","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
             ])
             .await
@@ -4646,6 +5123,47 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(httplib2[0].affected.status, "unknown");
+    }
+
+    #[tokio::test]
+    async fn cve_package_supplement_preserves_and_sorts_status_changes() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_json(
+                r#"{"cveMetadata":{"cveId":"CVE-2099-changes","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"changes","affected":[{"vendor":"example","product":"example","packageName":"example","collectionURL":"https://pypi.org/project/example","defaultStatus":"unaffected","versions":[{"version":"1.0","status":"unaffected","versionType":"python","lessThan":"4.0","changes":[{"at":"3.0","status":"unaffected"},{"at":"2.0","status":"affected"}]}]}]}}}"#
+                    .to_owned(),
+            )
+            .await
+            .unwrap();
+
+        let affected = database
+            .query_package_matches("PyPI", "example", "2.5", None)
+            .await
+            .unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].affected.status, "affected");
+        assert!(
+            database
+                .query_package_matches("PyPI", "example", "3.5", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let stored: String = database
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query_scalar("SELECT raw_json FROM cve_affected LIMIT 1")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let stored = cve_stored_versions(&stored).unwrap();
+        assert_eq!(stored[0].changes.len(), 2);
     }
 
     #[tokio::test]
@@ -5127,6 +5645,20 @@ mod tests {
             })
             .await
             .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-name-separator","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"node-forge"},"ranges":[{"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"1.0.0"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"PYSEC-2099-explicit","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"PyPI","name":"friendly-._-._-._-bard"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
 
         let npm = database
             .query_package_matches("npm", "jquery", "1.10.2", None)
@@ -5147,6 +5679,44 @@ mod tests {
                 .await
                 .unwrap()
         );
+
+        assert!(
+            database
+                .query_package_matches("npm", "node_forge", "0.9.0", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .query_package_matches("npm", "node-forge", "0.9.0", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let explicit_pypi = database
+            .query_package_matches("PyPI", "Friendly-._-Bard", "1.0", None)
+            .await
+            .unwrap();
+        assert_eq!(explicit_pypi.len(), 1);
+        assert_eq!(explicit_pypi[0].affected.status, "affected");
+        assert!(
+            database
+                .query_package_matches("PyPI", "friendly-bard", "2.0", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .query_osv_package("PyPI", "friendly-bard", "2.0")
+                .await
+                .unwrap()[0]
+                .status,
+            "not_affected"
+        );
     }
 
     #[tokio::test]
@@ -5156,7 +5726,7 @@ mod tests {
         database
             .import_osv_record(OsvRawRecord {
                 source_path: None,
-                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-purl","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"crates.io","name":"different-name","purl":"pkg:cargo/example@1.5.0"}}]}"#.to_owned(),
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-purl","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"crates.io","name":"different-name","purl":"pkg:cargo/example"}}]}"#.to_owned(),
             })
             .await
             .unwrap();
@@ -5172,6 +5742,356 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].status, "unknown");
         assert_eq!(findings[0].confidence, "low");
+    }
+
+    #[tokio::test]
+    async fn package_query_rejects_conflicting_name_and_purl_identity() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+
+        let error = database
+            .query_osv_package_with_purl(
+                "crates.io",
+                "safe-package",
+                "1.0.0",
+                Some("pkg:cargo/vulnerable-package@1.0.0"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts with purl"));
+
+        let error = database
+            .query_package_matches_batch(&[PackageQuery {
+                ecosystem: "npm".to_owned(),
+                package: "safe-package".to_owned(),
+                version: "1.0.0".to_owned(),
+                purl: Some("pkg:pypi/safe-package@1.0.0".to_owned()),
+            }])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("conflicts with purl"));
+    }
+
+    #[tokio::test]
+    async fn purl_qualifiers_disambiguate_same_named_package_variants() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for (id, platform) in [("ruby", "ruby"), ("java", "java")] {
+            database
+                .import_osv_record(OsvRawRecord {
+                    source_path: None,
+                    raw_json: format!(
+                        r#"{{"schema_version":"1.8.0","id":"GHSA-2099-{id}-variant","modified":"2099-01-01T00:00:00Z","affected":[{{"package":{{"ecosystem":"RubyGems","name":"example","purl":"pkg:gem/example?platform={platform}"}},"versions":["1.0.0"]}}]}}"#
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        let ruby = database
+            .query_package_matches(
+                "RubyGems",
+                "example",
+                "1.0",
+                Some("pkg:gem/example@1.0?platform=ruby"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ruby.len(), 1);
+        assert_eq!(ruby[0].primary_id, "GHSA-2099-ruby-variant");
+
+        let all = database
+            .query_package_matches("RubyGems", "example", "1.0", None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unqualified_advisory_purl_applies_to_a_qualified_package_variant() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-generic-variant","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"RubyGems","name":"example","purl":"pkg:gem/example"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let qualified = PackageQuery {
+            ecosystem: "RubyGems".to_owned(),
+            package: "example".to_owned(),
+            version: "1.0".to_owned(),
+            purl: Some("pkg:gem/example@1.0?platform=ruby".to_owned()),
+        };
+        let findings = database
+            .query_package_matches_batch(std::slice::from_ref(&qualified))
+            .await
+            .unwrap();
+        assert_eq!(findings[0].len(), 1);
+        assert_eq!(findings[0][0].primary_id, "GHSA-2099-generic-variant");
+        assert_eq!(
+            database
+                .has_osv_package_advisories_batch(std::slice::from_ref(&qualified))
+                .await
+                .unwrap(),
+            vec![true]
+        );
+        assert!(
+            database
+                .has_osv_package_advisory(
+                    "RubyGems",
+                    "example",
+                    Some("pkg:gem/example@1.0?platform=ruby"),
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .query_osv_package_with_purl(
+                    "RubyGems",
+                    "example",
+                    "1.0",
+                    Some("pkg:gem/example@1.0?platform=ruby"),
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_purl_spelling_matches_and_invalid_feed_purl_falls_back_to_name() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-canonical-purl","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"NuGet","name":"Example.Core","purl":"pkg:NuGet/Example.Core"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-invalid-purl","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"example","purl":"pkg:npm/ex%ZZample"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let canonical = database
+            .query_package_matches(
+                "nuget",
+                "example.core",
+                "1",
+                Some("PKG://NUGET/example.core@1.0.0"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0].primary_id, "GHSA-2099-canonical-purl");
+
+        let invalid_fallback = database
+            .query_package_matches("npm", "example", "1.0.0", Some("pkg:npm/example@1.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(invalid_fallback.len(), 1);
+        assert_eq!(invalid_fallback[0].primary_id, "GHSA-2099-invalid-purl");
+    }
+
+    #[tokio::test]
+    async fn package_query_normalizes_github_actions_and_pub_names() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for (id, ecosystem, name) in [
+            ("github", "GitHub Actions", "Owner/Repository"),
+            ("pub", "Pub", "Friendly-Package"),
+        ] {
+            database
+                .import_osv_record(OsvRawRecord {
+                    source_path: None,
+                    raw_json: format!(
+                        r#"{{"schema_version":"1.8.0","id":"GHSA-2099-{id}-name","modified":"2099-01-01T00:00:00Z","affected":[{{"package":{{"ecosystem":"{ecosystem}","name":"{name}"}},"versions":["1.0.0"]}}]}}"#
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            database
+                .query_package_matches("GitHub Actions", "owner/repository", "1.0.0", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .query_package_matches("Pub", "friendly_package", "1.0.0", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_package_search_uses_each_ecosystems_name_rules() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for (id, ecosystem, name) in [
+            ("npm-case", "npm", "CaseSensitive"),
+            ("pypi-name", "PyPI", "friendly-bard"),
+            ("pub-name", "Pub", "friendly_package"),
+        ] {
+            database
+                .import_osv_record(OsvRawRecord {
+                    source_path: None,
+                    raw_json: format!(
+                        r#"{{"schema_version":"1.8.0","id":"GHSA-2099-{id}","modified":"2099-01-01T00:00:00Z","affected":[{{"package":{{"ecosystem":"{ecosystem}","name":"{name}"}},"versions":["1.0.0"]}}]}}"#
+                    ),
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(
+            database
+                .search_osv_summaries_by_package("casesensitive", 10, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .search_osv_summaries_by_package("CaseSensitive", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .search_osv_summaries_by_package("Friendly_Bard", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .search_osv_summaries_by_package("friendly-package", 10, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            database
+                .count_osv_summaries_by_package("Friendly.Bard")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn maven_repository_identity_normalizes_central_and_preserves_path_case() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-custom-repository","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"Maven","name":"org.example:custom","purl":"pkg:maven/org.example/custom?repository_url=https%3A%2F%2FRepo.Example%2FCasePath%2F"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-central-repository","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"Maven:https://repo.maven.apache.org/maven2/","name":"org.example:central","purl":"pkg:maven/org.example/central?repository_url=https%3A%2F%2Frepo.maven.apache.org%2Fmaven2%2F"},"versions":["1.0.0"]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            database
+                .query_package_matches(
+                    "Maven:https://repo.example/CasePath",
+                    "org.example:custom",
+                    "1.0.0",
+                    None,
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            database
+                .query_package_matches(
+                    "Maven:https://repo.example/casepath",
+                    "org.example:custom",
+                    "1.0.0",
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .query_package_matches("Maven", "org.example:custom", "1.0.0", None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .query_package_matches(
+                    "Maven:https://repo.maven.apache.org/maven2/",
+                    "org.example:central",
+                    "1.0.0",
+                    Some(
+                        "PKG://MAVEN/org.example/central@1.0.0?repository_url=https%3A%2F%2Frepo.maven.apache.org%2Fmaven2%2F",
+                    ),
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_affected_entries_are_consolidated_per_advisory() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_record(OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-split-ranges","modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"crates.io","name":"example"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"2.0.0"}]}]},{"package":{"ecosystem":"crates.io","name":"example"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"3.0-final"}]}]}]}"#.to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let affected = database
+            .query_package_matches("crates.io", "example", "1.5.0", None)
+            .await
+            .unwrap();
+        assert_eq!(affected.len(), 1);
+        assert_eq!(affected[0].affected.status, "affected");
+
+        let review = database
+            .query_package_matches("crates.io", "example", "3.0.0", None)
+            .await
+            .unwrap();
+        assert_eq!(review.len(), 1);
+        assert_eq!(review[0].affected.status, "unknown");
     }
 
     #[tokio::test]

@@ -10,12 +10,12 @@ The project provides a CLI, terminal UI, Rust API, and MCP server. Searches run 
 
 ## Features
 
-- Build a database from the complete CVE archive and enrichment feeds.
+- Build a database from the complete CVE archive and selected enrichment feeds.
 - Apply CVE deltas and incremental OSV updates.
-- Search CVE and OSV records by identifier, text, affected product, CWE, CAPEC, CVSS, and date.
-- Evaluate package versions against supported OSV ranges.
-- Browse CVE, CWE, and CAPEC data in a terminal UI.
-- Scan GitHub SBOM JSON with local vulnerability data.
+- Search CVE records by identifier, text, affected product, CWE, CAPEC, CVSS, and date, and search OSV advisories by text.
+- Evaluate package versions against supported OSV and CVE List ranges.
+- Browse CVE, OSV, CWE, and CAPEC data in a terminal UI.
+- Scan GitHub dependency graph exports and SPDX or CycloneDX SBOM JSON with local vulnerability data.
 - Expose search, enrichment, and maintenance operations through MCP.
 
 ## Requirements
@@ -65,18 +65,25 @@ qanvuli init --no-progress
 
 `--delete-existing` (`-D`) deletes stale `*.qanvuli-new-*` replacement candidates and the active database before downloading and building the replacement. This minimizes peak disk usage, but can disrupt another running initialization and any later failure leaves no usable database. Use it only after confirming no other `qanvuli init` is running.
 
-Apply current deltas and refresh enrichment feeds:
+Apply unapplied remote CVE deltas and refresh enrichment feeds:
 
 ```bash
 qanvuli update
-qanvuli update --zip ./data/delta.zip
 qanvuli update --osv-refresh-all
 qanvuli update --no-progress
 ```
 
+Import a local CVE archive instead:
+
+```bash
+qanvuli update --zip ./data/delta.zip
+```
+
+Without `--zip`, `update` refreshes CWE, CAPEC, the stored OSV selection, KEV, and EPSS after applying CVE deltas. With `--zip`, it imports only the supplied CVE archive. OSV is also refreshed only when OSV family flags are supplied; CWE, CAPEC, KEV, and EPSS are not refreshed in this mode.
+
 `--osv-refresh-all` ignores the OSV cursor and upserts complete selected snapshots. Missing snapshot entries are not treated as deletions; withdrawn advisories remain available with their withdrawal timestamp.
 
-Select additional OSV source families with flags such as `--osv-ghsa`, `--osv-rustsec`, or `--osv-pysec`. Run `qanvuli init --help` for the complete list.
+`init` imports GHSA and OSV (OSS-Fuzz) by default. Add source families with flags such as `--osv-rustsec` or `--osv-pysec`, or select all families with `--osv-all`. `update` reuses the selection stored by `init` and extends it with any supplied family flags. Run `qanvuli init --help` for the complete list.
 
 Download a CVE archive without changing the database:
 
@@ -111,8 +118,10 @@ Query cross-source data:
 ```bash
 qanvuli query resolve --id CVE-2024-12345
 qanvuli query enriched-cve --id CVE-2024-12345
-qanvuli query package --ecosystem crates.io --name example --version 1.2.3
+qanvuli query package --ecosystem crates.io --name time --version 0.1.0
 ```
+
+`query package` evaluates supported OSV ranges using ecosystem-specific version rules. Unsupported or ambiguous evaluations are returned for review instead of being counted as confirmed findings.
 
 Use `--pretty` for indented JSON.
 
@@ -128,6 +137,12 @@ qanvuli db rebuild-search
 
 `db check` validates the schema and bounded search sentinels. `--scan` adds SQLite, foreign-key, FTS, and projection checks. `--full` runs the most expensive integrity scans.
 
+Rebuild cross-source identifier links from imported OSV relations:
+
+```bash
+qanvuli graph rebuild
+```
+
 Database files are derived artifacts. Unsupported schemas are not patched in place; rebuild them with `qanvuli init`.
 
 ## Terminal UI
@@ -142,10 +157,12 @@ Common keys:
 - `Enter`: search
 - `Tab`: change pane
 - `/`: find in details
+- `F1`: help
+- `F2`: change search mode
 - `F3`: advanced search
 - `F4`: display settings or catalog filters
 - `F5`: database maintenance
-- `F8`: raw CVE JSON
+- `F8`: raw CVE or OSV JSON
 - `F9`: CWE catalog
 - `F10`: CAPEC catalog
 - `Esc`: close a popup or leave the current mode
@@ -158,7 +175,7 @@ qanvuli sbom ./sbom.json
 qanvuli sbom --file ./sbom.json --per-package-limit 5
 ```
 
-OSV range evaluation confirms affected package versions where the ecosystem is supported. Name-only CVE matches are optional candidates and never count as confirmed vulnerabilities.
+`sbom` accepts GitHub dependency graph exports and SPDX or CycloneDX JSON, including nested CycloneDX components. PURL-backed packages are evaluated against OSV and CVE List data with ecosystem-specific version rules. Missing, unsupported, or ambiguous versions are returned for review instead of being counted as confirmed vulnerabilities. Name-only CVE matches are optional candidates and never count as confirmed vulnerabilities.
 
 ## MCP server
 
@@ -166,7 +183,7 @@ OSV range evaluation confirms affected package versions where the ecosystem is s
 qanvuli mcp
 ```
 
-The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries return compact results by default; request evidence only when match details are needed.
+The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
 
 OSV coverage is not a guarantee that a package has no CVEs. Check CVE List and vendor advisories for critical or end-of-life packages.
 

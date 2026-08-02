@@ -2,7 +2,7 @@
 
 use super::sqlx_database::{
     SqlxCveSearch, SqlxCveSummary, SqlxCvssSearch, SqlxDatabase, SqlxOsvSummary,
-    cve_affected_descriptions,
+    cve_affected_descriptions, cve_stored_versions, sql_normalized_package_name,
 };
 use crate::{
     AffectedPackageSummary, CveAdvancedQueryMode, CveAdvancedSearch, CveAffectedDetail,
@@ -376,18 +376,18 @@ impl SqlxDatabase {
                                 .cloned()
                                 .flatten();
                             *affected_index += 1;
-                            let versions = serde_json::from_str::<Vec<(Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>>(&raw_json)
+                            let versions = cve_stored_versions(&raw_json)
                                 .unwrap_or_else(|error| {
                                     tracing::warn!(cve_id = %cve_id, %error, "failed to parse cve_affected.raw_json");
                                     Vec::new()
                                 })
                                 .into_iter()
-                                .map(|(version, status, version_type, less_than, less_than_or_equal)| CveAffectedVersionDetail {
-                                    version,
-                                    status,
-                                    version_type,
-                                    less_than,
-                                    less_than_or_equal,
+                                .map(|version| CveAffectedVersionDetail {
+                                    version: version.version,
+                                    status: version.status,
+                                    version_type: version.version_type,
+                                    less_than: version.less_than,
+                                    less_than_or_equal: version.less_than_or_equal,
                                 })
                                 .collect();
                             detail.affected.push(CveAffectedDetail {
@@ -974,10 +974,14 @@ impl SqlxDatabase {
         self.writer.with_connection(|connection| Box::pin(async move {
             let families_json = serde_json::to_string(&families).unwrap_or_default();
             let ecosystems_json = serde_json::to_string(&ecosystems).unwrap_or_default();
-            let rows: Vec<SqlxOsvSummary> = sqlx::query_as("SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (? IS NULL OR p.package_name=? COLLATE NOCASE) ORDER BY a.modified_at DESC, a.osv_id LIMIT ? OFFSET ?")
+            let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
+            let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
+            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) ORDER BY a.modified_at DESC, a.osv_id LIMIT ? OFFSET ?");
+            let rows: Vec<SqlxOsvSummary> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
+                .bind(&package)
                 .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
                 .bind(&families_json).bind(&families_json).bind(&ecosystems_json).bind(&ecosystems_json)
-                .bind(&package).bind(&package).bind(limit as i64).bind(offset as i64)
+                .bind(limit as i64).bind(offset as i64)
                 .fetch_all(connection).await?;
             Ok(rows.into_iter().map(osv_summary).collect())
         })).await
@@ -1041,7 +1045,17 @@ impl SqlxDatabase {
         let ecosystems = serde_json::to_string(ecosystems.unwrap_or_default())
             .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         let package = package.map(str::to_owned);
-        self.writer.with_connection(|c| Box::pin(async move { let n:i64=sqlx::query_scalar("SELECT COUNT(DISTINCT a.osv_id) FROM osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (? IS NULL OR p.package_name=? COLLATE NOCASE)").bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&families).bind(&families).bind(&ecosystems).bind(&ecosystems).bind(&package).bind(&package).fetch_one(c).await?; Ok(n as u64) })).await
+        self.writer.with_connection(|c| Box::pin(async move {
+            let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
+            let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
+            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT COUNT(DISTINCT a.osv_id) FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY)");
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+                .bind(&package)
+                .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
+                .bind(&families).bind(&families).bind(&ecosystems).bind(&ecosystems)
+                .fetch_one(c).await?;
+            Ok(n as u64)
+        })).await
     }
 
     pub async fn find_cwe_entry(&self, id: i32) -> Result<Option<CweEntry>, sqlx::Error> {
@@ -1285,7 +1299,31 @@ impl SqlxDatabase {
         let mut rows = self
             .query_package_matches(ecosystem, package, version, purl)
             .await?;
-        if !include_evidence {
+        if include_evidence {
+            for row in &mut rows {
+                row.evidence.push(Evidence {
+                    kind: "package_version_evaluation".to_owned(),
+                    source: row.source.clone(),
+                    from: Some(format!(
+                        "{}:{}@{}",
+                        row.package.ecosystem, row.package.package, row.package.version
+                    )),
+                    to: Some(row.primary_id.clone()),
+                    cve_id: row.cve_ids.first().cloned(),
+                    osv_id: (row.source == "osv").then(|| row.primary_id.clone()),
+                    detail: Some(
+                        serde_json::json!({
+                            "status": &row.affected.status,
+                            "confidence": &row.affected.confidence,
+                            "purl": &row.package.purl,
+                            "fixed_versions": &row.fixed_versions,
+                        })
+                        .to_string(),
+                    ),
+                });
+                row.evidence_status = "available".to_owned();
+            }
+        } else {
             for row in &mut rows {
                 row.evidence.clear();
             }

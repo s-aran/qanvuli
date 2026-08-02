@@ -1436,7 +1436,12 @@ pub async fn sync_capec_catalog(db: SqlxDatabase) -> Result<(), String> {
 
     let bytes = std::fs::read(&path)
         .map_err(|error| format!("failed to hash {}: {error}", path.display()))?;
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let digest = Sha256::digest(&bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(hash, "{byte:02x}").expect("writing SHA-256 to a String cannot fail");
+    }
     if previous_hash.as_deref() == Some(hash.as_str()) {
         let _ = std::fs::remove_file(&path);
         store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;

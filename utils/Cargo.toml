@@ -1,8 +1,8 @@
 [package]
 name = "qanvuli-utils"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
 
 [lib]
 doctest = false

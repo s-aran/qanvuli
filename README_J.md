@@ -1,211 +1,197 @@
 <div align="center">
-    <img src="./design/logo.svg" width="12%" height="12%">
+    <img src="./design/logo.svg" width="12%" height="12%" alt="qanvuli logo">
 </div>
 
-# qanvuli (寒鰤)
+# qanvuli
 
-qanvuli はローカルに構築した CVE データベースを検索するライブラリーおよびツールソフトウェアです。
+qanvuli は、ローカルの脆弱性データベースを構築・検索するツールです。CVE List のデータに CWE、CAPEC、OSV、CISA KEV、FIRST EPSS の情報を組み合わせ、SQLite に格納します。
 
-It imports CVE JSON archives into a local SQLite database, applies delta updates, searches CVE records from the command line, opens an interactive TUI, and can run as an MCP server over stdio.
+CLI、ターミナル UI、Rust API、MCP サーバーを提供します。各データソースを取り込んだ後の検索は、ローカル環境で実行されます。
 
+## 機能
 
+- CVE の全件アーカイブと選択した補足データからデータベースを構築
+- CVE の差分と OSV の増分更新を適用
+- CVE レコードを識別子、テキスト、影響を受ける製品、CWE、CAPEC、CVSS、日付で検索し、OSV アドバイザリをテキストで検索
+- 対応する OSV と CVE List のバージョン範囲に基づき、パッケージのバージョンが影響を受けるか判定
+- ターミナル UI で CVE、OSV、CWE、CAPEC のデータを閲覧
+- GitHub の依存関係グラフから出力した SBOM と、SPDX または CycloneDX 形式の SBOM JSON をローカルの脆弱性データでスキャン
+- 検索、補足情報の取得、保守操作を MCP 経由で提供
 
-## Features
+## 動作要件
 
-- Initialize a local CVE database from the all-CVE archive.
-- Apply CVE delta updates.
-- Search by CVE ID, text, vendor/product, component, CWE, CVSS, and date.
-- Inspect results in an interactive terminal UI.
-- Show raw CVE JSON from the TUI when needed.
-- Search CVEs for packages in a GitHub SBOM JSON file.
-- Expose CVE search and update tools through MCP.
+- Rust 2024 Edition に対応する Rust ツールチェーン
+- データソースをダウンロードするためのネットワーク接続
+- CVE アーカイブの展開とデータベースの保存に必要な空き容量
 
-## Requirements
+既定では、カレントディレクトリの `db.sqlite` を使用します。
 
-- Rust toolchain with edition 2024 support.
-- Network access for downloading CVE/CWE archives during initialization and updates.
-- SQLite database path or connection URL.
-
-By default, qanvuli uses:
-
-```bash
+```text
 sqlite://./db.sqlite?mode=rwc
 ```
 
-You can override it with `--db-url` or `QANVULI_DB_URL`.
+保存先は `--db-url` または `QANVULI_DB_URL` で変更できます。
 
-## Build
-
-```bash
-cargo build --release
-```
-
-The CLI binary is:
-
-```bash
-./target/release/qanvuli
-```
-
-## Install
-
-リポジトリのルートで実行します。
+## インストール
 
 ```bash
 cargo install --path . --locked
 qanvuli --help
 ```
 
-For development, commands can be run directly through Cargo:
+開発時は、次のように実行できます。
 
 ```bash
 cargo run -- --help
 ```
 
-## Quick Start
+## 初期化と更新
 
-Initialize the database:
-
-```bash
-cargo run -- init
-```
-
-Apply later delta updates:
+最新のデータソースから置換用データベースを構築します。
 
 ```bash
-cargo run -- update
+qanvuli init
 ```
 
-Open the TUI:
+既存の CVE アーカイブを使用する場合や、使用するディスク容量のピークを抑える場合は、次のオプションを指定します。
 
 ```bash
-cargo run -- tui
+qanvuli init --zip ./data/all-cves.zip
+qanvuli init --delete-existing
+qanvuli init --no-progress
 ```
 
-Search from the CLI:
+通常、`init` は使用中のデータベースと同じ場所に置換候補を構築し、必須スキーマと所定の検索検証項目を確認してから接続を閉じ、置換します。使用中のデータベースをロールバック用バックアップへ移動する前に WAL のチェックポイントを実行し、安全に接続を閉じられない場合は置換を中止します。構築に失敗しても、使用中のデータベースは変更されません。初期化は、SQLite を使用するほかのプロセスを停止してから実行してください。
+
+`--delete-existing`（`-D`）は、古い `*.qanvuli-new-*` 置換候補と使用中のデータベースを削除してから、置換データをダウンロードして構築します。使用するディスク容量のピークは抑えられますが、同時に実行中の初期化を妨げる可能性があり、その後の処理に失敗すると利用可能なデータベースは残りません。ほかに `qanvuli init` が実行されていないことを確認した場合に限り使用してください。
+
+未適用の CVE 差分を取得して適用し、補足データを更新します。
 
 ```bash
-cargo run -- search --text openssl --limit 20
-cargo run -- search --cwe CWE-79
-cargo run -- search --vendor microsoft --product windows
-cargo run -- search --min-score 9.0 --severity CRITICAL
+qanvuli update
+qanvuli update --osv-refresh-all
+qanvuli update --no-progress
 ```
 
-Fetch one raw CVE JSON record:
+ローカルの CVE アーカイブを取り込む場合は、次のように指定します。
 
 ```bash
-cargo run -- search --cve CVE-2024-12345
+qanvuli update --zip ./data/delta.zip
 ```
 
-## Database Commands
+`--zip` を指定しない場合、`update` は CVE 差分の適用後に CWE、CAPEC、保存済みの OSV 選択、KEV、EPSS を更新します。`--zip` を指定した場合は、指定した CVE アーカイブだけを取り込みます。OSV ソースのフラグも指定した場合に限り OSV を更新し、このモードでは CWE、CAPEC、KEV、EPSS を更新しません。
 
-Create or rebuild the database schema and import CVE data:
+`--osv-refresh-all` は OSV カーソルを無視し、選択したスナップショットの全件を upsert します。スナップショットに存在しない項目は削除されたものとして扱いません。撤回されたアドバイザリも、撤回日時とともに引き続き参照できます。
+
+`init` は既定で GHSA と OSV（OSS-Fuzz）を取り込みます。`--osv-rustsec` や `--osv-pysec` などのフラグでソースを追加でき、`--osv-all` ですべてのソースを選択できます。`update` は `init` が保存した選択を再利用し、指定されたソースのフラグがあれば追加します。全項目は `qanvuli init --help` で確認してください。
+
+データベースを変更せずに CVE アーカイブをダウンロードするには、次のコマンドを実行します。
 
 ```bash
-cargo run -- init
-cargo run -- init --schema-only
-cargo run -- init --rebuild
-cargo run -- init --zip ./path/to/cve.zip
+qanvuli download-cve --kind delta --output-dir ./data
+qanvuli download-cve --kind all --output-dir ./data
 ```
 
-Apply updates:
+## 検索
 
 ```bash
-cargo run -- update
-cargo run -- update --zip ./path/to/delta.zip
+qanvuli search --text openssl --limit 20
+qanvuli search --source osv --text openssl
+qanvuli search --cwe CWE-79
+qanvuli search --capec CAPEC-63
+qanvuli search --vendor microsoft --product windows
+qanvuli search --min-score 9.0 --severity CRITICAL
+qanvuli search --cve CVE-2024-12345
 ```
 
-Download a CVE archive without modifying the database:
+CWE と CAPEC のカタログを検索・参照するには、次のコマンドを実行します。
 
 ```bash
-cargo run -- download-cve --kind delta --output-dir ./data
-cargo run -- download-cve --kind all --output-dir ./data
+qanvuli cwe cross-site --status Stable
+qanvuli cwe --id CWE-79 --detail
+qanvuli capec phishing --type Standard
+qanvuli capec --id CAPEC-98 --detail
 ```
 
-## TUI
-
-Start the terminal UI with an optional initial query:
+複数のデータソースを横断して検索するには、次のコマンドを実行します。
 
 ```bash
-cargo run -- tui openssl
+qanvuli query resolve --id CVE-2024-12345
+qanvuli query enriched-cve --id CVE-2024-12345
+qanvuli query package --ecosystem crates.io --name time --version 0.1.0
 ```
 
-Common keys:
+`query package` は、対応する OSV のバージョン範囲をエコシステム固有の規則で判定します。判定できない場合や結果が曖昧な場合は、確認済みの検出結果に含めず、要確認として返します。
 
-- `Enter`: run search
-- `Tab`: move focus
-- `/`: search within the detail pane
-- `F3`: open advanced search
-- `F4`: open CWE status filter in CWE mode
-- `F6`: display settings
-- `F7`: maintenance
-- `F8`: toggle raw CVE JSON
-- `F9`: toggle CWE mode
-- `Esc`: close popup or leave the current mode
-- `Ctrl-C`: quit
+整形済みの JSON を出力するには `--pretty` を指定します。
 
-## MCP Server
-
-Run the MCP server over stdio:
+## データベースの保守
 
 ```bash
-cargo run -- mcp
+qanvuli db status
+qanvuli db check
+qanvuli db check --scan
+qanvuli db check --full
+qanvuli db rebuild-search
 ```
 
-The MCP server exposes tools for:
+`db check` はスキーマと所定の検索検証項目を確認します。`--scan` を指定すると、SQLite、外部キー、FTS、プロジェクションの検査も行います。`--full` は、最も処理負荷の高い整合性検査を実行します。
 
-- CWE search
-- vendor/product search
-- text search
-- CVSS search
-- recent CVE search
-- exact raw CVE JSON lookup
-- database update
-
-Use `--db-url` or `QANVULI_DB_URL` to point the MCP server at the same database used by the CLI/TUI.
-
-## SBOM Search
-
-Search CVEs for packages in a GitHub SBOM JSON file:
+取り込んだ OSV の関連情報から、データソースを横断する識別子のリンクを再構築します。
 
 ```bash
-cargo run -- sbom ./sbom.json
-cargo run -- sbom --file ./sbom.json --per-package-limit 5
+qanvuli graph rebuild
 ```
 
-## Workspace Layout
+データベースファイルは、元データから生成される成果物です。未対応のスキーマをその場で修正することはありません。`qanvuli init` で再構築してください。
 
-- `app/`: CLI entrypoint and user-facing application crates.
-- `app/crates/commands/`: non-interactive command implementations.
-- `app/crates/tui/`: terminal UI.
-- `app/crates/mcp/`: MCP server.
-- `collector/`: release and archive collection.
-- `db/`: database access and query logic.
-- `models/`: CVE/CWE data models and parsing.
-- `utils/`: shared utilities.
-
-## Development
-
-Format the workspace:
+## ターミナル UI
 
 ```bash
-cargo fmt
+qanvuli tui
+qanvuli tui openssl
 ```
 
-Check the main app:
+主なキー操作は次のとおりです。
+
+- `Enter`: 検索
+- `Tab`: ペインの切り替え
+- `/`: 詳細内の検索
+- `F1`: ヘルプ
+- `F2`: 検索モードの切り替え
+- `F3`: 詳細検索
+- `F4`: 表示設定またはカタログの絞り込み
+- `F5`: データベースの保守
+- `F8`: CVE または OSV の未加工 JSON
+- `F9`: CWE カタログ
+- `F10`: CAPEC カタログ
+- `Esc`: ポップアップを閉じる、または現在のモードを終了
+- `Ctrl-C`: 終了
+
+## SBOM 検索
 
 ```bash
-cargo check
+qanvuli sbom ./sbom.json
+qanvuli sbom --file ./sbom.json --per-package-limit 5
 ```
 
-Run focused crate checks:
+`sbom` は、GitHub の依存関係グラフから出力した SBOM と、SPDX または CycloneDX 形式の JSON を読み込みます。入れ子になった CycloneDX コンポーネントにも対応します。PURL があるパッケージは、エコシステム固有のバージョン規則を用いて OSV と CVE List のデータに照合します。バージョンがない場合、対応していない場合、判定が曖昧な場合は、確認済みの検出結果に含めず、要確認として返します。パッケージ名のみが一致する CVE は任意の候補として扱われ、脆弱性が確認された件数には含まれません。
+
+## MCP サーバー
 
 ```bash
-cargo check -p qanvuli-app-tui
-cargo check -p qanvuli-app-mcp
+qanvuli mcp
 ```
 
-Run tests:
+stdio サーバーは、ローカルの CVE、CWE、CAPEC、OSV、KEV、EPSS に対するクエリと、データベースの更新機能を提供します。パッケージのクエリは既定で詳細な照合根拠を省略します。一致の詳細が必要な場合に限り、根拠情報を要求してください。
 
-```bash
-cargo test
-```
+OSV にデータがないことは、そのパッケージに CVE が存在しないことを保証しません。重要なパッケージやサポート終了済みのパッケージについては、CVE List とベンダーのアドバイザリも確認してください。
+
+## ワークスペース
+
+- `app/`: CLI とユーザー向けクレート
+- `collector/`: データソースのクライアント
+- `core/`: 公開 Rust API
+- `db/`: スキーマ、インポート、クエリ
+- `models/`: 各データソースのモデル
+- `utils/`: アーカイブ、GitHub、ログ、日時に関するユーティリティ
