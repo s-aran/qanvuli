@@ -1,5 +1,5 @@
 use ahash::AHashSet;
-use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, TimeDelta, Utc};
 use clap::ValueEnum;
 use qanvuli_core::ingest::OsvModifiedId;
 use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
@@ -59,6 +59,8 @@ const CAPEC_STORAGE_VERSION_METADATA_KEY: &str = "capec_catalog:storage_version"
 const CAPEC_STORAGE_VERSION: &str = "1";
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(crate) const CVE_DELTA_CURSOR_METADATA_KEY: &str = "cve_delta_cursor";
+const CVE_DAILY_UPDATE_AFTER: TimeDelta = TimeDelta::hours(24);
+const CVE_FULL_UPDATE_AFTER: TimeDelta = TimeDelta::days(14);
 
 pub(crate) fn cve_full_asset_cursor(path: &Path) -> Option<DateTime<Utc>> {
     let filename = path.file_name()?.to_str()?;
@@ -1576,6 +1578,59 @@ pub async fn delta_assets_published_after(
     Ok(cve.delta_assets_after(cursor))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CveRemoteUpdateKind {
+    Hourly,
+    DailyThenHourly,
+    Full,
+}
+
+fn cve_remote_update_kind(cursor: DateTime<Utc>, now: DateTime<Utc>) -> CveRemoteUpdateKind {
+    let elapsed = now.signed_duration_since(cursor);
+    if elapsed >= CVE_FULL_UPDATE_AFTER {
+        CveRemoteUpdateKind::Full
+    } else if elapsed > CVE_DAILY_UPDATE_AFTER {
+        CveRemoteUpdateKind::DailyThenHourly
+    } else {
+        CveRemoteUpdateKind::Hourly
+    }
+}
+
+enum CveRemoteUpdate {
+    Full(GitHubReleaseFile),
+    Deltas(Vec<(DateTime<Utc>, GitHubReleaseFile)>),
+}
+
+async fn cve_remote_update(
+    cursor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<CveRemoteUpdate, String> {
+    let mut cve = CveRelease::new();
+    match cve_remote_update_kind(cursor, now) {
+        CveRemoteUpdateKind::Full => {
+            cve.refresh()
+                .await
+                .map_err(|error| format!("failed to fetch CVE release list: {error}"))?;
+            let asset = cve
+                .latest_full_asset()
+                .cloned()
+                .ok_or_else(|| "no all CVE zip asset found".to_owned())?;
+            Ok(CveRemoteUpdate::Full(asset))
+        }
+        kind => {
+            cve.refresh_after(cursor)
+                .await
+                .map_err(|error| format!("failed to fetch CVE release list: {error}"))?;
+            let assets = match kind {
+                CveRemoteUpdateKind::Hourly => cve.delta_assets_after(cursor),
+                CveRemoteUpdateKind::DailyThenHourly => cve.daily_then_hourly_assets_after(cursor),
+                CveRemoteUpdateKind::Full => unreachable!(),
+            };
+            Ok(CveRemoteUpdate::Deltas(assets))
+        }
+    }
+}
+
 /// Applies local or downloaded CVE delta archives through the SQLx writer.
 pub async fn apply_delta_updates(
     db: &SqlxDatabase,
@@ -1617,7 +1672,19 @@ pub async fn apply_delta_updates_with_progress(
     let cursor = DateTime::parse_from_rfc3339(&cursor)
         .map_err(|error| format!("invalid CVE delta cursor; run init: {error}"))?
         .with_timezone(&Utc);
-    let assets = delta_assets_published_after(cursor).await?;
+    let update = cve_remote_update(cursor, Utc::now()).await?;
+    let assets = match update {
+        CveRemoteUpdate::Full(asset) => {
+            let asset_cursor = cve_full_asset_cursor(Path::new(&asset.name)).ok_or_else(|| {
+                format!(
+                    "cannot determine the full CVE archive timestamp from {}",
+                    asset.name
+                )
+            })?;
+            vec![(asset_cursor, asset)]
+        }
+        CveRemoteUpdate::Deltas(assets) => assets,
+    };
     let mut paths = Vec::with_capacity(assets.len());
     let mut database_changed = false;
     let apply_result = async {
@@ -1977,6 +2044,41 @@ mod tests {
             "2026-07-18T00:00:00+00:00"
         );
         assert!(cve_full_asset_cursor(Path::new("delta.zip")).is_none());
+    }
+
+    #[test]
+    fn cve_remote_update_kind_uses_hourly_through_exactly_24_hours() {
+        let cursor = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            cve_remote_update_kind(cursor, cursor + TimeDelta::hours(24)),
+            CveRemoteUpdateKind::Hourly
+        );
+        assert_eq!(
+            cve_remote_update_kind(
+                cursor,
+                cursor + TimeDelta::hours(24) + TimeDelta::seconds(1)
+            ),
+            CveRemoteUpdateKind::DailyThenHourly
+        );
+    }
+
+    #[test]
+    fn cve_remote_update_kind_uses_full_at_two_weeks() {
+        let cursor = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        assert_eq!(
+            cve_remote_update_kind(cursor, cursor + TimeDelta::days(14) - TimeDelta::seconds(1)),
+            CveRemoteUpdateKind::DailyThenHourly
+        );
+        assert_eq!(
+            cve_remote_update_kind(cursor, cursor + TimeDelta::days(14)),
+            CveRemoteUpdateKind::Full
+        );
     }
 
     #[test]

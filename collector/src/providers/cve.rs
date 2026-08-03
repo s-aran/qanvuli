@@ -27,6 +27,15 @@ mod tests {
         }
     }
 
+    fn end_of_day_release(published_at: &str, date: &str) -> GitHubRelease {
+        let mut release = release(
+            published_at,
+            &format!("{date}_delta_CVEs_at_end_of_day.zip"),
+        );
+        release.version = format!("cve_{date}_at_end_of_day");
+        release
+    }
+
     #[test]
     fn delta_cursor_filters_old_releases_and_keeps_chronological_order() {
         let provider = CveRelease {
@@ -51,6 +60,67 @@ mod tests {
             vec![
                 "2026-07-19_delta_0100.zip".to_owned(),
                 "2026-07-19_delta_0200.zip".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn daily_then_hourly_uses_daily_releases_before_newer_hourly_releases() {
+        let provider = CveRelease {
+            releases: vec![
+                release("2026-07-22T03:00:00Z", "2026-07-22_delta_0300.zip"),
+                release("2026-07-22T02:00:00Z", "2026-07-22_delta_0200.zip"),
+                end_of_day_release("2026-07-22T00:30:00Z", "2026-07-21"),
+                release("2026-07-21T23:00:00Z", "2026-07-21_delta_2300.zip"),
+                end_of_day_release("2026-07-21T00:30:00Z", "2026-07-20"),
+                release("2026-07-20T23:00:00Z", "2026-07-20_delta_2300.zip"),
+            ],
+        };
+        let cursor = DateTime::parse_from_rfc3339("2026-07-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let names = provider
+            .daily_then_hourly_assets_after(cursor)
+            .into_iter()
+            .map(|(_, asset)| asset.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "2026-07-20_delta_CVEs_at_end_of_day.zip".to_owned(),
+                "2026-07-21_delta_CVEs_at_end_of_day.zip".to_owned(),
+                "2026-07-22_delta_0200.zip".to_owned(),
+                "2026-07-22_delta_0300.zip".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn daily_then_hourly_falls_back_to_hourly_when_no_daily_release_is_newer() {
+        let provider = CveRelease {
+            releases: vec![
+                release("2026-07-22T03:00:00Z", "2026-07-22_delta_0300.zip"),
+                release("2026-07-22T02:00:00Z", "2026-07-22_delta_0200.zip"),
+                end_of_day_release("2026-07-22T00:30:00Z", "2026-07-21"),
+            ],
+        };
+        let cursor = DateTime::parse_from_rfc3339("2026-07-22T01:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let names = provider
+            .daily_then_hourly_assets_after(cursor)
+            .into_iter()
+            .map(|(_, asset)| asset.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "2026-07-22_delta_0200.zip".to_owned(),
+                "2026-07-22_delta_0300.zip".to_owned(),
             ]
         );
     }
@@ -211,6 +281,38 @@ impl CveRelease {
                     .map(move |file| (published_at, file))
             })
             .collect()
+    }
+
+    /// Returns completed daily deltas oldest first, followed by hourly deltas newer than the
+    /// newest selected daily release.
+    pub fn daily_then_hourly_assets_after(
+        &self,
+        cursor: DateTime<Utc>,
+    ) -> Vec<(DateTime<Utc>, GitHubReleaseFile)> {
+        let mut daily = self
+            .end_of_day_releases()
+            .into_iter()
+            .filter_map(|release| {
+                let published_at = release.published_at?;
+                (published_at > cursor).then_some((published_at, release))
+            })
+            .flat_map(|(published_at, release)| {
+                release
+                    .files
+                    .iter()
+                    .filter(|file| Self::is_end_of_day_zip(file))
+                    .cloned()
+                    .map(move |file| (published_at, file))
+            })
+            .collect::<Vec<_>>();
+        daily.sort_by_key(|(published_at, _)| *published_at);
+
+        let hourly_cursor = daily
+            .last()
+            .map(|(published_at, _)| *published_at)
+            .unwrap_or(cursor);
+        daily.extend(self.delta_assets_after(hourly_cursor));
+        daily
     }
 
     pub fn all_assets(&self) -> Vec<GitHubReleaseFile> {
