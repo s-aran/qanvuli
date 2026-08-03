@@ -184,7 +184,7 @@ qanvuli sbom ./sbom.json --sarif-output ./qanvuli.sarif
 
 `sbom` accepts GitHub dependency graph exports and SPDX or CycloneDX JSON. CycloneDX support includes top-level `components`, the root `metadata.component`, and components nested below either location. PURL-backed packages are evaluated against OSV and CVE List data with dedicated version handling for crates.io/Cargo, Go, GitHub Actions, Maven, npm, NuGet, PyPI, Pub, and RubyGems. Missing, unsupported, or ambiguous version schemes are returned for review instead of being counted as confirmed vulnerabilities. Name-only CVE matches are optional candidates and never count as confirmed vulnerabilities.
 
-JSON remains on standard output. `--sarif-output <PATH>` additionally writes the same scan as SARIF 2.1.0 for code-scanning integrations.
+JSON remains on standard output. `--sarif-output <PATH>` additionally writes the same scan as SARIF 2.1.0 for vulnerability reporting and code-scanning integrations. SARIF findings refer to the SBOM file as a whole; exact component line locations within the JSON document are not currently preserved, so the output is not intended for precise source navigation.
 
 ## MCP server
 

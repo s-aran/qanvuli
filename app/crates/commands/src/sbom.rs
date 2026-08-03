@@ -1,6 +1,6 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_database, connect_database, print_json};
 use qanvuli_core::database::{
-    CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
+    CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery, SqlxDatabase,
     ecosystem_identity_key, is_concrete_package_version, normalize_package_name,
     parse_package_purl,
 };
@@ -63,6 +63,16 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         return Err("--sarif-output must not overwrite the input SBOM".to_owned());
     }
     let db = connect_database(db_url).await?;
+    let operation_result = run_with_database(db.clone(), args, input_path).await;
+    let close_result = close_database(db).await;
+    operation_result.and(close_result)
+}
+
+async fn run_with_database(
+    db: SqlxDatabase,
+    args: Args,
+    input_path: PathBuf,
+) -> Result<(), String> {
     db.check_required_schema()
         .await
         .map_err(|err| format!("database rebuild required before SBOM search: {err}"))?;
@@ -211,8 +221,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         eprintln!("sbom: wrote SARIF report to {}", output_path.display());
     }
     print_json(&report)?;
-
-    close_database(db).await?;
     Ok(())
 }
 

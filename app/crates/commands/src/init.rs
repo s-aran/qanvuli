@@ -206,10 +206,7 @@ async fn run_with_progress(
             progress_for_build.clone(),
         )
         .await;
-        let osv_download_result = osv_download_task
-            .await
-            .map_err(|error| format!("OSV download task failed: {error}"))?;
-        cve_result?;
+        let osv_download_result = finish_cve_import(cve_result, osv_download_task).await?;
         if max_chunks.is_none() {
             let cve_delta_cursor = cve_delta_cursor.ok_or_else(|| {
                 "cannot determine the full CVE archive timestamp from its release or filename"
@@ -308,6 +305,25 @@ async fn run_with_progress(
     Ok(())
 }
 
+async fn finish_cve_import<T, U>(
+    cve_result: Result<U, String>,
+    osv_download_task: tokio::task::JoinHandle<Result<T, String>>,
+) -> Result<Result<T, String>, String>
+where
+    T: Send + 'static,
+{
+    match cve_result {
+        Ok(_) => osv_download_task
+            .await
+            .map_err(|error| format!("OSV download task failed: {error}")),
+        Err(error) => {
+            osv_download_task.abort();
+            let _ = osv_download_task.await;
+            Err(error)
+        }
+    }
+}
+
 fn with_candidate_cleanup(error: String, candidate: &std::path::Path) -> String {
     match remove_sqlite_database_files(candidate) {
         Ok(()) => error,
@@ -384,6 +400,10 @@ mod tests {
     use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
     use sqlx::{Connection, Executor};
     use std::io::Write;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Parser)]
     struct InitCli {
@@ -474,6 +494,36 @@ mod tests {
                 .iter()
                 .any(|target| target == "CVE full archive")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_cve_import_aborts_and_awaits_osv_prefetch() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let osv_download_task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_dropped);
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        tokio::task::yield_now().await;
+
+        let error = finish_cve_import(
+            Err::<(), _>("CVE import failed".to_owned()),
+            osv_download_task,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "CVE import failed");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     fn temporary_database(label: &str) -> (PathBuf, String) {
