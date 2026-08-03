@@ -43,6 +43,10 @@ impl EcosystemPolicy for PyPiPolicy {
                 .is_some_and(|(left, right)| left == right)
     }
 
+    fn is_concrete_version(&self, version: &str) -> bool {
+        version.parse::<Pep440Version>().is_ok()
+    }
+
     fn evaluate_ecosystem_range(&self, installed: &str, range: &OsvRange) -> RangeEvaluation {
         evaluate_parsed_range(
             installed,

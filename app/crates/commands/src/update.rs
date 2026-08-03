@@ -1,8 +1,8 @@
 use super::common::{
-    IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP, OsvImportSelection,
-    apply_delta_updates, apply_delta_updates_with_progress, connect_database, import_cve_zip,
-    import_cve_zip_with_progress, sync_capec_catalog, sync_cwe_catalog, sync_osv_with_refresh,
-    sync_risk_feeds,
+    CveArchiveOwnership, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
+    OsvImportSelection, apply_delta_updates, apply_delta_updates_with_progress,
+    cleanup_processed_cve_archive, connect_database, import_cve_zip, import_cve_zip_with_progress,
+    sync_capec_catalog, sync_cwe_catalog, sync_osv_with_refresh, sync_risk_feeds,
 };
 use std::path::PathBuf;
 
@@ -19,7 +19,7 @@ pub struct Args {
     /// Import at most this many archive chunks.
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
-    /// Keep the CVE archive after import.
+    /// Keep automatically downloaded CVE archives after import. Has no effect on --zip.
     #[arg(long)]
     keep: bool,
     /// Update all OSV source databases.
@@ -194,10 +194,8 @@ async fn run_with_progress(
             .close()
             .await
             .map_err(|error| format!("failed to close database: {error}"))?;
-        if !args.keep {
-            for path in applied_paths {
-                super::common::remove_processed_zip(&path)?;
-            }
+        for path in applied_paths {
+            cleanup_processed_cve_archive(&path, CveArchiveOwnership::Downloaded, args.keep)?;
         }
         return Ok(());
     }
@@ -256,9 +254,23 @@ pub async fn run_default_with_progress_and_keep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
     use qanvuli_core::database::SqlxDatabase;
     use sqlx::Connection;
     use std::io::Write;
+
+    #[derive(Parser)]
+    struct UpdateCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn keep_help_applies_only_to_downloaded_archives() {
+        let help = UpdateCli::command().render_long_help().to_string();
+        assert!(help.contains("automatically downloaded CVE archives"));
+        assert!(help.contains("Has no effect on --zip"));
+    }
 
     #[test]
     fn only_no_progress_disables_modern_progress() {
@@ -337,6 +349,38 @@ mod tests {
                 .is_some()
         );
         database.close().await.unwrap();
+        assert!(zip_path.exists());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn failed_local_zip_update_preserves_user_owned_archive() {
+        let directory = std::env::temp_dir().join(format!(
+            "qanvuli-sqlx-update-error-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("database.sqlite");
+        let zip_path = directory.join("broken.zip");
+        let url = format!("sqlite://{}?mode=rwc", database_path.display());
+        let database = SqlxDatabase::connect(&url).await.unwrap();
+        database.initialize().await.unwrap();
+        database.close().await.unwrap();
+        std::fs::write(&zip_path, b"not a zip archive").unwrap();
+
+        let error = run(
+            &url,
+            Args {
+                zip: Some(zip_path.clone()),
+                ..Args::default()
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!error.is_empty());
+        assert!(zip_path.exists());
         let _ = std::fs::remove_dir_all(directory);
     }
 

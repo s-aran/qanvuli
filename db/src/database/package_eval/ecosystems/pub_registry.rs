@@ -38,6 +38,10 @@ impl EcosystemPolicy for PubPolicy {
             .is_some_and(|(left, right)| left == right)
     }
 
+    fn is_concrete_version(&self, version: &str) -> bool {
+        pub_version(version).is_some()
+    }
+
     fn evaluate_ecosystem_range(&self, installed: &str, range: &OsvRange) -> RangeEvaluation {
         evaluate_parsed_range(installed, range, pub_version, compare_versions)
     }

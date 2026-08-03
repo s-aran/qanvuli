@@ -242,7 +242,9 @@ pub(crate) struct RecentUpdatesArgs {
     pub(crate) offset: Option<u64>,
     /// Include rejected CVE records when true. Default returns only published CVEs.
     pub(crate) include_rejected: Option<bool>,
-    /// Return complete English descriptions instead of 280-character previews. Defaults to false.
+    /// Return compact triage rows by default, or full CWE/CVSS/affected details with "full".
+    pub(crate) verbosity: Option<String>,
+    /// Return complete English descriptions in full mode. Also selects full mode when verbosity is omitted.
     pub(crate) full_description: Option<bool>,
 }
 
@@ -332,7 +334,7 @@ pub(crate) struct QueryPackagesEnrichedArgs {
     pub(crate) status: Option<String>,
     /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
     pub(crate) include_evidence: Option<bool>,
-    /// Return full findings (default) or only one compact summary per package.
+    /// Return one compact, decision-preserving summary per package by default, or full findings with "full".
     pub(crate) verbosity: Option<String>,
     /// Include OSV fixed-version candidates in findings and package summaries. Defaults to false.
     pub(crate) include_fixed: Option<bool>,

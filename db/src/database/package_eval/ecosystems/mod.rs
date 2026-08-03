@@ -39,6 +39,10 @@ pub(super) trait EcosystemPolicy: Sync {
         left == right
     }
 
+    fn is_concrete_version(&self, _version: &str) -> bool {
+        false
+    }
+
     fn allows_semver_v_prefix(&self) -> bool {
         false
     }
@@ -203,4 +207,13 @@ fn evaluate_semver_range(
         },
         semver::Version::cmp_precedence,
     )
+}
+
+pub(super) fn is_semver_version(version: &str, allow_leading_v: bool) -> bool {
+    let version = if allow_leading_v {
+        strip_conventional_v(version)
+    } else {
+        version
+    };
+    semver::Version::parse(version).is_ok()
 }

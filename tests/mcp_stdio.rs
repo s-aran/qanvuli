@@ -76,6 +76,12 @@ async fn initialized_database() -> TemporaryDatabase {
         .await
         .expect("MCP OSV fixture should import");
     database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0102","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"compact MCP recent fixture","descriptions":[{"lang":"en","value":"description for MCP compact response testing"}],"metrics":[{"cvssV3_1":{"version":"3.1","vectorString":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H","baseScore":9.8,"baseSeverity":"CRITICAL"}}],"affected":[{"vendor":"example","product":"widget","versions":[{"version":"1.0.0","status":"affected"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .expect("MCP CVE fixture should import");
+    database
         .close()
         .await
         .expect("temporary MCP database should close");
@@ -252,6 +258,41 @@ async fn mcp_stdio_lists_tools_recovers_from_request_error_and_exits_on_eof() {
                     }
                 }
             }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "query_packages_enriched",
+                    "arguments": {
+                        "packages": [{
+                            "ecosystem": "PyPI",
+                            "package": "Friendly_Bard",
+                            "version": "2.0",
+                            "purl": "pkg:pypi/friendly-bard@2.0"
+                        }],
+                        "include_fixed": true
+                    }
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_recent_updates",
+                    "arguments": {"limit": 1}
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_recent_updates",
+                    "arguments": {"limit": 1, "verbosity": "full"}
+                }
+            }),
         ],
     );
 
@@ -331,4 +372,32 @@ async fn mcp_stdio_lists_tools_recovers_from_request_error_and_exits_on_eof() {
             .and_then(Value::as_str),
         Some("available")
     );
+
+    let batch_text = response_with_id(&responses, 6)
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("batch result text");
+    let batch: Value = serde_json::from_str(batch_text).expect("batch result JSON");
+    assert_eq!(batch["verbosity"], "summary");
+    assert_eq!(batch["results"][0]["summary"]["vulnerable"], true);
+    assert!(batch["results"][0].get("findings").is_none());
+
+    let recent_summary_text = response_with_id(&responses, 7)
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("recent summary text");
+    let recent_summary: Value =
+        serde_json::from_str(recent_summary_text).expect("recent summary JSON");
+    assert_eq!(recent_summary["verbosity"], "summary");
+    assert_eq!(recent_summary["results"][0]["cve_id"], "CVE-2099-0102");
+    assert_eq!(recent_summary["results"][0]["max_cvss_score"], 9.8);
+    assert!(recent_summary["results"][0].get("affected").is_none());
+
+    let recent_full_text = response_with_id(&responses, 8)
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .expect("recent full text");
+    let recent_full: Value = serde_json::from_str(recent_full_text).expect("recent full JSON");
+    assert!(recent_full["results"][0]["affected"].is_array());
+    assert!(recent_summary_text.len() < recent_full_text.len());
 }

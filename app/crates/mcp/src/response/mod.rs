@@ -95,7 +95,7 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         object.insert(
             "hint".into(),
             json!(if package_batch {
-                "use verbosity=summary for large package batches"
+                "request verbosity=full only for selected packages"
             } else {
                 "narrow query or page with offset"
             }),

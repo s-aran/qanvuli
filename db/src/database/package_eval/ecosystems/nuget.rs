@@ -29,6 +29,10 @@ impl EcosystemPolicy for NuGetPolicy {
                 .is_some_and(|(left, right)| left == right)
     }
 
+    fn is_concrete_version(&self, version: &str) -> bool {
+        version_key(version).is_some()
+    }
+
     fn evaluate_ecosystem_range(&self, installed: &str, range: &OsvRange) -> RangeEvaluation {
         evaluate_parsed_range(installed, range, version_key, compare_versions)
     }

@@ -21,7 +21,8 @@ pub mod database {
         SqlxIdentifierResolution, SqlxKev, SqlxKevEntry, SqlxOsvRange, SqlxOsvSummary,
         SqlxPackageFinding, SqlxSourceSyncState, SqlxVersionMatch, cve_state_label,
         detect_identifier_type, ecosystem_identity_key, evaluate_sqlx_osv_version,
-        normalize_package_name, package_identity_purl, parse_package_purl, versions_equivalent,
+        is_concrete_package_version, normalize_package_name, package_identity_purl,
+        parse_package_purl, versions_equivalent,
     };
 }
 

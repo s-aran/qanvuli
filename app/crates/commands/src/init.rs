@@ -1,9 +1,10 @@
 use super::common::{
-    CVE_DELTA_CURSOR_METADATA_KEY, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
-    OsvImportMode, OsvImportSelection, ReleaseAssetKind, connect_database, cve_full_asset_cursor,
+    CVE_DELTA_CURSOR_METADATA_KEY, CveArchiveOwnership, IngestProgress, IngestProgressCallback,
+    OSV_SOURCE_PREFIX_HELP, OsvImportMode, OsvImportSelection, ReleaseAssetKind,
+    cleanup_processed_cve_archive, connect_database, cve_full_asset_cursor,
     download_latest_asset_with_source_with_progress, download_osv_selection_from_gcs,
     import_cve_zip_bulk_with_index_signal, import_downloaded_osv_selection, redact_database_url,
-    remove_processed_zip, sync_capec_catalog, sync_cwe_catalog, sync_risk_feeds,
+    sync_capec_catalog, sync_cwe_catalog, sync_risk_feeds,
 };
 use qanvuli_core::database::{
     DatabaseReplacement, RecoveryAction, candidate_database_path, recover_interrupted_replacement,
@@ -25,7 +26,7 @@ pub struct Args {
     /// Import at most this many archive chunks.
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
-    /// Keep the CVE archive after import.
+    /// Keep an automatically downloaded CVE archive after import. Has no effect on --zip.
     #[arg(long)]
     keep: bool,
     /// Delete existing database files before building. A failure then leaves no usable database.
@@ -137,10 +138,10 @@ async fn run_with_progress(
             .map_err(|error| format!("failed to remove existing database before init: {error}"))?;
     }
 
-    let (asset_path, cve_delta_cursor) = if let Some(zip) = args.zip {
+    let (asset_path, cve_delta_cursor, archive_ownership) = if let Some(zip) = args.zip {
         emit_init_progress(&progress, &zip.display().to_string(), "using local zip");
         let cursor = cve_full_asset_cursor(&zip);
-        (zip, cursor)
+        (zip, cursor, CveArchiveOwnership::UserSupplied)
     } else {
         let asset = download_latest_asset_with_source_with_progress(
             ReleaseAssetKind::All,
@@ -151,7 +152,7 @@ async fn run_with_progress(
         let cursor = asset
             .published_at
             .or_else(|| cve_full_asset_cursor(&asset.path));
-        (asset.path, cursor)
+        (asset.path, cursor, CveArchiveOwnership::Downloaded)
     };
 
     let candidate_path = candidate_database_path(&target)
@@ -205,10 +206,7 @@ async fn run_with_progress(
             progress_for_build.clone(),
         )
         .await;
-        let osv_download_result = osv_download_task
-            .await
-            .map_err(|error| format!("OSV download task failed: {error}"))?;
-        cve_result?;
+        let osv_download_result = finish_cve_import(cve_result, osv_download_task).await?;
         if max_chunks.is_none() {
             let cve_delta_cursor = cve_delta_cursor.ok_or_else(|| {
                 "cannot determine the full CVE archive timestamp from its release or filename"
@@ -298,15 +296,32 @@ async fn run_with_progress(
         eprintln!("init: inspect and remove it manually after confirming the replacement");
         eprintln!("init: cleanup error: {error}");
     }
-    if !args.keep
-        && let Err(error) = remove_processed_zip(&asset_path)
-    {
+    if let Err(error) = cleanup_processed_cve_archive(&asset_path, archive_ownership, args.keep) {
         eprintln!(
             "init: replacement installed, but failed to remove processed archive {}: {error}",
             asset_path.display()
         );
     }
     Ok(())
+}
+
+async fn finish_cve_import<T, U>(
+    cve_result: Result<U, String>,
+    osv_download_task: tokio::task::JoinHandle<Result<T, String>>,
+) -> Result<Result<T, String>, String>
+where
+    T: Send + 'static,
+{
+    match cve_result {
+        Ok(_) => osv_download_task
+            .await
+            .map_err(|error| format!("OSV download task failed: {error}")),
+        Err(error) => {
+            osv_download_task.abort();
+            let _ = osv_download_task.await;
+            Err(error)
+        }
+    }
 }
 
 fn with_candidate_cleanup(error: String, candidate: &std::path::Path) -> String {
@@ -385,6 +400,10 @@ mod tests {
     use qanvuli_core::database::{OsvRawRecord, SqlxDatabase};
     use sqlx::{Connection, Executor};
     use std::io::Write;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     #[derive(Parser)]
     struct InitCli {
@@ -416,6 +435,23 @@ mod tests {
         assert!(help.contains("-D, --delete-existing"));
         assert!(help.contains("Delete existing database files before building"));
         assert!(help.contains("failure then leaves no usable database"));
+        assert!(help.contains("automatically downloaded CVE archive"));
+        assert!(help.contains("Has no effect on --zip"));
+    }
+
+    #[test]
+    fn init_local_zip_is_preserved_after_successful_processing_without_keep() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-init-user-owned-{}-{}.zip",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::write(&path, b"user owned").unwrap();
+
+        cleanup_processed_cve_archive(&path, CveArchiveOwnership::UserSupplied, false).unwrap();
+
+        assert!(path.exists());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -458,6 +494,36 @@ mod tests {
                 .iter()
                 .any(|target| target == "CVE full archive")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_cve_import_aborts_and_awaits_osv_prefetch() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = dropped.clone();
+        let osv_download_task = tokio::spawn(async move {
+            let _drop_signal = DropSignal(task_dropped);
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        tokio::task::yield_now().await;
+
+        let error = finish_cve_import(
+            Err::<(), _>("CVE import failed".to_owned()),
+            osv_download_task,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "CVE import failed");
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     fn temporary_database(label: &str) -> (PathBuf, String) {
