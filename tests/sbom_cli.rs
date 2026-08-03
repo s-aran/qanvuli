@@ -9,11 +9,13 @@ struct TemporarySbomFixture {
     database_path: PathBuf,
     database_url: String,
     sbom_path: PathBuf,
+    sarif_path: PathBuf,
 }
 
 impl Drop for TemporarySbomFixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.sbom_path);
+        let _ = std::fs::remove_file(&self.sarif_path);
         let _ = std::fs::remove_file(&self.database_path);
         let _ = std::fs::remove_file(self.database_path.with_extension("sqlite-shm"));
         let _ = std::fs::remove_file(self.database_path.with_extension("sqlite-wal"));
@@ -29,6 +31,7 @@ async fn vulnerable_npm_sbom_fixture() -> TemporarySbomFixture {
     let database_path = std::env::temp_dir().join(format!("{stem}.sqlite"));
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let sbom_path = std::env::temp_dir().join(format!("{stem}.spdx.json"));
+    let sarif_path = std::env::temp_dir().join(format!("{stem}.sarif"));
 
     let database = qanvuli_core::database::SqlxDatabase::connect(&database_url)
         .await
@@ -98,6 +101,7 @@ async fn vulnerable_npm_sbom_fixture() -> TemporarySbomFixture {
         database_path,
         database_url,
         sbom_path,
+        sarif_path,
     }
 }
 
@@ -110,6 +114,7 @@ async fn custom_sbom_fixture(label: &str, advisory: Value, sbom: Value) -> Tempo
     let database_path = std::env::temp_dir().join(format!("{stem}.sqlite"));
     let database_url = format!("sqlite://{}?mode=rwc", database_path.display());
     let sbom_path = std::env::temp_dir().join(format!("{stem}.json"));
+    let sarif_path = std::env::temp_dir().join(format!("{stem}.sarif"));
 
     let database = qanvuli_core::database::SqlxDatabase::connect(&database_url)
         .await
@@ -139,6 +144,7 @@ async fn custom_sbom_fixture(label: &str, advisory: Value, sbom: Value) -> Tempo
         database_path,
         database_url,
         sbom_path,
+        sarif_path,
     }
 }
 
@@ -215,6 +221,56 @@ async fn sbom_cli_reports_vulnerability_from_spdx_purl_and_osv_semver_range() {
         stderr.contains("sbom: completed 1/1 unique components"),
         "SBOM progress did not reach completion: {stderr}"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sbom_cli_writes_sarif_and_keeps_json_on_stdout() {
+    let fixture = vulnerable_npm_sbom_fixture().await;
+    let output = Command::new(env!("CARGO_BIN_EXE_qanvuli"))
+        .args(["--db-url", &fixture.database_url, "sbom", "--file"])
+        .arg(&fixture.sbom_path)
+        .arg("--sarif-output")
+        .arg(&fixture.sarif_path)
+        .output()
+        .expect("SBOM CLI process should start");
+
+    let stdout = String::from_utf8(output.stdout).expect("SBOM stdout should be UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("SBOM stderr should be UTF-8");
+    assert!(
+        output.status.success(),
+        "SBOM CLI failed with {}\nstderr:\n{stderr}\nstdout:\n{stdout}",
+        output.status
+    );
+
+    let json_report: Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("SBOM CLI returned invalid JSON: {error}\n{stdout}"));
+    assert_eq!(json_report["osv_count"], 1);
+
+    let sarif: Value = serde_json::from_slice(
+        &std::fs::read(&fixture.sarif_path).expect("SARIF output should be written"),
+    )
+    .expect("SARIF output should be JSON");
+    assert_eq!(sarif["version"], "2.1.0");
+    assert_eq!(sarif["runs"][0]["tool"]["driver"]["name"], "qanvuli");
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["ruleId"],
+        "GHSA-2099-sbom-cli"
+    );
+    assert_eq!(sarif["runs"][0]["results"][0]["level"], "warning");
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["properties"]["matchedPurl"],
+        "pkg:npm/node-forge@1.5.0"
+    );
+    assert!(
+        sarif["runs"][0]["results"][0]["partialFingerprints"]["primaryLocationLineHash"]
+            .as_str()
+            .is_some_and(|value| value.len() == 64)
+    );
+    assert_eq!(
+        sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"]["startLine"],
+        1
+    );
+    assert!(stderr.contains("sbom: wrote SARIF report to"));
 }
 
 #[tokio::test(flavor = "current_thread")]

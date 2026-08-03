@@ -5,7 +5,10 @@ use qanvuli_core::database::{
     parse_package_purl,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// CLI arguments for `qanvuli sbom`.
@@ -32,6 +35,9 @@ pub struct Args {
     /// Include unverified name matches outside vulnerability counts.
     #[arg(long)]
     include_name_matches: bool,
+    /// Also write the report as SARIF 2.1.0 while JSON remains on stdout.
+    #[arg(long, value_name = "PATH")]
+    sarif_output: Option<PathBuf>,
 }
 
 impl Args {
@@ -52,12 +58,16 @@ impl Args {
 
 /// Reads an SBOM JSON file and prints local vulnerability findings as JSON.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
+    let input_path = args.path()?.to_path_buf();
+    if args.sarif_output.as_deref() == Some(input_path.as_path()) {
+        return Err("--sarif-output must not overwrite the input SBOM".to_owned());
+    }
     let db = connect_database(db_url).await?;
     db.check_required_schema()
         .await
         .map_err(|err| format!("database rebuild required before SBOM search: {err}"))?;
     let date_filter = args.date_filter()?;
-    let packages = load_sbom_packages(args.path()?)?;
+    let packages = load_sbom_packages(&input_path)?;
     let component_count = packages.len();
     let packages = deduplicate_sbom_packages(packages);
     let unique_component_count = packages.len();
@@ -196,6 +206,10 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         unverified_name_matches: args.include_name_matches.then_some(unverified_name_matches),
         unresolved_versions,
     };
+    if let Some(output_path) = args.sarif_output.as_deref() {
+        write_sarif(output_path, &SarifLog::from_report(&report, &input_path))?;
+        eprintln!("sbom: wrote SARIF report to {}", output_path.display());
+    }
     print_json(&report)?;
 
     close_database(db).await?;
@@ -716,6 +730,375 @@ struct SbomReport {
     osv_findings: Vec<SbomOsvFinding>,
     unverified_name_matches: Option<Vec<SbomCveFinding>>,
     unresolved_versions: BTreeSet<UnresolvedVersion>,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifLog {
+    #[serde(rename = "$schema")]
+    schema: &'static str,
+    version: &'static str,
+    runs: Vec<SarifRun>,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifRun {
+    tool: SarifTool,
+    results: Vec<SarifResult>,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifTool {
+    driver: SarifDriver,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifDriver {
+    name: &'static str,
+    #[serde(rename = "semanticVersion")]
+    semantic_version: &'static str,
+    #[serde(rename = "informationUri")]
+    information_uri: &'static str,
+    rules: Vec<SarifRule>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SarifRule {
+    id: String,
+    #[serde(rename = "shortDescription")]
+    short_description: SarifMessage,
+    #[serde(rename = "helpUri", skip_serializing_if = "Option::is_none")]
+    help_uri: Option<String>,
+    properties: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SarifMessage {
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifResult {
+    #[serde(rename = "ruleId")]
+    rule_id: String,
+    level: &'static str,
+    message: SarifMessage,
+    locations: Vec<SarifLocation>,
+    #[serde(rename = "partialFingerprints")]
+    partial_fingerprints: BTreeMap<String, String>,
+    properties: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifLocation {
+    #[serde(rename = "physicalLocation")]
+    physical_location: SarifPhysicalLocation,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifPhysicalLocation {
+    #[serde(rename = "artifactLocation")]
+    artifact_location: SarifArtifactLocation,
+    region: SarifRegion,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifArtifactLocation {
+    uri: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SarifRegion {
+    #[serde(rename = "startLine")]
+    start_line: u64,
+}
+
+impl SarifLog {
+    fn from_report(report: &SbomReport, input_path: &Path) -> Self {
+        let artifact_uri = sarif_artifact_uri(input_path);
+        let mut rules = BTreeMap::<String, SarifRule>::new();
+        let mut results = Vec::new();
+
+        for finding in &report.findings {
+            let rule_id = finding.cve.cve_id.clone();
+            rules.entry(rule_id.clone()).or_insert_with(|| SarifRule {
+                id: rule_id.clone(),
+                short_description: SarifMessage {
+                    text: nonempty_or(&finding.cve.title, "CVE vulnerability").to_owned(),
+                },
+                help_uri: Some(format!(
+                    "https://www.cve.org/CVERecord?id={}",
+                    finding.cve.cve_id
+                )),
+                properties: sarif_rule_properties("cve"),
+            });
+            let version = finding.version.as_deref().unwrap_or("unknown version");
+            let identity = format!(
+                "cve\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                finding.package,
+                version,
+                finding.matched_purl.as_deref().unwrap_or_default(),
+                finding.cve.cve_id
+            );
+            results.push(sarif_result(
+                rule_id,
+                "warning",
+                format!(
+                    "{} affects {} {}.",
+                    finding.cve.cve_id, finding.package, version
+                ),
+                &artifact_uri,
+                &identity,
+                BTreeMap::from([
+                    ("package".to_owned(), json!(finding.package)),
+                    ("version".to_owned(), json!(finding.version)),
+                    (
+                        "matchedComponent".to_owned(),
+                        json!(finding.matched_component),
+                    ),
+                    ("matchedPurl".to_owned(), json!(finding.matched_purl)),
+                    ("versionMatch".to_owned(), json!(finding.version_match)),
+                    ("publishedAt".to_owned(), json!(finding.cve.published_at)),
+                    ("updatedAt".to_owned(), json!(finding.cve.updated_at)),
+                ]),
+            ));
+        }
+
+        for finding in &report.osv_findings {
+            let rule_id = finding.finding.primary_id.clone();
+            rules.entry(rule_id.clone()).or_insert_with(|| SarifRule {
+                id: rule_id.clone(),
+                short_description: SarifMessage {
+                    text: "OSV vulnerability advisory".to_owned(),
+                },
+                help_uri: Some(format!(
+                    "https://osv.dev/vulnerability/{}",
+                    finding.finding.primary_id
+                )),
+                properties: sarif_rule_properties("osv"),
+            });
+            let version = finding.version.as_deref().unwrap_or("unknown version");
+            let identity = format!(
+                "osv\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                finding.package, version, finding.matched_purl, finding.finding.primary_id
+            );
+            let fixed_suffix = if finding.finding.fixed_versions.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Fixed versions: {}.",
+                    finding.finding.fixed_versions.join(", ")
+                )
+            };
+            results.push(sarif_result(
+                rule_id,
+                if finding.finding.priority_signals.known_exploited {
+                    "error"
+                } else {
+                    "warning"
+                },
+                format!(
+                    "{} affects {} {}.{}",
+                    finding.finding.primary_id, finding.package, version, fixed_suffix
+                ),
+                &artifact_uri,
+                &identity,
+                BTreeMap::from([
+                    ("package".to_owned(), json!(finding.package)),
+                    ("version".to_owned(), json!(finding.version)),
+                    ("matchedPurl".to_owned(), json!(finding.matched_purl)),
+                    ("source".to_owned(), json!(finding.finding.source)),
+                    ("cveIds".to_owned(), json!(finding.finding.cve_ids)),
+                    ("aliases".to_owned(), json!(finding.finding.aliases)),
+                    (
+                        "fixedVersions".to_owned(),
+                        json!(finding.finding.fixed_versions),
+                    ),
+                    (
+                        "knownExploited".to_owned(),
+                        json!(finding.finding.priority_signals.known_exploited),
+                    ),
+                    (
+                        "epssPercentile".to_owned(),
+                        json!(finding.finding.priority_signals.epss_percentile),
+                    ),
+                    (
+                        "suggestedPriority".to_owned(),
+                        json!(finding.finding.priority_signals.suggested_priority),
+                    ),
+                ]),
+            ));
+        }
+
+        if let Some(findings) = &report.unverified_name_matches {
+            for finding in findings {
+                let rule_id = finding.cve.cve_id.clone();
+                rules.entry(rule_id.clone()).or_insert_with(|| SarifRule {
+                    id: rule_id.clone(),
+                    short_description: SarifMessage {
+                        text: nonempty_or(&finding.cve.title, "Unverified CVE match").to_owned(),
+                    },
+                    help_uri: Some(format!(
+                        "https://www.cve.org/CVERecord?id={}",
+                        finding.cve.cve_id
+                    )),
+                    properties: sarif_rule_properties("cve"),
+                });
+                let version = finding.version.as_deref().unwrap_or("unknown version");
+                let identity = format!(
+                    "unverified\u{1f}{}\u{1f}{}\u{1f}{}",
+                    finding.package, version, finding.cve.cve_id
+                );
+                results.push(sarif_result(
+                    rule_id,
+                    "note",
+                    format!(
+                        "{} may match {} {}; the package version was not verified.",
+                        finding.cve.cve_id, finding.package, version
+                    ),
+                    &artifact_uri,
+                    &identity,
+                    BTreeMap::from([
+                        ("package".to_owned(), json!(finding.package)),
+                        ("version".to_owned(), json!(finding.version)),
+                        (
+                            "matchedComponent".to_owned(),
+                            json!(finding.matched_component),
+                        ),
+                        ("versionMatch".to_owned(), json!(finding.version_match)),
+                    ]),
+                ));
+            }
+        }
+
+        if !report.unresolved_versions.is_empty() {
+            let rule_id = "QANVULI-UNRESOLVED-VERSION".to_owned();
+            rules.insert(
+                rule_id.clone(),
+                SarifRule {
+                    id: rule_id.clone(),
+                    short_description: SarifMessage {
+                        text: "Package version could not be evaluated".to_owned(),
+                    },
+                    help_uri: None,
+                    properties: sarif_rule_properties("review"),
+                },
+            );
+            for unresolved in &report.unresolved_versions {
+                let identity = format!(
+                    "unresolved\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+                    unresolved.package,
+                    unresolved.version,
+                    unresolved.matched_purl,
+                    unresolved.reason
+                );
+                results.push(sarif_result(
+                    rule_id.clone(),
+                    "note",
+                    format!(
+                        "Could not evaluate {} {}: {}.",
+                        unresolved.package, unresolved.version, unresolved.reason
+                    ),
+                    &artifact_uri,
+                    &identity,
+                    BTreeMap::from([
+                        ("package".to_owned(), json!(unresolved.package)),
+                        ("version".to_owned(), json!(unresolved.version)),
+                        ("matchedPurl".to_owned(), json!(unresolved.matched_purl)),
+                        ("reason".to_owned(), json!(unresolved.reason)),
+                    ]),
+                ));
+            }
+        }
+
+        Self {
+            schema: "https://json.schemastore.org/sarif-2.1.0.json",
+            version: "2.1.0",
+            runs: vec![SarifRun {
+                tool: SarifTool {
+                    driver: SarifDriver {
+                        name: "qanvuli",
+                        semantic_version: env!("CARGO_PKG_VERSION"),
+                        information_uri: "https://github.com/s-aran/qanvuli",
+                        rules: rules.into_values().collect(),
+                    },
+                },
+                results,
+            }],
+        }
+    }
+}
+
+fn sarif_rule_properties(kind: &str) -> BTreeMap<String, Value> {
+    BTreeMap::from([
+        ("kind".to_owned(), json!(kind)),
+        (
+            "tags".to_owned(),
+            json!(["security", "vulnerability", "dependency"]),
+        ),
+    ])
+}
+
+fn sarif_result(
+    rule_id: String,
+    level: &'static str,
+    message: String,
+    artifact_uri: &str,
+    identity: &str,
+    properties: BTreeMap<String, Value>,
+) -> SarifResult {
+    SarifResult {
+        rule_id,
+        level,
+        message: SarifMessage { text: message },
+        locations: vec![SarifLocation {
+            physical_location: SarifPhysicalLocation {
+                artifact_location: SarifArtifactLocation {
+                    uri: artifact_uri.to_owned(),
+                },
+                region: SarifRegion { start_line: 1 },
+            },
+        }],
+        partial_fingerprints: BTreeMap::from([(
+            "primaryLocationLineHash".to_owned(),
+            sarif_fingerprint(identity),
+        )]),
+        properties,
+    }
+}
+
+fn sarif_fingerprint(identity: &str) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(identity.as_bytes()) {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+fn sarif_artifact_uri(input_path: &Path) -> String {
+    let path = if input_path.is_absolute() {
+        std::env::current_dir()
+            .ok()
+            .and_then(|directory| input_path.strip_prefix(directory).ok())
+            .unwrap_or_else(|| input_path.file_name().map(Path::new).unwrap_or(input_path))
+    } else {
+        input_path
+    };
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn nonempty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value
+    }
+}
+
+fn write_sarif(path: &Path, report: &SarifLog) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|error| format!("failed to encode SARIF: {error}"))?;
+    std::fs::write(path, bytes)
+        .map_err(|error| format!("failed to write SARIF {}: {error}", path.display()))
 }
 
 #[derive(Debug, Serialize)]

@@ -179,9 +179,12 @@ qanvuli tui openssl
 ```bash
 qanvuli sbom ./sbom.json
 qanvuli sbom --file ./sbom.json --per-package-limit 5
+qanvuli sbom ./sbom.json --sarif-output ./qanvuli.sarif
 ```
 
 `sbom` は、GitHub の依存関係グラフから出力した SBOM と、SPDX または CycloneDX 形式の JSON を読み込みます。CycloneDX のトップレベル `components`、ルートの `metadata.component`、および両者の配下に入れ子になったコンポーネントに対応します。PURL があるパッケージは、crates.io／Cargo、Go、GitHub Actions、Maven、npm、NuGet、PyPI、Pub、RubyGems 専用のバージョン規則を用いて OSV と CVE List のデータに照合します。バージョンがない場合、バージョン方式に対応していない場合、判定が曖昧な場合は、確認済みの検出結果に含めず、要確認として返します。パッケージ名のみが一致する CVE は任意の候補として扱われ、脆弱性が確認された件数には含まれません。
+
+JSON は従来どおり標準出力へ出力します。`--sarif-output <PATH>` を指定すると、同じスキャン結果をコードスキャン連携用の SARIF 2.1.0 ファイルにも同時出力します。
 
 ## MCP サーバー
 
