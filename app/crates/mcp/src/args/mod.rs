@@ -1,5 +1,27 @@
 use rmcp::schemars;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+
+// Claude may send numeric MCP arguments as strings, so accept both forms.
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum U64OrString {
+        Number(u64),
+        String(String),
+    }
+
+    Option::<U64OrString>::deserialize(deserializer)?
+        .map(|value| match value {
+            U64OrString::Number(value) => Ok(value),
+            U64OrString::String(value) => value.trim().parse::<u64>().map_err(|_| {
+                D::Error::custom(format!("expected a non-negative integer, got `{value}`"))
+            }),
+        })
+        .transpose()
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct CweArgs {
@@ -311,8 +333,10 @@ pub(crate) struct QueryPackageEnrichedArgs {
     /// Return only confirmed affected findings (default), or all evaluated findings.
     pub(crate) status: Option<String>,
     /// Maximum findings to return. Clamped to 1..=30; default is 10.
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     pub(crate) limit: Option<u64>,
     /// Number of matching findings to skip. Default is 0.
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     pub(crate) offset: Option<u64>,
     /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
     pub(crate) include_evidence: Option<bool>,
@@ -370,5 +394,61 @@ impl CweArgValue {
             Self::Number(value) => value.to_string(),
             Self::String(value) => value,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryPackageEnrichedArgs;
+
+    fn package_args(limit: serde_json::Value, offset: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ecosystem": "crates.io",
+            "package": "example",
+            "version": "1.0.0",
+            "limit": limit,
+            "offset": offset,
+        })
+    }
+
+    #[test]
+    fn query_package_enriched_accepts_numeric_strings_for_pagination() {
+        let args: QueryPackageEnrichedArgs =
+            serde_json::from_value(package_args("30".into(), "2".into())).unwrap();
+
+        assert_eq!(args.limit, Some(30));
+        assert_eq!(args.offset, Some(2));
+    }
+
+    #[test]
+    fn query_package_enriched_still_accepts_numbers_and_omitted_pagination() {
+        let args: QueryPackageEnrichedArgs =
+            serde_json::from_value(package_args(30.into(), 2.into())).unwrap();
+        assert_eq!(args.limit, Some(30));
+        assert_eq!(args.offset, Some(2));
+
+        let args: QueryPackageEnrichedArgs = serde_json::from_value(serde_json::json!({
+            "ecosystem": "crates.io",
+            "package": "example",
+            "version": "1.0.0",
+        }))
+        .unwrap();
+        assert_eq!(args.limit, None);
+        assert_eq!(args.offset, None);
+    }
+
+    #[test]
+    fn query_package_enriched_rejects_invalid_numeric_strings() {
+        let error = serde_json::from_value::<QueryPackageEnrichedArgs>(package_args(
+            "many".into(),
+            0.into(),
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("expected a non-negative integer")
+        );
     }
 }

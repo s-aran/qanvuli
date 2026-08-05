@@ -9,8 +9,8 @@ use crate::{
     response,
 };
 use qanvuli_app_commands::common::{
-    OsvImportSelection, apply_delta_updates, redact_database_url,
-    sync_all_enrichment_sources_after_update,
+    CveArchiveOwnership, OsvImportSelection, apply_delta_updates, cleanup_processed_cve_archive,
+    redact_database_url, sync_all_enrichment_sources_after_update, sync_osv_after_update,
 };
 use qanvuli_core::database::{
     CveDatabase, CveRiskSummary, CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding,
@@ -1152,22 +1152,50 @@ pub(crate) async fn apply_updates(
     osv_all: bool,
     osv_prefixes: &[String],
 ) -> Result<CallToolResult, McpError> {
-    db.initialize_schema()
+    db.check_required_schema()
         .await
-        .map_err(|err| mcp_error(format!("failed to initialize schema: {err}")))?;
+        .map_err(|err| mcp_error(format!("database rebuild required before update: {err}")))?;
 
+    let local_zip = zip.is_some();
     let applied = apply_delta_updates(db, zip.map(PathBuf::from), max_chunks)
         .await
         .map_err(mcp_error)?;
+    let cve_changed = !applied.is_empty();
 
     let osv_additions = OsvImportSelection::update_additions(osv_all, osv_prefixes);
-    sync_all_enrichment_sources_after_update(db, "mcp update_db", osv_additions.as_ref())
+    if local_zip {
+        // Match `qanvuli update --zip`: a local CVE archive only expands OSV
+        // coverage when explicitly requested and does not refresh other feeds.
+        if let Some(osv_additions) = osv_additions.as_ref() {
+            sync_osv_after_update(db, "mcp update_db", Some(osv_additions))
+                .await
+                .map_err(mcp_error)?;
+        }
+    } else {
+        sync_all_enrichment_sources_after_update(
+            db,
+            "mcp update_db",
+            osv_additions.as_ref(),
+            cve_changed,
+        )
         .await
         .map_err(mcp_error)?;
+    }
+
+    db.check_search_integrity_quick()
+        .await
+        .map_err(|err| mcp_error(format!("post-update database check failed: {err}")))?;
 
     db.rebuild_identifier_graph()
         .await
         .map_err(|err| mcp_error(format!("failed to rebuild identifier graph: {err}")))?;
+
+    if !local_zip {
+        for path in &applied {
+            cleanup_processed_cve_archive(path, CveArchiveOwnership::Downloaded, false)
+                .map_err(mcp_error)?;
+        }
+    }
 
     response::tool_result(json!({
         "updated": true,

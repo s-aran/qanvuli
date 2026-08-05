@@ -1207,12 +1207,12 @@ pub fn remove_processed_zip(path: &Path) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CveArchiveOwnership {
+pub enum CveArchiveOwnership {
     UserSupplied,
     Downloaded,
 }
 
-pub(crate) fn cleanup_processed_cve_archive(
+pub fn cleanup_processed_cve_archive(
     path: &Path,
     ownership: CveArchiveOwnership,
     keep_downloads: bool,
@@ -1659,6 +1659,14 @@ pub async fn apply_delta_updates_with_progress(
             progress,
         )
         .await?;
+        db.mark_cve_asset_applied(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("local-cve.zip"),
+            "local",
+        )
+        .await
+        .map_err(|error| format!("failed to record local delta asset: {error}"))?;
         return Ok(vec![path]);
     }
 
@@ -1741,8 +1749,8 @@ pub async fn apply_delta_updates_with_progress(
     Ok(paths)
 }
 
-/// Refreshes all enrichment sources.
-pub async fn sync_all_enrichment_sources_after_update(
+/// Refreshes OSV using the stored selection plus any newly requested coverage.
+pub async fn sync_osv_after_update(
     db: &SqlxDatabase,
     label: &str,
     requested_osv_additions: Option<&OsvImportSelection>,
@@ -1755,8 +1763,22 @@ pub async fn sync_all_enrichment_sources_after_update(
         .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
     let selection =
         requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
-    sync_osv(db.clone(), label, selection).await?;
-    sync_risk_feeds(db.clone(), label, true).await.map(|_| ())
+    sync_osv(db.clone(), label, selection).await.map(|_| ())
+}
+
+/// Refreshes the catalogs and enrichment sources used by a normal update.
+pub async fn sync_all_enrichment_sources_after_update(
+    db: &SqlxDatabase,
+    label: &str,
+    requested_osv_additions: Option<&OsvImportSelection>,
+    cve_changed: bool,
+) -> Result<(), String> {
+    sync_cwe_catalog(db.clone()).await?;
+    sync_capec_catalog(db.clone()).await?;
+    sync_osv_after_update(db, label, requested_osv_additions).await?;
+    sync_risk_feeds(db.clone(), label, cve_changed)
+        .await
+        .map(|_| ())
 }
 
 /// Imports CVE JSON from a ZIP archive.

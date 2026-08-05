@@ -652,6 +652,8 @@ pub struct SqlxDatabaseStatus {
 #[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
 pub struct SqlxSourceSyncState {
     pub source: String,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
     pub status: String,
     pub last_cursor: Option<String>,
     pub error_message: Option<String>,
@@ -1888,7 +1890,7 @@ impl SqlxDatabase {
 
     pub async fn source_sync_states(&self) -> Result<Vec<SqlxSourceSyncState>, sqlx::Error> {
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT source, status, last_cursor, error_message FROM source_sync_state ORDER BY source")
+            sqlx::query_as("SELECT source, last_attempt_at, last_success_at, status, last_cursor, error_message FROM source_sync_state ORDER BY source")
                 .fetch_all(connection).await
         })).await
     }
@@ -2241,7 +2243,9 @@ impl SqlxDatabase {
                         .map(|row| row.try_get::<Option<String>, _>(0))
                         .transpose()?
                         .flatten();
-                    sqlx::query("INSERT INTO source_sync_state (source, status) VALUES ('OSV', 'running') ON CONFLICT(source) DO UPDATE SET status='running', error_message=NULL")
+                    let attempted_at = chrono::Utc::now().to_rfc3339();
+                    sqlx::query("INSERT INTO source_sync_state (source, last_attempt_at, status) VALUES ('OSV', ?, 'running') ON CONFLICT(source) DO UPDATE SET last_attempt_at=excluded.last_attempt_at, status='running', error_message=NULL")
+                        .bind(attempted_at)
                         .execute(&mut *transaction)
                         .await?;
                     transaction.commit().await?;
@@ -2257,7 +2261,9 @@ impl SqlxDatabase {
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    sqlx::query("UPDATE source_sync_state SET status='success', last_cursor=?, error_message=NULL WHERE source='OSV'")
+                    let succeeded_at = chrono::Utc::now().to_rfc3339();
+                    sqlx::query("UPDATE source_sync_state SET last_success_at=?, status='success', last_cursor=?, error_message=NULL WHERE source='OSV'")
+                        .bind(succeeded_at)
                         .bind(cursor)
                         .execute(connection)
                         .await?;
@@ -6246,6 +6252,12 @@ mod tests {
             .complete_osv_sync("2099-01-02T00:00:00Z")
             .await
             .unwrap();
+        let sync_state = database.source_sync_states().await.unwrap().pop().unwrap();
+        let attempted_at = sync_state.last_attempt_at.as_deref().unwrap();
+        let succeeded_at = sync_state.last_success_at.as_deref().unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(attempted_at).is_ok());
+        assert!(chrono::DateTime::parse_from_rfc3339(succeeded_at).is_ok());
+        assert!(succeeded_at >= attempted_at);
         let completed: (String, String, i64) = database.writer.with_connection(|connection| Box::pin(async move {
             sqlx::query_as("SELECT status, last_cursor, (SELECT COUNT(*) FROM osv_advisories) FROM source_sync_state WHERE source='OSV'").fetch_one(connection).await
         })).await.unwrap();
