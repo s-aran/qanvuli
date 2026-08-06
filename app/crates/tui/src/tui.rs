@@ -184,7 +184,7 @@ async fn run_loop(
 
         if app.show_display {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.show_display = false,
+                KeyCode::Esc | KeyCode::Enter => app.apply_display_settings(db.as_ref().cloned()),
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::PageDown => app.display.scroll = app.display.scroll.saturating_add(8),
                 KeyCode::PageUp => app.display.scroll = app.display.scroll.saturating_sub(8),

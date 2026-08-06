@@ -464,6 +464,22 @@ impl SqlxDatabase {
             .await
     }
 
+    pub async fn cve_summaries_by_ids_sorted(
+        &self,
+        ids: &[String],
+        scope: CveStateScope,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, sqlx::Error> {
+        Ok(self
+            .cves_by_ids_sorted(ids, scope, sort_order, limit, offset)
+            .await?
+            .into_iter()
+            .map(summary)
+            .collect())
+    }
+
     pub async fn search_cve_summaries_by_cwe_with_state_scope(
         &self,
         cwe_ids: &[String],
@@ -673,14 +689,7 @@ impl SqlxDatabase {
             }
             CveAdvancedQueryMode::Cwe => filters.cwe_ids.extend(options.query.iter().cloned()),
             CveAdvancedQueryMode::Cve => {
-                return self
-                    .search_cve_summaries_by_cve_id_prefix_with_state_scope(
-                        options.query.as_deref().unwrap_or_default(),
-                        options.state_scope,
-                        limit,
-                        offset,
-                    )
-                    .await;
+                filters.cve_id_prefix = options.query.clone();
             }
         }
         let rows = self
@@ -799,11 +808,39 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        let rows = self.search_osv(query, (limit + offset) as i64).await?;
-        Ok(rows
+        self.search_osv_summaries_free_text_sorted(
+            query,
+            crate::CveSummarySortOrder::RelationRankAsc,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_osv_summaries_free_text_sorted(
+        &self,
+        query: &str,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        let rows = self
+            .search_osv_paginated_sorted(query, sort_order, limit as i64, offset as i64)
+            .await?;
+        Ok(rows.into_iter().map(osv_summary).collect())
+    }
+
+    pub async fn osv_summaries_by_ids_sorted(
+        &self,
+        ids: &[String],
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        Ok(self
+            .osvs_by_ids_sorted(ids, sort_order, limit, offset)
+            .await?
             .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
             .map(osv_summary)
             .collect())
     }
@@ -941,7 +978,27 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        self.search_osv_scoped_inner(query, families, ecosystems, None, limit, offset)
+        self.search_osv_summaries_scoped_sorted(
+            query,
+            families,
+            ecosystems,
+            crate::CveSummarySortOrder::UpdatedDesc,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn search_osv_summaries_scoped_sorted(
+        &self,
+        query: Option<&str>,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        self.search_osv_scoped_inner(query, families, ecosystems, None, sort_order, limit, offset)
             .await
     }
 
@@ -954,8 +1011,39 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        self.search_osv_scoped_inner(query, families, ecosystems, Some(package), limit, offset)
-            .await
+        self.search_osv_summaries_scoped_by_exact_package_sorted(
+            query,
+            families,
+            ecosystems,
+            package,
+            crate::CveSummarySortOrder::UpdatedDesc,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_osv_summaries_scoped_by_exact_package_sorted(
+        &self,
+        query: Option<&str>,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        package: &str,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        self.search_osv_scoped_inner(
+            query,
+            families,
+            ecosystems,
+            Some(package),
+            sort_order,
+            limit,
+            offset,
+        )
+        .await
     }
 
     async fn search_osv_scoped_inner(
@@ -964,6 +1052,7 @@ impl SqlxDatabase {
         families: &[String],
         ecosystems: Option<&[String]>,
         package: Option<&str>,
+        sort_order: crate::CveSummarySortOrder,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
@@ -976,7 +1065,17 @@ impl SqlxDatabase {
             let ecosystems_json = serde_json::to_string(&ecosystems).unwrap_or_default();
             let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
             let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
-            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) ORDER BY a.modified_at DESC, a.osv_id LIMIT ? OFFSET ?");
+            let order_by = match sort_order {
+                crate::CveSummarySortOrder::PublishedAsc => "a.published_at ASC, a.osv_id ASC",
+                crate::CveSummarySortOrder::PublishedDesc => "a.published_at DESC, a.osv_id DESC",
+                crate::CveSummarySortOrder::UpdatedAsc => "a.modified_at ASC, a.osv_id ASC",
+                crate::CveSummarySortOrder::UpdatedDesc => "a.modified_at DESC, a.osv_id DESC",
+                crate::CveSummarySortOrder::CveIdAsc | crate::CveSummarySortOrder::ScoreAsc => "a.osv_id ASC",
+                crate::CveSummarySortOrder::CveIdDesc | crate::CveSummarySortOrder::ScoreDesc => "a.osv_id DESC",
+                crate::CveSummarySortOrder::RelationRankAsc => "a.published_at ASC, a.osv_id ASC",
+                crate::CveSummarySortOrder::RelationRankDesc => "a.published_at DESC, a.osv_id DESC",
+            };
+            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) ORDER BY {order_by} LIMIT ? OFFSET ?");
             let rows: Vec<SqlxOsvSummary> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
                 .bind(&package)
                 .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)

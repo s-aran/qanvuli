@@ -199,6 +199,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     }
     let filters = SqlxCveSearch {
         text: args.text.clone(),
+        cve_id_prefix: None,
         cwe_ids: args.cwe_ids.clone(),
         capec_ids: args.capec_ids.clone(),
         vendor_like: args.vendor_like().map(|value| format!("%{value}%")),

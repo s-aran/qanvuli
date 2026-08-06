@@ -352,6 +352,7 @@ impl App {
                 query: String::new(),
                 state_scope: CveStateScope::PublishedOnly,
                 kev_only: false,
+                sort_order: CveSummarySortOrder::PublishedDesc,
             },
             exhausted: false,
             left_page_size: 10,
@@ -387,6 +388,7 @@ impl App {
                 query: self.query.clone(),
                 state_scope: self.state_scope,
                 kev_only: self.display.kev_only,
+                sort_order,
             }
         } else {
             SearchRequest::Advanced {
@@ -481,6 +483,30 @@ impl App {
         self.display.source_focus = false;
         self.display.scroll = 0;
         self.show_display = true;
+    }
+
+    pub(super) fn apply_display_settings(&mut self, db: Option<CveDatabase>) {
+        self.show_display = false;
+        let Some(db) = db else {
+            return;
+        };
+        let mut request = self.searched_request.clone();
+        match &mut request {
+            SearchRequest::Mode {
+                kev_only,
+                sort_order,
+                ..
+            } => {
+                *kev_only = self.display.kev_only;
+                *sort_order = self.display.sort_order();
+            }
+            SearchRequest::Advanced { options, .. } => {
+                options.kev_only = self.display.kev_only;
+                options.sort_order = self.display.sort_order();
+            }
+        }
+        self.searched_request = request.clone();
+        self.start_replace_search(db, request, "failed to apply display settings");
     }
 
     pub(super) fn start_load_more(&mut self, db: CveDatabase) {
@@ -1909,6 +1935,7 @@ impl App {
             query: String::new(),
             state_scope: CveStateScope::PublishedOnly,
             kev_only: false,
+            sort_order: CveSummarySortOrder::PublishedDesc,
         };
         self.exhausted = false;
         self.show_help = false;
@@ -2677,6 +2704,50 @@ mod tests {
                 assert!(!include_osv);
             }
             SearchRequest::Mode { .. } => panic!("empty Enter must browse CVEs"),
+        }
+        app.abort_search();
+    }
+
+    #[tokio::test]
+    async fn search_modes_and_display_apply_preserve_the_selected_sort() {
+        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize_schema().await.unwrap();
+        let mut app = App::new("CVE-2099".to_owned(), 25);
+        app.display.sort_field = crate::display::SortField::Updated;
+        app.display.sort_direction = crate::display::SortDirection::Asc;
+
+        app.start_search(database.clone());
+        match &app.searched_request {
+            SearchRequest::Advanced { options, .. } => {
+                assert_eq!(
+                    options.query_mode,
+                    Some(qanvuli_core::database::CveAdvancedQueryMode::Cve)
+                );
+                assert_eq!(options.sort_order, CveSummarySortOrder::UpdatedAsc);
+            }
+            SearchRequest::Mode { .. } => panic!("CVE prefix searches must use sorted search"),
+        }
+
+        app.display.sort_field = crate::display::SortField::Score;
+        app.display.sort_direction = crate::display::SortDirection::Desc;
+        app.apply_display_settings(Some(database.clone()));
+        match &app.searched_request {
+            SearchRequest::Advanced { options, .. } => {
+                assert_eq!(options.sort_order, CveSummarySortOrder::ScoreDesc);
+                assert_eq!(options.query.as_deref(), Some("CVE-2099"));
+            }
+            SearchRequest::Mode { .. } => panic!("display apply must preserve the search request"),
+        }
+
+        app.query = "GHSA-2099-example".to_owned();
+        app.display.sort_field = crate::display::SortField::RelationRank;
+        app.display.sort_direction = crate::display::SortDirection::Desc;
+        app.start_search(database);
+        match &app.searched_request {
+            SearchRequest::Mode { sort_order, .. } => {
+                assert_eq!(*sort_order, CveSummarySortOrder::RelationRankDesc);
+            }
+            SearchRequest::Advanced { .. } => panic!("identifier searches must retain graph rank"),
         }
         app.abort_search();
     }
