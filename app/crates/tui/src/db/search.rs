@@ -15,12 +15,72 @@ pub(crate) struct SearchResult {
     pub(crate) exhausted: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SearchTerm {
+    FreeText(String),
+    Product(String),
+    Vendor(String),
+    Cwe(String),
+    CvePrefix(String),
+    Identifier(String),
+}
+
+impl SearchTerm {
+    pub(crate) fn new(mode: SearchMode, value: String) -> Self {
+        match mode {
+            SearchMode::FreeText => Self::FreeText(value),
+            SearchMode::Product => Self::Product(value),
+            SearchMode::Vendor => Self::Vendor(value),
+            SearchMode::Cwe => Self::Cwe(value),
+            SearchMode::Cve => Self::CvePrefix(value),
+            SearchMode::Identifier => Self::Identifier(value),
+        }
+    }
+
+    fn value(&self) -> &str {
+        match self {
+            Self::FreeText(value)
+            | Self::Product(value)
+            | Self::Vendor(value)
+            | Self::Cwe(value)
+            | Self::CvePrefix(value)
+            | Self::Identifier(value) => value,
+        }
+    }
+
+    fn advanced_query_mode(&self) -> Option<CveAdvancedQueryMode> {
+        match self {
+            Self::FreeText(_) => Some(CveAdvancedQueryMode::FreeText),
+            Self::Product(_) => Some(CveAdvancedQueryMode::Product),
+            Self::Vendor(_) => Some(CveAdvancedQueryMode::Vendor),
+            Self::Cwe(_) => Some(CveAdvancedQueryMode::Cwe),
+            Self::CvePrefix(_) => Some(CveAdvancedQueryMode::Cve),
+            Self::Identifier(_) => None,
+        }
+    }
+
+    fn advanced_options(
+        &self,
+        state_scope: CveStateScope,
+        kev_only: bool,
+        sort_order: CveSummarySortOrder,
+    ) -> Option<CveAdvancedSearch> {
+        Some(CveAdvancedSearch {
+            query: Some(self.value().to_owned()),
+            query_mode: Some(self.advanced_query_mode()?),
+            state_scope,
+            kev_only,
+            sort_order,
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum SearchRequest {
-    Mode {
-        mode: SearchMode,
-        query: String,
+    Query {
+        term: SearchTerm,
         state_scope: CveStateScope,
         kev_only: bool,
         sort_order: CveSummarySortOrder,
@@ -41,35 +101,27 @@ pub(crate) async fn run_search_request(
     offset: u64,
 ) -> Result<SearchResult, String> {
     match request {
-        SearchRequest::Mode {
-            mode,
-            query,
+        SearchRequest::Query {
+            term,
             state_scope,
             kev_only,
             sort_order,
         } => {
-            let rows = if kev_only {
-                db.search_cve_summaries_advanced(
-                    &CveAdvancedSearch {
-                        query: Some(query.clone()),
-                        query_mode: Some(mode.into()),
-                        state_scope,
-                        kev_only: true,
-                        sort_order,
-                        ..Default::default()
-                    },
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(|err| err.to_string())?
+            let rows = if kev_only
+                && let Some(options) = term.advanced_options(state_scope, true, sort_order)
+            {
+                db.search_cve_summaries_advanced(&options, limit, offset)
+                    .await
+                    .map_err(|err| err.to_string())?
+            } else if kev_only {
+                Vec::new()
             } else {
-                search_by_mode(&db, mode, &query, state_scope, sort_order, limit, offset).await?
+                search_by_term(&db, &term, state_scope, sort_order, limit, offset).await?
             };
             let osv_rows = if kev_only {
                 Vec::new()
             } else {
-                search_osv_by_mode(&db, mode, &query, sort_order, limit, offset).await?
+                search_osv_by_term(&db, &term, sort_order, limit, offset).await?
             };
             let consumed = rows.len().max(osv_rows.len()) as u64;
             let exhausted = rows.len() < limit as usize && osv_rows.len() < limit as usize;
@@ -135,6 +187,17 @@ pub(crate) async fn run_search_request(
                 || has_cve_only_advanced_filters(&options)
             {
                 Vec::new()
+            } else if let Some(package) = osv_package_query(&options) {
+                db.search_osv_summaries_scoped_by_package_sorted(
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    package,
+                    options.sort_order,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string())?
             } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
                 db.search_osv_summaries_free_text_sorted(
                     options.query.as_deref().unwrap_or_default(),
@@ -265,20 +328,19 @@ async fn collapse_linked_osv(
     Ok((rows, osv_rows))
 }
 
-async fn search_osv_by_mode(
+async fn search_osv_by_term(
     db: &CveDatabase,
-    mode: SearchMode,
-    query: &str,
+    term: &SearchTerm,
     sort_order: CveSummarySortOrder,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<OsvSummary>, String> {
-    match mode {
-        SearchMode::FreeText => db
+    match term {
+        SearchTerm::FreeText(query) => db
             .search_osv_summaries_free_text_sorted(query, sort_order, limit, offset)
             .await
             .map_err(|err| err.to_string()),
-        SearchMode::Identifier => {
+        SearchTerm::Identifier(query) => {
             let resolution = db
                 .resolve_identifier(query)
                 .await
@@ -287,9 +349,8 @@ async fn search_osv_by_mode(
                 .await
                 .map_err(|err| err.to_string())
         }
-        SearchMode::Product => db
-            .search_osv_summaries_scoped_by_exact_package_sorted(
-                None,
+        SearchTerm::Product(query) => db
+            .search_osv_summaries_scoped_by_package_sorted(
                 &[],
                 None,
                 query,
@@ -299,11 +360,9 @@ async fn search_osv_by_mode(
             )
             .await
             .map_err(|err| err.to_string()),
-        SearchMode::Vendor => db
-            .search_osv_summaries_free_text_sorted(query, sort_order, limit, offset)
-            .await
-            .map_err(|err| err.to_string()),
-        SearchMode::Cwe | SearchMode::Cve => Ok(Vec::new()),
+        // OSV has no normalized vendor field. Treating arbitrary advisory text as a vendor
+        // match produces false positives, so vendor searches intentionally remain CVE-only.
+        SearchTerm::Vendor(_) | SearchTerm::Cwe(_) | SearchTerm::CvePrefix(_) => Ok(Vec::new()),
     }
 }
 
@@ -325,28 +384,23 @@ pub(crate) async fn run_count_request(
     request: SearchRequest,
 ) -> Result<u64, String> {
     match request {
-        SearchRequest::Mode {
-            mode,
-            query,
+        SearchRequest::Query {
+            term,
             state_scope,
             kev_only,
             sort_order,
         } => {
-            if kev_only {
+            if kev_only && let Some(options) = term.advanced_options(state_scope, true, sort_order)
+            {
                 let cve = db
-                    .count_cve_summaries_advanced(&CveAdvancedSearch {
-                        query: Some(query.clone()),
-                        query_mode: Some(mode.into()),
-                        state_scope,
-                        kev_only: true,
-                        sort_order,
-                        ..Default::default()
-                    })
+                    .count_cve_summaries_advanced(&options)
                     .await
                     .map_err(|err| err.to_string())?;
                 Ok(cve)
+            } else if kev_only {
+                Ok(0)
             } else {
-                count_by_mode(&db, mode, &query, state_scope).await
+                count_by_term(&db, &term, state_scope).await
             }
         }
         SearchRequest::Advanced {
@@ -383,6 +437,14 @@ pub(crate) async fn run_count_request(
                 || has_cve_only_advanced_filters(&options)
             {
                 0
+            } else if let Some(package) = osv_package_query(&options) {
+                db.count_osv_summaries_scoped_by_package(
+                    &osv_families,
+                    ecosystems.as_deref(),
+                    package,
+                )
+                .await
+                .map_err(|err| err.to_string())?
             } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
                 db.count_osv_summaries_free_text(options.query.as_deref().unwrap_or_default())
                     .await
@@ -423,7 +485,30 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
     ]
     .into_iter()
     .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
+        || (options.query_mode == Some(CveAdvancedQueryMode::Vendor)
+            && options
+                .query
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty()))
+        || options
+            .vendor
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || options
+            .vendor_exact
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
         || options.kev_only
+}
+
+fn osv_package_query(options: &CveAdvancedSearch) -> Option<&str> {
+    let value = if options.query_mode == Some(CveAdvancedQueryMode::Product) {
+        options.query.as_deref()
+    } else {
+        options.product.as_deref()
+    }?;
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 /// Package matching requires ecosystem, name, and version.
@@ -461,29 +546,23 @@ fn uses_osv_text_fts(
 }
 
 fn advanced_osv_query(options: &CveAdvancedSearch) -> Option<String> {
-    let query = [
-        options.query.as_deref(),
-        options.product.as_deref(),
-        options.vendor.as_deref(),
-        options.vendor_exact.as_deref(),
-    ]
-    .into_iter()
-    .filter_map(|value| value.map(str::trim).filter(|value| !value.is_empty()))
-    .collect::<Vec<_>>()
-    .join(" ");
+    let query = [options.query.as_deref(), options.product.as_deref()]
+        .into_iter()
+        .filter_map(|value| value.map(str::trim).filter(|value| !value.is_empty()))
+        .collect::<Vec<_>>()
+        .join(" ");
     (!query.is_empty()).then_some(query)
 }
 
-async fn search_by_mode(
+async fn search_by_term(
     db: &CveDatabase,
-    mode: SearchMode,
-    query: &str,
+    term: &SearchTerm,
     state_scope: CveStateScope,
     sort_order: CveSummarySortOrder,
     limit: u64,
     offset: u64,
 ) -> Result<Vec<CveSummary>, String> {
-    if mode == SearchMode::Identifier {
+    if let SearchTerm::Identifier(query) = term {
         let resolution = db
             .resolve_identifier(query)
             .await
@@ -499,29 +578,21 @@ async fn search_by_mode(
             .await
             .map_err(|err| err.to_string());
     }
-    db.search_cve_summaries_advanced(
-        &CveAdvancedSearch {
-            query: Some(query.to_owned()),
-            query_mode: Some(mode.into()),
-            state_scope,
-            sort_order,
-            ..Default::default()
-        },
-        limit,
-        offset,
-    )
-    .await
-    .map_err(|err| err.to_string())
+    let options = term
+        .advanced_options(state_scope, false, sort_order)
+        .expect("only identifiers lack an advanced query mode");
+    db.search_cve_summaries_advanced(&options, limit, offset)
+        .await
+        .map_err(|err| err.to_string())
 }
 
-async fn count_by_mode(
+async fn count_by_term(
     db: &CveDatabase,
-    mode: SearchMode,
-    query: &str,
+    term: &SearchTerm,
     state_scope: CveStateScope,
 ) -> Result<u64, String> {
-    match mode {
-        SearchMode::FreeText => {
+    match term {
+        SearchTerm::FreeText(query) => {
             let cves = db
                 .count_cve_summaries_free_text_with_state_scope(query, state_scope)
                 .await
@@ -532,7 +603,7 @@ async fn count_by_mode(
                 .map_err(|err| err.to_string())?;
             Ok(cves + osv)
         }
-        SearchMode::Product => {
+        SearchTerm::Product(query) => {
             let cves = db
                 .count_cve_summaries_by_vendor_product_with_state_scope(
                     None,
@@ -542,12 +613,12 @@ async fn count_by_mode(
                 .await
                 .map_err(|err| err.to_string())?;
             let osv = db
-                .count_osv_summaries_by_package(query)
+                .count_osv_summaries_scoped_by_package(&[], None, query)
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(cves + osv)
         }
-        SearchMode::Vendor => {
+        SearchTerm::Vendor(query) => {
             let cves = db
                 .count_cve_summaries_by_vendor_product_with_state_scope(
                     Some(query),
@@ -556,21 +627,17 @@ async fn count_by_mode(
                 )
                 .await
                 .map_err(|err| err.to_string())?;
-            let osv = db
-                .count_osv_summaries_free_text(query)
-                .await
-                .map_err(|err| err.to_string())?;
-            Ok(cves + osv)
+            Ok(cves)
         }
-        SearchMode::Cwe => {
-            db.count_cve_summaries_by_cwe_with_state_scope(&[query.to_owned()], state_scope)
+        SearchTerm::Cwe(query) => {
+            db.count_cve_summaries_by_cwe_with_state_scope(std::slice::from_ref(query), state_scope)
                 .await
         }
-        SearchMode::Cve => {
+        SearchTerm::CvePrefix(query) => {
             db.count_cve_summaries_by_cve_id_prefix_with_state_scope(query, state_scope)
                 .await
         }
-        SearchMode::Identifier => db.resolve_identifier(query).await.map(|resolution| {
+        SearchTerm::Identifier(query) => db.resolve_identifier(query).await.map(|resolution| {
             (resolution.related_cve_ids.len() + resolution.related_osv_ids.len()) as u64
         }),
     }
@@ -585,8 +652,13 @@ mod tests {
     #[test]
     fn advanced_osv_search_excludes_cve_only_filters() {
         assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch::default()));
-        assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch {
+        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
             vendor: Some("Example".to_owned()),
+            ..Default::default()
+        }));
+        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
+            query: Some("Example".to_owned()),
+            query_mode: Some(CveAdvancedQueryMode::Vendor),
             ..Default::default()
         }));
         assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch {
@@ -685,13 +757,11 @@ mod tests {
             }])
             .await
             .unwrap();
-
             for mode in [SearchMode::Identifier, SearchMode::FreeText] {
                 let result = run_search_request(
                     db.clone(),
-                    SearchRequest::Mode {
-                        mode,
-                        query: "GHSA-test-alias-only".to_owned(),
+                    SearchRequest::Query {
+                        term: SearchTerm::new(mode, "GHSA-test-alias-only".to_owned()),
                         state_scope: CveStateScope::PublishedOnly,
                         kev_only: false,
                         sort_order: CveSummarySortOrder::PublishedDesc,
@@ -710,9 +780,8 @@ mod tests {
                 );
             }
 
-            let request = SearchRequest::Mode {
-                mode: SearchMode::FreeText,
-                query: "GHSA-test-alias-only".to_owned(),
+            let request = SearchRequest::Query {
+                term: SearchTerm::FreeText("GHSA-test-alias-only".to_owned()),
                 state_scope: CveStateScope::PublishedOnly,
                 kev_only: true,
                 sort_order: CveSummarySortOrder::PublishedDesc,
@@ -769,9 +838,8 @@ mod tests {
 
             let result = run_search_request(
                 db,
-                SearchRequest::Mode {
-                    mode: SearchMode::FreeText,
-                    query: "unique-osv-search-needle".to_owned(),
+                SearchRequest::Query {
+                    term: SearchTerm::FreeText("unique-osv-search-needle".to_owned()),
                     state_scope: CveStateScope::PublishedOnly,
                     kev_only: false,
                     sort_order: CveSummarySortOrder::PublishedDesc,
@@ -824,12 +892,13 @@ mod tests {
                 (CveSummarySortOrder::PublishedDesc, "GHSA-sort-newer"),
                 (CveSummarySortOrder::UpdatedAsc, "GHSA-sort-newer"),
                 (CveSummarySortOrder::UpdatedDesc, "GHSA-sort-older"),
+                (CveSummarySortOrder::CveIdAsc, "GHSA-sort-newer"),
+                (CveSummarySortOrder::CveIdDesc, "GHSA-sort-older"),
             ] {
                 let result = run_search_request(
                     db.clone(),
-                    SearchRequest::Mode {
-                        mode: SearchMode::FreeText,
-                        query: "shared-sort-needle".to_owned(),
+                    SearchRequest::Query {
+                        term: SearchTerm::FreeText("shared-sort-needle".to_owned()),
                         state_scope: CveStateScope::PublishedOnly,
                         kev_only: false,
                         sort_order,
@@ -845,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn product_and_vendor_modes_search_osv_advisories() {
+    fn product_mode_uses_osv_packages_while_vendor_mode_remains_cve_only() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -870,41 +939,150 @@ mod tests {
             }])
             .await
             .unwrap();
+            db.import_osv_records(vec![OsvRawRecord {
+                source_path: Some("GHSA-product-name-only.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-product-name-only",
+                    "modified":"2099-01-03T00:00:00Z",
+                    "published":"2099-01-02T00:00:00Z",
+                    "summary":"example-product is mentioned but not affected",
+                    "affected":[],
+                    "references":[]
+                }"#
+                .to_owned(),
+            }])
+            .await
+            .unwrap();
+            db.import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-3001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"actual affected vendor","affected":[{"vendor":"Example Vendor","product":"unrelated"}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-3002","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-02-01T00:00:00Z"},"containers":{"cna":{"title":"Example Vendor appears only in free text","affected":[{"vendor":"Other Vendor","product":"unrelated"}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
 
-            for (mode, query) in [
-                (SearchMode::Product, "example-product"),
-                (SearchMode::Vendor, "Example Vendor"),
+            let product_request = SearchRequest::Query {
+                term: SearchTerm::Product("example-product".to_owned()),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
+                sort_order: CveSummarySortOrder::PublishedDesc,
+            };
+            let product_result = run_search_request(db.clone(), product_request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert!(product_result.rows.is_empty());
+            assert_eq!(product_result.osv_rows.len(), 1);
+            assert_eq!(
+                run_count_request(db.clone(), product_request)
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            let vendor_request = SearchRequest::Query {
+                term: SearchTerm::Vendor("Example Vendor".to_owned()),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
+                sort_order: CveSummarySortOrder::PublishedDesc,
+            };
+            let vendor_result = run_search_request(db.clone(), vendor_request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(vendor_result.rows.len(), 1);
+            assert_eq!(vendor_result.rows[0].summary.cve_id, "CVE-2099-3001");
+            assert!(vendor_result.osv_rows.is_empty());
+            assert_eq!(
+                run_count_request(db.clone(), vendor_request).await.unwrap(),
+                1
+            );
+
+            db.import_osv_records(vec![OsvRawRecord {
+                source_path: Some("GHSA-product-older.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-product-older",
+                    "modified":"2099-01-01T00:00:00Z",
+                    "published":"2098-12-31T00:00:00Z",
+                    "summary":"Older matching package",
+                    "affected":[{
+                        "package":{"ecosystem":"crates.io","name":"example-product-addon"}
+                    }],
+                    "references":[]
+                }"#
+                .to_owned(),
+            }])
+            .await
+            .unwrap();
+
+            let product_request = SearchRequest::Advanced {
+                options: CveAdvancedSearch {
+                    query: Some("example-product".to_owned()),
+                    query_mode: Some(CveAdvancedQueryMode::Product),
+                    sort_order: CveSummarySortOrder::UpdatedDesc,
+                    ..Default::default()
+                },
+                include_cve: false,
+                include_osv: true,
+                osv_families: Vec::new(),
+                ecosystems: None,
+            };
+            let product_result = run_search_request(db.clone(), product_request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(product_result.osv_rows.len(), 2);
+            assert_eq!(product_result.osv_rows[0].osv_id, "GHSA-product-vendor");
+            assert_eq!(
+                product_result.osv_rows[0].package_summary.as_deref(),
+                Some("crates.io:example-product")
+            );
+            assert_eq!(product_result.osv_rows[1].osv_id, "GHSA-product-older");
+            assert_eq!(
+                run_count_request(db.clone(), product_request)
+                    .await
+                    .unwrap(),
+                2
+            );
+
+            for (sort_order, expected) in [
+                (
+                    CveSummarySortOrder::UpdatedAsc,
+                    ["GHSA-product-older", "GHSA-product-vendor"],
+                ),
+                (
+                    CveSummarySortOrder::UpdatedDesc,
+                    ["GHSA-product-vendor", "GHSA-product-older"],
+                ),
+                (
+                    CveSummarySortOrder::CveIdAsc,
+                    ["GHSA-product-older", "GHSA-product-vendor"],
+                ),
+                (
+                    CveSummarySortOrder::CveIdDesc,
+                    ["GHSA-product-vendor", "GHSA-product-older"],
+                ),
             ] {
                 let result = run_search_request(
                     db.clone(),
-                    SearchRequest::Mode {
-                        mode,
-                        query: query.to_owned(),
+                    SearchRequest::Query {
+                        term: SearchTerm::Product("example-product".to_owned()),
                         state_scope: CveStateScope::PublishedOnly,
                         kev_only: false,
-                        sort_order: CveSummarySortOrder::PublishedDesc,
+                        sort_order,
                     },
                     10,
                     0,
                 )
                 .await
                 .unwrap();
-                assert!(result.rows.is_empty());
-                assert_eq!(result.osv_rows.len(), 1);
-
-                let count = run_count_request(
-                    db.clone(),
-                    SearchRequest::Mode {
-                        mode,
-                        query: query.to_owned(),
-                        state_scope: CveStateScope::PublishedOnly,
-                        kev_only: false,
-                        sort_order: CveSummarySortOrder::PublishedDesc,
-                    },
-                )
-                .await
-                .unwrap();
-                assert_eq!(count, 1);
+                assert_eq!(
+                    result
+                        .osv_rows
+                        .iter()
+                        .map(|row| row.osv_id.as_str())
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "unexpected product OSV {sort_order:?} order"
+                );
             }
 
             let request = SearchRequest::Advanced {
@@ -920,8 +1098,8 @@ mod tests {
             let result = run_search_request(db.clone(), request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(result.osv_rows.len(), 1);
-            assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 1);
+            assert_eq!(result.osv_rows.len(), 2);
+            assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 2);
 
             for (name, options) in [
                 (
@@ -955,6 +1133,135 @@ mod tests {
                     0,
                     "{name}"
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn product_mode_does_not_fall_back_to_cve_free_text() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+            db.import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"actual affected product","affected":[{"vendor":"Acme","product":"example-product"}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1002","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-02-01T00:00:00Z"},"containers":{"cna":{"title":"example-product appears only in free text","affected":[{"vendor":"Other","product":"unrelated"}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+
+            let result = run_search_request(
+                db,
+                SearchRequest::Advanced {
+                    options: CveAdvancedSearch {
+                        query: Some("example-product".to_owned()),
+                        query_mode: Some(CveAdvancedQueryMode::Product),
+                        sort_order: CveSummarySortOrder::PublishedDesc,
+                        ..Default::default()
+                    },
+                    include_cve: true,
+                    include_osv: false,
+                    osv_families: Vec::new(),
+                    ecosystems: None,
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0].summary.cve_id, "CVE-2099-1001");
+            assert_eq!(result.rows[0].detail.affected[0].product.as_deref(), Some("example-product"));
+        });
+    }
+
+    #[test]
+    fn every_typed_cve_search_honors_updated_and_natural_id_sorting() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+            db.import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-9998","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-04-01T00:00:00Z"},"containers":{"cna":{"title":"shared matrix sorting needle","affected":[{"vendor":"Matrix Vendor","product":"matrix-product"}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-9999","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"shared matrix sorting needle","affected":[{"vendor":"Matrix Vendor","product":"matrix-product"}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79"}]}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-10000","state":"PUBLISHED","datePublished":"2099-03-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"shared matrix sorting needle","affected":[{"vendor":"Matrix Vendor","product":"matrix-product"}],"problemTypes":[{"descriptions":[{"cweId":"CWE-79"}]}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+            db.import_osv_records(vec![OsvRawRecord {
+                source_path: Some("GHSA-matrix-sort.json".to_owned()),
+                raw_json: r#"{
+                    "schema_version":"1.7.5",
+                    "id":"GHSA-matrix-sort",
+                    "modified":"2099-04-01T00:00:00Z",
+                    "published":"2099-04-01T00:00:00Z",
+                    "summary":"identifier relation fixture",
+                    "aliases":["CVE-2099-9998","CVE-2099-9999","CVE-2099-10000"],
+                    "affected":[],
+                    "references":[]
+                }"#
+                .to_owned(),
+            }])
+            .await
+            .unwrap();
+
+            let terms = [
+                SearchTerm::FreeText("shared matrix sorting".to_owned()),
+                SearchTerm::Product("matrix-product".to_owned()),
+                SearchTerm::Vendor("Matrix Vendor".to_owned()),
+                SearchTerm::Cwe("cwe-79".to_owned()),
+                SearchTerm::CvePrefix("CVE-2099-".to_owned()),
+                SearchTerm::Identifier("GHSA-matrix-sort".to_owned()),
+            ];
+            for term in terms {
+                for (sort_order, expected) in [
+                    (
+                        CveSummarySortOrder::UpdatedAsc,
+                        ["CVE-2099-9999", "CVE-2099-10000", "CVE-2099-9998"],
+                    ),
+                    (
+                        CveSummarySortOrder::UpdatedDesc,
+                        ["CVE-2099-9998", "CVE-2099-10000", "CVE-2099-9999"],
+                    ),
+                    (
+                        CveSummarySortOrder::CveIdAsc,
+                        ["CVE-2099-9998", "CVE-2099-9999", "CVE-2099-10000"],
+                    ),
+                    (
+                        CveSummarySortOrder::CveIdDesc,
+                        ["CVE-2099-10000", "CVE-2099-9999", "CVE-2099-9998"],
+                    ),
+                ] {
+                    let result = run_search_request(
+                        db.clone(),
+                        SearchRequest::Query {
+                            term: term.clone(),
+                            state_scope: CveStateScope::PublishedOnly,
+                            kev_only: false,
+                            sort_order,
+                        },
+                        10,
+                        0,
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        result
+                            .rows
+                            .iter()
+                            .map(|row| row.summary.cve_id.as_str())
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "unexpected {sort_order:?} order for {term:?}"
+                    );
+                }
             }
         });
     }

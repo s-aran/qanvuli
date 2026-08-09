@@ -38,6 +38,21 @@ type CompatAffectedRow = (
     String,
 );
 
+#[derive(Clone, Copy)]
+enum OsvPackageFilter<'a> {
+    Any,
+    Exact(&'a str),
+    Contains(&'a str),
+}
+
+#[derive(Clone, Copy)]
+struct OsvScopedFilters<'a> {
+    query: Option<&'a str>,
+    families: &'a [String],
+    ecosystems: Option<&'a [String]>,
+    package: OsvPackageFilter<'a>,
+}
+
 fn include_rejected(scope: CveStateScope) -> bool {
     scope == CveStateScope::IncludeRejected
 }
@@ -157,7 +172,7 @@ fn osv_summary(row: SqlxOsvSummary) -> OsvSummary {
         withdrawn_at: row.withdrawn_at,
         summary: row.summary,
         details: row.details,
-        package_summary: None,
+        package_summary: row.package_summary,
     }
 }
 
@@ -610,6 +625,7 @@ impl SqlxDatabase {
                 severity: severity.map(str::to_owned),
                 version: version.map(str::to_owned),
             },
+            sort_order: crate::CveSummarySortOrder::ScoreDesc,
             ..Default::default()
         };
         Ok(self
@@ -998,8 +1014,18 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        self.search_osv_scoped_inner(query, families, ecosystems, None, sort_order, limit, offset)
-            .await
+        self.search_osv_scoped_inner(
+            OsvScopedFilters {
+                query,
+                families,
+                ecosystems,
+                package: OsvPackageFilter::Any,
+            },
+            sort_order,
+            limit,
+            offset,
+        )
+        .await
     }
 
     pub async fn search_osv_summaries_scoped_by_exact_package(
@@ -1035,10 +1061,36 @@ impl SqlxDatabase {
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
         self.search_osv_scoped_inner(
-            query,
-            families,
-            ecosystems,
-            Some(package),
+            OsvScopedFilters {
+                query,
+                families,
+                ecosystems,
+                package: OsvPackageFilter::Exact(package),
+            },
+            sort_order,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_osv_summaries_scoped_by_package_sorted(
+        &self,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        package: &str,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        self.search_osv_scoped_inner(
+            OsvScopedFilters {
+                query: None,
+                families,
+                ecosystems,
+                package: OsvPackageFilter::Contains(package),
+            },
             sort_order,
             limit,
             offset,
@@ -1048,26 +1100,27 @@ impl SqlxDatabase {
 
     async fn search_osv_scoped_inner(
         &self,
-        query: Option<&str>,
-        families: &[String],
-        ecosystems: Option<&[String]>,
-        package: Option<&str>,
+        filters: OsvScopedFilters<'_>,
         sort_order: crate::CveSummarySortOrder,
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        let query = query.map(|q| format!("%{q}%"));
-        let package = package.map(str::to_owned);
-        let families = families.to_vec();
-        let ecosystems = ecosystems.unwrap_or_default().to_vec();
+        let query = filters.query.map(|q| format!("%{q}%"));
+        let (package, package_like) = match filters.package {
+            OsvPackageFilter::Any => (None, None),
+            OsvPackageFilter::Exact(value) => (Some(value.to_owned()), None),
+            OsvPackageFilter::Contains(value) => (None, Some(format!("%{value}%"))),
+        };
+        let families = filters.families.to_vec();
+        let ecosystems = filters.ecosystems.unwrap_or_default().to_vec();
         self.writer.with_connection(|connection| Box::pin(async move {
             let families_json = serde_json::to_string(&families).unwrap_or_default();
             let ecosystems_json = serde_json::to_string(&ecosystems).unwrap_or_default();
             let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
             let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
             let order_by = match sort_order {
-                crate::CveSummarySortOrder::PublishedAsc => "a.published_at ASC, a.osv_id ASC",
-                crate::CveSummarySortOrder::PublishedDesc => "a.published_at DESC, a.osv_id DESC",
+                crate::CveSummarySortOrder::PublishedAsc => "a.published_at IS NULL ASC, a.published_at ASC, a.osv_id ASC",
+                crate::CveSummarySortOrder::PublishedDesc => "a.published_at IS NULL ASC, a.published_at DESC, a.osv_id DESC",
                 crate::CveSummarySortOrder::UpdatedAsc => "a.modified_at ASC, a.osv_id ASC",
                 crate::CveSummarySortOrder::UpdatedDesc => "a.modified_at DESC, a.osv_id DESC",
                 crate::CveSummarySortOrder::CveIdAsc | crate::CveSummarySortOrder::ScoreAsc => "a.osv_id ASC",
@@ -1075,9 +1128,10 @@ impl SqlxDatabase {
                 crate::CveSummarySortOrder::RelationRankAsc => "a.published_at ASC, a.osv_id ASC",
                 crate::CveSummarySortOrder::RelationRankDesc => "a.published_at DESC, a.osv_id DESC",
             };
-            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) ORDER BY {order_by} LIMIT ? OFFSET ?");
+            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=a.osv_id) AS package_summary FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like) ORDER BY {order_by} LIMIT ? OFFSET ?");
             let rows: Vec<SqlxOsvSummary> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
                 .bind(&package)
+                .bind(&package_like)
                 .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
                 .bind(&families_json).bind(&families_json).bind(&ecosystems_json).bind(&ecosystems_json)
                 .bind(limit as i64).bind(offset as i64)
@@ -1092,8 +1146,13 @@ impl SqlxDatabase {
         families: &[String],
         ecosystems: Option<&[String]>,
     ) -> Result<u64, sqlx::Error> {
-        self.count_osv_scoped_inner(query, families, ecosystems, None)
-            .await
+        self.count_osv_scoped_inner(OsvScopedFilters {
+            query,
+            families,
+            ecosystems,
+            package: OsvPackageFilter::Any,
+        })
+        .await
     }
 
     pub async fn count_osv_summaries_scoped_by_exact_package(
@@ -1103,8 +1162,13 @@ impl SqlxDatabase {
         ecosystems: Option<&[String]>,
         package: &str,
     ) -> Result<u64, sqlx::Error> {
-        self.count_osv_scoped_inner(query, families, ecosystems, Some(package))
-            .await
+        self.count_osv_scoped_inner(OsvScopedFilters {
+            query,
+            families,
+            ecosystems,
+            package: OsvPackageFilter::Exact(package),
+        })
+        .await
     }
 
     pub async fn count_osv_summaries_free_text(&self, query: &str) -> Result<u64, sqlx::Error> {
@@ -1127,29 +1191,51 @@ impl SqlxDatabase {
     }
 
     pub async fn count_osv_summaries_by_package(&self, query: &str) -> Result<u64, sqlx::Error> {
-        self.count_osv_scoped_inner(None, &[], None, Some(query))
-            .await
+        self.count_osv_scoped_inner(OsvScopedFilters {
+            query: None,
+            families: &[],
+            ecosystems: None,
+            package: OsvPackageFilter::Exact(query),
+        })
+        .await
+    }
+
+    pub async fn count_osv_summaries_scoped_by_package(
+        &self,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        package: &str,
+    ) -> Result<u64, sqlx::Error> {
+        self.count_osv_scoped_inner(OsvScopedFilters {
+            query: None,
+            families,
+            ecosystems,
+            package: OsvPackageFilter::Contains(package),
+        })
+        .await
     }
 
     async fn count_osv_scoped_inner(
         &self,
-        query: Option<&str>,
-        families: &[String],
-        ecosystems: Option<&[String]>,
-        package: Option<&str>,
+        filters: OsvScopedFilters<'_>,
     ) -> Result<u64, sqlx::Error> {
-        let query = query.map(|q| format!("%{q}%"));
-        let families =
-            serde_json::to_string(families).map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
-        let ecosystems = serde_json::to_string(ecosystems.unwrap_or_default())
+        let query = filters.query.map(|q| format!("%{q}%"));
+        let families = serde_json::to_string(filters.families)
             .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
-        let package = package.map(str::to_owned);
+        let ecosystems = serde_json::to_string(filters.ecosystems.unwrap_or_default())
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        let (package, package_like) = match filters.package {
+            OsvPackageFilter::Any => (None, None),
+            OsvPackageFilter::Exact(value) => (Some(value.to_owned()), None),
+            OsvPackageFilter::Contains(value) => (None, Some(format!("%{value}%"))),
+        };
         self.writer.with_connection(|c| Box::pin(async move {
             let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
             let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
-            let statement = format!("WITH input(package_name) AS (VALUES (?)) SELECT COUNT(DISTINCT a.osv_id) FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY)");
+            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT COUNT(DISTINCT a.osv_id) FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like)");
             let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
                 .bind(&package)
+                .bind(&package_like)
                 .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
                 .bind(&families).bind(&families).bind(&ecosystems).bind(&ecosystems)
                 .fetch_one(c).await?;

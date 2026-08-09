@@ -36,6 +36,28 @@ const PACKAGE_ID_BATCH_SIZE: usize = 2_000;
 const OSV_ID_BATCH_SIZE: usize = 2_000;
 /// Maximum number of OSV IDs used by one advisory-date statement.
 const OSV_DATE_BATCH_SIZE: usize = 2_000;
+/// Natural CVE ordering compares the four-digit year and variable-width sequence numerically.
+/// The full identifier remains the final key for malformed or otherwise tied identifiers.
+const CVE_ID_ASC_KEYS: &str = "CAST(substr(c.cve_id, 5, 4) AS INTEGER) ASC, CAST(substr(c.cve_id, 10) AS INTEGER) ASC, c.cve_id ASC";
+const CVE_ID_DESC_KEYS: &str = "CAST(substr(c.cve_id, 5, 4) AS INTEGER) DESC, CAST(substr(c.cve_id, 10) AS INTEGER) DESC, c.cve_id DESC";
+
+fn prefixed_numeric_id(value: &str, prefix: &str) -> Option<i64> {
+    let value = value.trim();
+    let suffix = if value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    {
+        value.get(prefix.len()..)?
+    } else {
+        value
+    };
+    suffix
+        .strip_prefix('-')
+        .unwrap_or(suffix)
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+}
 /// Builds SQLite-side package normalization for already-imported rows.
 /// Repeating `replace('--', '-')` 16 times collapses separator runs up to
 /// 65,536 characters, well beyond practical package-name limits.
@@ -634,6 +656,7 @@ pub struct SqlxOsvSummary {
     pub summary: Option<String>,
     pub details: Option<String>,
     pub withdrawn_at: Option<String>,
+    pub package_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, sqlx::FromRow)]
@@ -1522,7 +1545,7 @@ impl SqlxDatabase {
         offset: i64,
     ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT DISTINCT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_cvss AS cvss ON cvss.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR cvss.base_score >= ?) AND (? IS NULL OR cvss.base_score <= ?) AND (? IS NULL OR UPPER(cvss.base_severity)=UPPER(?)) AND (? IS NULL OR cvss.version=?) ORDER BY cvss.base_score DESC, c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
+            sqlx::query_as("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_cvss AS cvss ON cvss.cve_db_id=c.id WHERE (? OR c.state=0) AND (? IS NULL OR cvss.base_score >= ?) AND (? IS NULL OR cvss.base_score <= ?) AND (? IS NULL OR UPPER(cvss.base_severity)=UPPER(?)) AND (? IS NULL OR cvss.version=?) GROUP BY c.id ORDER BY MAX(cvss.base_score) DESC, c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
                 .bind(include_rejected)
                 .bind(options.min_score).bind(options.min_score)
                 .bind(options.max_score).bind(options.max_score)
@@ -1574,32 +1597,18 @@ impl SqlxDatabase {
         let cwe_ids = filters
             .cwe_ids
             .iter()
-            .filter_map(|value| {
-                value
-                    .trim()
-                    .strip_prefix("CWE-")
-                    .unwrap_or(value.trim())
-                    .parse::<i64>()
-                    .ok()
-            })
+            .filter_map(|value| prefixed_numeric_id(value, "CWE"))
             .collect::<Vec<_>>();
-        let cwe_ids = (!cwe_ids.is_empty())
+        let cwe_ids = (!filters.cwe_ids.is_empty())
             .then(|| serde_json::to_string(&cwe_ids))
             .transpose()
             .map_err(|error| sqlx::Error::Protocol(format!("failed to encode CWE IDs: {error}")))?;
         let capec_ids = filters
             .capec_ids
             .iter()
-            .filter_map(|value| {
-                value
-                    .trim()
-                    .strip_prefix("CAPEC-")
-                    .unwrap_or(value.trim())
-                    .parse::<i64>()
-                    .ok()
-            })
+            .filter_map(|value| prefixed_numeric_id(value, "CAPEC"))
             .collect::<Vec<_>>();
-        let capec_ids = (!capec_ids.is_empty())
+        let capec_ids = (!filters.capec_ids.is_empty())
             .then(|| serde_json::to_string(&capec_ids))
             .transpose()
             .map_err(|error| {
@@ -1670,18 +1679,18 @@ impl SqlxDatabase {
                 query.push(")");
             }
             match filters.sort_order {
-                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY c.published_at ASC, c.cve_id ASC"),
-                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY c.published_at DESC, c.cve_id DESC"),
-                CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY c.updated_at ASC, c.cve_id ASC"),
-                CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY c.updated_at DESC, c.cve_id DESC"),
-                CveSummarySortOrder::CveIdAsc => query.push(" ORDER BY c.cve_id ASC"),
-                CveSummarySortOrder::CveIdDesc => query.push(" ORDER BY c.cve_id DESC"),
+                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY c.published_at ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY c.published_at DESC, ").push(CVE_ID_DESC_KEYS),
+                CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY c.updated_at ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY c.updated_at DESC, ").push(CVE_ID_DESC_KEYS),
+                CveSummarySortOrder::CveIdAsc => query.push(" ORDER BY ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::CveIdDesc => query.push(" ORDER BY ").push(CVE_ID_DESC_KEYS),
                 // Relation rank is only meaningful for identifier-graph searches. Keep the
                 // normal CVE list deterministic when no graph ranking is available.
-                CveSummarySortOrder::RelationRankAsc => query.push(" ORDER BY c.published_at ASC, c.cve_id ASC"),
-                CveSummarySortOrder::RelationRankDesc => query.push(" ORDER BY c.published_at DESC, c.cve_id DESC"),
-                CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) ASC, c.cve_id ASC"),
-                CveSummarySortOrder::ScoreDesc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) DESC, c.cve_id DESC"),
+                CveSummarySortOrder::RelationRankAsc => query.push(" ORDER BY c.published_at ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::RelationRankDesc => query.push(" ORDER BY c.published_at DESC, ").push(CVE_ID_DESC_KEYS),
+                CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::ScoreDesc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) DESC, ").push(CVE_ID_DESC_KEYS),
             };
             query.push(" LIMIT ").push_bind(limit.max(1)).push(" OFFSET ").push_bind(offset.max(0));
             query.build_query_as().fetch_all(connection).await
@@ -1710,16 +1719,16 @@ impl SqlxDatabase {
             query.push_bind(ids_json).push(") AS requested JOIN cve AS c ON c.cve_id=requested.value WHERE ")
                 .push_bind(include_rejected).push(" OR c.state=0");
             match sort_order {
-                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY c.published_at ASC, c.cve_id ASC"),
-                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY c.published_at DESC, c.cve_id DESC"),
-                CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY c.updated_at ASC, c.cve_id ASC"),
-                CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY c.updated_at DESC, c.cve_id DESC"),
-                CveSummarySortOrder::CveIdAsc => query.push(" ORDER BY c.cve_id ASC"),
-                CveSummarySortOrder::CveIdDesc => query.push(" ORDER BY c.cve_id DESC"),
+                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY c.published_at ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY c.published_at DESC, ").push(CVE_ID_DESC_KEYS),
+                CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY c.updated_at ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY c.updated_at DESC, ").push(CVE_ID_DESC_KEYS),
+                CveSummarySortOrder::CveIdAsc => query.push(" ORDER BY ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::CveIdDesc => query.push(" ORDER BY ").push(CVE_ID_DESC_KEYS),
                 CveSummarySortOrder::RelationRankAsc => query.push(" ORDER BY CAST(requested.key AS INTEGER) ASC"),
                 CveSummarySortOrder::RelationRankDesc => query.push(" ORDER BY CAST(requested.key AS INTEGER) DESC"),
-                CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) ASC, c.cve_id ASC"),
-                CveSummarySortOrder::ScoreDesc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) DESC, c.cve_id DESC"),
+                CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) ASC, ").push(CVE_ID_ASC_KEYS),
+                CveSummarySortOrder::ScoreDesc => query.push(" ORDER BY (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) IS NULL ASC, (SELECT MAX(base_score) FROM cve_cvss WHERE cve_db_id=c.id) DESC, ").push(CVE_ID_DESC_KEYS),
             };
             query.push(" LIMIT ").push_bind(limit.max(1) as i64).push(" OFFSET ").push_bind(offset as i64);
             query.build_query_as().fetch_all(connection).await
@@ -1757,7 +1766,7 @@ impl SqlxDatabase {
                 .unwrap_or_default();
             let epss = sqlx::query_as("SELECT epss, percentile, score_date, model_version FROM epss_current WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
             let kev = sqlx::query_as("SELECT vendor_project, product, vulnerability_name, COALESCE(date_added, '') AS date_added, due_date FROM kev_entries WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
-            let osv_advisories = sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at FROM osv_aliases AS alias JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id=? ORDER BY advisory.modified_at DESC, advisory.osv_id").bind(&cve_id).fetch_all(&mut *connection).await?;
+            let osv_advisories = sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=advisory.osv_id) AS package_summary FROM osv_aliases AS alias JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id=? ORDER BY advisory.modified_at DESC, advisory.osv_id").bind(&cve_id).fetch_all(&mut *connection).await?;
             Ok(Some(SqlxCveDetail { cvss, cwes, affected, references, epss, kev, osv_advisories }))
         })).await
     }
@@ -1869,7 +1878,7 @@ impl SqlxDatabase {
             ).bind(&requested_json).fetch_all(&mut *connection).await?;
             for (cve_id, osv_id, modified_at, summary, osv_details, withdrawn_at) in osv_rows {
                 if let Some(id) = ids_by_cve.get(&cve_id) {
-                    details.get_mut(id).expect("known parent").osv_advisories.push(SqlxOsvSummary { osv_id, modified_at, summary, details: osv_details, withdrawn_at });
+                    details.get_mut(id).expect("known parent").osv_advisories.push(SqlxOsvSummary { osv_id, modified_at, summary, details: osv_details, withdrawn_at, package_summary: None });
                 }
             }
             Ok(requested.into_iter().map(|cve_id| {
@@ -2202,11 +2211,11 @@ impl SqlxDatabase {
             return Ok(Vec::new());
         };
         self.writer.with_connection(|connection| Box::pin(async move {
-            let mut statement = QueryBuilder::<Sqlite>::new("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ");
+            let mut statement = QueryBuilder::<Sqlite>::new("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=advisory.osv_id) AS package_summary FROM osv_text_fts JOIN osv_advisories AS advisory ON advisory.osv_id=osv_text_fts.osv_id WHERE osv_text_fts MATCH ");
             statement.push_bind(query);
             match sort_order {
-                CveSummarySortOrder::PublishedAsc => statement.push(" ORDER BY advisory.published_at ASC, advisory.osv_id ASC"),
-                CveSummarySortOrder::PublishedDesc => statement.push(" ORDER BY advisory.published_at DESC, advisory.osv_id DESC"),
+                CveSummarySortOrder::PublishedAsc => statement.push(" ORDER BY advisory.published_at IS NULL ASC, advisory.published_at ASC, advisory.osv_id ASC"),
+                CveSummarySortOrder::PublishedDesc => statement.push(" ORDER BY advisory.published_at IS NULL ASC, advisory.published_at DESC, advisory.osv_id DESC"),
                 CveSummarySortOrder::UpdatedAsc => statement.push(" ORDER BY advisory.modified_at ASC, advisory.osv_id ASC"),
                 CveSummarySortOrder::UpdatedDesc => statement.push(" ORDER BY advisory.modified_at DESC, advisory.osv_id DESC"),
                 CveSummarySortOrder::CveIdAsc | CveSummarySortOrder::ScoreAsc => statement.push(" ORDER BY advisory.osv_id ASC"),
@@ -2232,11 +2241,11 @@ impl SqlxDatabase {
         let ids_json =
             serde_json::to_string(ids).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
         self.writer.with_connection(|connection| Box::pin(async move {
-            let mut query = QueryBuilder::<Sqlite>::new("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at FROM json_each(");
+            let mut query = QueryBuilder::<Sqlite>::new("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=advisory.osv_id) AS package_summary FROM json_each(");
             query.push_bind(ids_json).push(") AS requested JOIN osv_advisories AS advisory ON advisory.osv_id=requested.value");
             match sort_order {
-                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY advisory.published_at ASC, advisory.osv_id ASC"),
-                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY advisory.published_at DESC, advisory.osv_id DESC"),
+                CveSummarySortOrder::PublishedAsc => query.push(" ORDER BY advisory.published_at IS NULL ASC, advisory.published_at ASC, advisory.osv_id ASC"),
+                CveSummarySortOrder::PublishedDesc => query.push(" ORDER BY advisory.published_at IS NULL ASC, advisory.published_at DESC, advisory.osv_id DESC"),
                 CveSummarySortOrder::UpdatedAsc => query.push(" ORDER BY advisory.modified_at ASC, advisory.osv_id ASC"),
                 CveSummarySortOrder::UpdatedDesc => query.push(" ORDER BY advisory.modified_at DESC, advisory.osv_id DESC"),
                 CveSummarySortOrder::CveIdAsc | CveSummarySortOrder::ScoreAsc => query.push(" ORDER BY advisory.osv_id ASC"),
@@ -2258,7 +2267,7 @@ impl SqlxDatabase {
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    sqlx::query_as("SELECT osv_id, COALESCE(modified_at, '') AS modified_at, summary, details, withdrawn_at FROM osv_advisories WHERE osv_id=? COLLATE NOCASE")
+                    sqlx::query_as("SELECT advisory.osv_id, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=advisory.osv_id) AS package_summary FROM osv_advisories AS advisory WHERE advisory.osv_id=? COLLATE NOCASE")
                         .bind(osv_id)
                         .fetch_optional(connection)
                         .await
@@ -5501,6 +5510,181 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ranked[0].cve_id, "CVE-2099-0002");
+    }
+
+    #[tokio::test]
+    async fn cvss_search_orders_each_cve_by_its_highest_matching_score() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"multiple CVSS metrics","metrics":[{"cvssV3_1":{"version":"3.1","baseScore":2.0,"baseSeverity":"LOW"}},{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-1002","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-02-01T00:00:00Z"},"containers":{"cna":{"title":"single CVSS metric","metrics":[{"cvssV3_1":{"version":"3.1","baseScore":8.0,"baseSeverity":"HIGH"}}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+
+        let rows = database
+            .search_cve_summaries_by_cvss_with_state_scope(
+                None,
+                None,
+                None,
+                None,
+                CveStateScope::PublishedOnly,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2099-1001", "CVE-2099-1002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn product_cvss_search_uses_score_order_instead_of_publication_order() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-2001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"older critical issue","affected":[{"vendor":"Acme","product":"widget"}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":9.8,"baseSeverity":"CRITICAL"}}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-2002","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-02-01T00:00:00Z"},"containers":{"cna":{"title":"newer medium issue","affected":[{"vendor":"Acme","product":"widget"}],"metrics":[{"cvssV3_1":{"version":"3.1","baseScore":5.0,"baseSeverity":"MEDIUM"}}]}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+
+        let rows = database
+            .search_cve_summaries_by_product_cvss_exact_with_state_scope(
+                None,
+                None,
+                Some("Acme"),
+                Some("widget"),
+                None,
+                None,
+                None,
+                None,
+                CveStateScope::PublishedOnly,
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.cve_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-2099-2001", "CVE-2099-2002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn osv_publication_sort_keeps_missing_dates_last_in_both_directions() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        database
+            .import_osv_records(vec![
+                OsvRawRecord {
+                    source_path: None,
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-SORT-0001","modified":"2099-01-03T00:00:00Z","published":"2099-01-01T00:00:00Z","summary":"publication sorting fixture older","affected":[],"references":[]}"#.to_owned(),
+                },
+                OsvRawRecord {
+                    source_path: None,
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-SORT-0002","modified":"2099-01-01T00:00:00Z","published":"2099-01-02T00:00:00Z","summary":"publication sorting fixture newer","affected":[],"references":[]}"#.to_owned(),
+                },
+                OsvRawRecord {
+                    source_path: None,
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-SORT-0003","modified":"2099-01-02T00:00:00Z","summary":"publication sorting fixture undated","affected":[],"references":[]}"#.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        for (sort_order, expected) in [
+            (
+                CveSummarySortOrder::PublishedAsc,
+                vec!["GHSA-SORT-0001", "GHSA-SORT-0002", "GHSA-SORT-0003"],
+            ),
+            (
+                CveSummarySortOrder::PublishedDesc,
+                vec!["GHSA-SORT-0002", "GHSA-SORT-0001", "GHSA-SORT-0003"],
+            ),
+        ] {
+            let rows = database
+                .search_osv_summaries_free_text_sorted("publication sorting", sort_order, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.osv_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected {sort_order:?} order"
+            );
+        }
+
+        let ids = vec![
+            "GHSA-SORT-0003".to_owned(),
+            "GHSA-SORT-0001".to_owned(),
+            "GHSA-SORT-0002".to_owned(),
+        ];
+        for (sort_order, expected) in [
+            (
+                CveSummarySortOrder::UpdatedAsc,
+                vec!["GHSA-SORT-0002", "GHSA-SORT-0003", "GHSA-SORT-0001"],
+            ),
+            (
+                CveSummarySortOrder::UpdatedDesc,
+                vec!["GHSA-SORT-0001", "GHSA-SORT-0003", "GHSA-SORT-0002"],
+            ),
+            (
+                CveSummarySortOrder::CveIdAsc,
+                vec!["GHSA-SORT-0001", "GHSA-SORT-0002", "GHSA-SORT-0003"],
+            ),
+            (
+                CveSummarySortOrder::CveIdDesc,
+                vec!["GHSA-SORT-0003", "GHSA-SORT-0002", "GHSA-SORT-0001"],
+            ),
+        ] {
+            let rows = database
+                .osv_summaries_by_ids_sorted(&ids, sort_order, 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.osv_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "unexpected explicit OSV ID {sort_order:?} order"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn published_sort_has_stable_non_overlapping_pages_for_ties() {
+        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize().await.unwrap();
+        for id in ["CVE-2099-3001", "CVE-2099-3002", "CVE-2099-3003"] {
+            database
+                .import_cve_raw_json(format!(
+                    r#"{{"cveMetadata":{{"cveId":"{id}","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"}},"containers":{{"cna":{{"title":"stable pagination fixture"}}}}}}"#
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut ids = Vec::new();
+        for offset in 0..3 {
+            let rows = database
+                .search_cve_summaries_advanced(&crate::CveAdvancedSearch::default(), 1, offset)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            ids.push(rows[0].cve_id.clone());
+        }
+        assert_eq!(ids, vec!["CVE-2099-3003", "CVE-2099-3002", "CVE-2099-3001"]);
     }
 
     #[tokio::test]

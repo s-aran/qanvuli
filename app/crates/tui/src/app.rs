@@ -4,7 +4,7 @@ use super::{
         capec::search_capec_entries,
         cwe::search_cwe_entries,
         raw_json::{load_cve_raw_json, load_osv_raw_json},
-        search::{SearchRequest, SearchResult, run_count_request, run_search_request},
+        search::{SearchRequest, SearchResult, SearchTerm, run_count_request, run_search_request},
     },
     display::DisplaySettings,
     form::AdvancedForm,
@@ -40,6 +40,7 @@ pub(super) const CWE_STATUSES: [CweStatus; CWE_STATUS_COUNT] = [
 pub(super) struct App {
     pub(super) query: String,
     pub(super) search_mode: SearchMode,
+    search_mode_explicit: bool,
     pub(super) state_scope: CveStateScope,
     pub(super) advanced: AdvancedForm,
     pub(super) display: DisplaySettings,
@@ -284,6 +285,7 @@ impl App {
         let mut app = Self {
             query,
             search_mode,
+            search_mode_explicit: false,
             state_scope: CveStateScope::PublishedOnly,
             advanced: AdvancedForm::default(),
             display: DisplaySettings::default(),
@@ -347,9 +349,8 @@ impl App {
             scope_task: None,
             search_started_at: None,
             search_timeout_at: None,
-            searched_request: SearchRequest::Mode {
-                mode: search_mode,
-                query: String::new(),
+            searched_request: SearchRequest::Query {
+                term: SearchTerm::new(search_mode, String::new()),
                 state_scope: CveStateScope::PublishedOnly,
                 kev_only: false,
                 sort_order: CveSummarySortOrder::PublishedDesc,
@@ -381,11 +382,10 @@ impl App {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
         let sort_order = self.display.sort_order();
-        let request = if self.search_mode == SearchMode::Identifier && !self.query.trim().is_empty()
-        {
-            SearchRequest::Mode {
-                mode: self.search_mode,
-                query: self.query.clone(),
+        let term = SearchTerm::new(self.search_mode, self.query.clone());
+        let request = if !self.query.trim().is_empty() {
+            SearchRequest::Query {
+                term,
                 state_scope: self.state_scope,
                 kev_only: self.display.kev_only,
                 sort_order,
@@ -408,6 +408,7 @@ impl App {
     pub(super) fn start_advanced_search(&mut self, db: CveDatabase) {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
+        self.search_mode_explicit = true;
         self.state_scope = self.advanced.state_scope;
         let mut options = self.advanced.to_search_options(self.display.sort_order());
         options.kev_only = self.display.kev_only;
@@ -492,7 +493,7 @@ impl App {
         };
         let mut request = self.searched_request.clone();
         match &mut request {
-            SearchRequest::Mode {
+            SearchRequest::Query {
                 kev_only,
                 sort_order,
                 ..
@@ -1646,11 +1647,13 @@ impl App {
 
     pub(super) fn next_search_mode(&mut self) {
         self.search_mode = self.search_mode.next();
+        self.search_mode_explicit = true;
         self.sync_advanced_from_main();
     }
 
     pub(super) fn previous_search_mode(&mut self) {
         self.search_mode = self.search_mode.previous();
+        self.search_mode_explicit = true;
         self.sync_advanced_from_main();
     }
 
@@ -1871,6 +1874,7 @@ impl App {
     pub(super) fn sync_main_from_advanced(&mut self) {
         self.query = self.advanced.query.clone();
         self.search_mode = self.advanced.query_mode;
+        self.search_mode_explicit = true;
         self.state_scope = self.advanced.state_scope;
         self.scroll_detail_to_top();
     }
@@ -1885,6 +1889,7 @@ impl App {
         self.abort_search();
         self.query.clear();
         self.search_mode = SearchMode::FreeText;
+        self.search_mode_explicit = false;
         self.state_scope = CveStateScope::PublishedOnly;
         self.advanced = AdvancedForm::default();
         self.display = DisplaySettings::default();
@@ -1930,9 +1935,8 @@ impl App {
         self.detail_search_query.clear();
         self.detail_search_input = false;
         self.detail_search_error = None;
-        self.searched_request = SearchRequest::Mode {
-            mode: SearchMode::FreeText,
-            query: String::new(),
+        self.searched_request = SearchRequest::Query {
+            term: SearchTerm::FreeText(String::new()),
             state_scope: CveStateScope::PublishedOnly,
             kev_only: false,
             sort_order: CveSummarySortOrder::PublishedDesc,
@@ -1950,9 +1954,11 @@ impl App {
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {
-        if let Some(mode) = SearchMode::from_query_prefix(&self.query) {
-            self.search_mode = mode;
+        if self.search_mode_explicit {
+            return;
         }
+        self.search_mode =
+            SearchMode::from_query_prefix(&self.query).unwrap_or(SearchMode::FreeText);
     }
 
     fn main_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
@@ -2703,7 +2709,7 @@ mod tests {
                 assert!(*include_cve);
                 assert!(!include_osv);
             }
-            SearchRequest::Mode { .. } => panic!("empty Enter must browse CVEs"),
+            SearchRequest::Query { .. } => panic!("empty Enter must browse CVEs"),
         }
         app.abort_search();
     }
@@ -2718,25 +2724,28 @@ mod tests {
 
         app.start_search(database.clone());
         match &app.searched_request {
-            SearchRequest::Advanced { options, .. } => {
-                assert_eq!(
-                    options.query_mode,
-                    Some(qanvuli_core::database::CveAdvancedQueryMode::Cve)
-                );
-                assert_eq!(options.sort_order, CveSummarySortOrder::UpdatedAsc);
+            SearchRequest::Query {
+                term, sort_order, ..
+            } => {
+                assert_eq!(term, &SearchTerm::CvePrefix("CVE-2099".to_owned()));
+                assert_eq!(*sort_order, CveSummarySortOrder::UpdatedAsc);
             }
-            SearchRequest::Mode { .. } => panic!("CVE prefix searches must use sorted search"),
+            SearchRequest::Advanced { .. } => panic!("CVE prefix lost its typed search term"),
         }
 
         app.display.sort_field = crate::display::SortField::Score;
         app.display.sort_direction = crate::display::SortDirection::Desc;
         app.apply_display_settings(Some(database.clone()));
         match &app.searched_request {
-            SearchRequest::Advanced { options, .. } => {
-                assert_eq!(options.sort_order, CveSummarySortOrder::ScoreDesc);
-                assert_eq!(options.query.as_deref(), Some("CVE-2099"));
+            SearchRequest::Query {
+                term, sort_order, ..
+            } => {
+                assert_eq!(term, &SearchTerm::CvePrefix("CVE-2099".to_owned()));
+                assert_eq!(*sort_order, CveSummarySortOrder::ScoreDesc);
             }
-            SearchRequest::Mode { .. } => panic!("display apply must preserve the search request"),
+            SearchRequest::Advanced { .. } => {
+                panic!("display apply must preserve the typed search request")
+            }
         }
 
         app.query = "GHSA-2099-example".to_owned();
@@ -2744,12 +2753,64 @@ mod tests {
         app.display.sort_direction = crate::display::SortDirection::Desc;
         app.start_search(database);
         match &app.searched_request {
-            SearchRequest::Mode { sort_order, .. } => {
+            SearchRequest::Query {
+                term, sort_order, ..
+            } => {
+                assert_eq!(
+                    term,
+                    &SearchTerm::Identifier("GHSA-2099-example".to_owned())
+                );
                 assert_eq!(*sort_order, CveSummarySortOrder::RelationRankDesc);
             }
             SearchRequest::Advanced { .. } => panic!("identifier searches must retain graph rank"),
         }
         app.abort_search();
+    }
+
+    #[tokio::test]
+    async fn hyphenated_product_input_stays_in_product_mode() {
+        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize_schema().await.unwrap();
+        let mut app = App::new(String::new(), 25);
+        app.next_search_mode();
+        assert_eq!(app.search_mode, SearchMode::Product);
+
+        for ch in "example-product".chars() {
+            app.push_query(ch);
+        }
+        assert_eq!(app.search_mode, SearchMode::Product);
+
+        app.start_search(database);
+        match &app.searched_request {
+            SearchRequest::Query { term, .. } => {
+                assert_eq!(term, &SearchTerm::Product("example-product".to_owned()));
+            }
+            SearchRequest::Advanced { .. } => panic!("main search lost its typed product term"),
+        }
+        app.abort_search();
+    }
+
+    #[test]
+    fn explicit_and_inferred_search_modes_are_distinct() {
+        let mut inferred = App::new(String::new(), 25);
+        for ch in "GHSA-2099-example".chars() {
+            inferred.push_query(ch);
+        }
+        assert_eq!(inferred.search_mode, SearchMode::Identifier);
+        while !inferred.query.is_empty() {
+            inferred.backspace_query();
+        }
+        assert_eq!(inferred.search_mode, SearchMode::FreeText);
+
+        let mut explicit = App::new(String::new(), 25);
+        for _ in 0..6 {
+            explicit.next_search_mode();
+        }
+        assert_eq!(explicit.search_mode, SearchMode::FreeText);
+        for ch in "GHSA-2099-example".chars() {
+            explicit.push_query(ch);
+        }
+        assert_eq!(explicit.search_mode, SearchMode::FreeText);
     }
 
     #[test]
