@@ -3,16 +3,41 @@ use qanvuli_core::database::{
     CveAdvancedQueryMode, CveAdvancedSearch, CveDatabase, CveStateScope, CveSummary,
     CveSummarySortOrder, CveSummaryWithDetail, EnrichedCveSummary, OsvSummary,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap},
+};
 
 #[derive(Debug)]
 pub(crate) struct SearchResult {
-    pub(crate) rows: Vec<CveSummaryWithDetail>,
-    pub(crate) osv_rows: Vec<OsvSummary>,
+    pub(crate) candidates: Vec<SearchCandidate>,
     pub(crate) enrichment: Vec<EnrichedCveSummary>,
     pub(crate) linked_osv: HashMap<String, Vec<OsvSummary>>,
     pub(crate) consumed: u64,
     pub(crate) exhausted: bool,
+    pub(crate) continuation: SearchContinuation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SearchContinuation {
+    cve_offset: u64,
+    osv_offset: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum SearchCandidate {
+    Cve(CveSummaryWithDetail),
+    Osv(OsvSummary),
+}
+
+enum CandidateSummary {
+    Cve(CveSummary),
+    Osv(OsvSummary),
+}
+
+struct RankedCandidate {
+    source_rank: u64,
+    summary: CandidateSummary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,12 +119,67 @@ pub(crate) enum SearchRequest {
     },
 }
 
+impl SearchRequest {
+    /// An unfiltered browse can page efficiently, but an exact total requires scanning the whole
+    /// CVE table. Keep the total unknown instead of making the TUI compete with that scan.
+    pub(crate) fn should_count(&self) -> bool {
+        !matches!(
+            self,
+            Self::Advanced {
+                options,
+                osv_families,
+                ecosystems,
+                ..
+            } if is_unfiltered_browse(options)
+                && osv_families.is_empty()
+                && ecosystems.as_ref().is_none_or(Vec::is_empty)
+        )
+    }
+}
+
+fn is_unfiltered_browse(options: &CveAdvancedSearch) -> bool {
+    [
+        options.query.as_deref(),
+        options.published_from.as_deref(),
+        options.published_to.as_deref(),
+        options.cwe.as_deref(),
+        options.product.as_deref(),
+        options.product_exact.as_deref(),
+        options.package_ecosystem.as_deref(),
+        options.package_version.as_deref(),
+        options.vendor.as_deref(),
+        options.vendor_exact.as_deref(),
+    ]
+    .into_iter()
+    .all(|value| value.is_none_or(|value| value.trim().is_empty()))
+        && !options.kev_only
+}
+
 pub(crate) async fn run_search_request(
     db: CveDatabase,
     request: SearchRequest,
     limit: u64,
     offset: u64,
 ) -> Result<SearchResult, String> {
+    run_search_request_at(db, request, limit, SearchPosition::Offset(offset)).await
+}
+
+pub(crate) async fn run_search_request_after(
+    db: CveDatabase,
+    request: SearchRequest,
+    limit: u64,
+    continuation: SearchContinuation,
+) -> Result<SearchResult, String> {
+    run_search_request_at(db, request, limit, SearchPosition::Continue(continuation)).await
+}
+
+async fn run_search_request_at(
+    db: CveDatabase,
+    request: SearchRequest,
+    limit: u64,
+    position: SearchPosition,
+) -> Result<SearchResult, String> {
+    let limit = limit.max(1);
     match request {
         SearchRequest::Query {
             term,
@@ -107,40 +187,51 @@ pub(crate) async fn run_search_request(
             kev_only,
             sort_order,
         } => {
-            let rows = if kev_only
-                && let Some(options) = term.advanced_options(state_scope, true, sort_order)
-            {
-                db.search_cve_summaries_advanced(&options, limit, offset)
+            let include_cve = !kev_only || term.advanced_query_mode().is_some();
+            let include_osv = !kev_only
+                && matches!(
+                    term,
+                    SearchTerm::FreeText(_) | SearchTerm::Product(_) | SearchTerm::Identifier(_)
+                );
+            let page = source_page(limit, position, include_cve && include_osv);
+            let osv_db = independent_database(&db).await;
+            let rows_future = async {
+                if kev_only
+                    && let Some(options) = term.advanced_options(state_scope, true, sort_order)
+                {
+                    db.search_cve_summaries_advanced(&options, page.fetch_limit, page.cve_offset)
+                        .await
+                        .map_err(|err| err.to_string())
+                } else if kev_only {
+                    Ok(Vec::new())
+                } else {
+                    search_by_term(
+                        &db,
+                        &term,
+                        state_scope,
+                        sort_order,
+                        page.fetch_limit,
+                        page.cve_offset,
+                    )
                     .await
-                    .map_err(|err| err.to_string())?
-            } else if kev_only {
-                Vec::new()
-            } else {
-                search_by_term(&db, &term, state_scope, sort_order, limit, offset).await?
+                }
             };
-            let osv_rows = if kev_only {
-                Vec::new()
-            } else {
-                search_osv_by_term(&db, &term, sort_order, limit, offset).await?
+            let osv_future = async {
+                if kev_only {
+                    Ok(Vec::new())
+                } else {
+                    search_osv_by_term(
+                        &osv_db,
+                        &term,
+                        sort_order,
+                        page.fetch_limit,
+                        page.osv_offset,
+                    )
+                    .await
+                }
             };
-            let consumed = rows.len().max(osv_rows.len()) as u64;
-            let exhausted = rows.len() < limit as usize && osv_rows.len() < limit as usize;
-            let (rows, osv_rows) =
-                collapse_linked_osv(&db, rows, osv_rows, state_scope, sort_order).await?;
-            let rows = db
-                .attach_cve_overview_details(rows)
-                .await
-                .map_err(|err| err.to_string())?;
-            let enrichment = load_enrichment_summaries(&db, &rows).await?;
-            let linked_osv = load_linked_osv(&db, &rows).await?;
-            Ok(SearchResult {
-                rows,
-                osv_rows,
-                enrichment,
-                linked_osv,
-                consumed,
-                exhausted,
-            })
+            let (rows, osv_rows) = tokio::try_join!(rows_future, osv_future)?;
+            finish_search_result(&db, &osv_db, rows, osv_rows, sort_order, page).await
         }
         SearchRequest::Advanced {
             options,
@@ -149,183 +240,378 @@ pub(crate) async fn run_search_request(
             osv_families,
             ecosystems,
         } => {
-            let osv_query = advanced_osv_query(&options);
-            let package_version = package_version_query(&options);
-            let rows = if include_cve {
-                if let Some((ecosystem, package, version)) = package_version.as_ref() {
-                    let findings = db
-                        .query_package_matches(ecosystem, package, version, None)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                    let cve_ids = findings
-                        .into_iter()
-                        .filter(|finding| finding.affected.status == "affected")
-                        .flat_map(|finding| finding.cve_ids)
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    db.cve_summaries_by_ids_sorted(
-                        &cve_ids,
-                        options.state_scope,
-                        options.sort_order,
-                        limit,
-                        offset,
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?
-                } else {
-                    db.search_cve_summaries_advanced(&options, limit, offset)
-                        .await
-                        .map_err(|err| err.to_string())?
-                }
-            } else {
-                Vec::new()
-            };
-            let osv_rows = if package_version.is_some()
-                || options.kev_only
-                || !include_osv
-                || has_cve_only_advanced_filters(&options)
-            {
-                Vec::new()
-            } else if let Some(package) = osv_package_query(&options) {
-                db.search_osv_summaries_scoped_by_package_sorted(
+            let include_osv = include_osv
+                && package_version_query(&options).is_none()
+                && !options.kev_only
+                && !has_cve_only_advanced_filters(&options);
+            let page = source_page(limit, position, include_cve && include_osv);
+            let osv_db = independent_database(&db).await;
+            let (rows, osv_rows) = tokio::try_join!(
+                search_advanced_cves(
+                    &db,
+                    &options,
+                    include_cve,
+                    page.fetch_limit,
+                    page.cve_offset,
+                ),
+                search_advanced_osv(
+                    &osv_db,
+                    &options,
+                    include_osv,
                     &osv_families,
                     ecosystems.as_deref(),
-                    package,
-                    options.sort_order,
-                    limit,
-                    offset,
+                    page.fetch_limit,
+                    page.osv_offset,
                 )
-                .await
-                .map_err(|err| err.to_string())?
-            } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
-                db.search_osv_summaries_free_text_sorted(
-                    options.query.as_deref().unwrap_or_default(),
-                    options.sort_order,
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            } else if let Some(package_name) = options
-                .product_exact
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-            {
-                db.search_osv_summaries_scoped_by_exact_package_sorted(
-                    osv_query.as_deref(),
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    package_name,
-                    options.sort_order,
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            } else {
-                db.search_osv_summaries_scoped_sorted(
-                    osv_query.as_deref(),
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    options.sort_order,
-                    limit,
-                    offset,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            };
-            let consumed = rows.len().max(osv_rows.len()) as u64;
-            let exhausted = rows.len() < limit as usize && osv_rows.len() < limit as usize;
-            let (rows, osv_rows) = if include_cve {
-                collapse_linked_osv(&db, rows, osv_rows, options.state_scope, options.sort_order)
-                    .await?
-            } else {
-                (rows, osv_rows)
-            };
-            let rows = db
-                .attach_cve_overview_details(rows)
-                .await
-                .map_err(|err| err.to_string())?;
-            let enrichment = load_enrichment_summaries(&db, &rows).await?;
-            let linked_osv = load_linked_osv(&db, &rows).await?;
-            Ok(SearchResult {
-                rows,
-                osv_rows,
-                enrichment,
-                linked_osv,
-                consumed,
-                exhausted,
-            })
+            )?;
+            finish_search_result(&db, &osv_db, rows, osv_rows, options.sort_order, page).await
         }
     }
 }
 
-async fn load_linked_osv(
-    db: &CveDatabase,
-    rows: &[CveSummaryWithDetail],
-) -> Result<HashMap<String, Vec<OsvSummary>>, String> {
-    let cve_ids = rows
-        .iter()
-        .map(|row| row.summary.cve_id.clone())
-        .collect::<Vec<_>>();
-    db.osv_summaries_for_cve_ids(&cve_ids)
-        .await
-        .map_err(|err| err.to_string())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchPosition {
+    Offset(u64),
+    Continue(SearchContinuation),
 }
 
-async fn collapse_linked_osv(
-    db: &CveDatabase,
-    mut rows: Vec<CveSummary>,
-    osv_rows: Vec<OsvSummary>,
-    state_scope: CveStateScope,
-    sort_order: CveSummarySortOrder,
-) -> Result<(Vec<CveSummary>, Vec<OsvSummary>), String> {
-    let osv_ids = osv_rows
-        .iter()
-        .map(|row| row.osv_id.clone())
-        .collect::<Vec<_>>();
-    let aliases = db
-        .cve_aliases_for_osv_ids(&osv_ids, state_scope)
-        .await
-        .map_err(|err| err.to_string())?;
-    if aliases.is_empty() {
-        return Ok((rows, osv_rows));
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourcePage {
+    page_limit: u64,
+    fetch_limit: u64,
+    cve_offset: u64,
+    osv_offset: u64,
+    slice_offset: u64,
+}
 
-    let mut known_cves = rows
+fn source_page(limit: u64, position: SearchPosition, mixed_sources: bool) -> SourcePage {
+    match position {
+        SearchPosition::Continue(continuation) => SourcePage {
+            page_limit: limit,
+            fetch_limit: limit.saturating_add(1),
+            cve_offset: continuation.cve_offset,
+            osv_offset: continuation.osv_offset,
+            slice_offset: 0,
+        },
+        SearchPosition::Offset(offset) if mixed_sources => {
+            // Direct callers may request an arbitrary global offset. The sequential TUI path
+            // resumes each source independently through the continuation branch above.
+            SourcePage {
+                page_limit: limit,
+                fetch_limit: offset.saturating_add(limit).saturating_add(1),
+                cve_offset: 0,
+                osv_offset: 0,
+                slice_offset: offset,
+            }
+        }
+        SearchPosition::Offset(offset) => SourcePage {
+            page_limit: limit,
+            fetch_limit: limit.saturating_add(1),
+            cve_offset: offset,
+            osv_offset: offset,
+            slice_offset: 0,
+        },
+    }
+}
+
+async fn finish_search_result(
+    db: &CveDatabase,
+    related_db: &CveDatabase,
+    rows: Vec<CveSummary>,
+    osv_rows: Vec<OsvSummary>,
+    sort_order: CveSummarySortOrder,
+    page: SourcePage,
+) -> Result<SearchResult, String> {
+    let mut merged = rows
+        .into_iter()
+        .enumerate()
+        .map(|(source_rank, row)| RankedCandidate {
+            source_rank: page.cve_offset.saturating_add(source_rank as u64),
+            summary: CandidateSummary::Cve(row),
+        })
+        .chain(
+            osv_rows
+                .into_iter()
+                .enumerate()
+                .map(|(source_rank, row)| RankedCandidate {
+                    source_rank: page.osv_offset.saturating_add(source_rank as u64),
+                    summary: CandidateSummary::Osv(row),
+                }),
+        )
+        .collect::<Vec<_>>();
+    merged.sort_by(|left, right| compare_ranked_candidates(left, right, sort_order));
+    let merged_len = merged.len();
+    let consumed_prefix = merged
+        .iter()
+        .take(page.slice_offset.saturating_add(page.page_limit) as usize)
+        .fold(SearchContinuation::default(), |mut consumed, candidate| {
+            match candidate.summary {
+                CandidateSummary::Cve(_) => consumed.cve_offset += 1,
+                CandidateSummary::Osv(_) => consumed.osv_offset += 1,
+            }
+            consumed
+        });
+    let page_candidates = merged
+        .into_iter()
+        .skip(page.slice_offset as usize)
+        .take(page.page_limit as usize)
+        .map(|candidate| candidate.summary)
+        .collect::<Vec<_>>();
+    let cve_rows = page_candidates
+        .iter()
+        .filter_map(|candidate| match candidate {
+            CandidateSummary::Cve(row) => Some(row.clone()),
+            CandidateSummary::Osv(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let (rows, enrichment, linked_osv) = attach_search_data(db, related_db, cve_rows).await?;
+    let mut rows = rows
+        .into_iter()
+        .map(|row| (row.summary.cve_id.clone(), row))
+        .collect::<HashMap<_, _>>();
+    let candidates = page_candidates
+        .into_iter()
+        .filter_map(|candidate| match candidate {
+            CandidateSummary::Cve(row) => rows.remove(&row.cve_id).map(SearchCandidate::Cve),
+            CandidateSummary::Osv(row) => Some(SearchCandidate::Osv(row)),
+        })
+        .collect::<Vec<_>>();
+    let consumed = candidates.len() as u64;
+    let exhausted = merged_len <= page.slice_offset.saturating_add(page.page_limit) as usize;
+    Ok(SearchResult {
+        candidates,
+        enrichment,
+        linked_osv,
+        consumed,
+        exhausted,
+        continuation: SearchContinuation {
+            cve_offset: page.cve_offset.saturating_add(consumed_prefix.cve_offset),
+            osv_offset: page.osv_offset.saturating_add(consumed_prefix.osv_offset),
+        },
+    })
+}
+
+fn compare_ranked_candidates(
+    left: &RankedCandidate,
+    right: &RankedCandidate,
+    sort_order: CveSummarySortOrder,
+) -> Ordering {
+    match sort_order {
+        CveSummarySortOrder::PublishedAsc | CveSummarySortOrder::PublishedDesc => {
+            let ascending = sort_order == CveSummarySortOrder::PublishedAsc;
+            compare_optional_datetime(
+                candidate_published(&left.summary),
+                candidate_published(&right.summary),
+                ascending,
+            )
+            .then_with(|| candidate_source(&left.summary).cmp(&candidate_source(&right.summary)))
+            .then_with(|| left.source_rank.cmp(&right.source_rank))
+        }
+        CveSummarySortOrder::UpdatedAsc | CveSummarySortOrder::UpdatedDesc => {
+            let ascending = sort_order == CveSummarySortOrder::UpdatedAsc;
+            compare_optional_datetime(
+                candidate_updated(&left.summary),
+                candidate_updated(&right.summary),
+                ascending,
+            )
+            .then_with(|| candidate_source(&left.summary).cmp(&candidate_source(&right.summary)))
+            .then_with(|| left.source_rank.cmp(&right.source_rank))
+        }
+        CveSummarySortOrder::CveIdAsc => candidate_source(&left.summary)
+            .cmp(&candidate_source(&right.summary))
+            .then_with(|| left.source_rank.cmp(&right.source_rank)),
+        CveSummarySortOrder::CveIdDesc => candidate_source(&left.summary)
+            .cmp(&candidate_source(&right.summary))
+            .reverse()
+            .then_with(|| left.source_rank.cmp(&right.source_rank)),
+        CveSummarySortOrder::ScoreAsc | CveSummarySortOrder::ScoreDesc => {
+            candidate_source(&left.summary)
+                .cmp(&candidate_source(&right.summary))
+                .then_with(|| left.source_rank.cmp(&right.source_rank))
+        }
+        CveSummarySortOrder::RelationRankAsc | CveSummarySortOrder::RelationRankDesc => left
+            .source_rank
+            .cmp(&right.source_rank)
+            .then_with(|| candidate_source(&left.summary).cmp(&candidate_source(&right.summary))),
+    }
+}
+
+fn candidate_published(candidate: &CandidateSummary) -> Option<&str> {
+    match candidate {
+        CandidateSummary::Cve(row) => Some(&row.published_at),
+        CandidateSummary::Osv(row) => row.published_at.as_deref(),
+    }
+}
+
+fn candidate_updated(candidate: &CandidateSummary) -> Option<&str> {
+    match candidate {
+        CandidateSummary::Cve(row) => Some(&row.updated_at),
+        CandidateSummary::Osv(row) => row.modified_at.as_deref(),
+    }
+}
+
+fn candidate_source(candidate: &CandidateSummary) -> u8 {
+    match candidate {
+        CandidateSummary::Cve(_) => 0,
+        CandidateSummary::Osv(_) => 1,
+    }
+}
+
+fn compare_optional_datetime(left: Option<&str>, right: Option<&str>, ascending: bool) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            // Match SQLite's ordering exactly so each source prefix remains valid for the merge.
+            let order = left.cmp(right);
+            if ascending { order } else { order.reverse() }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+async fn attach_search_data(
+    db: &CveDatabase,
+    related_db: &CveDatabase,
+    rows: Vec<CveSummary>,
+) -> Result<
+    (
+        Vec<CveSummaryWithDetail>,
+        Vec<EnrichedCveSummary>,
+        HashMap<String, Vec<OsvSummary>>,
+    ),
+    String,
+> {
+    let cve_ids = rows
         .iter()
         .map(|row| row.cve_id.clone())
-        .collect::<HashSet<_>>();
-    let promoted_ids = aliases
-        .values()
-        .flatten()
-        .filter(|cve_id| known_cves.insert((*cve_id).clone()))
-        .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
-    if !promoted_ids.is_empty() {
-        rows.extend(
-            db.cve_summaries_by_ids_with_state_scope(&promoted_ids, state_scope)
-                .await
-                .map_err(|err| err.to_string())?,
-        );
-        let ids = rows
-            .iter()
-            .map(|row| row.cve_id.clone())
-            .collect::<Vec<_>>();
-        rows = db
-            .cve_summaries_by_ids_sorted(&ids, state_scope, sort_order, ids.len() as u64, 0)
+    let details = async {
+        db.attach_cve_overview_details(rows)
+            .await
+            .map_err(|err| err.to_string())
+    };
+    let related = async {
+        let enrichment = related_db
+            .enriched_cve_summaries(&cve_ids)
             .await
             .map_err(|err| err.to_string())?;
+        let linked_osv = related_db
+            .osv_summaries_for_cve_ids(&cve_ids)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok::<_, String>((enrichment, linked_osv))
+    };
+    let (rows, (enrichment, linked_osv)) = tokio::try_join!(details, related)?;
+    Ok((rows, enrichment, linked_osv))
+}
+
+async fn search_advanced_cves(
+    db: &CveDatabase,
+    options: &CveAdvancedSearch,
+    include_cve: bool,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<CveSummary>, String> {
+    if !include_cve {
+        return Ok(Vec::new());
     }
-    let osv_rows = osv_rows
-        .into_iter()
-        .filter(|row| !aliases.contains_key(&row.osv_id))
-        .collect();
-    Ok((rows, osv_rows))
+    if let Some((ecosystem, package, version)) = package_version_query(options) {
+        let findings = db
+            .query_package_matches(&ecosystem, &package, &version, None)
+            .await
+            .map_err(|err| err.to_string())?;
+        let cve_ids = findings
+            .into_iter()
+            .filter(|finding| finding.affected.status == "affected")
+            .flat_map(|finding| finding.cve_ids)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        db.cve_summaries_by_ids_sorted(
+            &cve_ids,
+            options.state_scope,
+            options.sort_order,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    } else {
+        db.search_cve_summaries_advanced(options, limit, offset)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn search_advanced_osv(
+    db: &CveDatabase,
+    options: &CveAdvancedSearch,
+    include_osv: bool,
+    osv_families: &[String],
+    ecosystems: Option<&[String]>,
+    limit: u64,
+    offset: u64,
+) -> Result<Vec<OsvSummary>, String> {
+    let osv_text_query = advanced_osv_text_query(options);
+    if package_version_query(options).is_some()
+        || options.kev_only
+        || !include_osv
+        || has_cve_only_advanced_filters(options)
+    {
+        return Ok(Vec::new());
+    }
+    if let Some(package) = osv_package_query(options) {
+        db.search_osv_summaries_scoped_by_package_and_text_sorted(
+            osv_text_query,
+            osv_families,
+            ecosystems,
+            package,
+            options.sort_order,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    } else if uses_osv_text_fts(options, osv_families, ecosystems) {
+        db.search_osv_summaries_free_text_sorted(
+            options.query.as_deref().unwrap_or_default(),
+            options.sort_order,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    } else if let Some(package_name) = options
+        .product_exact
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        db.search_osv_summaries_scoped_by_exact_package_sorted(
+            osv_text_query,
+            osv_families,
+            ecosystems,
+            package_name,
+            options.sort_order,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    } else {
+        db.search_osv_summaries_scoped_sorted(
+            osv_text_query,
+            osv_families,
+            ecosystems,
+            options.sort_order,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    }
 }
 
 async fn search_osv_by_term(
@@ -366,23 +652,13 @@ async fn search_osv_by_term(
     }
 }
 
-async fn load_enrichment_summaries(
-    db: &CveDatabase,
-    rows: &[CveSummaryWithDetail],
-) -> Result<Vec<EnrichedCveSummary>, String> {
-    let cve_ids = rows
-        .iter()
-        .map(|row| row.summary.cve_id.clone())
-        .collect::<Vec<_>>();
-    db.enriched_cve_summaries(&cve_ids)
-        .await
-        .map_err(|err| err.to_string())
-}
-
 pub(crate) async fn run_count_request(
     db: CveDatabase,
     request: SearchRequest,
 ) -> Result<u64, String> {
+    // Counting starts after the first page is visible. Keep this potentially expensive full-result
+    // query off the primary connection so detail loading and subsequent interaction stay responsive.
+    let db = independent_database(&db).await;
     match request {
         SearchRequest::Query {
             term,
@@ -410,7 +686,7 @@ pub(crate) async fn run_count_request(
             osv_families,
             ecosystems,
         } => {
-            let osv_query = advanced_osv_query(&options);
+            let osv_text_query = advanced_osv_text_query(&options);
             let cve = if include_cve {
                 if let Some((ecosystem, package, version)) = package_version_query(&options) {
                     let findings = db
@@ -438,7 +714,8 @@ pub(crate) async fn run_count_request(
             {
                 0
             } else if let Some(package) = osv_package_query(&options) {
-                db.count_osv_summaries_scoped_by_package(
+                db.count_osv_summaries_scoped_by_package_and_text(
+                    osv_text_query,
                     &osv_families,
                     ecosystems.as_deref(),
                     package,
@@ -456,7 +733,7 @@ pub(crate) async fn run_count_request(
                 .filter(|name| !name.is_empty())
             {
                 db.count_osv_summaries_scoped_by_exact_package(
-                    osv_query.as_deref(),
+                    osv_text_query,
                     &osv_families,
                     ecosystems.as_deref(),
                     package_name,
@@ -464,17 +741,19 @@ pub(crate) async fn run_count_request(
                 .await
                 .map_err(|err| err.to_string())?
             } else {
-                db.count_osv_summaries_scoped(
-                    osv_query.as_deref(),
-                    &osv_families,
-                    ecosystems.as_deref(),
-                )
-                .await
-                .map_err(|err| err.to_string())?
+                db.count_osv_summaries_scoped(osv_text_query, &osv_families, ecosystems.as_deref())
+                    .await
+                    .map_err(|err| err.to_string())?
             };
             Ok(cve + osv)
         }
     }
+}
+
+async fn independent_database(db: &CveDatabase) -> CveDatabase {
+    db.independent_connection()
+        .await
+        .unwrap_or_else(|_| db.clone())
 }
 
 fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
@@ -485,11 +764,17 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
     ]
     .into_iter()
     .any(|value| value.is_some_and(|value| !value.trim().is_empty()))
-        || (options.query_mode == Some(CveAdvancedQueryMode::Vendor)
-            && options
-                .query
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty()))
+        || (matches!(
+            options.query_mode,
+            Some(
+                CveAdvancedQueryMode::Vendor
+                    | CveAdvancedQueryMode::Cwe
+                    | CveAdvancedQueryMode::Cve
+            )
+        ) && options
+            .query
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()))
         || options
             .vendor
             .as_deref()
@@ -545,13 +830,12 @@ fn uses_osv_text_fts(
         && ecosystems.is_none_or(|ecosystems| ecosystems.is_empty())
 }
 
-fn advanced_osv_query(options: &CveAdvancedSearch) -> Option<String> {
-    let query = [options.query.as_deref(), options.product.as_deref()]
-        .into_iter()
-        .filter_map(|value| value.map(str::trim).filter(|value| !value.is_empty()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    (!query.is_empty()).then_some(query)
+fn advanced_osv_text_query(options: &CveAdvancedSearch) -> Option<&str> {
+    (options.query_mode.unwrap_or(CveAdvancedQueryMode::FreeText) == CveAdvancedQueryMode::FreeText)
+        .then_some(options.query.as_deref())
+        .flatten()
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
 }
 
 async fn search_by_term(
@@ -649,6 +933,39 @@ mod tests {
     use super::*;
     use qanvuli_core::database::OsvRawRecord;
 
+    fn cve_candidates(result: &SearchResult) -> Vec<&CveSummaryWithDetail> {
+        result
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                SearchCandidate::Cve(cve) => Some(cve),
+                SearchCandidate::Osv(_) => None,
+            })
+            .collect()
+    }
+
+    fn osv_candidates(result: &SearchResult) -> Vec<&OsvSummary> {
+        result
+            .candidates
+            .iter()
+            .filter_map(|candidate| match candidate {
+                SearchCandidate::Cve(_) => None,
+                SearchCandidate::Osv(osv) => Some(osv),
+            })
+            .collect()
+    }
+
+    fn candidate_ids(result: &SearchResult) -> Vec<&str> {
+        result
+            .candidates
+            .iter()
+            .map(|candidate| match candidate {
+                SearchCandidate::Cve(cve) => cve.summary.cve_id.as_str(),
+                SearchCandidate::Osv(osv) => osv.osv_id.as_str(),
+            })
+            .collect()
+    }
+
     #[test]
     fn advanced_osv_search_excludes_cve_only_filters() {
         assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch::default()));
@@ -656,11 +973,17 @@ mod tests {
             vendor: Some("Example".to_owned()),
             ..Default::default()
         }));
-        assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
-            query: Some("Example".to_owned()),
-            query_mode: Some(CveAdvancedQueryMode::Vendor),
-            ..Default::default()
-        }));
+        for query_mode in [
+            CveAdvancedQueryMode::Vendor,
+            CveAdvancedQueryMode::Cwe,
+            CveAdvancedQueryMode::Cve,
+        ] {
+            assert!(has_cve_only_advanced_filters(&CveAdvancedSearch {
+                query: Some("Example".to_owned()),
+                query_mode: Some(query_mode),
+                ..Default::default()
+            }));
+        }
         assert!(!has_cve_only_advanced_filters(&CveAdvancedSearch {
             product_exact: Some("Django".to_owned()),
             ..Default::default()
@@ -677,6 +1000,381 @@ mod tests {
             kev_only: true,
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn arbitrary_offsets_use_a_prefix_but_continuations_resume_each_source() {
+        assert_eq!(
+            source_page(30, SearchPosition::Offset(3_000), false),
+            SourcePage {
+                page_limit: 30,
+                fetch_limit: 31,
+                cve_offset: 3_000,
+                osv_offset: 3_000,
+                slice_offset: 0,
+            }
+        );
+        assert_eq!(
+            source_page(30, SearchPosition::Offset(3_000), true),
+            SourcePage {
+                page_limit: 30,
+                fetch_limit: 3_031,
+                cve_offset: 0,
+                osv_offset: 0,
+                slice_offset: 3_000,
+            }
+        );
+        assert_eq!(
+            source_page(
+                30,
+                SearchPosition::Continue(SearchContinuation {
+                    cve_offset: 2_100,
+                    osv_offset: 900,
+                }),
+                true,
+            ),
+            SourcePage {
+                page_limit: 30,
+                fetch_limit: 31,
+                cve_offset: 2_100,
+                osv_offset: 900,
+                slice_offset: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn only_an_unfiltered_browse_skips_the_expensive_exact_count() {
+        let request = SearchRequest::Advanced {
+            options: CveAdvancedSearch::default(),
+            include_cve: true,
+            include_osv: false,
+            osv_families: Vec::new(),
+            ecosystems: None,
+        };
+        assert!(!request.should_count());
+
+        let blank_query = SearchRequest::Advanced {
+            options: CveAdvancedSearch {
+                query: Some("  \t".to_owned()),
+                ..Default::default()
+            },
+            include_cve: true,
+            include_osv: false,
+            osv_families: Vec::new(),
+            ecosystems: None,
+        };
+        assert!(!blank_query.should_count());
+
+        for (name, options) in [
+            (
+                "query",
+                CveAdvancedSearch {
+                    query: Some("openssl".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "published_from",
+                CveAdvancedSearch {
+                    published_from: Some("2099-01-01".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "published_to",
+                CveAdvancedSearch {
+                    published_to: Some("2099-12-31".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "cwe",
+                CveAdvancedSearch {
+                    cwe: Some("CWE-79".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "product",
+                CveAdvancedSearch {
+                    product: Some("openssl".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "product_exact",
+                CveAdvancedSearch {
+                    product_exact: Some("openssl".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ecosystem",
+                CveAdvancedSearch {
+                    package_ecosystem: Some("crates.io".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "version",
+                CveAdvancedSearch {
+                    package_version: Some("1.0.0".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vendor",
+                CveAdvancedSearch {
+                    vendor: Some("Acme".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "vendor_exact",
+                CveAdvancedSearch {
+                    vendor_exact: Some("Acme".to_owned()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "kev",
+                CveAdvancedSearch {
+                    kev_only: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let filtered = SearchRequest::Advanced {
+                options,
+                include_cve: true,
+                include_osv: false,
+                osv_families: Vec::new(),
+                ecosystems: None,
+            };
+            assert!(filtered.should_count(), "{name} filter was ignored");
+        }
+
+        for (name, osv_families, ecosystems) in [
+            ("OSV family", vec!["GHSA".to_owned()], None),
+            (
+                "OSV ecosystem",
+                Vec::new(),
+                Some(vec!["crates.io".to_owned()]),
+            ),
+        ] {
+            let filtered = SearchRequest::Advanced {
+                options: CveAdvancedSearch::default(),
+                include_cve: true,
+                include_osv: true,
+                osv_families,
+                ecosystems,
+            };
+            assert!(filtered.should_count(), "{name} filter was ignored");
+        }
+    }
+
+    #[test]
+    fn empty_published_browse_stays_sorted_across_page_boundaries() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+            let base = chrono::DateTime::parse_from_rfc3339("2099-03-01T00:00:00Z").unwrap();
+            let records = (0..23)
+                .map(|index| {
+                    let published = (base - chrono::Duration::minutes(index)).to_rfc3339();
+                    let id_year = if index % 2 == 0 { 2098 } else { 2099 };
+                    format!(
+                        r#"{{"cveMetadata":{{"cveId":"CVE-{id_year}-{index:04}","state":"PUBLISHED","datePublished":"{published}","dateUpdated":"{published}"}},"containers":{{"cna":{{"title":"paged browse {index}"}}}}}}"#
+                    )
+                })
+                .collect();
+            db.import_cve_raw_jsons(records).await.unwrap();
+            let request = SearchRequest::Advanced {
+                options: CveAdvancedSearch {
+                    query_mode: Some(CveAdvancedQueryMode::FreeText),
+                    sort_order: CveSummarySortOrder::PublishedDesc,
+                    ..Default::default()
+                },
+                include_cve: true,
+                include_osv: false,
+                osv_families: Vec::new(),
+                ecosystems: None,
+            };
+            let mut rows = Vec::new();
+            for offset in [0, 10, 20] {
+                let result = run_search_request(db.clone(), request.clone(), 10, offset)
+                    .await
+                    .unwrap();
+                let expected_page_len = if offset == 20 { 3 } else { 10 };
+                assert_eq!(result.consumed, expected_page_len);
+                assert_eq!(result.exhausted, offset == 20);
+                rows.extend(result.candidates.into_iter().map(|candidate| match candidate {
+                    SearchCandidate::Cve(cve) => cve,
+                    SearchCandidate::Osv(osv) => {
+                        panic!("CVE-only browse returned unexpected OSV {}", osv.osv_id)
+                    }
+                }));
+            }
+
+            let expected_ids = (0..23)
+                .map(|index| {
+                    let id_year = if index % 2 == 0 { 2098 } else { 2099 };
+                    format!("CVE-{id_year}-{index:04}")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.summary.cve_id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert!(rows.windows(2).all(|pair| {
+                pair[0].summary.published_at >= pair[1].summary.published_at
+            }));
+        });
+    }
+
+    #[tokio::test]
+    async fn mixed_date_sorts_keep_exact_order_with_ties_missing_dates_and_variable_pages() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_jsons(vec![
+            r#"{"cveMetadata":{"cveId":"CVE-2099-1","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-04-01T00:00:00Z"},"containers":{"cna":{"title":"boundaryaudit one"}}}"#.to_owned(),
+            r#"{"cveMetadata":{"cveId":"CVE-2099-2","state":"PUBLISHED","datePublished":"2099-02-01T00:00:00Z","dateUpdated":"2099-03-01T00:00:00Z"},"containers":{"cna":{"title":"boundaryaudit two"}}}"#.to_owned(),
+        ])
+        .await
+        .unwrap();
+        db.import_osv_records(vec![
+            OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-boundary-one","published":"2099-01-01T00:00:00Z","modified":"2099-02-01T00:00:00Z","summary":"boundaryaudit three","affected":[]}"#.to_owned(),
+            },
+            OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-boundary-two","published":"2099-03-01T00:00:00Z","modified":"2099-03-01T00:00:00Z","summary":"boundaryaudit four","affected":[]}"#.to_owned(),
+            },
+            OsvRawRecord {
+                source_path: None,
+                raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-boundary-undated","modified":"2099-01-01T00:00:00Z","summary":"boundaryaudit five","affected":[]}"#.to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+
+        for (sort_order, expected) in [
+            (
+                CveSummarySortOrder::PublishedAsc,
+                [
+                    "CVE-2099-1",
+                    "GHSA-boundary-one",
+                    "CVE-2099-2",
+                    "GHSA-boundary-two",
+                    "GHSA-boundary-undated",
+                ],
+            ),
+            (
+                CveSummarySortOrder::PublishedDesc,
+                [
+                    "GHSA-boundary-two",
+                    "CVE-2099-2",
+                    "CVE-2099-1",
+                    "GHSA-boundary-one",
+                    "GHSA-boundary-undated",
+                ],
+            ),
+            (
+                CveSummarySortOrder::UpdatedAsc,
+                [
+                    "GHSA-boundary-undated",
+                    "GHSA-boundary-one",
+                    "CVE-2099-2",
+                    "GHSA-boundary-two",
+                    "CVE-2099-1",
+                ],
+            ),
+            (
+                CveSummarySortOrder::UpdatedDesc,
+                [
+                    "CVE-2099-1",
+                    "CVE-2099-2",
+                    "GHSA-boundary-two",
+                    "GHSA-boundary-one",
+                    "GHSA-boundary-undated",
+                ],
+            ),
+        ] {
+            let request = SearchRequest::Query {
+                term: SearchTerm::FreeText("boundaryaudit".to_owned()),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
+                sort_order,
+            };
+            let complete = run_search_request(db.clone(), request.clone(), 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(
+                candidate_ids(&complete),
+                expected,
+                "unexpected {sort_order:?}"
+            );
+            assert!(complete.exhausted);
+
+            let mut paged = Vec::new();
+            let mut continuation = None;
+            for page_size in [2, 1, 2] {
+                let result = if let Some(continuation) = continuation {
+                    run_search_request_after(db.clone(), request.clone(), page_size, continuation)
+                        .await
+                } else {
+                    run_search_request(db.clone(), request.clone(), page_size, 0).await
+                }
+                .unwrap();
+                continuation = Some(result.continuation);
+                paged.extend(candidate_ids(&result).into_iter().map(str::to_owned));
+            }
+            assert_eq!(
+                paged.iter().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "variable pages changed {sort_order:?} order"
+            );
+        }
+
+        for sort_order in [
+            CveSummarySortOrder::RelationRankAsc,
+            CveSummarySortOrder::RelationRankDesc,
+        ] {
+            let request = SearchRequest::Query {
+                term: SearchTerm::FreeText("boundaryaudit".to_owned()),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
+                sort_order,
+            };
+            let complete = run_search_request(db.clone(), request.clone(), 10, 0)
+                .await
+                .unwrap();
+            let expected = candidate_ids(&complete)
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let mut continuation = None;
+            let mut paged = Vec::new();
+            for _ in 0..expected.len() {
+                let result = if let Some(continuation) = continuation {
+                    run_search_request_after(db.clone(), request.clone(), 1, continuation).await
+                } else {
+                    run_search_request(db.clone(), request.clone(), 1, 0).await
+                }
+                .unwrap();
+                continuation = Some(result.continuation);
+                paged.extend(candidate_ids(&result).into_iter().map(str::to_owned));
+            }
+            assert_eq!(paged, expected, "continuation changed {sort_order:?} order");
+        }
     }
 
     #[test]
@@ -771,13 +1469,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert!(result.rows.is_empty());
-                assert_eq!(result.osv_rows.len(), 1);
-                assert_eq!(result.osv_rows[0].osv_id, "MAL-2099-1");
-                assert_eq!(
-                    result.osv_rows[0].details.as_deref(),
-                    Some("OSV-only fixture")
-                );
+                assert!(cve_candidates(&result).is_empty());
+                let osv = osv_candidates(&result);
+                assert_eq!(osv.len(), 1);
+                assert_eq!(osv[0].osv_id, "MAL-2099-1");
+                assert_eq!(osv[0].details.as_deref(), Some("OSV-only fixture"));
             }
 
             let request = SearchRequest::Query {
@@ -789,14 +1485,13 @@ mod tests {
             let result = run_search_request(db.clone(), request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert!(result.rows.is_empty());
-            assert!(result.osv_rows.is_empty());
+            assert!(result.candidates.is_empty());
             assert_eq!(run_count_request(db, request).await.unwrap(), 0);
         });
     }
 
     #[test]
-    fn linked_osv_result_is_promoted_to_its_cve() {
+    fn linked_osv_result_keeps_the_matching_osv_as_the_candidate() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -850,16 +1545,13 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(result.rows.len(), 1);
-            assert_eq!(result.rows[0].summary.cve_id, "CVE-2099-4242");
-            assert!(result.osv_rows.is_empty());
-            assert_eq!(result.enrichment.len(), 1);
-            assert_eq!(result.enrichment[0].osv_ids, "GHSA-2099-promoted");
-            let linked = &result.linked_osv["CVE-2099-4242"][0];
-            assert_eq!(linked.osv_id, "GHSA-2099-promoted");
-            assert_eq!(linked.summary.as_deref(), Some("unique-osv-search-needle"));
-            assert_eq!(linked.details.as_deref(), Some("OSV details"));
-            assert_eq!(linked.published_at.as_deref(), Some("2099-01-01T12:00:00Z"));
+            assert_eq!(candidate_ids(&result), ["GHSA-2099-promoted"]);
+            assert!(result.enrichment.is_empty());
+            assert!(result.linked_osv.is_empty());
+            let osv = osv_candidates(&result);
+            assert_eq!(osv[0].summary.as_deref(), Some("unique-osv-search-needle"));
+            assert_eq!(osv[0].details.as_deref(), Some("OSV details"));
+            assert_eq!(osv[0].published_at.as_deref(), Some("2099-01-01T12:00:00Z"));
             assert_eq!(result.consumed, 1);
             assert!(result.exhausted);
         });
@@ -883,17 +1575,61 @@ mod tests {
                     source_path: Some("GHSA-sort-newer.json".to_owned()),
                     raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-sort-newer","published":"2099-02-01T00:00:00Z","modified":"2099-01-01T00:00:00Z","summary":"shared-sort-needle","affected":[],"references":[]}"#.to_owned(),
                 },
+                OsvRawRecord {
+                    source_path: Some("GHSA-sort-undated.json".to_owned()),
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-sort-undated","modified":"2099-02-01T00:00:00Z","summary":"shared-sort-needle","affected":[],"references":[]}"#.to_owned(),
+                },
             ])
             .await
             .unwrap();
 
+            let unfiltered = run_search_request(
+                db.clone(),
+                SearchRequest::Advanced {
+                    options: CveAdvancedSearch {
+                        sort_order: CveSummarySortOrder::PublishedDesc,
+                        ..Default::default()
+                    },
+                    include_cve: false,
+                    include_osv: true,
+                    osv_families: Vec::new(),
+                    ecosystems: None,
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                candidate_ids(&unfiltered),
+                ["GHSA-sort-newer", "GHSA-sort-older", "GHSA-sort-undated"]
+            );
+
             for (sort_order, expected) in [
-                (CveSummarySortOrder::PublishedAsc, "GHSA-sort-older"),
-                (CveSummarySortOrder::PublishedDesc, "GHSA-sort-newer"),
-                (CveSummarySortOrder::UpdatedAsc, "GHSA-sort-newer"),
-                (CveSummarySortOrder::UpdatedDesc, "GHSA-sort-older"),
-                (CveSummarySortOrder::CveIdAsc, "GHSA-sort-newer"),
-                (CveSummarySortOrder::CveIdDesc, "GHSA-sort-older"),
+                (
+                    CveSummarySortOrder::PublishedAsc,
+                    ["GHSA-sort-older", "GHSA-sort-newer", "GHSA-sort-undated"],
+                ),
+                (
+                    CveSummarySortOrder::PublishedDesc,
+                    ["GHSA-sort-newer", "GHSA-sort-older", "GHSA-sort-undated"],
+                ),
+                (
+                    CveSummarySortOrder::UpdatedAsc,
+                    ["GHSA-sort-newer", "GHSA-sort-undated", "GHSA-sort-older"],
+                ),
+                (
+                    CveSummarySortOrder::UpdatedDesc,
+                    ["GHSA-sort-older", "GHSA-sort-undated", "GHSA-sort-newer"],
+                ),
+                (
+                    CveSummarySortOrder::CveIdAsc,
+                    ["GHSA-sort-newer", "GHSA-sort-older", "GHSA-sort-undated"],
+                ),
+                (
+                    CveSummarySortOrder::CveIdDesc,
+                    ["GHSA-sort-undated", "GHSA-sort-older", "GHSA-sort-newer"],
+                ),
             ] {
                 let result = run_search_request(
                     db.clone(),
@@ -908,8 +1644,33 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(result.osv_rows[0].osv_id, expected);
+                assert_eq!(candidate_ids(&result), expected, "unexpected {sort_order:?}");
             }
+
+            let published = run_search_request(
+                db,
+                SearchRequest::Query {
+                    term: SearchTerm::FreeText("shared-sort-needle".to_owned()),
+                    state_scope: CveStateScope::PublishedOnly,
+                    kev_only: false,
+                    sort_order: CveSummarySortOrder::PublishedDesc,
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                osv_candidates(&published)
+                    .into_iter()
+                    .map(|row| row.published_at.as_deref())
+                    .collect::<Vec<_>>(),
+                [
+                    Some("2099-02-01T00:00:00Z"),
+                    Some("2099-01-01T00:00:00Z"),
+                    None,
+                ]
+            );
         });
     }
 
@@ -929,7 +1690,8 @@ mod tests {
                     "id":"GHSA-product-vendor",
                     "modified":"2099-01-02T00:00:00Z",
                     "published":"2099-01-01T00:00:00Z",
-                    "summary":"Example Vendor advisory",
+                    "summary":"Example Vendor remote advisory",
+                    "details":"execution consequence",
                     "affected":[{
                         "package":{"ecosystem":"crates.io","name":"example-product"}
                     }],
@@ -970,8 +1732,8 @@ mod tests {
             let product_result = run_search_request(db.clone(), product_request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert!(product_result.rows.is_empty());
-            assert_eq!(product_result.osv_rows.len(), 1);
+            assert!(cve_candidates(&product_result).is_empty());
+            assert_eq!(candidate_ids(&product_result), ["GHSA-product-vendor"]);
             assert_eq!(
                 run_count_request(db.clone(), product_request)
                     .await
@@ -988,9 +1750,10 @@ mod tests {
             let vendor_result = run_search_request(db.clone(), vendor_request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(vendor_result.rows.len(), 1);
-            assert_eq!(vendor_result.rows[0].summary.cve_id, "CVE-2099-3001");
-            assert!(vendor_result.osv_rows.is_empty());
+            let vendor_cves = cve_candidates(&vendor_result);
+            assert_eq!(vendor_cves.len(), 1);
+            assert_eq!(vendor_cves[0].summary.cve_id, "CVE-2099-3001");
+            assert!(osv_candidates(&vendor_result).is_empty());
             assert_eq!(
                 run_count_request(db.clone(), vendor_request).await.unwrap(),
                 1
@@ -1014,6 +1777,49 @@ mod tests {
             .await
             .unwrap();
 
+            for query in ["remote execution", "execution remote"] {
+                let request = SearchRequest::Advanced {
+                    options: CveAdvancedSearch {
+                        query: Some(query.to_owned()),
+                        query_mode: Some(CveAdvancedQueryMode::FreeText),
+                        product: Some("example-product".to_owned()),
+                        ..Default::default()
+                    },
+                    include_cve: false,
+                    include_osv: true,
+                    osv_families: vec!["GHSA".to_owned()],
+                    ecosystems: Some(vec!["crates.io".to_owned()]),
+                };
+                let result = run_search_request(db.clone(), request.clone(), 10, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(candidate_ids(&result), ["GHSA-product-vendor"]);
+                assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 1);
+            }
+
+            let scoped_text_request = SearchRequest::Advanced {
+                options: CveAdvancedSearch {
+                    query: Some("execution remote".to_owned()),
+                    query_mode: Some(CveAdvancedQueryMode::FreeText),
+                    ..Default::default()
+                },
+                include_cve: false,
+                include_osv: true,
+                osv_families: vec!["GHSA".to_owned()],
+                ecosystems: None,
+            };
+            let result =
+                run_search_request(db.clone(), scoped_text_request.clone(), 10, 0)
+                    .await
+                    .unwrap();
+            assert_eq!(candidate_ids(&result), ["GHSA-product-vendor"]);
+            assert_eq!(
+                run_count_request(db.clone(), scoped_text_request)
+                    .await
+                    .unwrap(),
+                1
+            );
+
             let product_request = SearchRequest::Advanced {
                 options: CveAdvancedSearch {
                     query: Some("example-product".to_owned()),
@@ -1029,13 +1835,14 @@ mod tests {
             let product_result = run_search_request(db.clone(), product_request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(product_result.osv_rows.len(), 2);
-            assert_eq!(product_result.osv_rows[0].osv_id, "GHSA-product-vendor");
+            let product_osv = osv_candidates(&product_result);
+            assert_eq!(product_osv.len(), 2);
+            assert_eq!(product_osv[0].osv_id, "GHSA-product-vendor");
             assert_eq!(
-                product_result.osv_rows[0].package_summary.as_deref(),
+                product_osv[0].package_summary.as_deref(),
                 Some("crates.io:example-product")
             );
-            assert_eq!(product_result.osv_rows[1].osv_id, "GHSA-product-older");
+            assert_eq!(product_osv[1].osv_id, "GHSA-product-older");
             assert_eq!(
                 run_count_request(db.clone(), product_request)
                     .await
@@ -1075,9 +1882,8 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(
-                    result
-                        .osv_rows
-                        .iter()
+                    osv_candidates(&result)
+                        .into_iter()
                         .map(|row| row.osv_id.as_str())
                         .collect::<Vec<_>>(),
                     expected,
@@ -1098,7 +1904,10 @@ mod tests {
             let result = run_search_request(db.clone(), request.clone(), 10, 0)
                 .await
                 .unwrap();
-            assert_eq!(result.osv_rows.len(), 2);
+            assert_eq!(
+                candidate_ids(&result),
+                ["GHSA-product-vendor", "GHSA-product-older"]
+            );
             assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 2);
 
             for (name, options) in [
@@ -1116,6 +1925,30 @@ mod tests {
                         ..Default::default()
                     },
                 ),
+                (
+                    "vendor query mode",
+                    CveAdvancedSearch {
+                        query: Some("Example Vendor".to_owned()),
+                        query_mode: Some(CveAdvancedQueryMode::Vendor),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "CWE query mode",
+                    CveAdvancedSearch {
+                        query: Some("Example".to_owned()),
+                        query_mode: Some(CveAdvancedQueryMode::Cwe),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "CVE query mode",
+                    CveAdvancedSearch {
+                        query: Some("Example".to_owned()),
+                        query_mode: Some(CveAdvancedQueryMode::Cve),
+                        ..Default::default()
+                    },
+                ),
             ] {
                 let request = SearchRequest::Advanced {
                     options,
@@ -1127,7 +1960,7 @@ mod tests {
                 let result = run_search_request(db.clone(), request.clone(), 10, 0)
                     .await
                     .unwrap();
-                assert!(result.osv_rows.is_empty(), "{name}");
+                assert!(result.candidates.is_empty(), "{name}");
                 assert_eq!(
                     run_count_request(db.clone(), request).await.unwrap(),
                     0,
@@ -1173,9 +2006,13 @@ mod tests {
             .await
             .unwrap();
 
-            assert_eq!(result.rows.len(), 1);
-            assert_eq!(result.rows[0].summary.cve_id, "CVE-2099-1001");
-            assert_eq!(result.rows[0].detail.affected[0].product.as_deref(), Some("example-product"));
+            let cves = cve_candidates(&result);
+            assert_eq!(cves.len(), 1);
+            assert_eq!(cves[0].summary.cve_id, "CVE-2099-1001");
+            assert_eq!(
+                cves[0].detail.affected[0].product.as_deref(),
+                Some("example-product")
+            );
         });
     }
 
@@ -1253,15 +2090,68 @@ mod tests {
                     .await
                     .unwrap();
                     assert_eq!(
-                        result
-                            .rows
-                            .iter()
+                        cve_candidates(&result)
+                            .into_iter()
                             .map(|row| row.summary.cve_id.as_str())
                             .collect::<Vec<_>>(),
                         expected,
                         "unexpected {sort_order:?} order for {term:?}"
                     );
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn free_text_requires_every_whitespace_separated_term_for_cve_and_osv() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+            db.initialize_schema().await.unwrap();
+            db.import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-4101","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"quartz material","descriptions":[{"lang":"en","value":"a distant falcon appears in another field"}]}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-4102","state":"PUBLISHED","datePublished":"2099-01-02T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"quartz only"}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-4103","state":"PUBLISHED","datePublished":"2099-01-03T00:00:00Z","dateUpdated":"2099-01-03T00:00:00Z"},"containers":{"cna":{"title":"falcon only"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+            db.import_osv_records(vec![
+                OsvRawRecord {
+                    source_path: Some("GHSA-2099-both.json".to_owned()),
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-2099-both","modified":"2099-01-01T00:00:00Z","summary":"quartz advisory","details":"the separate details contain falcon","affected":[],"references":[]}"#.to_owned(),
+                },
+                OsvRawRecord {
+                    source_path: Some("GHSA-2099-quartz.json".to_owned()),
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-2099-quartz","modified":"2099-01-02T00:00:00Z","summary":"quartz only","affected":[],"references":[]}"#.to_owned(),
+                },
+                OsvRawRecord {
+                    source_path: Some("GHSA-2099-falcon.json".to_owned()),
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-2099-falcon","modified":"2099-01-03T00:00:00Z","summary":"falcon only","affected":[],"references":[]}"#.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+            for query in ["quartz falcon", "falcon quartz"] {
+                let request = SearchRequest::Query {
+                    term: SearchTerm::FreeText(query.to_owned()),
+                    state_scope: CveStateScope::PublishedOnly,
+                    kev_only: false,
+                    sort_order: CveSummarySortOrder::PublishedDesc,
+                };
+                let result = run_search_request(db.clone(), request.clone(), 10, 0)
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    candidate_ids(&result),
+                    ["CVE-2099-4101", "GHSA-2099-both"],
+                    "query order changed AND semantics: {query}"
+                );
+                assert_eq!(run_count_request(db.clone(), request).await.unwrap(), 2);
             }
         });
     }

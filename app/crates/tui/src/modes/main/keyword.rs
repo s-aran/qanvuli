@@ -1,4 +1,7 @@
-use crate::{app::App, traits::keyword::KeywordInput};
+use crate::{
+    app::{App, PaneFocus},
+    traits::keyword::KeywordInput,
+};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -14,7 +17,12 @@ impl KeywordInput for MainKeywordInput {
             app.search_mode.footer_text(),
             app.limit
         );
-        let input = Paragraph::new(app.query.as_str())
+        let cursor = if app.focus == PaneFocus::Left {
+            "▏"
+        } else {
+            ""
+        };
+        let input = Paragraph::new(format!("{}{cursor}", app.query))
             .block(
                 Block::default()
                     .title(input_title)

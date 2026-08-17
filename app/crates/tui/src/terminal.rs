@@ -3,11 +3,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::{io, path::PathBuf};
+use std::io;
 
 pub(super) struct TuiLogGuard {
     _guard: qanvuli_utils::logging::LogFileGuard,
-    pub(super) path: PathBuf,
 }
 
 impl TuiLogGuard {
@@ -15,10 +14,7 @@ impl TuiLogGuard {
         let path = std::env::temp_dir().join(format!("qanvuli-tui-{}.log", std::process::id()));
         let guard = qanvuli_utils::logging::redirect_to_file(&path)
             .map_err(|err| format!("failed to redirect TUI logs to {}: {err}", path.display()))?;
-        Ok(Self {
-            _guard: guard,
-            path,
-        })
+        Ok(Self { _guard: guard })
     }
 }
 

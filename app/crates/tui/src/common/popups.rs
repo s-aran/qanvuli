@@ -1,7 +1,7 @@
 use crate::{
     app::{App, MaintenanceChoice, TimeoutChoice},
     common::{
-        centered_rect,
+        centered_size,
         components::{ActionButton, ButtonRow, Checkbox, RadioOption, SelectableField},
     },
     display::{DisplayField, DisplaySettings},
@@ -20,7 +20,7 @@ use ratatui::{
 };
 
 pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
-    let area = centered_rect(60, 42, frame.area());
+    let area = centered_size(72, 22, frame.area());
     let help = Paragraph::new(vec![
         Line::from("Enter       Search"),
         Line::from("Tab          Change pane"),
@@ -40,7 +40,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("PageUp/Down  Full page"),
         Line::from("F1           Help"),
         Line::from("Esc          Close popup"),
-        Line::from("Ctrl-L       Reset screen and popup settings"),
+        Line::from("Ctrl-L       Redraw screen"),
         Line::from("Ctrl-C       Quit"),
     ])
     .block(Block::default().title("Help").borders(Borders::ALL))
@@ -50,7 +50,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
 }
 
 pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_rect(70, 66, frame.area());
+    let area = centered_size(74, 16, frame.area());
     let form = &app.advanced;
     let lines = vec![
         advanced_line(
@@ -106,7 +106,7 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
         ),
         Line::from(""),
         Line::from(
-            "Enter search  Esc close  Space toggle exact  Tab/Down next  Shift+Tab/Up previous",
+            "Enter search  Esc cancel  Space toggle exact  Tab/Down next  Shift+Tab/Up previous",
         ),
     ];
     frame.render_widget(Clear, area);
@@ -155,7 +155,7 @@ fn scope_entry_line(
 }
 
 pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_rect(70, 58, frame.area());
+    let area = centered_size(74, 20, frame.area());
     let display = &app.display;
     frame.render_widget(Clear, area);
     let block = Block::default()
@@ -193,9 +193,11 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
             "KEV listed only",
             if display.kev_only { "on" } else { "off" },
         ),
-        Line::from(""),
-        Line::from("DB Sources"),
     ];
+    if let Some(hint) = display.sort_field.hint() {
+        lines.push(Line::from(format!("  {hint}")));
+    }
+    lines.extend([Line::from(""), Line::from("DB Sources")]);
     lines.extend(entries.iter().filter_map(|entry| match entry {
         crate::form::ScopeEntry::Cve | crate::form::ScopeEntry::Osv => {
             Some(scope_entry_line(form, *entry, active(*entry)))
@@ -233,7 +235,7 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
         .line(),
     );
     lines.push(Line::from(
-        "Enter/Esc close  Tab/Up/Down focus  Left/Right change  Space toggle  A/X all OSV  PgUp/PgDn scroll",
+        "Enter apply  Esc cancel  Tab/Up/Down focus  Left/Right change  Space toggle  A/X all OSV  PgUp/PgDn scroll",
     ));
     frame.render_widget(
         Paragraph::new(lines.clone())
@@ -250,7 +252,7 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 pub(crate) fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_rect(56, 26, frame.area());
+    let area = centered_size(64, 8, frame.area());
     let lines = vec![
         Line::from("Search is taking longer than expected."),
         Line::from("Continue waiting or cancel the running search?"),
@@ -284,7 +286,7 @@ pub(crate) fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_rect(56, 28, frame.area());
+    let area = centered_size(64, 12, frame.area());
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title("Database Maintenance")
@@ -328,6 +330,30 @@ pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
             .ratio(ratio)
             .label(format!("{:.0}%", ratio * 100.0));
         frame.render_widget(gauge, chunks[1]);
+        frame.render_widget(
+            Paragraph::new("Please wait; maintenance cannot be canceled safely."),
+            chunks[2],
+        );
+        return;
+    }
+
+    if app.maintenance_confirming {
+        let operation = match app.maintenance_choice {
+            MaintenanceChoice::Init => "initialize and rebuild",
+            MaintenanceChoice::Update => "update",
+            MaintenanceChoice::Cancel => "cancel",
+        };
+        let lines = vec![
+            Line::from(format!("Confirm database {operation}.")),
+            Line::from("Search results are cleared while the database is reopened."),
+            Line::from("Do not close qanvuli after the operation starts."),
+            Line::from(""),
+            Line::from("Enter/Y run  Esc/N go back"),
+        ];
+        frame.render_widget(
+            Paragraph::new(lines).block(block).wrap(Wrap { trim: true }),
+            area,
+        );
         return;
     }
 

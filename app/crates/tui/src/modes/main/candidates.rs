@@ -1,7 +1,10 @@
 use crate::{
     app::{App, PaneFocus},
     common::focus_style,
+    db::search::SearchCandidate,
+    display::SortField,
     traits::list::ResultList,
+    utils::datetime::format_timestamp,
 };
 use ratatui::{
     layout::Rect,
@@ -14,25 +17,29 @@ pub(super) struct CandidateList;
 
 impl ResultList for CandidateList {
     fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-        let items = app
-            .results
-            .iter()
-            .map(|cve| {
-                ListItem::new(vec![
-                    Line::from(Span::raw(cve.summary.cve_id.clone())),
-                    Line::from(Span::raw(cve.summary.title.clone())),
-                ])
+        let items = (0..app.candidate_count())
+            .filter_map(|index| app.candidate(index))
+            .map(|candidate| {
+                let sort_key = candidate_sort_key(app, candidate);
+                match candidate {
+                    SearchCandidate::Cve(cve) => ListItem::new(vec![
+                        Line::from(Span::raw(cve.summary.cve_id.clone())),
+                        Line::from(Span::raw(candidate_subtitle(
+                            sort_key,
+                            cve.summary.title.clone(),
+                        ))),
+                    ]),
+                    SearchCandidate::Osv(osv) => ListItem::new(vec![
+                        Line::from(Span::raw(osv.osv_id.clone())),
+                        Line::from(Span::raw(candidate_subtitle(
+                            sort_key,
+                            osv.summary
+                                .clone()
+                                .unwrap_or_else(|| "OSV advisory".to_owned()),
+                        ))),
+                    ]),
+                }
             })
-            .chain(app.osv_results.iter().map(|osv| {
-                ListItem::new(vec![
-                    Line::from(Span::raw(osv.osv_id.clone())),
-                    Line::from(Span::raw(
-                        osv.summary
-                            .clone()
-                            .unwrap_or_else(|| "OSV advisory".to_owned()),
-                    )),
-                ])
-            }))
             .collect::<Vec<_>>();
         let list = List::new(items)
             .block(
@@ -42,12 +49,48 @@ impl ResultList for CandidateList {
                         app.candidate_count(),
                         app.total_results
                             .map(|total| total.to_string())
-                            .unwrap_or_else(|| "-".to_owned())
+                            .unwrap_or_else(|| "?".to_owned())
                     ))
                     .borders(Borders::ALL)
                     .border_style(focus_style(app.focus == PaneFocus::Left)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         frame.render_stateful_widget(list, area, &mut app.list_state);
+    }
+}
+
+fn candidate_sort_key(app: &App, candidate: &SearchCandidate) -> Option<String> {
+    let timestamp = match (app.display.sort_field, candidate) {
+        (SortField::Published, SearchCandidate::Cve(cve)) => {
+            Some(cve.summary.published_at.as_str())
+        }
+        (SortField::Published, SearchCandidate::Osv(osv)) => osv.published_at.as_deref(),
+        (SortField::Updated, SearchCandidate::Cve(cve)) => Some(cve.summary.updated_at.as_str()),
+        (SortField::Updated, SearchCandidate::Osv(osv)) => osv.modified_at.as_deref(),
+        _ => None,
+    };
+    if let Some(timestamp) = timestamp {
+        return Some(format_timestamp(timestamp, app.display.timezone));
+    }
+    if app.display.sort_field == SortField::Score {
+        return Some(match candidate {
+            SearchCandidate::Cve(cve) => cve
+                .detail
+                .cvss
+                .iter()
+                .filter_map(|score| score.base_score)
+                .max_by(f64::total_cmp)
+                .map(|score| format!("CVSS {score:.1}"))
+                .unwrap_or_else(|| "CVSS -".to_owned()),
+            SearchCandidate::Osv(_) => "CVSS -".to_owned(),
+        });
+    }
+    None
+}
+
+fn candidate_subtitle(sort_key: Option<String>, title: String) -> String {
+    match sort_key {
+        Some(key) => format!("{key}  {title}"),
+        None => title,
     }
 }

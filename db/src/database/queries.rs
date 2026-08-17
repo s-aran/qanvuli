@@ -57,6 +57,32 @@ fn include_rejected(scope: CveStateScope) -> bool {
     scope == CveStateScope::IncludeRejected
 }
 
+fn advanced_cve_filters(options: &CveAdvancedSearch) -> SqlxCveSearch {
+    let mut filters = SqlxCveSearch {
+        published_since: options.published_from.clone(),
+        published_until: options.published_to.clone(),
+        cwe_ids: options.cwe.iter().cloned().collect(),
+        vendor_like: options.vendor.as_ref().map(|v| format!("%{v}%")),
+        product_like: options.product.as_ref().map(|v| format!("%{v}%")),
+        vendor_exact: options.vendor_exact.clone(),
+        product_exact: options.product_exact.clone(),
+        sort_order: options.sort_order,
+        ..Default::default()
+    };
+    match options.query_mode.unwrap_or(CveAdvancedQueryMode::FreeText) {
+        CveAdvancedQueryMode::FreeText => filters.text = options.query.clone(),
+        CveAdvancedQueryMode::Product => {
+            filters.product_like = options.query.as_ref().map(|v| format!("%{v}%"))
+        }
+        CveAdvancedQueryMode::Vendor => {
+            filters.vendor_like = options.query.as_ref().map(|v| format!("%{v}%"))
+        }
+        CveAdvancedQueryMode::Cwe => filters.cwe_ids.extend(options.query.iter().cloned()),
+        CveAdvancedQueryMode::Cve => filters.cve_id_prefix = options.query.clone(),
+    }
+    filters
+}
+
 fn cwe_number(value: &str) -> Option<i32> {
     let value = value.trim();
     let upper = value.to_ascii_uppercase();
@@ -167,7 +193,7 @@ fn osv_summary(row: SqlxOsvSummary) -> OsvSummary {
     OsvSummary {
         osv_id: row.osv_id,
         schema_version: None,
-        published_at: None,
+        published_at: row.published_at,
         modified_at: Some(row.modified_at),
         withdrawn_at: row.withdrawn_at,
         summary: row.summary,
@@ -684,33 +710,9 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, sqlx::Error> {
-        let mut filters = SqlxCveSearch {
-            published_since: options.published_from.clone(),
-            published_until: options.published_to.clone(),
-            cwe_ids: options.cwe.iter().cloned().collect(),
-            vendor_like: options.vendor.as_ref().map(|v| format!("%{v}%")),
-            product_like: options.product.as_ref().map(|v| format!("%{v}%")),
-            vendor_exact: options.vendor_exact.clone(),
-            product_exact: options.product_exact.clone(),
-            sort_order: options.sort_order,
-            ..Default::default()
-        };
-        match options.query_mode.unwrap_or(CveAdvancedQueryMode::FreeText) {
-            CveAdvancedQueryMode::FreeText => filters.text = options.query.clone(),
-            CveAdvancedQueryMode::Product => {
-                filters.product_like = options.query.as_ref().map(|v| format!("%{v}%"))
-            }
-            CveAdvancedQueryMode::Vendor => {
-                filters.vendor_like = options.query.as_ref().map(|v| format!("%{v}%"))
-            }
-            CveAdvancedQueryMode::Cwe => filters.cwe_ids.extend(options.query.iter().cloned()),
-            CveAdvancedQueryMode::Cve => {
-                filters.cve_id_prefix = options.query.clone();
-            }
-        }
         let rows = self
             .search_cves_advanced_with_kev(
-                filters,
+                advanced_cve_filters(options),
                 include_rejected(options.state_scope),
                 options.kev_only,
                 limit as i64,
@@ -724,10 +726,12 @@ impl SqlxDatabase {
         &self,
         options: &CveAdvancedSearch,
     ) -> Result<u64, sqlx::Error> {
-        Ok(self
-            .search_cve_summaries_advanced(options, u64::MAX / 2, 0)
-            .await?
-            .len() as u64)
+        self.count_cves_advanced_with_kev(
+            advanced_cve_filters(options),
+            include_rejected(options.state_scope),
+            options.kev_only,
+        )
+        .await
     }
 
     pub async fn count_cve_summaries_free_text_with_state_scope(
@@ -1084,9 +1088,26 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        self.search_osv_summaries_scoped_by_package_and_text_sorted(
+            None, families, ecosystems, package, sort_order, limit, offset,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_osv_summaries_scoped_by_package_and_text_sorted(
+        &self,
+        query: Option<&str>,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        package: &str,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
         self.search_osv_scoped_inner(
             OsvScopedFilters {
-                query: None,
+                query,
                 families,
                 ecosystems,
                 package: OsvPackageFilter::Contains(package),
@@ -1105,7 +1126,22 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<OsvSummary>, sqlx::Error> {
-        let query = filters.query.map(|q| format!("%{q}%"));
+        if filters.query.is_none()
+            && filters.families.is_empty()
+            && filters.ecosystems.is_none_or(<[String]>::is_empty)
+            && matches!(filters.package, OsvPackageFilter::Any)
+        {
+            return self
+                .search_osv_unfiltered_sorted(sort_order, limit, offset)
+                .await;
+        }
+        let query_terms = filters
+            .query
+            .map(super::search::fts_tokens)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|term| format!("%{term}%"))
+            .collect::<Vec<_>>();
         let (package, package_like) = match filters.package {
             OsvPackageFilter::Any => (None, None),
             OsvPackageFilter::Exact(value) => (Some(value.to_owned()), None),
@@ -1116,6 +1152,7 @@ impl SqlxDatabase {
         self.writer.with_connection(|connection| Box::pin(async move {
             let families_json = serde_json::to_string(&families).unwrap_or_default();
             let ecosystems_json = serde_json::to_string(&ecosystems).unwrap_or_default();
+            let query_terms_json = serde_json::to_string(&query_terms).unwrap_or_default();
             let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
             let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
             let order_by = match sort_order {
@@ -1128,14 +1165,62 @@ impl SqlxDatabase {
                 crate::CveSummarySortOrder::RelationRankAsc => "a.published_at ASC, a.osv_id ASC",
                 crate::CveSummarySortOrder::RelationRankDesc => "a.published_at DESC, a.osv_id DESC",
             };
-            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT DISTINCT a.osv_id, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=a.osv_id) AS package_summary FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like) ORDER BY {order_by} LIMIT ? OFFSET ?");
+            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT DISTINCT a.osv_id, a.published_at, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=a.osv_id) AS package_summary FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (json_array_length(?)=0 OR NOT EXISTS(SELECT 1 FROM json_each(?) term WHERE NOT (a.osv_id LIKE term.value OR COALESCE(a.summary, '') LIKE term.value OR COALESCE(a.details, '') LIKE term.value OR EXISTS(SELECT 1 FROM osv_affected_packages text_package WHERE text_package.osv_id=a.osv_id AND (COALESCE(text_package.ecosystem, '') LIKE term.value OR COALESCE(text_package.package_name, '') LIKE term.value OR COALESCE(text_package.purl, '') LIKE term.value))))) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like) ORDER BY {order_by} LIMIT ? OFFSET ?");
             let rows: Vec<SqlxOsvSummary> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
                 .bind(&package)
                 .bind(&package_like)
-                .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
+                .bind(&query_terms_json).bind(&query_terms_json)
                 .bind(&families_json).bind(&families_json).bind(&ecosystems_json).bind(&ecosystems_json)
                 .bind(limit as i64).bind(offset as i64)
                 .fetch_all(connection).await?;
+            Ok(rows.into_iter().map(osv_summary).collect())
+        })).await
+    }
+
+    async fn search_osv_unfiltered_sorted(
+        &self,
+        sort_order: crate::CveSummarySortOrder,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, sqlx::Error> {
+        self.writer.with_connection(|connection| Box::pin(async move {
+            let mut statement = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT a.osv_id, a.published_at, COALESCE(a.modified_at, '') AS modified_at, a.summary, a.details, a.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=a.osv_id) AS package_summary FROM osv_advisories AS a",
+            );
+            match sort_order {
+                crate::CveSummarySortOrder::PublishedAsc => statement.push(
+                    " ORDER BY a.published_at IS NULL ASC, a.published_at ASC, a.osv_id ASC",
+                ),
+                crate::CveSummarySortOrder::PublishedDesc => statement.push(
+                    " ORDER BY a.published_at IS NULL ASC, a.published_at DESC, a.osv_id DESC",
+                ),
+                crate::CveSummarySortOrder::UpdatedAsc => {
+                    statement.push(" ORDER BY a.modified_at ASC, a.osv_id ASC")
+                }
+                crate::CveSummarySortOrder::UpdatedDesc => {
+                    statement.push(" ORDER BY a.modified_at DESC, a.osv_id DESC")
+                }
+                crate::CveSummarySortOrder::CveIdAsc
+                | crate::CveSummarySortOrder::ScoreAsc => {
+                    statement.push(" ORDER BY a.osv_id ASC")
+                }
+                crate::CveSummarySortOrder::CveIdDesc
+                | crate::CveSummarySortOrder::ScoreDesc => {
+                    statement.push(" ORDER BY a.osv_id DESC")
+                }
+                crate::CveSummarySortOrder::RelationRankAsc => {
+                    statement.push(" ORDER BY a.published_at ASC, a.osv_id ASC")
+                }
+                crate::CveSummarySortOrder::RelationRankDesc => {
+                    statement.push(" ORDER BY a.published_at DESC, a.osv_id DESC")
+                }
+            };
+            statement
+                .push(" LIMIT ")
+                .push_bind(i64::try_from(limit).unwrap_or(i64::MAX).max(1))
+                .push(" OFFSET ")
+                .push_bind(i64::try_from(offset).unwrap_or(i64::MAX));
+            let rows: Vec<SqlxOsvSummary> = statement.build_query_as().fetch_all(connection).await?;
             Ok(rows.into_iter().map(osv_summary).collect())
         })).await
     }
@@ -1206,8 +1291,19 @@ impl SqlxDatabase {
         ecosystems: Option<&[String]>,
         package: &str,
     ) -> Result<u64, sqlx::Error> {
+        self.count_osv_summaries_scoped_by_package_and_text(None, families, ecosystems, package)
+            .await
+    }
+
+    pub async fn count_osv_summaries_scoped_by_package_and_text(
+        &self,
+        query: Option<&str>,
+        families: &[String],
+        ecosystems: Option<&[String]>,
+        package: &str,
+    ) -> Result<u64, sqlx::Error> {
         self.count_osv_scoped_inner(OsvScopedFilters {
-            query: None,
+            query,
             families,
             ecosystems,
             package: OsvPackageFilter::Contains(package),
@@ -1219,7 +1315,15 @@ impl SqlxDatabase {
         &self,
         filters: OsvScopedFilters<'_>,
     ) -> Result<u64, sqlx::Error> {
-        let query = filters.query.map(|q| format!("%{q}%"));
+        let query_terms = filters
+            .query
+            .map(super::search::fts_tokens)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|term| format!("%{term}%"))
+            .collect::<Vec<_>>();
+        let query_terms = serde_json::to_string(&query_terms)
+            .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         let families = serde_json::to_string(filters.families)
             .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
         let ecosystems = serde_json::to_string(filters.ecosystems.unwrap_or_default())
@@ -1232,11 +1336,11 @@ impl SqlxDatabase {
         self.writer.with_connection(|c| Box::pin(async move {
             let stored_package = sql_normalized_package_name("p.package_name", "p.ecosystem");
             let input_package = sql_normalized_package_name("input.package_name", "p.ecosystem");
-            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT COUNT(DISTINCT a.osv_id) FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (? IS NULL OR a.osv_id LIKE ? OR a.summary LIKE ? OR a.details LIKE ? OR p.ecosystem LIKE ? OR p.package_name LIKE ? OR p.purl LIKE ?) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like)");
+            let statement = format!("WITH input(package_name, package_like) AS (VALUES (?, ?)) SELECT COUNT(DISTINCT a.osv_id) FROM input CROSS JOIN osv_advisories a LEFT JOIN osv_affected_packages p ON p.osv_id=a.osv_id WHERE (json_array_length(?)=0 OR NOT EXISTS(SELECT 1 FROM json_each(?) term WHERE NOT (a.osv_id LIKE term.value OR COALESCE(a.summary, '') LIKE term.value OR COALESCE(a.details, '') LIKE term.value OR EXISTS(SELECT 1 FROM osv_affected_packages text_package WHERE text_package.osv_id=a.osv_id AND (COALESCE(text_package.ecosystem, '') LIKE term.value OR COALESCE(text_package.package_name, '') LIKE term.value OR COALESCE(text_package.purl, '') LIKE term.value))))) AND (json_array_length(?)=0 OR EXISTS(SELECT 1 FROM json_each(?) f WHERE a.osv_id LIKE f.value || '-%')) AND (json_array_length(?)=0 OR p.ecosystem IN (SELECT value FROM json_each(?))) AND (input.package_name IS NULL OR {stored_package}={input_package} COLLATE BINARY) AND (input.package_like IS NULL OR p.package_name LIKE input.package_like OR p.purl LIKE input.package_like)");
             let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
                 .bind(&package)
                 .bind(&package_like)
-                .bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query).bind(&query)
+                .bind(&query_terms).bind(&query_terms)
                 .bind(&families).bind(&families).bind(&ecosystems).bind(&ecosystems)
                 .fetch_one(c).await?;
             Ok(n as u64)

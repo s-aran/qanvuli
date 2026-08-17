@@ -36,6 +36,7 @@ pub(crate) fn handle_key(
         KeyCode::F(9) => app.toggle_cwe_list_mode(None),
         KeyCode::F(10) => app.toggle_capec_list_mode(db),
         KeyCode::F(8) => app.toggle_raw_json_mode(db),
+        KeyCode::F(1) | KeyCode::Char('?') => app.show_help = true,
         KeyCode::Char('/') => app.start_detail_search(),
         KeyCode::Char('c') if is_ctrl(key, 'c') => return true,
         KeyCode::Char('d') if is_ctrl(key, 'd') && app.focus == PaneFocus::Right => {
@@ -63,13 +64,13 @@ pub(crate) fn handle_key(
         KeyCode::PageDown => app.move_cwe_full_page_down(page_size),
         KeyCode::PageUp => app.move_cwe_full_page_up(page_size),
         KeyCode::F(4) => app.open_cwe_status_popup(),
-        KeyCode::Backspace => app.backspace_cwe_query(db),
+        KeyCode::Backspace if app.focus == PaneFocus::Left => app.backspace_cwe_query(db),
         KeyCode::Tab | KeyCode::BackTab => app.toggle_cwe_focus(),
         KeyCode::Left => app.move_cwe_to_parent(page_size),
         KeyCode::Right => app.move_cwe_to_relation_return(page_size),
         KeyCode::Char('[') => app.move_cwe_to_previous_sibling(page_size),
         KeyCode::Char(']') => app.move_cwe_to_next_sibling(page_size),
-        KeyCode::Char(ch) => app.push_cwe_query(ch, db),
+        KeyCode::Char(ch) if app.focus == PaneFocus::Left => app.push_cwe_query(ch, db),
         KeyCode::Down if app.focus == PaneFocus::Right => {
             app.move_cwe_detail_down(detail_line_count, detail_page_size)
         }

@@ -34,7 +34,12 @@ pub(super) fn render(
 
     match app.right_tab {
         RightPaneTab::Cve => detail::MainDetailPanel.render(frame, app, detail_search, rows[1]),
-        RightPaneTab::Osv => render_lines(frame, app, osv_lines(app, detail_search), rows[1]),
+        RightPaneTab::Osv => render_lines(
+            frame,
+            app,
+            osv_lines(app, detail_search, rows[1].width.max(1) as usize),
+            rows[1],
+        ),
         RightPaneTab::Metadata => render_lines(
             frame,
             app,
@@ -133,7 +138,11 @@ fn enrichment_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static
     render_enrichment(enrichment, detail_search)
 }
 
-pub(crate) fn osv_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static>> {
+pub(crate) fn osv_lines(
+    app: &App,
+    detail_search: &DetailSearch,
+    width: usize,
+) -> Vec<Line<'static>> {
     let Some(cve) = app.selected() else {
         return vec![Line::from("No result")];
     };
@@ -153,6 +162,7 @@ pub(crate) fn osv_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'st
             advisory,
             app.display.timezone,
             detail_search,
+            width,
         ));
     }
     lines
@@ -269,12 +279,13 @@ fn split_summary_list(value: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::search::SearchCandidate;
     use qanvuli_core::database::OsvSummary;
 
     #[test]
     fn osv_result_hides_the_linked_osv_tab() {
         let mut app = App::new(String::new(), 25);
-        app.osv_results.push(OsvSummary {
+        app.candidates.push(SearchCandidate::Osv(OsvSummary {
             osv_id: "GHSA-2099-only".to_owned(),
             schema_version: None,
             published_at: None,
@@ -283,7 +294,7 @@ mod tests {
             summary: None,
             details: None,
             package_summary: None,
-        });
+        }));
         app.list_state.select(Some(0));
 
         assert_eq!(

@@ -1,4 +1,7 @@
-use crate::{app::App, traits::keyword::KeywordInput};
+use crate::{
+    app::{App, PaneFocus},
+    traits::keyword::KeywordInput,
+};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -9,7 +12,12 @@ pub(super) struct CweKeywordInput;
 
 impl KeywordInput for CweKeywordInput {
     fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-        let input = Paragraph::new(app.cwe_query.as_str()).block(
+        let cursor = if app.focus == PaneFocus::Left {
+            "▏"
+        } else {
+            ""
+        };
+        let input = Paragraph::new(format!("{}{cursor}", app.cwe_query)).block(
             Block::default()
                 .title(format!(
                     "CWE Search [Status: {} CAPEC: {}]",

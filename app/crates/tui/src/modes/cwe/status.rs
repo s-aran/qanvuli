@@ -5,7 +5,7 @@ pub(crate) struct CweStatusLine;
 impl StatusLine for CweStatusLine {
     fn text(&self, app: &App) -> String {
         format!(
-            "F4 status | Left parent | Right return | [ ] siblings | / search detail | Tab focus | {}",
+            "Esc/F9 close | F1/? help | F4 filter | Left parent | Right return | [ ] siblings | / find | Tab pane | {}",
             detail_search_status(app)
         )
     }

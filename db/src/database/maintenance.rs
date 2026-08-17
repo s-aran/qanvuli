@@ -140,6 +140,9 @@ pub(crate) async fn prepare_osv_bulk_load(
         DROP INDEX IF EXISTS idx_osv_cve_search_cve_id;
         DROP INDEX IF EXISTS idx_osv_affected_packages_lookup;
         DROP INDEX IF EXISTS idx_osv_affected_packages_osv_id;
+        DROP INDEX IF EXISTS idx_osv_published_asc;
+        DROP INDEX IF EXISTS idx_osv_published_desc;
+        DROP INDEX IF EXISTS idx_osv_modified_osv_id;
         DROP INDEX IF EXISTS idx_osv_ranges_package;
         DROP INDEX IF EXISTS idx_osv_range_events_range;
         DROP INDEX IF EXISTS idx_identifier_edges_to;
@@ -170,6 +173,9 @@ pub(crate) async fn finish_osv_bulk_load(
         CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search(cve_id);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages(ecosystem COLLATE NOCASE, package_name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_osv_id ON osv_affected_packages(osv_id);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_asc ON osv_advisories(published_at IS NULL, published_at ASC, osv_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_desc ON osv_advisories(published_at IS NULL, published_at DESC, osv_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_osv_modified_osv_id ON osv_advisories(modified_at, osv_id);
         CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges(affected_package_id);
         CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events(range_id, event_order);
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges(to_identifier);

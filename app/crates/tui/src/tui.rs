@@ -21,14 +21,18 @@ pub struct Args {
     /// Initial CVE search text.
     #[arg(value_name = "QUERY")]
     query: Option<String>,
-    /// Maximum number of search results.
-    #[arg(long, default_value_t = TUI_LIMIT)]
+    /// Number of results loaded on the first page.
+    #[arg(
+        long,
+        default_value_t = TUI_LIMIT,
+        value_parser = clap::value_parser!(u64).range(1..=1_000)
+    )]
     limit: u64,
 }
 
 /// Opens the interactive terminal UI for local CVE search and maintenance.
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
-    let tui_log = TuiLogGuard::redirect()?;
+    let _tui_log = TuiLogGuard::redirect()?;
     let mut db = Some(connection::connect(db_url).await?);
     let mut terminal = TerminalGuard::enter()?;
     let mut app = App::new(args.query.unwrap_or_default(), args.limit);
@@ -41,7 +45,6 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
         app.start_search(db.clone());
     }
 
-    app.status_message = Some(format!("TUI logs: {}", tui_log.path.display()));
     let result = run_loop(&mut terminal.terminal, db_url, &mut db, &mut app).await;
     terminal.leave()?;
     if let Some(db) = db.take() {
@@ -94,9 +97,6 @@ async fn run_loop(
             continue;
         }
 
-        if app.maintenance_running() && is_ctrl(&key, 'c') {
-            break;
-        }
         if app.maintenance_running() {
             continue;
         }
@@ -105,7 +105,6 @@ async fn run_loop(
             terminal
                 .clear()
                 .map_err(|err| format!("failed to clear TUI: {err}"))?;
-            app.reset_screen();
             continue;
         }
 
@@ -126,7 +125,7 @@ async fn run_loop(
 
         if app.show_help {
             match key.code {
-                KeyCode::Esc => app.show_help = false,
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => app.show_help = false,
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 _ => {}
             }
@@ -135,12 +134,12 @@ async fn run_loop(
 
         if app.show_advanced {
             match key.code {
-                KeyCode::Esc => app.show_advanced = false,
+                KeyCode::Esc => app.cancel_advanced_search(),
                 KeyCode::Enter => {
                     if let Some(db) = db.as_ref() {
                         app.start_advanced_search(db.clone());
                     }
-                    app.show_advanced = false;
+                    app.apply_advanced_search();
                 }
                 KeyCode::Backspace => {
                     app.advanced.backspace();
@@ -184,7 +183,8 @@ async fn run_loop(
 
         if app.show_display {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => app.apply_display_settings(db.as_ref().cloned()),
+                KeyCode::Esc => app.cancel_display_settings(),
+                KeyCode::Enter => app.apply_display_settings(db.as_ref().cloned()),
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::PageDown => app.display.scroll = app.display.scroll.saturating_add(8),
                 KeyCode::PageUp => app.display.scroll = app.display.scroll.saturating_sub(8),
@@ -249,11 +249,22 @@ async fn run_loop(
         }
 
         if app.show_maintenance {
+            if app.maintenance_confirming {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        start_selected_maintenance(db_url, db, app).await;
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') => {
+                        app.cancel_maintenance_confirmation();
+                    }
+                    KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Esc => app.close_maintenance(),
-                KeyCode::Enter => {
-                    start_selected_maintenance(db_url, db, app).await;
-                }
+                KeyCode::Enter => app.confirm_maintenance_choice(),
                 KeyCode::Char('c') if is_ctrl(&key, 'c') => break,
                 KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
                     app.next_maintenance_choice();
@@ -286,9 +297,9 @@ async fn run_loop(
 
         if app.show_cwe_status {
             match key.code {
-                KeyCode::Esc => app.close_cwe_status_popup(),
+                KeyCode::Esc => app.cancel_cwe_status_popup(),
                 KeyCode::Enter => {
-                    if !app.activate_cwe_status_control(db.as_ref().cloned()) {
+                    if !app.activate_cwe_status_control() {
                         app.apply_cwe_filters(db.as_ref().cloned());
                     }
                 }
@@ -301,9 +312,9 @@ async fn run_loop(
                 KeyCode::Char(ch) if app.cwe_status_cursor == crate::app::CWE_CAPEC_CURSOR => {
                     app.push_cwe_capec_filter(ch)
                 }
-                KeyCode::Char(' ') => app.toggle_current_cwe_status(db.as_ref().cloned()),
-                KeyCode::Char('a') => app.select_all_cwe_statuses(db.as_ref().cloned()),
-                KeyCode::Char('x') => app.clear_all_cwe_statuses(db.as_ref().cloned()),
+                KeyCode::Char(' ') => app.toggle_current_cwe_status(),
+                KeyCode::Char('a') => app.select_all_cwe_statuses(),
+                KeyCode::Char('x') => app.clear_all_cwe_statuses(),
                 _ => {}
             }
             continue;
@@ -311,8 +322,8 @@ async fn run_loop(
 
         if app.show_capec_filter {
             match key.code {
-                KeyCode::Esc => app.close_capec_filter(db.as_ref().cloned()),
-                KeyCode::Enter => app.close_capec_filter(db.as_ref().cloned()),
+                KeyCode::Esc => app.cancel_capec_filter(),
+                KeyCode::Enter => app.apply_capec_filter(db.as_ref().cloned()),
                 KeyCode::Tab | KeyCode::Down => {
                     app.capec_filter_field = (app.capec_filter_field + 1) % 3;
                 }
@@ -486,8 +497,7 @@ async fn close_db_before_maintenance(
             .await
             .map_err(|err| format!("failed to close database before {operation}: {err}"))?;
     }
-    app.results.clear();
-    app.osv_results.clear();
+    app.candidates.clear();
     app.linked_osv.clear();
     app.enrichment.clear();
     app.total_results = None;
@@ -523,12 +533,71 @@ async fn update_db_as_of(app: &mut App, db: &CveDatabase) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::search::SearchCandidate;
+    use clap::Parser;
+    use qanvuli_core::database::{EnrichedCveSummary, OsvSummary};
     use tokio::sync::mpsc;
+
+    #[derive(Debug, Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        tui: Args,
+    }
+
+    #[test]
+    fn initial_page_size_must_be_positive() {
+        assert_eq!(
+            TestCli::try_parse_from(["tui", "--limit", "1"])
+                .unwrap()
+                .tui
+                .limit,
+            1
+        );
+        assert!(TestCli::try_parse_from(["tui", "--limit", "0"]).is_err());
+        assert!(TestCli::try_parse_from(["tui", "--limit", "1001"]).is_err());
+    }
+
+    fn test_osv(id: &str) -> OsvSummary {
+        OsvSummary {
+            osv_id: id.to_owned(),
+            schema_version: None,
+            published_at: None,
+            modified_at: None,
+            withdrawn_at: None,
+            summary: None,
+            details: None,
+            package_summary: None,
+        }
+    }
 
     #[tokio::test]
     async fn close_db_before_maintenance_drops_connection_and_clears_search_state() {
         let mut db = Some(CveDatabase::connect("sqlite::memory:").await.unwrap());
         let mut app = App::new("django".to_owned(), 30);
+        app.candidates
+            .push(SearchCandidate::Osv(test_osv("GHSA-before-maintenance")));
+        app.linked_osv.insert(
+            "CVE-before-maintenance".to_owned(),
+            vec![test_osv("GHSA-linked-before-maintenance")],
+        );
+        app.enrichment.insert(
+            "CVE-before-maintenance".to_owned(),
+            EnrichedCveSummary {
+                cve_id: "CVE-before-maintenance".to_owned(),
+                aliases: String::new(),
+                osv_ids: String::new(),
+                osv_summaries: String::new(),
+                affected_packages: String::new(),
+                kev_listed: false,
+                kev_date_added: None,
+                kev_due_date: None,
+                kev_known_ransomware_campaign_use: None,
+                epss: None,
+                epss_percentile: None,
+                epss_score_date: None,
+                epss_model_version: None,
+            },
+        );
         app.total_results = Some(42);
         app.status_message = Some("existing status".to_owned());
 
@@ -537,7 +606,8 @@ mod tests {
             .unwrap();
 
         assert!(db.is_none());
-        assert!(app.results.is_empty());
+        assert!(app.candidates.is_empty());
+        assert!(app.linked_osv.is_empty());
         assert!(app.enrichment.is_empty());
         assert_eq!(app.total_results, None);
     }

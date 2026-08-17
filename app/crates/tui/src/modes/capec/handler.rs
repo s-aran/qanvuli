@@ -20,6 +20,7 @@ pub(crate) fn handle_key(
         KeyCode::Esc | KeyCode::F(10) => app.toggle_capec_list_mode(None),
         KeyCode::F(9) => app.toggle_cwe_list_mode(db),
         KeyCode::F(4) => app.open_capec_filter(),
+        KeyCode::F(1) | KeyCode::Char('?') => app.show_help = true,
         KeyCode::Enter => {
             app.open_capec_taxonomy(db);
         }

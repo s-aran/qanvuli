@@ -22,7 +22,16 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, search: &Detai
         Layout::horizontal([Constraint::Percentage(38), Constraint::Percentage(62)]).split(main[1]);
 
     frame.render_widget(
-        Paragraph::new(app.capec_query.as_str()).block(
+        Paragraph::new(format!(
+            "{}{}",
+            app.capec_query,
+            if app.focus == PaneFocus::Left {
+                "▏"
+            } else {
+                ""
+            }
+        ))
+        .block(
             Block::default()
                 .title(format!(
                     "CAPEC Search [Status: {} Type: {} CWE: {}]",
@@ -37,7 +46,9 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, search: &Detai
     draw_list(frame, app, body[0]);
     draw_detail(frame, app, search, body[1]);
     frame.render_widget(
-        Paragraph::new("F10 Close  F4 Filters  ← Parent  → Return  [ ] Siblings  Tab Pane  / Find"),
+        Paragraph::new(
+            "Esc/F10 Close  F1/? Help  F4 Filters  ← Parent  → Return  [ ] Siblings  Tab Pane  / Find",
+        ),
         main[2],
     );
     if app.show_capec_filter {

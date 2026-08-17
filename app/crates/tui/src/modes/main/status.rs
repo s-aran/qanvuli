@@ -22,12 +22,10 @@ impl StatusLine for MainStatusLine {
             status.to_owned()
         };
         format!(
-            "{} | {} {} | {} | DB: {} | {} | {}",
-            activity,
+            "F1/? help | Enter search | {activity} | {}/{} | {} | DB {db_as_of} {} | {}",
             app.display.sort_field.label(),
             app.display.sort_direction.label(),
             app.state_scope.label(),
-            db_as_of,
             app.display.timezone.label(),
             detail_search_status(app)
         )

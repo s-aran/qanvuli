@@ -21,7 +21,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
         .split(frame.area());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(main[0]);
     let left = Layout::default()
         .direction(Direction::Vertical)

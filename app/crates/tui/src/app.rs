@@ -4,7 +4,10 @@ use super::{
         capec::search_capec_entries,
         cwe::search_cwe_entries,
         raw_json::{load_cve_raw_json, load_osv_raw_json},
-        search::{SearchRequest, SearchResult, SearchTerm, run_count_request, run_search_request},
+        search::{
+            SearchCandidate, SearchContinuation, SearchRequest, SearchResult, SearchTerm,
+            run_count_request, run_search_request, run_search_request_after,
+        },
     },
     display::DisplaySettings,
     form::AdvancedForm,
@@ -46,8 +49,8 @@ pub(super) struct App {
     pub(super) display: DisplaySettings,
     pub(super) limit: u64,
     search_offset: u64,
-    pub(super) results: Vec<CveSummaryWithDetail>,
-    pub(super) osv_results: Vec<OsvSummary>,
+    search_continuation: SearchContinuation,
+    pub(super) candidates: Vec<SearchCandidate>,
     pub(super) linked_osv: HashMap<String, Vec<OsvSummary>>,
     pub(super) total_results: Option<u64>,
     pub(super) list_state: ListState,
@@ -123,6 +126,11 @@ pub(super) struct App {
     pub(super) db_as_of: Option<String>,
     pub(super) maintenance_progress: Option<MaintenanceProgress>,
     maintenance: Option<PendingMaintenance>,
+    advanced_before_popup: Option<AdvancedForm>,
+    display_before_popup: Option<(DisplaySettings, AdvancedForm)>,
+    cwe_filter_before_popup: Option<([bool; CWE_STATUS_COUNT], String)>,
+    capec_filter_before_popup: Option<(String, String, String)>,
+    pub(super) maintenance_confirming: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -291,8 +299,8 @@ impl App {
             display: DisplaySettings::default(),
             limit,
             search_offset: 0,
-            results: Vec::new(),
-            osv_results: Vec::new(),
+            search_continuation: SearchContinuation::default(),
+            candidates: Vec::new(),
             linked_osv: HashMap::new(),
             total_results: None,
             list_state,
@@ -373,6 +381,11 @@ impl App {
             db_as_of: None,
             maintenance_progress: None,
             maintenance: None,
+            advanced_before_popup: None,
+            display_before_popup: None,
+            cwe_filter_before_popup: None,
+            capec_filter_before_popup: None,
+            maintenance_confirming: false,
         };
         app.sync_advanced_from_main();
         app
@@ -436,8 +449,22 @@ impl App {
     pub(super) fn open_advanced_search(&mut self, db: Option<CveDatabase>) {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
+        self.advanced_before_popup = Some(self.advanced.clone());
         self.load_scope_candidates(db);
         self.show_advanced = true;
+    }
+
+    pub(super) fn apply_advanced_search(&mut self) {
+        self.advanced_before_popup = None;
+        self.show_advanced = false;
+    }
+
+    pub(super) fn cancel_advanced_search(&mut self) {
+        if let Some(previous) = self.advanced_before_popup.take() {
+            self.advanced = previous;
+            self.sync_main_from_advanced();
+        }
+        self.show_advanced = false;
     }
 
     pub(super) fn load_scope_candidates(&mut self, db: Option<CveDatabase>) {
@@ -481,12 +508,22 @@ impl App {
     }
 
     pub(super) fn open_display_settings(&mut self) {
+        self.display_before_popup = Some((self.display.clone(), self.advanced.clone()));
         self.display.source_focus = false;
         self.display.scroll = 0;
         self.show_display = true;
     }
 
+    pub(super) fn cancel_display_settings(&mut self) {
+        if let Some((display, advanced)) = self.display_before_popup.take() {
+            self.display = display;
+            self.advanced = advanced;
+        }
+        self.show_display = false;
+    }
+
     pub(super) fn apply_display_settings(&mut self, db: Option<CveDatabase>) {
+        self.display_before_popup = None;
         self.show_display = false;
         let Some(db) = db else {
             return;
@@ -560,15 +597,12 @@ impl App {
         self.search_timeout_at = None;
         self.show_timeout_prompt = false;
         let count = search.count;
-        for row in result.enrichment {
-            self.enrichment.insert(row.cve_id.clone(), row);
-        }
+        self.search_continuation = result.continuation;
         match kind {
             SearchKind::Replace => {
                 self.exhausted = result.exhausted;
                 self.search_offset = result.consumed;
-                self.results = result.rows;
-                self.osv_results = result.osv_rows;
+                self.candidates = result.candidates;
                 self.linked_osv = result.linked_osv;
                 self.clear_detail();
                 self.select_candidate(0);
@@ -580,28 +614,7 @@ impl App {
             SearchKind::Append { select_offset } => {
                 self.exhausted = result.exhausted;
                 self.search_offset = self.search_offset.saturating_add(result.consumed);
-                let mut cve_ids = self
-                    .results
-                    .iter()
-                    .map(|row| row.summary.cve_id.clone())
-                    .collect::<HashSet<_>>();
-                self.results.extend(
-                    result
-                        .rows
-                        .into_iter()
-                        .filter(|row| cve_ids.insert(row.summary.cve_id.clone())),
-                );
-                let mut osv_ids = self
-                    .osv_results
-                    .iter()
-                    .map(|row| row.osv_id.clone())
-                    .collect::<HashSet<_>>();
-                self.osv_results.extend(
-                    result
-                        .osv_rows
-                        .into_iter()
-                        .filter(|row| osv_ids.insert(row.osv_id.clone())),
-                );
+                self.candidates.extend(result.candidates);
                 for (cve_id, advisories) in result.linked_osv {
                     let existing = self.linked_osv.entry(cve_id).or_default();
                     let mut ids = existing
@@ -616,6 +629,9 @@ impl App {
                 }
                 self.select_candidate(select_offset);
             }
+        }
+        for row in result.enrichment {
+            self.enrichment.insert(row.cve_id.clone(), row);
         }
         Ok(())
     }
@@ -740,13 +756,16 @@ impl App {
     }
 
     pub(super) fn ensure_loaded_enrichment(&mut self, db: Option<CveDatabase>) {
-        if self.results.is_empty() || self.enrichment_task.is_some() {
+        if self.candidates.is_empty() || self.enrichment_task.is_some() {
             return;
         }
         let cve_ids = self
-            .results
+            .candidates
             .iter()
-            .map(|cve| cve.summary.cve_id.clone())
+            .filter_map(|candidate| match candidate {
+                SearchCandidate::Cve(cve) => Some(cve.summary.cve_id.clone()),
+                SearchCandidate::Osv(_) => None,
+            })
             .filter(|cve_id| !self.enrichment.contains_key(cve_id))
             .collect::<Vec<_>>();
         if cve_ids.is_empty() {
@@ -795,9 +814,16 @@ impl App {
             return;
         }
         let pending = self
-            .results
+            .candidates
             .iter()
-            .filter(|cve| !self.metadata_capec_ids.contains_key(&cve.summary.cve_id))
+            .filter_map(|candidate| match candidate {
+                SearchCandidate::Cve(cve)
+                    if !self.metadata_capec_ids.contains_key(&cve.summary.cve_id) =>
+                {
+                    Some(cve)
+                }
+                _ => None,
+            })
             .map(|cve| {
                 (
                     cve.summary.cve_id.clone(),
@@ -1065,10 +1091,24 @@ impl App {
         }
         self.show_maintenance = true;
         self.maintenance_choice = MaintenanceChoice::Update;
+        self.maintenance_confirming = false;
     }
 
     pub(super) fn close_maintenance(&mut self) {
         self.show_maintenance = false;
+        self.maintenance_confirming = false;
+    }
+
+    pub(super) fn confirm_maintenance_choice(&mut self) {
+        if self.maintenance_choice == MaintenanceChoice::Cancel {
+            self.close_maintenance();
+        } else {
+            self.maintenance_confirming = true;
+        }
+    }
+
+    pub(super) fn cancel_maintenance_confirmation(&mut self) {
+        self.maintenance_confirming = false;
     }
 
     pub(super) fn toggle_maintenance_keep_downloads(&mut self) {
@@ -1099,6 +1139,7 @@ impl App {
     ) {
         self.abort_search();
         self.show_maintenance = true;
+        self.maintenance_confirming = false;
         self.status_message = Some(match operation {
             MaintenanceOperation::Init => "init started".to_owned(),
             MaintenanceOperation::Update => "update started".to_owned(),
@@ -1165,9 +1206,14 @@ impl App {
     }
 
     pub(super) fn selected(&self) -> Option<&CveSummaryWithDetail> {
-        self.list_state
+        match self
+            .list_state
             .selected()
-            .and_then(|index| self.results.get(index))
+            .and_then(|index| self.candidate(index))?
+        {
+            SearchCandidate::Cve(cve) => Some(cve),
+            SearchCandidate::Osv(_) => None,
+        }
     }
 
     pub(super) fn selected_metadata_capec_ids(&self) -> Option<&[i32]> {
@@ -1179,14 +1225,22 @@ impl App {
     }
 
     pub(super) fn selected_osv(&self) -> Option<&OsvSummary> {
-        self.list_state
+        match self
+            .list_state
             .selected()
-            .and_then(|index| index.checked_sub(self.results.len()))
-            .and_then(|index| self.osv_results.get(index))
+            .and_then(|index| self.candidate(index))?
+        {
+            SearchCandidate::Cve(_) => None,
+            SearchCandidate::Osv(osv) => Some(osv),
+        }
     }
 
     pub(super) fn candidate_count(&self) -> usize {
-        self.results.len() + self.osv_results.len()
+        self.candidates.len()
+    }
+
+    pub(super) fn candidate(&self, index: usize) -> Option<&SearchCandidate> {
+        self.candidates.get(index)
     }
 
     pub(super) fn toggle_raw_json_mode(&mut self, db: Option<CveDatabase>) {
@@ -1354,6 +1408,11 @@ impl App {
     }
 
     pub(super) fn open_capec_filter(&mut self) {
+        self.capec_filter_before_popup = Some((
+            self.capec_status_filter.clone(),
+            self.capec_type_filter.clone(),
+            self.capec_cwe_filter.clone(),
+        ));
         self.show_capec_filter = true;
     }
 
@@ -1375,9 +1434,19 @@ impl App {
         }));
     }
 
-    pub(super) fn close_capec_filter(&mut self, db: Option<CveDatabase>) {
+    pub(super) fn apply_capec_filter(&mut self, db: Option<CveDatabase>) {
+        self.capec_filter_before_popup = None;
         self.show_capec_filter = false;
         self.start_capec_search(db);
+    }
+
+    pub(super) fn cancel_capec_filter(&mut self) {
+        if let Some((status, abstraction, cwe)) = self.capec_filter_before_popup.take() {
+            self.capec_status_filter = status;
+            self.capec_type_filter = abstraction;
+            self.capec_cwe_filter = cwe;
+        }
+        self.show_capec_filter = false;
     }
 
     pub(super) fn push_cwe_query(&mut self, ch: char, db: Option<CveDatabase>) {
@@ -1408,14 +1477,21 @@ impl App {
     }
 
     pub(super) fn open_cwe_status_popup(&mut self) {
+        self.cwe_filter_before_popup =
+            Some((self.cwe_status_filter, self.cwe_capec_filter.clone()));
         self.show_cwe_status = true;
     }
 
-    pub(super) fn close_cwe_status_popup(&mut self) {
+    pub(super) fn cancel_cwe_status_popup(&mut self) {
+        if let Some((statuses, capec)) = self.cwe_filter_before_popup.take() {
+            self.cwe_status_filter = statuses;
+            self.cwe_capec_filter = capec;
+        }
         self.show_cwe_status = false;
     }
 
     pub(super) fn apply_cwe_filters(&mut self, db: Option<CveDatabase>) {
+        self.cwe_filter_before_popup = None;
         self.show_cwe_status = false;
         self.start_cwe_search(db);
     }
@@ -1432,7 +1508,7 @@ impl App {
         };
     }
 
-    pub(super) fn toggle_current_cwe_status(&mut self, db: Option<CveDatabase>) {
+    pub(super) fn toggle_current_cwe_status(&mut self) {
         match self.cwe_status_cursor {
             0..CWE_STATUS_COUNT => {
                 self.cwe_status_filter[self.cwe_status_cursor] =
@@ -1442,27 +1518,24 @@ impl App {
             CWE_STATUS_CLEAR_ALL_CURSOR => self.cwe_status_filter = [false; CWE_STATUS_COUNT],
             _ => {}
         }
-        self.start_cwe_search(db);
     }
 
-    pub(super) fn select_all_cwe_statuses(&mut self, db: Option<CveDatabase>) {
+    pub(super) fn select_all_cwe_statuses(&mut self) {
         self.cwe_status_filter = [true; CWE_STATUS_COUNT];
-        self.start_cwe_search(db);
     }
 
-    pub(super) fn clear_all_cwe_statuses(&mut self, db: Option<CveDatabase>) {
+    pub(super) fn clear_all_cwe_statuses(&mut self) {
         self.cwe_status_filter = [false; CWE_STATUS_COUNT];
-        self.start_cwe_search(db);
     }
 
-    pub(super) fn activate_cwe_status_control(&mut self, db: Option<CveDatabase>) -> bool {
+    pub(super) fn activate_cwe_status_control(&mut self) -> bool {
         match self.cwe_status_cursor {
             CWE_STATUS_SELECT_ALL_CURSOR => {
-                self.select_all_cwe_statuses(db);
+                self.select_all_cwe_statuses();
                 true
             }
             CWE_STATUS_CLEAR_ALL_CURSOR => {
-                self.clear_all_cwe_statuses(db);
+                self.clear_all_cwe_statuses();
                 true
             }
             _ => false,
@@ -1549,6 +1622,7 @@ impl App {
         } else {
             self.right_tab.next()
         };
+        self.reset_main_view_scroll();
     }
 
     pub(super) fn previous_right_tab(&mut self) {
@@ -1561,6 +1635,7 @@ impl App {
         } else {
             self.right_tab.previous()
         };
+        self.reset_main_view_scroll();
     }
 
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
@@ -1579,7 +1654,10 @@ impl App {
             .selected()
             .map(|index| (index + 1).min(candidate_count - 1))
             .unwrap_or(0);
-        self.list_state.select(Some(next));
+        if next != current {
+            self.list_state.select(Some(next));
+            self.reset_main_view_scroll();
+        }
     }
 
     pub(super) fn move_focused_down(&mut self, db: CveDatabase) {
@@ -1638,7 +1716,10 @@ impl App {
             .selected()
             .map(|index| index.saturating_sub(1))
             .unwrap_or(0);
-        self.list_state.select(Some(previous));
+        if self.list_state.selected() != Some(previous) {
+            self.list_state.select(Some(previous));
+            self.reset_main_view_scroll();
+        }
     }
 
     pub(super) fn scroll_detail_to_top(&mut self) {
@@ -1885,74 +1966,6 @@ impl App {
         self.advanced.state_scope = self.state_scope;
     }
 
-    pub(super) fn reset_screen(&mut self) {
-        self.abort_search();
-        self.query.clear();
-        self.search_mode = SearchMode::FreeText;
-        self.search_mode_explicit = false;
-        self.state_scope = CveStateScope::PublishedOnly;
-        self.advanced = AdvancedForm::default();
-        self.display = DisplaySettings::default();
-        self.results.clear();
-        self.osv_results.clear();
-        self.linked_osv.clear();
-        self.search_offset = 0;
-        self.enrichment.clear();
-        self.metadata_capec_ids.clear();
-        self.total_results = None;
-        self.list_state.select(Some(0));
-        self.focus = PaneFocus::Left;
-        self.view_mode = ViewMode::Normal;
-        self.detail_scroll = 0;
-        self.metadata_scroll = 0;
-        self.raw_json = None;
-        self.raw_scroll = 0;
-        self.cwe_query.clear();
-        self.cwe_results.clear();
-        self.cwe_scroll = 0;
-        self.cwe_selected = 0;
-        self.cwe_detail_scroll = 0;
-        self.cwe_relation_return_id = None;
-        self.cwe_status_filter = default_cwe_status_filter();
-        self.cwe_status_cursor = 0;
-        self.show_cwe_status = false;
-        self.cwe_capec_filter.clear();
-        self.capec_query.clear();
-        self.capec_catalog.clear();
-        self.capec_results.clear();
-        self.capec_tree_paths.clear();
-        self.capec_tree_prefixes.clear();
-        self.capec_scroll = 0;
-        self.capec_selected = 0;
-        self.capec_detail_scroll = 0;
-        self.capec_relation_return_path = None;
-        self.capec_status_filter.clear();
-        self.capec_type_filter.clear();
-        self.capec_cwe_filter.clear();
-        self.show_capec_filter = false;
-        self.show_capec_taxonomy = false;
-        self.capec_taxonomy = None;
-        self.detail_search_query.clear();
-        self.detail_search_input = false;
-        self.detail_search_error = None;
-        self.searched_request = SearchRequest::Query {
-            term: SearchTerm::FreeText(String::new()),
-            state_scope: CveStateScope::PublishedOnly,
-            kev_only: false,
-            sort_order: CveSummarySortOrder::PublishedDesc,
-        };
-        self.exhausted = false;
-        self.show_help = false;
-        self.show_advanced = false;
-        self.show_display = false;
-        self.show_timeout_prompt = false;
-        self.show_maintenance = false;
-        self.timeout_choice = TimeoutChoice::Continue;
-        self.maintenance_choice = MaintenanceChoice::Update;
-        self.status_message = None;
-        self.maintenance_progress = None;
-    }
-
     pub(super) fn apply_prefix_mode(&mut self) {
         if self.search_mode_explicit {
             return;
@@ -2010,19 +2023,26 @@ impl App {
         self.abort_search();
         self.status_message = None;
         self.arm_search_timeout();
-        let count = matches!(&kind, SearchKind::Replace).then(|| PendingCount {
-            db: db.clone(),
-            request: request.clone(),
+        let count = (matches!(&kind, SearchKind::Replace) && request.should_count()).then(|| {
+            PendingCount {
+                db: db.clone(),
+                request: request.clone(),
+            }
         });
+        let continuation =
+            matches!(&kind, SearchKind::Append { .. }).then_some(self.search_continuation);
         let error_prefix = error_prefix.to_owned();
         self.search = Some(PendingSearch {
             kind,
             count,
             timed_out_once: false,
             handle: tokio::spawn(async move {
-                run_search_request(db, request, limit, offset)
-                    .await
-                    .map_err(|err| format!("{error_prefix}: {err}"))
+                let result = if let Some(continuation) = continuation {
+                    run_search_request_after(db, request, limit, continuation).await
+                } else {
+                    run_search_request(db, request, limit, offset).await
+                };
+                result.map_err(|err| format!("{error_prefix}: {err}"))
             }),
         });
     }
@@ -2155,7 +2175,10 @@ impl App {
             PageDirection::Up => current.saturating_sub(step),
             PageDirection::Down => current.saturating_add(step).min(candidate_count - 1),
         };
-        self.list_state.select(Some(next));
+        if next != current {
+            self.list_state.select(Some(next));
+            self.reset_main_view_scroll();
+        }
         if matches!(direction, PageDirection::Down)
             && next + 1 >= candidate_count
             && let Some(db) = db
@@ -2196,6 +2219,7 @@ impl App {
                 cve,
                 self.display.timezone,
                 &crate::common::DetailSearch::new(""),
+                self.detail_content_width,
             ))
             .wrap(Wrap { trim: false })
             .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
@@ -2204,6 +2228,7 @@ impl App {
                 osv,
                 self.display.timezone,
                 &crate::common::DetailSearch::new(""),
+                self.detail_content_width,
             ))
             .wrap(Wrap { trim: false })
             .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
@@ -2219,6 +2244,7 @@ impl App {
             RightPaneTab::Osv => Paragraph::new(crate::modes::main::right::osv_lines(
                 self,
                 &crate::common::DetailSearch::new(""),
+                self.metadata_content_width,
             ))
             .wrap(Wrap { trim: false })
             .line_count(self.metadata_content_width.min(u16::MAX as usize) as u16),
@@ -2308,9 +2334,10 @@ impl App {
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {
+        let visible_candidates = (self.left_page_size / 2).max(MIN_PAGE_SIZE);
         match amount {
-            PageAmount::Half => (self.left_page_size / 2).max(MIN_PAGE_SIZE),
-            PageAmount::Full => self.left_page_size.max(MIN_PAGE_SIZE),
+            PageAmount::Half => (visible_candidates / 2).max(MIN_PAGE_SIZE),
+            PageAmount::Full => visible_candidates,
         }
     }
 
@@ -2348,6 +2375,12 @@ impl App {
         } else {
             self.list_state.select(Some(index.min(candidate_count - 1)));
         }
+        self.reset_main_view_scroll();
+    }
+
+    fn reset_main_view_scroll(&mut self) {
+        self.detail_scroll = 0;
+        self.metadata_scroll = 0;
     }
 
     fn finish_failed_search(&mut self, message: String) {
@@ -2814,6 +2847,236 @@ mod tests {
     }
 
     #[test]
+    fn popup_cancel_restores_edited_settings_and_filters() {
+        let mut app = App::new("before".to_owned(), 25);
+
+        app.open_advanced_search(None);
+        app.advanced.query = "after".to_owned();
+        app.advanced.product = "changed-product".to_owned();
+        app.sync_main_from_advanced();
+        app.cancel_advanced_search();
+        assert_eq!(app.query, "before");
+        assert!(app.advanced.product.is_empty());
+
+        let original_sort = app.display.sort_field;
+        app.open_display_settings();
+        app.display.sort_field = crate::display::SortField::Score;
+        app.advanced.source_cve = false;
+        app.cancel_display_settings();
+        assert_eq!(app.display.sort_field, original_sort);
+        assert!(app.advanced.source_cve);
+
+        app.capec_status_filter = "Stable".to_owned();
+        app.open_capec_filter();
+        app.capec_status_filter = "Deprecated".to_owned();
+        app.cancel_capec_filter();
+        assert_eq!(app.capec_status_filter, "Stable");
+
+        app.cwe_capec_filter = "100".to_owned();
+        app.open_cwe_status_popup();
+        app.cwe_capec_filter = "200".to_owned();
+        app.cwe_status_filter = [false; CWE_STATUS_COUNT];
+        app.cancel_cwe_status_popup();
+        assert_eq!(app.cwe_capec_filter, "100");
+        assert_eq!(app.cwe_status_filter, default_cwe_status_filter());
+    }
+
+    #[test]
+    fn maintenance_requires_confirmation_before_it_can_start() {
+        let mut app = App::new(String::new(), 25);
+        app.open_maintenance();
+
+        assert!(!app.maintenance_confirming);
+        app.confirm_maintenance_choice();
+        assert!(app.maintenance_confirming);
+        app.cancel_maintenance_confirmation();
+        assert!(!app.maintenance_confirming);
+
+        app.maintenance_choice = MaintenanceChoice::Cancel;
+        app.confirm_maintenance_choice();
+        assert!(!app.show_maintenance);
+    }
+
+    #[tokio::test]
+    async fn mixed_source_sort_pages_only_append_to_the_loaded_order() {
+        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        database.initialize_schema().await.unwrap();
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-300","state":"PUBLISHED","datePublished":"2099-03-01T00:00:00Z","dateUpdated":"2099-03-01T00:00:00Z"},"containers":{"cna":{"title":"timelineproof newest"}}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-100","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"timelineproof older"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap();
+        database
+            .import_osv_records(vec![
+                qanvuli_core::database::OsvRawRecord {
+                    source_path: None,
+                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-2099-middle","published":"2099-02-01T00:00:00Z","modified":"2099-04-01T00:00:00Z","summary":"timelineproof middle","affected":[]}"#.to_owned(),
+                },
+                qanvuli_core::database::OsvRawRecord {
+                    source_path: None,
+                    raw_json: r#"{"schema_version":"1.7.5","id":"ALSA-2098-oldest","published":"2098-12-01T00:00:00Z","modified":"2099-02-01T00:00:00Z","summary":"timelineproof oldest","affected":[]}"#.to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let request = SearchRequest::Query {
+            term: SearchTerm::FreeText("timelineproof".to_owned()),
+            state_scope: CveStateScope::PublishedOnly,
+            kev_only: false,
+            sort_order: CveSummarySortOrder::PublishedDesc,
+        };
+        let mut app = App::new("test".to_owned(), 25);
+        app.searched_request = request.clone();
+        let expected = [
+            "CVE-2099-300",
+            "GHSA-2099-middle",
+            "CVE-2099-100",
+            "ALSA-2098-oldest",
+        ];
+        for offset in 0..expected.len() {
+            let kind = if offset == 0 {
+                SearchKind::Replace
+            } else {
+                SearchKind::Append {
+                    select_offset: app.candidate_count(),
+                }
+            };
+            app.start_pending_search(
+                database.clone(),
+                request.clone(),
+                1,
+                app.search_offset,
+                kind,
+                "pagination test failed",
+            );
+            for _ in 0..100_000 {
+                app.poll_search().await.unwrap();
+                if !app.searching() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(!app.searching(), "search task did not finish");
+            assert_eq!(app.search_offset, offset as u64 + 1);
+            assert_eq!(app.exhausted, offset + 1 == expected.len());
+
+            let loaded = app
+                .candidates
+                .iter()
+                .map(|candidate| match candidate {
+                    SearchCandidate::Cve(cve) => cve.summary.cve_id.as_str(),
+                    SearchCandidate::Osv(osv) => osv.osv_id.as_str(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(loaded, expected[..=offset]);
+        }
+
+        app.select_candidate(1);
+        assert_eq!(app.selected_osv().unwrap().osv_id, "GHSA-2099-middle");
+        app.select_candidate(2);
+        assert_eq!(app.selected().unwrap().summary.cve_id, "CVE-2099-100");
+
+        for (sort_order, expected) in [
+            (
+                CveSummarySortOrder::UpdatedDesc,
+                [
+                    "GHSA-2099-middle",
+                    "CVE-2099-300",
+                    "ALSA-2098-oldest",
+                    "CVE-2099-100",
+                ],
+            ),
+            (
+                CveSummarySortOrder::CveIdAsc,
+                [
+                    "CVE-2099-100",
+                    "CVE-2099-300",
+                    "ALSA-2098-oldest",
+                    "GHSA-2099-middle",
+                ],
+            ),
+            (
+                CveSummarySortOrder::CveIdDesc,
+                [
+                    "GHSA-2099-middle",
+                    "ALSA-2098-oldest",
+                    "CVE-2099-300",
+                    "CVE-2099-100",
+                ],
+            ),
+        ] {
+            let request = SearchRequest::Query {
+                term: SearchTerm::FreeText("timelineproof".to_owned()),
+                state_scope: CveStateScope::PublishedOnly,
+                kev_only: false,
+                sort_order,
+            };
+            let mut loaded = Vec::new();
+            for offset in 0..expected.len() {
+                let result =
+                    run_search_request(database.clone(), request.clone(), 1, offset as u64)
+                        .await
+                        .unwrap();
+                assert_eq!(result.candidates.len(), 1);
+                loaded.extend(
+                    result
+                        .candidates
+                        .into_iter()
+                        .map(|candidate| match candidate {
+                            SearchCandidate::Cve(cve) => cve.summary.cve_id,
+                            SearchCandidate::Osv(osv) => osv.osv_id,
+                        }),
+                );
+                assert_eq!(
+                    loaded.iter().map(String::as_str).collect::<Vec<_>>(),
+                    expected[..=offset],
+                    "unexpected {sort_order:?} prefix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_and_tab_changes_reset_scroll_and_use_item_height_for_pages() {
+        let mut app = App::new(String::new(), 25);
+        app.candidates = vec![
+            SearchCandidate::Osv(test_osv("OSV-1")),
+            SearchCandidate::Osv(test_osv("OSV-2")),
+        ];
+        app.detail_scroll = 8;
+        app.metadata_scroll = 9;
+
+        app.select_candidate(1);
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.metadata_scroll, 0);
+
+        app.detail_scroll = 4;
+        app.metadata_scroll = 5;
+        app.next_right_tab();
+        assert_eq!(app.detail_scroll, 0);
+        assert_eq!(app.metadata_scroll, 0);
+
+        app.left_page_size = 20;
+        assert_eq!(app.left_step(PageAmount::Full), 10);
+        assert_eq!(app.left_step(PageAmount::Half), 5);
+    }
+
+    fn test_osv(id: &str) -> OsvSummary {
+        OsvSummary {
+            osv_id: id.to_owned(),
+            schema_version: None,
+            published_at: None,
+            modified_at: None,
+            withdrawn_at: None,
+            summary: None,
+            details: None,
+            package_summary: None,
+        }
+    }
+
+    #[test]
     fn capec_tree_projects_each_parent_path_and_stops_cycles() {
         let entry = |id, parents| CapecEntry {
             id,
@@ -2850,7 +3113,7 @@ mod tests {
         assert_eq!(filtered.prefixes, ["", "└─ ", "   └─ "]);
 
         let cyclic = project_capec_tree(vec![entry(4, vec![5]), entry(5, vec![4])]);
-        assert!(cyclic.entries.len() <= 4);
+        assert_eq!(cyclic.paths, [vec![4], vec![4, 5], vec![5], vec![5, 4]]);
     }
 
     #[test]

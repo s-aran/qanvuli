@@ -8,6 +8,8 @@ qanvuli builds and searches a local vulnerability database. It combines CVE List
 
 The project provides a CLI, terminal UI, Rust API, and MCP server. Searches run locally after the source feeds have been imported.
 
+API documentation: [English](./docs/API.md) · [日本語](./docs/API.ja.md)
+
 ## Features
 
 - Build a database from the complete CVE archive and selected enrichment feeds.

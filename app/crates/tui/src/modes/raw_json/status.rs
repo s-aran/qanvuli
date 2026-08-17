@@ -7,6 +7,9 @@ pub(crate) struct RawJsonStatusLine {
 impl StatusLine for RawJsonStatusLine {
     fn text(&self, app: &App) -> String {
         let position = if self.at_eof { "EOF" } else { "-" };
-        format!("{position} | {}", detail_search_status(app))
+        format!(
+            "Esc/F8 close | F1/? help | {position} | {}",
+            detail_search_status(app)
+        )
     }
 }
