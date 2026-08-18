@@ -12,7 +12,6 @@ use super::{
     display::DisplaySettings,
     form::AdvancedForm,
     mode::SearchMode,
-    utils::text::{normalize_spaces, wrapped_line_count},
 };
 use qanvuli_app_commands::common::IngestProgress;
 use qanvuli_core::database::{
@@ -23,6 +22,15 @@ use ratatui::widgets::{ListState, Paragraph, Wrap};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+
+mod capec_tree;
+mod state;
+
+#[cfg(test)]
+mod tests;
+
+use capec_tree::{filter_capec_tree, project_capec_tree};
+use state::{CapecState, CweState, MainState, OverlayState, RawState, Tasks};
 
 const MIN_PAGE_SIZE: usize = 1;
 const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
@@ -41,96 +49,12 @@ pub(super) const CWE_STATUSES: [CweStatus; CWE_STATUS_COUNT] = [
 ];
 
 pub(super) struct App {
-    pub(super) query: String,
-    pub(super) search_mode: SearchMode,
-    search_mode_explicit: bool,
-    pub(super) state_scope: CveStateScope,
-    pub(super) advanced: AdvancedForm,
-    pub(super) display: DisplaySettings,
-    pub(super) limit: u64,
-    search_offset: u64,
-    search_continuation: SearchContinuation,
-    pub(super) candidates: Vec<SearchCandidate>,
-    pub(super) linked_osv: HashMap<String, Vec<OsvSummary>>,
-    pub(super) total_results: Option<u64>,
-    pub(super) list_state: ListState,
-    pub(super) focus: PaneFocus,
-    pub(super) right_tab: RightPaneTab,
-    pub(super) detail_scroll: u16,
-    pub(super) metadata_scroll: u16,
-    pub(super) view_mode: ViewMode,
-    pub(super) raw_json: Option<String>,
-    pub(super) raw_scroll: u16,
-    pub(super) cwe_query: String,
-    pub(super) cwe_results: Vec<CweEntry>,
-    pub(super) cwe_scroll: u16,
-    pub(super) cwe_selected: usize,
-    pub(super) cwe_detail_scroll: u16,
-    pub(super) cwe_relation_return_id: Option<i32>,
-    pub(super) cwe_status_filter: [bool; CWE_STATUS_COUNT],
-    pub(super) cwe_status_cursor: usize,
-    pub(super) show_cwe_status: bool,
-    pub(super) cwe_capec_filter: String,
-    pub(super) capec_query: String,
-    capec_catalog: Vec<CapecEntry>,
-    pub(super) capec_results: Vec<CapecEntry>,
-    pub(super) capec_tree_paths: Vec<Vec<i32>>,
-    pub(super) capec_tree_prefixes: Vec<String>,
-    pub(super) capec_scroll: u16,
-    pub(super) capec_selected: usize,
-    pub(super) capec_detail_scroll: u16,
-    capec_relation_return_path: Option<Vec<i32>>,
-    pub(super) capec_status_filter: String,
-    pub(super) capec_type_filter: String,
-    pub(super) capec_cwe_filter: String,
-    pub(super) show_capec_filter: bool,
-    pub(super) capec_filter_field: usize,
-    pub(super) show_capec_taxonomy: bool,
-    pub(super) capec_taxonomy_tab: usize,
-    pub(super) capec_taxonomy_section: usize,
-    pub(super) capec_taxonomy_scroll: u16,
-    pub(super) capec_taxonomy_selected: usize,
-    pub(super) capec_taxonomy: Option<CapecDetail>,
-    pub(super) detail_search_query: String,
-    pub(super) detail_search_input: bool,
-    pub(super) detail_search_error: Option<String>,
-    search: Option<PendingSearch>,
-    count_task: Option<JoinHandle<Result<u64, String>>>,
-    raw_json_task: Option<JoinHandle<Result<String, String>>>,
-    pub(super) enrichment: HashMap<String, EnrichedCveSummary>,
-    enrichment_task: Option<PendingEnrichment>,
-    metadata_capec_ids: HashMap<String, Vec<i32>>,
-    metadata_capec_task: Option<PendingMetadataCapec>,
-    cwe_task: Option<JoinHandle<Result<Vec<CweEntry>, String>>>,
-    capec_task: Option<JoinHandle<Result<Vec<CapecEntry>, String>>>,
-    capec_detail_task: Option<JoinHandle<Result<Option<CapecDetail>, String>>>,
-    scope_task: Option<JoinHandle<Result<Vec<String>, String>>>,
-    search_started_at: Option<Instant>,
-    search_timeout_at: Option<Instant>,
-    searched_request: SearchRequest,
-    exhausted: bool,
-    left_page_size: usize,
-    right_page_size: usize,
-    metadata_page_size: usize,
-    detail_content_width: usize,
-    metadata_content_width: usize,
-    pub(super) show_help: bool,
-    pub(super) show_advanced: bool,
-    pub(super) show_display: bool,
-    pub(super) show_timeout_prompt: bool,
-    pub(super) show_maintenance: bool,
-    pub(super) timeout_choice: TimeoutChoice,
-    pub(super) maintenance_choice: MaintenanceChoice,
-    pub(super) maintenance_keep_downloads: bool,
-    pub(super) status_message: Option<String>,
-    pub(super) db_as_of: Option<String>,
-    pub(super) maintenance_progress: Option<MaintenanceProgress>,
-    maintenance: Option<PendingMaintenance>,
-    advanced_before_popup: Option<AdvancedForm>,
-    display_before_popup: Option<(DisplaySettings, AdvancedForm)>,
-    cwe_filter_before_popup: Option<([bool; CWE_STATUS_COUNT], String)>,
-    capec_filter_before_popup: Option<(String, String, String)>,
-    pub(super) maintenance_confirming: bool,
+    pub(super) main: MainState,
+    pub(super) raw: RawState,
+    pub(super) cwe: CweState,
+    pub(super) capec: CapecState,
+    pub(super) overlay: OverlayState,
+    tasks: Tasks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -287,105 +211,14 @@ impl From<IngestProgress> for MaintenanceProgress {
 
 impl App {
     pub(super) fn new(query: String, limit: u64) -> Self {
-        let mut list_state = ListState::default();
-        list_state.select(Some(0));
         let search_mode = SearchMode::from_query_prefix(&query).unwrap_or(SearchMode::FreeText);
         let mut app = Self {
-            query,
-            search_mode,
-            search_mode_explicit: false,
-            state_scope: CveStateScope::PublishedOnly,
-            advanced: AdvancedForm::default(),
-            display: DisplaySettings::default(),
-            limit,
-            search_offset: 0,
-            search_continuation: SearchContinuation::default(),
-            candidates: Vec::new(),
-            linked_osv: HashMap::new(),
-            total_results: None,
-            list_state,
-            focus: PaneFocus::Left,
-            right_tab: RightPaneTab::Cve,
-            detail_scroll: 0,
-            metadata_scroll: 0,
-            view_mode: ViewMode::Normal,
-            raw_json: None,
-            raw_scroll: 0,
-            enrichment: HashMap::new(),
-            enrichment_task: None,
-            metadata_capec_ids: HashMap::new(),
-            metadata_capec_task: None,
-            cwe_query: String::new(),
-            cwe_results: Vec::new(),
-            cwe_scroll: 0,
-            cwe_selected: 0,
-            cwe_detail_scroll: 0,
-            cwe_relation_return_id: None,
-            cwe_status_filter: default_cwe_status_filter(),
-            cwe_status_cursor: 0,
-            show_cwe_status: false,
-            cwe_capec_filter: String::new(),
-            capec_query: String::new(),
-            capec_catalog: Vec::new(),
-            capec_results: Vec::new(),
-            capec_tree_paths: Vec::new(),
-            capec_tree_prefixes: Vec::new(),
-            capec_scroll: 0,
-            capec_selected: 0,
-            capec_detail_scroll: 0,
-            capec_relation_return_path: None,
-            capec_status_filter: String::new(),
-            capec_type_filter: String::new(),
-            capec_cwe_filter: String::new(),
-            show_capec_filter: false,
-            capec_filter_field: 0,
-            show_capec_taxonomy: false,
-            capec_taxonomy_tab: 0,
-            capec_taxonomy_section: 0,
-            capec_taxonomy_scroll: 0,
-            capec_taxonomy_selected: 0,
-            capec_taxonomy: None,
-            detail_search_query: String::new(),
-            detail_search_input: false,
-            detail_search_error: None,
-            search: None,
-            count_task: None,
-            raw_json_task: None,
-            cwe_task: None,
-            capec_task: None,
-            capec_detail_task: None,
-            scope_task: None,
-            search_started_at: None,
-            search_timeout_at: None,
-            searched_request: SearchRequest::Query {
-                term: SearchTerm::new(search_mode, String::new()),
-                state_scope: CveStateScope::PublishedOnly,
-                kev_only: false,
-                sort_order: CveSummarySortOrder::PublishedDesc,
-            },
-            exhausted: false,
-            left_page_size: 10,
-            right_page_size: 10,
-            metadata_page_size: 10,
-            detail_content_width: 80,
-            metadata_content_width: 80,
-            show_help: false,
-            show_advanced: false,
-            show_display: false,
-            show_timeout_prompt: false,
-            show_maintenance: false,
-            timeout_choice: TimeoutChoice::Continue,
-            maintenance_choice: MaintenanceChoice::Update,
-            maintenance_keep_downloads: false,
-            status_message: None,
-            db_as_of: None,
-            maintenance_progress: None,
-            maintenance: None,
-            advanced_before_popup: None,
-            display_before_popup: None,
-            cwe_filter_before_popup: None,
-            capec_filter_before_popup: None,
-            maintenance_confirming: false,
+            main: MainState::new(query, limit, search_mode),
+            raw: RawState::default(),
+            cwe: CweState::default(),
+            capec: CapecState::default(),
+            overlay: OverlayState::default(),
+            tasks: Tasks::default(),
         };
         app.sync_advanced_from_main();
         app
@@ -394,13 +227,13 @@ impl App {
     pub(super) fn start_search(&mut self, db: CveDatabase) {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
-        let sort_order = self.display.sort_order();
-        let term = SearchTerm::new(self.search_mode, self.query.clone());
-        let request = if !self.query.trim().is_empty() {
+        let sort_order = self.main.display.sort_order();
+        let term = SearchTerm::new(self.main.search_mode, self.main.query.clone());
+        let request = if !self.main.query.trim().is_empty() {
             SearchRequest::Query {
                 term,
-                state_scope: self.state_scope,
-                kev_only: self.display.kev_only,
+                state_scope: self.main.state_scope,
+                kev_only: self.main.display.kev_only,
                 sort_order,
             }
         } else {
@@ -409,22 +242,25 @@ impl App {
                 include_cve: true,
                 // Empty Enter is the TUI's browse-all action. Do not append every OSV
                 // advisory to that CVE list.
-                include_osv: !self.query.trim().is_empty(),
+                include_osv: !self.main.query.trim().is_empty(),
                 osv_families: Vec::new(),
                 ecosystems: None,
             }
         };
-        self.searched_request = request.clone();
+        self.main.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to search");
     }
 
     pub(super) fn start_advanced_search(&mut self, db: CveDatabase) {
-        self.query = self.advanced.query.clone();
-        self.search_mode = self.advanced.query_mode;
-        self.search_mode_explicit = true;
-        self.state_scope = self.advanced.state_scope;
-        let mut options = self.advanced.to_search_options(self.display.sort_order());
-        options.kev_only = self.display.kev_only;
+        self.main.query = self.main.advanced.query.clone();
+        self.main.search_mode = self.main.advanced.query_mode;
+        self.main.search_mode_explicit = true;
+        self.main.state_scope = self.main.advanced.state_scope;
+        let mut options = self
+            .main
+            .advanced
+            .to_search_options(self.main.display.sort_order());
+        options.kev_only = self.main.display.kev_only;
         let ecosystems = options
             .package_ecosystem
             .as_deref()
@@ -433,48 +269,48 @@ impl App {
             .map(|ecosystem| vec![ecosystem.to_owned()]);
         let request = SearchRequest::Advanced {
             options,
-            include_cve: self.advanced.source_cve,
-            include_osv: self.advanced.source_osv,
-            osv_families: if self.advanced.source_osv {
-                self.advanced.selected_advisories()
+            include_cve: self.main.advanced.source_cve,
+            include_osv: self.main.advanced.source_osv,
+            osv_families: if self.main.advanced.source_osv {
+                self.main.advanced.selected_advisories()
             } else {
                 Vec::new()
             },
             ecosystems,
         };
-        self.searched_request = request.clone();
+        self.main.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to search");
     }
 
     pub(super) fn open_advanced_search(&mut self, db: Option<CveDatabase>) {
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
-        self.advanced_before_popup = Some(self.advanced.clone());
+        self.overlay.snapshots.advanced = Some(self.main.advanced.clone());
         self.load_scope_candidates(db);
-        self.show_advanced = true;
+        self.overlay.show_advanced = true;
     }
 
     pub(super) fn apply_advanced_search(&mut self) {
-        self.advanced_before_popup = None;
-        self.show_advanced = false;
+        self.overlay.snapshots.advanced = None;
+        self.overlay.show_advanced = false;
     }
 
     pub(super) fn cancel_advanced_search(&mut self) {
-        if let Some(previous) = self.advanced_before_popup.take() {
-            self.advanced = previous;
+        if let Some(previous) = self.overlay.snapshots.advanced.take() {
+            self.main.advanced = previous;
             self.sync_main_from_advanced();
         }
-        self.show_advanced = false;
+        self.overlay.show_advanced = false;
     }
 
     pub(super) fn load_scope_candidates(&mut self, db: Option<CveDatabase>) {
-        if self.scope_task.is_some() {
+        if self.tasks.scope.is_some() {
             return;
         }
         let Some(db) = db else {
             return;
         };
-        self.scope_task = Some(tokio::spawn(async move {
+        self.tasks.scope = Some(tokio::spawn(async move {
             let configured_prefixes = db
                 .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
                 .await
@@ -508,52 +344,53 @@ impl App {
     }
 
     pub(super) fn open_display_settings(&mut self) {
-        self.display_before_popup = Some((self.display.clone(), self.advanced.clone()));
-        self.display.source_focus = false;
-        self.display.scroll = 0;
-        self.show_display = true;
+        self.overlay.snapshots.display =
+            Some((self.main.display.clone(), self.main.advanced.clone()));
+        self.main.display.source_focus = false;
+        self.main.display.scroll = 0;
+        self.overlay.show_display = true;
     }
 
     pub(super) fn cancel_display_settings(&mut self) {
-        if let Some((display, advanced)) = self.display_before_popup.take() {
-            self.display = display;
-            self.advanced = advanced;
+        if let Some((display, advanced)) = self.overlay.snapshots.display.take() {
+            self.main.display = display;
+            self.main.advanced = advanced;
         }
-        self.show_display = false;
+        self.overlay.show_display = false;
     }
 
     pub(super) fn apply_display_settings(&mut self, db: Option<CveDatabase>) {
-        self.display_before_popup = None;
-        self.show_display = false;
+        self.overlay.snapshots.display = None;
+        self.overlay.show_display = false;
         let Some(db) = db else {
             return;
         };
-        let mut request = self.searched_request.clone();
+        let mut request = self.main.searched_request.clone();
         match &mut request {
             SearchRequest::Query {
                 kev_only,
                 sort_order,
                 ..
             } => {
-                *kev_only = self.display.kev_only;
-                *sort_order = self.display.sort_order();
+                *kev_only = self.main.display.kev_only;
+                *sort_order = self.main.display.sort_order();
             }
             SearchRequest::Advanced { options, .. } => {
-                options.kev_only = self.display.kev_only;
-                options.sort_order = self.display.sort_order();
+                options.kev_only = self.main.display.kev_only;
+                options.sort_order = self.main.display.sort_order();
             }
         }
-        self.searched_request = request.clone();
+        self.main.searched_request = request.clone();
         self.start_replace_search(db, request, "failed to apply display settings");
     }
 
     pub(super) fn start_load_more(&mut self, db: CveDatabase) {
-        if self.searching() || self.exhausted || self.candidate_count() == 0 {
+        if self.searching() || self.main.exhausted || self.candidate_count() == 0 {
             return;
         }
 
-        let request = self.searched_request.clone();
-        let offset = self.search_offset;
+        let request = self.main.searched_request.clone();
+        let offset = self.main.search_offset;
         let select_offset = self.candidate_count();
         self.start_pending_search(
             db,
@@ -566,7 +403,7 @@ impl App {
     }
 
     pub(super) async fn poll_search(&mut self) -> Result<(), String> {
-        let Some(search) = self.search.as_ref() else {
+        let Some(search) = self.tasks.search.as_ref() else {
             return Ok(());
         };
         if !search.handle.is_finished() {
@@ -574,11 +411,11 @@ impl App {
             return Ok(());
         }
 
-        let Some(search) = self.search.take() else {
-            self.status_message = Some("search task disappeared".to_owned());
-            self.search_started_at = None;
-            self.search_timeout_at = None;
-            self.show_timeout_prompt = false;
+        let Some(search) = self.tasks.search.take() else {
+            self.overlay.status_message = Some("search task disappeared".to_owned());
+            self.tasks.search_started_at = None;
+            self.tasks.search_timeout_at = None;
+            self.overlay.show_timeout_prompt = false;
             return Ok(());
         };
         let kind = search.kind;
@@ -593,30 +430,30 @@ impl App {
                 return Ok(());
             }
         };
-        self.search_started_at = None;
-        self.search_timeout_at = None;
-        self.show_timeout_prompt = false;
+        self.tasks.search_started_at = None;
+        self.tasks.search_timeout_at = None;
+        self.overlay.show_timeout_prompt = false;
         let count = search.count;
-        self.search_continuation = result.continuation;
+        self.main.search_continuation = result.continuation;
         match kind {
             SearchKind::Replace => {
-                self.exhausted = result.exhausted;
-                self.search_offset = result.consumed;
-                self.candidates = result.candidates;
-                self.linked_osv = result.linked_osv;
+                self.main.exhausted = result.exhausted;
+                self.main.search_offset = result.consumed;
+                self.main.candidates = result.candidates;
+                self.main.linked_osv = result.linked_osv;
                 self.clear_detail();
                 self.select_candidate(0);
                 if let Some(count) = count {
-                    self.count_task =
+                    self.tasks.count =
                         Some(tokio::spawn(run_count_request(count.db, count.request)));
                 }
             }
             SearchKind::Append { select_offset } => {
-                self.exhausted = result.exhausted;
-                self.search_offset = self.search_offset.saturating_add(result.consumed);
-                self.candidates.extend(result.candidates);
+                self.main.exhausted = result.exhausted;
+                self.main.search_offset = self.main.search_offset.saturating_add(result.consumed);
+                self.main.candidates.extend(result.candidates);
                 for (cve_id, advisories) in result.linked_osv {
-                    let existing = self.linked_osv.entry(cve_id).or_default();
+                    let existing = self.main.linked_osv.entry(cve_id).or_default();
                     let mut ids = existing
                         .iter()
                         .map(|row| row.osv_id.clone())
@@ -631,46 +468,47 @@ impl App {
             }
         }
         for row in result.enrichment {
-            self.enrichment.insert(row.cve_id.clone(), row);
+            self.main.enrichment.insert(row.cve_id.clone(), row);
         }
         Ok(())
     }
 
     pub(super) async fn poll_count(&mut self) {
-        let Some(task) = self.count_task.as_ref() else {
+        let Some(task) = self.tasks.count.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.count_task.take() else {
-            self.status_message = Some("count task disappeared".to_owned());
+        let Some(task) = self.tasks.count.take() else {
+            self.overlay.status_message = Some("count task disappeared".to_owned());
             return;
         };
         match task.await {
             Ok(Ok(total)) => {
-                self.total_results = Some(total);
+                self.main.total_results = Some(total);
             }
             Ok(Err(err)) => {
-                self.status_message = Some(format!("failed to count search results: {err}"));
+                self.overlay.status_message =
+                    Some(format!("failed to count search results: {err}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("failed to join count task: {err}"));
+                self.overlay.status_message = Some(format!("failed to join count task: {err}"));
             }
         }
     }
 
     pub(super) async fn poll_maintenance(&mut self) -> bool {
-        let Some(maintenance) = self.maintenance.as_mut() else {
+        let Some(maintenance) = self.tasks.maintenance.as_mut() else {
             return false;
         };
         while let Ok(progress) = maintenance.progress.try_recv() {
-            self.maintenance_progress = Some(progress.into());
+            self.overlay.maintenance_progress = Some(progress.into());
         }
         match maintenance.result.try_recv() {
             Ok(result) => {
                 let operation = maintenance.operation;
-                self.maintenance = None;
+                self.tasks.maintenance = None;
                 let message = match result {
                     Ok(()) => match operation {
                         MaintenanceOperation::Init => "init completed".to_owned(),
@@ -681,101 +519,104 @@ impl App {
                         MaintenanceOperation::Update => format!("update failed: {err}"),
                     },
                 };
-                self.status_message = Some(message);
-                self.maintenance_progress = None;
-                self.show_maintenance = false;
+                self.overlay.status_message = Some(message);
+                self.overlay.maintenance_progress = None;
+                self.overlay.show_maintenance = false;
                 true
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 let operation = maintenance.operation;
-                self.maintenance = None;
-                self.status_message = Some(match operation {
+                self.tasks.maintenance = None;
+                self.overlay.status_message = Some(match operation {
                     MaintenanceOperation::Init => "init task disconnected".to_owned(),
                     MaintenanceOperation::Update => "update task disconnected".to_owned(),
                 });
-                self.maintenance_progress = None;
-                self.show_maintenance = false;
+                self.overlay.maintenance_progress = None;
+                self.overlay.show_maintenance = false;
                 true
             }
         }
     }
 
     pub(super) async fn poll_raw_json(&mut self) {
-        let Some(task) = self.raw_json_task.as_ref() else {
+        let Some(task) = self.tasks.raw_json.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.raw_json_task.take() else {
-            self.raw_json = Some("raw JSON task disappeared".to_owned());
-            self.raw_scroll = 0;
+        let Some(task) = self.tasks.raw_json.take() else {
+            self.raw.json = Some("raw JSON task disappeared".to_owned());
+            self.raw.scroll = 0;
             return;
         };
         match task.await {
             Ok(Ok(raw_json)) => {
-                self.raw_json = Some(raw_json);
-                self.raw_scroll = 0;
+                self.raw.json = Some(raw_json);
+                self.raw.scroll = 0;
             }
             Ok(Err(err)) => {
-                self.raw_json = Some(err);
-                self.raw_scroll = 0;
+                self.raw.json = Some(err);
+                self.raw.scroll = 0;
             }
             Err(err) => {
-                self.raw_json = Some(format!("failed to join raw JSON task: {err}"));
-                self.raw_scroll = 0;
+                self.raw.json = Some(format!("failed to join raw JSON task: {err}"));
+                self.raw.scroll = 0;
             }
         }
     }
 
     pub(super) async fn poll_enrichment(&mut self) {
-        let Some(task) = self.enrichment_task.as_ref() else {
+        let Some(task) = self.tasks.enrichment.as_ref() else {
             return;
         };
         if !task.handle.is_finished() {
             return;
         }
-        let Some(task) = self.enrichment_task.take() else {
-            self.status_message = Some("enrichment task disappeared".to_owned());
+        let Some(task) = self.tasks.enrichment.take() else {
+            self.overlay.status_message = Some("enrichment task disappeared".to_owned());
             return;
         };
         match task.handle.await {
             Ok(Ok(rows)) => {
                 for row in rows {
-                    self.enrichment.insert(row.cve_id.clone(), row);
+                    self.main.enrichment.insert(row.cve_id.clone(), row);
                 }
             }
             Ok(Err(err)) => {
-                self.status_message = Some(format!("failed to load enrichment summaries: {err}"));
+                self.overlay.status_message =
+                    Some(format!("failed to load enrichment summaries: {err}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("failed to join enrichment task: {err}"));
+                self.overlay.status_message =
+                    Some(format!("failed to join enrichment task: {err}"));
             }
         }
     }
 
     pub(super) fn ensure_loaded_enrichment(&mut self, db: Option<CveDatabase>) {
-        if self.candidates.is_empty() || self.enrichment_task.is_some() {
+        if self.main.candidates.is_empty() || self.tasks.enrichment.is_some() {
             return;
         }
         let cve_ids = self
+            .main
             .candidates
             .iter()
             .filter_map(|candidate| match candidate {
                 SearchCandidate::Cve(cve) => Some(cve.summary.cve_id.clone()),
                 SearchCandidate::Osv(_) => None,
             })
-            .filter(|cve_id| !self.enrichment.contains_key(cve_id))
+            .filter(|cve_id| !self.main.enrichment.contains_key(cve_id))
             .collect::<Vec<_>>();
         if cve_ids.is_empty() {
             return;
         }
         let Some(db) = db else {
-            self.status_message = Some("database is unavailable".to_owned());
+            self.overlay.status_message = Some("database is unavailable".to_owned());
             return;
         };
-        self.enrichment_task = Some(PendingEnrichment {
+        self.tasks.enrichment = Some(PendingEnrichment {
             handle: tokio::spawn(async move {
                 db.enriched_cve_summaries(&cve_ids)
                     .await
@@ -785,40 +626,46 @@ impl App {
     }
 
     pub(super) async fn poll_metadata_capec(&mut self) {
-        let Some(task) = self.metadata_capec_task.as_ref() else {
+        let Some(task) = self.tasks.metadata_capec.as_ref() else {
             return;
         };
         if !task.handle.is_finished() {
             return;
         }
-        let Some(task) = self.metadata_capec_task.take() else {
+        let Some(task) = self.tasks.metadata_capec.take() else {
             return;
         };
         match task.handle.await {
             Ok(Ok(rows)) => {
-                self.metadata_capec_ids
+                self.main
+                    .metadata_capec_ids
                     .extend(rows.into_iter().map(|row| (row.cve_id, row.capec_ids)));
                 self.clamp_metadata_scroll();
             }
             Ok(Err(err)) => {
-                self.status_message = Some(format!("failed to load CAPEC links: {err}"));
+                self.overlay.status_message = Some(format!("failed to load CAPEC links: {err}"));
             }
             Err(err) => {
-                self.status_message = Some(format!("failed to join CAPEC link task: {err}"));
+                self.overlay.status_message =
+                    Some(format!("failed to join CAPEC link task: {err}"));
             }
         }
     }
 
     pub(super) fn ensure_loaded_metadata_capec(&mut self, db: Option<CveDatabase>) {
-        if self.metadata_capec_task.is_some() {
+        if self.tasks.metadata_capec.is_some() {
             return;
         }
         let pending = self
+            .main
             .candidates
             .iter()
             .filter_map(|candidate| match candidate {
                 SearchCandidate::Cve(cve)
-                    if !self.metadata_capec_ids.contains_key(&cve.summary.cve_id) =>
+                    if !self
+                        .main
+                        .metadata_capec_ids
+                        .contains_key(&cve.summary.cve_id) =>
                 {
                     Some(cve)
                 }
@@ -837,7 +684,7 @@ impl App {
         let Some(db) = db else {
             return;
         };
-        self.metadata_capec_task = Some(PendingMetadataCapec {
+        self.tasks.metadata_capec = Some(PendingMetadataCapec {
             handle: tokio::spawn(async move {
                 let cwe_ids = pending
                     .iter()
@@ -868,140 +715,144 @@ impl App {
     }
 
     pub(super) async fn poll_cwe_search(&mut self) {
-        let Some(task) = self.cwe_task.as_ref() else {
+        let Some(task) = self.tasks.cwe.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.cwe_task.take() else {
-            self.status_message = Some("CWE task disappeared".to_owned());
+        let Some(task) = self.tasks.cwe.take() else {
+            self.overlay.status_message = Some("CWE task disappeared".to_owned());
             return;
         };
         match task.await {
             Ok(Ok(rows)) => {
-                self.cwe_results = rows;
-                self.cwe_scroll = 0;
-                self.cwe_selected = 0;
-                self.cwe_detail_scroll = 0;
-                self.cwe_relation_return_id = None;
-                self.clamp_cwe_scroll(self.left_page_size);
+                self.cwe.results = rows;
+                self.cwe.scroll = 0;
+                self.cwe.selected = 0;
+                self.cwe.detail_scroll = 0;
+                self.cwe.relation_return_id = None;
+                self.clamp_cwe_scroll(self.main.left_page_size);
             }
             Ok(Err(err)) => {
-                self.status_message = Some(err);
-                self.cwe_results.clear();
-                self.cwe_scroll = 0;
-                self.cwe_selected = 0;
-                self.cwe_detail_scroll = 0;
-                self.cwe_relation_return_id = None;
+                self.overlay.status_message = Some(err);
+                self.cwe.results.clear();
+                self.cwe.scroll = 0;
+                self.cwe.selected = 0;
+                self.cwe.detail_scroll = 0;
+                self.cwe.relation_return_id = None;
             }
             Err(err) => {
-                self.status_message = Some(format!("failed to join CWE task: {err}"));
-                self.cwe_results.clear();
-                self.cwe_scroll = 0;
-                self.cwe_selected = 0;
-                self.cwe_detail_scroll = 0;
-                self.cwe_relation_return_id = None;
+                self.overlay.status_message = Some(format!("failed to join CWE task: {err}"));
+                self.cwe.results.clear();
+                self.cwe.scroll = 0;
+                self.cwe.selected = 0;
+                self.cwe.detail_scroll = 0;
+                self.cwe.relation_return_id = None;
             }
         }
     }
 
     pub(super) async fn poll_capec_search(&mut self) {
-        let Some(task) = self.capec_task.as_ref() else {
+        let Some(task) = self.tasks.capec.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.capec_task.take() else {
+        let Some(task) = self.tasks.capec.take() else {
             return;
         };
         match task.await {
             Ok(Ok(rows)) => {
-                self.capec_catalog = rows;
+                self.capec.catalog = rows;
                 self.apply_capec_filters();
             }
             Ok(Err(err)) => {
-                self.status_message = Some(err);
-                self.capec_results.clear();
-                self.capec_tree_paths.clear();
-                self.capec_tree_prefixes.clear();
+                self.overlay.status_message = Some(err);
+                self.capec.results.clear();
+                self.capec.tree_paths.clear();
+                self.capec.tree_prefixes.clear();
             }
             Err(err) => {
-                self.status_message = Some(format!("failed to join CAPEC task: {err}"));
-                self.capec_results.clear();
-                self.capec_tree_paths.clear();
-                self.capec_tree_prefixes.clear();
+                self.overlay.status_message = Some(format!("failed to join CAPEC task: {err}"));
+                self.capec.results.clear();
+                self.capec.tree_paths.clear();
+                self.capec.tree_prefixes.clear();
             }
         }
     }
 
     pub(super) async fn poll_capec_detail(&mut self) {
-        let Some(task) = self.capec_detail_task.as_ref() else {
+        let Some(task) = self.tasks.capec_detail.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.capec_detail_task.take() else {
+        let Some(task) = self.tasks.capec_detail.take() else {
             return;
         };
         match task.await {
-            Ok(Ok(detail)) => self.capec_taxonomy = detail,
-            Ok(Err(error)) => self.status_message = Some(error),
+            Ok(Ok(detail)) => self.capec.taxonomy = detail,
+            Ok(Err(error)) => self.overlay.status_message = Some(error),
             Err(error) => {
-                self.status_message = Some(format!("failed to join CAPEC detail task: {error}"))
+                self.overlay.status_message =
+                    Some(format!("failed to join CAPEC detail task: {error}"))
             }
         }
     }
 
     pub(super) fn searching(&self) -> bool {
-        self.search.is_some()
+        self.tasks.search.is_some()
     }
 
     pub(super) async fn poll_scope_candidates(&mut self) {
-        let Some(task) = self.scope_task.as_ref() else {
+        let Some(task) = self.tasks.scope.as_ref() else {
             return;
         };
         if !task.is_finished() {
             return;
         }
-        let Some(task) = self.scope_task.take() else {
+        let Some(task) = self.tasks.scope.take() else {
             return;
         };
         match task.await {
-            Ok(Ok(advisories)) => self.advanced.set_scope_candidates(advisories),
-            Ok(Err(err)) => self.status_message = Some(err),
-            Err(err) => self.status_message = Some(format!("failed to join scope task: {err}")),
+            Ok(Ok(advisories)) => self.main.advanced.set_scope_candidates(advisories),
+            Ok(Err(err)) => self.overlay.status_message = Some(err),
+            Err(err) => {
+                self.overlay.status_message = Some(format!("failed to join scope task: {err}"))
+            }
         }
     }
 
     pub(super) fn scope_candidates_loading(&self) -> bool {
-        self.scope_task.is_some()
+        self.tasks.scope.is_some()
     }
 
     pub(super) fn has_background_task(&self) -> bool {
-        self.search.is_some()
-            || self.count_task.is_some()
-            || self.raw_json_task.is_some()
-            || self.enrichment_task.is_some()
-            || self.cwe_task.is_some()
-            || self.capec_task.is_some()
-            || self.capec_detail_task.is_some()
-            || self.scope_task.is_some()
-            || self.maintenance.is_some()
+        self.tasks.search.is_some()
+            || self.tasks.count.is_some()
+            || self.tasks.raw_json.is_some()
+            || self.tasks.enrichment.is_some()
+            || self.tasks.cwe.is_some()
+            || self.tasks.capec.is_some()
+            || self.tasks.capec_detail.is_some()
+            || self.tasks.scope.is_some()
+            || self.tasks.maintenance.is_some()
     }
 
     pub(super) fn cwe_searching(&self) -> bool {
-        self.cwe_task.is_some()
+        self.tasks.cwe.is_some()
     }
 
     pub(super) fn maintenance_running(&self) -> bool {
-        self.maintenance.is_some()
+        self.tasks.maintenance.is_some()
     }
 
     pub(super) fn maintenance_status(&self) -> Option<&'static str> {
-        self.maintenance
+        self.tasks
+            .maintenance
             .as_ref()
             .map(|maintenance| match maintenance.operation {
                 MaintenanceOperation::Init => "init running",
@@ -1020,103 +871,104 @@ impl App {
     }
 
     pub(super) fn abort_search(&mut self) {
-        if let Some(search) = self.search.take() {
+        if let Some(search) = self.tasks.search.take() {
             search.handle.abort();
         }
-        if let Some(task) = self.count_task.take() {
+        if let Some(task) = self.tasks.count.take() {
             task.abort();
         }
-        if let Some(task) = self.raw_json_task.take() {
+        if let Some(task) = self.tasks.raw_json.take() {
             task.abort();
         }
-        if let Some(task) = self.enrichment_task.take() {
+        if let Some(task) = self.tasks.enrichment.take() {
             task.handle.abort();
         }
-        if let Some(task) = self.cwe_task.take() {
+        if let Some(task) = self.tasks.cwe.take() {
             task.abort();
         }
-        self.search_started_at = None;
-        self.search_timeout_at = None;
-        self.show_timeout_prompt = false;
+        self.tasks.search_started_at = None;
+        self.tasks.search_timeout_at = None;
+        self.overlay.show_timeout_prompt = false;
     }
 
     /// Cancels and joins every task that may retain a cloned database handle.
     /// Maintenance must wait for these before closing the single-owner SQLite writer.
     pub(super) async fn abort_database_tasks(&mut self) {
-        if let Some(search) = self.search.take() {
+        if let Some(search) = self.tasks.search.take() {
             search.handle.abort();
             let _ = search.handle.await;
         }
-        if let Some(task) = self.count_task.take() {
+        if let Some(task) = self.tasks.count.take() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = self.raw_json_task.take() {
+        if let Some(task) = self.tasks.raw_json.take() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = self.enrichment_task.take() {
+        if let Some(task) = self.tasks.enrichment.take() {
             task.handle.abort();
             let _ = task.handle.await;
         }
-        if let Some(task) = self.metadata_capec_task.take() {
+        if let Some(task) = self.tasks.metadata_capec.take() {
             task.handle.abort();
             let _ = task.handle.await;
         }
-        if let Some(task) = self.cwe_task.take() {
+        if let Some(task) = self.tasks.cwe.take() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = self.capec_task.take() {
+        if let Some(task) = self.tasks.capec.take() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = self.capec_detail_task.take() {
+        if let Some(task) = self.tasks.capec_detail.take() {
             task.abort();
             let _ = task.await;
         }
-        if let Some(task) = self.scope_task.take() {
+        if let Some(task) = self.tasks.scope.take() {
             task.abort();
             let _ = task.await;
         }
-        self.search_started_at = None;
-        self.search_timeout_at = None;
-        self.show_timeout_prompt = false;
+        self.tasks.search_started_at = None;
+        self.tasks.search_timeout_at = None;
+        self.overlay.show_timeout_prompt = false;
     }
 
     pub(super) fn open_maintenance(&mut self) {
         if self.maintenance_running() {
-            self.status_message = Some("database maintenance is already running".to_owned());
+            self.overlay.status_message =
+                Some("database maintenance is already running".to_owned());
             return;
         }
-        self.show_maintenance = true;
-        self.maintenance_choice = MaintenanceChoice::Update;
-        self.maintenance_confirming = false;
+        self.overlay.show_maintenance = true;
+        self.overlay.maintenance_choice = MaintenanceChoice::Update;
+        self.overlay.maintenance_confirming = false;
     }
 
     pub(super) fn close_maintenance(&mut self) {
-        self.show_maintenance = false;
-        self.maintenance_confirming = false;
+        self.overlay.show_maintenance = false;
+        self.overlay.maintenance_confirming = false;
     }
 
     pub(super) fn confirm_maintenance_choice(&mut self) {
-        if self.maintenance_choice == MaintenanceChoice::Cancel {
+        if self.overlay.maintenance_choice == MaintenanceChoice::Cancel {
             self.close_maintenance();
         } else {
-            self.maintenance_confirming = true;
+            self.overlay.maintenance_confirming = true;
         }
     }
 
     pub(super) fn cancel_maintenance_confirmation(&mut self) {
-        self.maintenance_confirming = false;
+        self.overlay.maintenance_confirming = false;
     }
 
     pub(super) fn toggle_maintenance_keep_downloads(&mut self) {
-        self.maintenance_keep_downloads = !self.maintenance_keep_downloads;
+        self.overlay.maintenance_keep_downloads = !self.overlay.maintenance_keep_downloads;
     }
 
     pub(super) fn next_maintenance_choice(&mut self) {
-        self.maintenance_choice = match self.maintenance_choice {
+        self.overlay.maintenance_choice = match self.overlay.maintenance_choice {
             MaintenanceChoice::Init => MaintenanceChoice::Update,
             MaintenanceChoice::Update => MaintenanceChoice::Cancel,
             MaintenanceChoice::Cancel => MaintenanceChoice::Init,
@@ -1124,7 +976,7 @@ impl App {
     }
 
     pub(super) fn previous_maintenance_choice(&mut self) {
-        self.maintenance_choice = match self.maintenance_choice {
+        self.overlay.maintenance_choice = match self.overlay.maintenance_choice {
             MaintenanceChoice::Init => MaintenanceChoice::Cancel,
             MaintenanceChoice::Update => MaintenanceChoice::Init,
             MaintenanceChoice::Cancel => MaintenanceChoice::Update,
@@ -1138,13 +990,13 @@ impl App {
         result: UnboundedReceiver<Result<(), String>>,
     ) {
         self.abort_search();
-        self.show_maintenance = true;
-        self.maintenance_confirming = false;
-        self.status_message = Some(match operation {
+        self.overlay.show_maintenance = true;
+        self.overlay.maintenance_confirming = false;
+        self.overlay.status_message = Some(match operation {
             MaintenanceOperation::Init => "init started".to_owned(),
             MaintenanceOperation::Update => "update started".to_owned(),
         });
-        self.maintenance_progress = Some(MaintenanceProgress {
+        self.overlay.maintenance_progress = Some(MaintenanceProgress {
             label: match operation {
                 MaintenanceOperation::Init => "init".to_owned(),
                 MaintenanceOperation::Update => "update".to_owned(),
@@ -1152,7 +1004,7 @@ impl App {
             phase: "starting".to_owned(),
             ..MaintenanceProgress::default()
         });
-        self.maintenance = Some(PendingMaintenance {
+        self.tasks.maintenance = Some(PendingMaintenance {
             operation,
             progress,
             result,
@@ -1161,36 +1013,36 @@ impl App {
 
     pub(super) fn cancel_timed_out_search(&mut self) {
         self.abort_search();
-        self.status_message = Some("search canceled".to_owned());
+        self.overlay.status_message = Some("search canceled".to_owned());
     }
 
     pub(super) fn continue_timed_out_search(&mut self) {
-        if let Some(search) = self.search.as_mut() {
+        if let Some(search) = self.tasks.search.as_mut() {
             search.timed_out_once = true;
-            self.search_timeout_at = Some(Instant::now() + SEARCH_TIMEOUT);
+            self.tasks.search_timeout_at = Some(Instant::now() + SEARCH_TIMEOUT);
         }
-        self.show_timeout_prompt = false;
-        self.timeout_choice = TimeoutChoice::Continue;
-        self.status_message = Some("search continued".to_owned());
+        self.overlay.show_timeout_prompt = false;
+        self.overlay.timeout_choice = TimeoutChoice::Continue;
+        self.overlay.status_message = Some("search continued".to_owned());
     }
 
     pub(super) fn toggle_timeout_choice(&mut self) {
-        self.timeout_choice = match self.timeout_choice {
+        self.overlay.timeout_choice = match self.overlay.timeout_choice {
             TimeoutChoice::Continue => TimeoutChoice::Cancel,
             TimeoutChoice::Cancel => TimeoutChoice::Continue,
         };
     }
 
     pub(super) fn select_timeout_continue(&mut self) {
-        self.timeout_choice = TimeoutChoice::Continue;
+        self.overlay.timeout_choice = TimeoutChoice::Continue;
     }
 
     pub(super) fn select_timeout_cancel(&mut self) {
-        self.timeout_choice = TimeoutChoice::Cancel;
+        self.overlay.timeout_choice = TimeoutChoice::Cancel;
     }
 
     pub(super) fn confirm_timeout_choice(&mut self) {
-        match self.timeout_choice {
+        match self.overlay.timeout_choice {
             TimeoutChoice::Continue => self.continue_timed_out_search(),
             TimeoutChoice::Cancel => self.cancel_timed_out_search(),
         }
@@ -1199,6 +1051,7 @@ impl App {
     pub(super) fn search_spinner(&self) -> &'static str {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame = self
+            .tasks
             .search_started_at
             .map(|started_at| (started_at.elapsed().as_millis() / 80) as usize)
             .unwrap_or(0);
@@ -1207,6 +1060,7 @@ impl App {
 
     pub(super) fn selected(&self) -> Option<&CveSummaryWithDetail> {
         match self
+            .main
             .list_state
             .selected()
             .and_then(|index| self.candidate(index))?
@@ -1218,7 +1072,8 @@ impl App {
 
     pub(super) fn selected_metadata_capec_ids(&self) -> Option<&[i32]> {
         self.selected().and_then(|cve| {
-            self.metadata_capec_ids
+            self.main
+                .metadata_capec_ids
                 .get(&cve.summary.cve_id)
                 .map(Vec::as_slice)
         })
@@ -1226,6 +1081,7 @@ impl App {
 
     pub(super) fn selected_osv(&self) -> Option<&OsvSummary> {
         match self
+            .main
             .list_state
             .selected()
             .and_then(|index| self.candidate(index))?
@@ -1236,123 +1092,126 @@ impl App {
     }
 
     pub(super) fn candidate_count(&self) -> usize {
-        self.candidates.len()
+        self.main.candidates.len()
     }
 
     pub(super) fn candidate(&self, index: usize) -> Option<&SearchCandidate> {
-        self.candidates.get(index)
+        self.main.candidates.get(index)
     }
 
     pub(super) fn toggle_raw_json_mode(&mut self, db: Option<CveDatabase>) {
-        if self.view_mode == ViewMode::RawJson {
-            self.view_mode = ViewMode::Normal;
+        if self.raw.view_mode == ViewMode::RawJson {
+            self.raw.view_mode = ViewMode::Normal;
             return;
         }
-        self.view_mode = ViewMode::RawJson;
-        self.raw_scroll = 0;
+        self.raw.view_mode = ViewMode::RawJson;
+        self.raw.scroll = 0;
         let Some(db) = db else {
-            self.raw_json = Some("Database is unavailable".to_owned());
+            self.raw.json = Some("Database is unavailable".to_owned());
             return;
         };
-        if let Some(task) = self.raw_json_task.take() {
+        if let Some(task) = self.tasks.raw_json.take() {
             task.abort();
         }
-        self.raw_json = Some("Loading".to_owned());
-        self.raw_json_task = match (
+        self.raw.json = Some("Loading".to_owned());
+        self.tasks.raw_json = match (
             self.selected().map(|cve| cve.summary.cve_id.clone()),
             self.selected_osv().map(|osv| osv.osv_id.clone()),
         ) {
             (Some(cve_id), _) => Some(tokio::spawn(load_cve_raw_json(db, cve_id))),
             (_, Some(osv_id)) => Some(tokio::spawn(load_osv_raw_json(db, osv_id))),
             (None, None) => {
-                self.raw_json = Some("No result selected".to_owned());
+                self.raw.json = Some("No result selected".to_owned());
                 None
             }
         };
     }
 
     pub(super) fn toggle_cwe_list_mode(&mut self, db: Option<CveDatabase>) {
-        if self.view_mode == ViewMode::CweList {
-            self.view_mode = ViewMode::Normal;
+        if self.raw.view_mode == ViewMode::CweList {
+            self.raw.view_mode = ViewMode::Normal;
             return;
         }
-        self.view_mode = ViewMode::CweList;
+        self.raw.view_mode = ViewMode::CweList;
         self.start_cwe_search(db);
     }
 
     pub(super) fn toggle_capec_list_mode(&mut self, db: Option<CveDatabase>) {
-        if self.view_mode == ViewMode::CapecList {
-            self.view_mode = ViewMode::Normal;
+        if self.raw.view_mode == ViewMode::CapecList {
+            self.raw.view_mode = ViewMode::Normal;
             return;
         }
-        self.view_mode = ViewMode::CapecList;
+        self.raw.view_mode = ViewMode::CapecList;
         self.start_capec_search(db);
     }
 
     pub(super) fn selected_capec(&self) -> Option<&CapecEntry> {
-        self.capec_results.get(self.capec_selected)
+        self.capec.results.get(self.capec.selected)
     }
 
     pub(super) fn push_capec_query(&mut self, ch: char, db: Option<CveDatabase>) {
-        self.capec_query.push(ch);
+        self.capec.query.push(ch);
         self.start_capec_search(db);
     }
 
     pub(super) fn backspace_capec_query(&mut self, db: Option<CveDatabase>) {
-        self.capec_query.pop();
+        self.capec.query.pop();
         self.start_capec_search(db);
     }
 
     pub(super) fn move_capec(&mut self, down: bool, page_size: usize, step: usize) {
-        if self.capec_results.is_empty() {
+        if self.capec.results.is_empty() {
             return;
         }
-        self.capec_selected = if down {
-            self.capec_selected
+        self.capec.selected = if down {
+            self.capec
+                .selected
                 .saturating_add(step)
-                .min(self.capec_results.len() - 1)
+                .min(self.capec.results.len() - 1)
         } else {
-            self.capec_selected.saturating_sub(step)
+            self.capec.selected.saturating_sub(step)
         };
         let page_size = page_size.max(1);
-        if self.capec_selected < self.capec_scroll as usize {
-            self.capec_scroll = self.capec_selected as u16;
-        } else if self.capec_selected >= self.capec_scroll as usize + page_size {
-            self.capec_scroll = self.capec_selected.saturating_sub(page_size - 1) as u16;
+        if self.capec.selected < self.capec.scroll as usize {
+            self.capec.scroll = self.capec.selected as u16;
+        } else if self.capec.selected >= self.capec.scroll as usize + page_size {
+            self.capec.scroll = self.capec.selected.saturating_sub(page_size - 1) as u16;
         }
-        self.capec_detail_scroll = 0;
-        self.capec_relation_return_path = None;
+        self.capec.detail_scroll = 0;
+        self.capec.relation_return_path = None;
     }
 
     pub(super) fn move_capec_to_parent(&mut self, page_size: usize) {
-        let Some(path) = self.capec_tree_paths.get(self.capec_selected).cloned() else {
+        let Some(path) = self.capec.tree_paths.get(self.capec.selected).cloned() else {
             return;
         };
         if path.len() < 2 {
-            self.status_message = Some("selected CAPEC has no parent on this path".to_owned());
+            self.overlay.status_message =
+                Some("selected CAPEC has no parent on this path".to_owned());
             return;
         }
         let mut parent_path = path.clone();
         parent_path.pop();
-        self.capec_relation_return_path = Some(path);
+        self.capec.relation_return_path = Some(path);
         self.select_capec_path(&parent_path, page_size);
     }
 
     pub(super) fn move_capec_to_relation_return(&mut self, page_size: usize) {
-        let Some(path) = self.capec_relation_return_path.take() else {
-            self.status_message = Some("no CAPEC relation return target".to_owned());
+        let Some(path) = self.capec.relation_return_path.take() else {
+            self.overlay.status_message = Some("no CAPEC relation return target".to_owned());
             return;
         };
         self.select_capec_path(&path, page_size);
     }
 
     pub(super) fn move_capec_sibling(&mut self, next: bool, page_size: usize) {
-        let Some(path) = self.capec_tree_paths.get(self.capec_selected).cloned() else {
+        let Some(path) = self.capec.tree_paths.get(self.capec.selected).cloned() else {
             return;
         };
         let parent = path.get(..path.len().saturating_sub(1)).unwrap_or_default();
         let candidates = self
-            .capec_tree_paths
+            .capec
+            .tree_paths
             .iter()
             .enumerate()
             .filter(|(_, candidate)| {
@@ -1366,7 +1225,7 @@ impl App {
             .collect::<Vec<_>>();
         let Some(position) = candidates
             .iter()
-            .position(|index| *index == self.capec_selected)
+            .position(|index| *index == self.capec.selected)
         else {
             return;
         };
@@ -1378,56 +1237,57 @@ impl App {
                 .and_then(|index| candidates.get(index))
         };
         if let Some(target) = target {
-            self.capec_selected = *target;
+            self.capec.selected = *target;
             self.scroll_capec_selection_into_view(page_size);
-            self.capec_detail_scroll = 0;
-            self.capec_relation_return_path = None;
+            self.capec.detail_scroll = 0;
+            self.capec.relation_return_path = None;
         }
     }
 
     fn select_capec_path(&mut self, path: &[i32], page_size: usize) {
         if let Some(index) = self
-            .capec_tree_paths
+            .capec
+            .tree_paths
             .iter()
             .position(|candidate| candidate == path)
         {
-            self.capec_selected = index;
+            self.capec.selected = index;
             self.scroll_capec_selection_into_view(page_size);
-            self.capec_detail_scroll = 0;
-            self.status_message = None;
+            self.capec.detail_scroll = 0;
+            self.overlay.status_message = None;
         }
     }
 
     fn scroll_capec_selection_into_view(&mut self, page_size: usize) {
         let page_size = page_size.max(1);
-        if self.capec_selected < self.capec_scroll as usize {
-            self.capec_scroll = self.capec_selected as u16;
-        } else if self.capec_selected >= self.capec_scroll as usize + page_size {
-            self.capec_scroll = self.capec_selected.saturating_sub(page_size - 1) as u16;
+        if self.capec.selected < self.capec.scroll as usize {
+            self.capec.scroll = self.capec.selected as u16;
+        } else if self.capec.selected >= self.capec.scroll as usize + page_size {
+            self.capec.scroll = self.capec.selected.saturating_sub(page_size - 1) as u16;
         }
     }
 
     pub(super) fn open_capec_filter(&mut self) {
-        self.capec_filter_before_popup = Some((
-            self.capec_status_filter.clone(),
-            self.capec_type_filter.clone(),
-            self.capec_cwe_filter.clone(),
+        self.overlay.snapshots.capec_filter = Some((
+            self.capec.status_filter.clone(),
+            self.capec.type_filter.clone(),
+            self.capec.cwe_filter.clone(),
         ));
-        self.show_capec_filter = true;
+        self.capec.show_filter = true;
     }
 
     pub(super) fn open_capec_taxonomy(&mut self, db: Option<CveDatabase>) {
-        self.show_capec_taxonomy = true;
-        self.capec_taxonomy_scroll = 0;
-        self.capec_taxonomy_selected = 0;
-        self.capec_taxonomy = None;
-        if let Some(task) = self.capec_detail_task.take() {
+        self.capec.show_taxonomy = true;
+        self.capec.taxonomy_scroll = 0;
+        self.capec.taxonomy_selected = 0;
+        self.capec.taxonomy = None;
+        if let Some(task) = self.tasks.capec_detail.take() {
             task.abort();
         }
         let Some((db, id)) = db.zip(self.selected_capec().map(|entry| entry.id)) else {
             return;
         };
-        self.capec_detail_task = Some(tokio::spawn(async move {
+        self.tasks.capec_detail = Some(tokio::spawn(async move {
             db.find_capec(id)
                 .await
                 .map_err(|error| format!("failed to load CAPEC-{id} classifications: {error}"))
@@ -1435,27 +1295,27 @@ impl App {
     }
 
     pub(super) fn apply_capec_filter(&mut self, db: Option<CveDatabase>) {
-        self.capec_filter_before_popup = None;
-        self.show_capec_filter = false;
+        self.overlay.snapshots.capec_filter = None;
+        self.capec.show_filter = false;
         self.start_capec_search(db);
     }
 
     pub(super) fn cancel_capec_filter(&mut self) {
-        if let Some((status, abstraction, cwe)) = self.capec_filter_before_popup.take() {
-            self.capec_status_filter = status;
-            self.capec_type_filter = abstraction;
-            self.capec_cwe_filter = cwe;
+        if let Some((status, abstraction, cwe)) = self.overlay.snapshots.capec_filter.take() {
+            self.capec.status_filter = status;
+            self.capec.type_filter = abstraction;
+            self.capec.cwe_filter = cwe;
         }
-        self.show_capec_filter = false;
+        self.capec.show_filter = false;
     }
 
     pub(super) fn push_cwe_query(&mut self, ch: char, db: Option<CveDatabase>) {
-        self.cwe_query.push(ch);
+        self.cwe.query.push(ch);
         self.start_cwe_search(db);
     }
 
     pub(super) fn backspace_cwe_query(&mut self, db: Option<CveDatabase>) {
-        self.cwe_query.pop();
+        self.cwe.query.pop();
         self.start_cwe_search(db);
     }
 
@@ -1463,7 +1323,7 @@ impl App {
         CWE_STATUSES
             .iter()
             .enumerate()
-            .filter_map(|(index, status)| self.cwe_status_filter[index].then_some(status.label()))
+            .filter_map(|(index, status)| self.cwe.status_filter[index].then_some(status.label()))
             .collect()
     }
 
@@ -1477,59 +1337,59 @@ impl App {
     }
 
     pub(super) fn open_cwe_status_popup(&mut self) {
-        self.cwe_filter_before_popup =
-            Some((self.cwe_status_filter, self.cwe_capec_filter.clone()));
-        self.show_cwe_status = true;
+        self.overlay.snapshots.cwe_filter =
+            Some((self.cwe.status_filter, self.cwe.capec_filter.clone()));
+        self.cwe.show_status = true;
     }
 
     pub(super) fn cancel_cwe_status_popup(&mut self) {
-        if let Some((statuses, capec)) = self.cwe_filter_before_popup.take() {
-            self.cwe_status_filter = statuses;
-            self.cwe_capec_filter = capec;
+        if let Some((statuses, capec)) = self.overlay.snapshots.cwe_filter.take() {
+            self.cwe.status_filter = statuses;
+            self.cwe.capec_filter = capec;
         }
-        self.show_cwe_status = false;
+        self.cwe.show_status = false;
     }
 
     pub(super) fn apply_cwe_filters(&mut self, db: Option<CveDatabase>) {
-        self.cwe_filter_before_popup = None;
-        self.show_cwe_status = false;
+        self.overlay.snapshots.cwe_filter = None;
+        self.cwe.show_status = false;
         self.start_cwe_search(db);
     }
 
     pub(super) fn next_cwe_status(&mut self) {
-        self.cwe_status_cursor = (self.cwe_status_cursor + 1) % CWE_STATUS_CONTROL_COUNT;
+        self.cwe.status_cursor = (self.cwe.status_cursor + 1) % CWE_STATUS_CONTROL_COUNT;
     }
 
     pub(super) fn previous_cwe_status(&mut self) {
-        self.cwe_status_cursor = if self.cwe_status_cursor == 0 {
+        self.cwe.status_cursor = if self.cwe.status_cursor == 0 {
             CWE_STATUS_CONTROL_COUNT - 1
         } else {
-            self.cwe_status_cursor - 1
+            self.cwe.status_cursor - 1
         };
     }
 
     pub(super) fn toggle_current_cwe_status(&mut self) {
-        match self.cwe_status_cursor {
+        match self.cwe.status_cursor {
             0..CWE_STATUS_COUNT => {
-                self.cwe_status_filter[self.cwe_status_cursor] =
-                    !self.cwe_status_filter[self.cwe_status_cursor];
+                self.cwe.status_filter[self.cwe.status_cursor] =
+                    !self.cwe.status_filter[self.cwe.status_cursor];
             }
-            CWE_STATUS_SELECT_ALL_CURSOR => self.cwe_status_filter = [true; CWE_STATUS_COUNT],
-            CWE_STATUS_CLEAR_ALL_CURSOR => self.cwe_status_filter = [false; CWE_STATUS_COUNT],
+            CWE_STATUS_SELECT_ALL_CURSOR => self.cwe.status_filter = [true; CWE_STATUS_COUNT],
+            CWE_STATUS_CLEAR_ALL_CURSOR => self.cwe.status_filter = [false; CWE_STATUS_COUNT],
             _ => {}
         }
     }
 
     pub(super) fn select_all_cwe_statuses(&mut self) {
-        self.cwe_status_filter = [true; CWE_STATUS_COUNT];
+        self.cwe.status_filter = [true; CWE_STATUS_COUNT];
     }
 
     pub(super) fn clear_all_cwe_statuses(&mut self) {
-        self.cwe_status_filter = [false; CWE_STATUS_COUNT];
+        self.cwe.status_filter = [false; CWE_STATUS_COUNT];
     }
 
     pub(super) fn activate_cwe_status_control(&mut self) -> bool {
-        match self.cwe_status_cursor {
+        match self.cwe.status_cursor {
             CWE_STATUS_SELECT_ALL_CURSOR => {
                 self.select_all_cwe_statuses();
                 true
@@ -1543,35 +1403,35 @@ impl App {
     }
 
     pub(super) fn push_cwe_capec_filter(&mut self, ch: char) {
-        self.cwe_capec_filter.push(ch);
+        self.cwe.capec_filter.push(ch);
     }
 
     pub(super) fn backspace_cwe_capec_filter(&mut self) {
-        self.cwe_capec_filter.pop();
+        self.cwe.capec_filter.pop();
     }
 
     pub(super) fn selected_cwe(&self) -> Option<&CweEntry> {
-        self.cwe_results.get(self.cwe_selected)
+        self.cwe.results.get(self.cwe.selected)
     }
 
     pub(super) fn start_detail_search(&mut self) {
-        self.detail_search_input = true;
-        self.detail_search_error = None;
+        self.overlay.detail_search_input = true;
+        self.overlay.detail_search_error = None;
     }
 
     pub(super) fn close_detail_search(&mut self) {
-        self.detail_search_input = false;
-        self.detail_search_error = None;
+        self.overlay.detail_search_input = false;
+        self.overlay.detail_search_error = None;
     }
 
     pub(super) fn push_detail_search(&mut self, ch: char) {
-        self.detail_search_query.push(ch);
-        self.detail_search_error = None;
+        self.overlay.detail_search_query.push(ch);
+        self.overlay.detail_search_error = None;
     }
 
     pub(super) fn backspace_detail_search(&mut self) {
-        self.detail_search_query.pop();
-        self.detail_search_error = None;
+        self.overlay.detail_search_query.pop();
+        self.overlay.detail_search_error = None;
     }
 
     pub(super) fn set_page_sizes(
@@ -1582,58 +1442,58 @@ impl App {
         detail_width: usize,
         metadata_width: usize,
     ) {
-        self.left_page_size = left.max(MIN_PAGE_SIZE);
-        self.right_page_size = right.max(MIN_PAGE_SIZE);
-        self.metadata_page_size = metadata.max(MIN_PAGE_SIZE);
-        self.detail_content_width = detail_width.max(MIN_PAGE_SIZE);
-        self.metadata_content_width = metadata_width.max(MIN_PAGE_SIZE);
+        self.main.left_page_size = left.max(MIN_PAGE_SIZE);
+        self.main.right_page_size = right.max(MIN_PAGE_SIZE);
+        self.main.metadata_page_size = metadata.max(MIN_PAGE_SIZE);
+        self.main.detail_content_width = detail_width.max(MIN_PAGE_SIZE);
+        self.main.metadata_content_width = metadata_width.max(MIN_PAGE_SIZE);
         self.clamp_detail_scroll();
         self.clamp_metadata_scroll();
     }
 
     pub(super) fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
+        self.main.focus = match self.main.focus {
             PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Left,
         };
     }
 
     pub(super) fn toggle_cwe_focus(&mut self) {
-        self.focus = match self.focus {
+        self.main.focus = match self.main.focus {
             PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Left,
         };
     }
 
     pub(super) fn previous_focus(&mut self) {
-        self.focus = match self.focus {
+        self.main.focus = match self.main.focus {
             PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Left,
         };
     }
 
     pub(super) fn next_right_tab(&mut self) {
-        self.right_tab = if self.selected_osv().is_some() {
-            match self.right_tab {
+        self.main.right_tab = if self.selected_osv().is_some() {
+            match self.main.right_tab {
                 RightPaneTab::Cve | RightPaneTab::Osv => RightPaneTab::Metadata,
                 RightPaneTab::Metadata => RightPaneTab::Enrichment,
                 RightPaneTab::Enrichment => RightPaneTab::Cve,
             }
         } else {
-            self.right_tab.next()
+            self.main.right_tab.next()
         };
         self.reset_main_view_scroll();
     }
 
     pub(super) fn previous_right_tab(&mut self) {
-        self.right_tab = if self.selected_osv().is_some() {
-            match self.right_tab {
+        self.main.right_tab = if self.selected_osv().is_some() {
+            match self.main.right_tab {
                 RightPaneTab::Cve | RightPaneTab::Osv => RightPaneTab::Enrichment,
                 RightPaneTab::Metadata => RightPaneTab::Cve,
                 RightPaneTab::Enrichment => RightPaneTab::Metadata,
             }
         } else {
-            self.right_tab.previous()
+            self.main.right_tab.previous()
         };
         self.reset_main_view_scroll();
     }
@@ -1641,34 +1501,35 @@ impl App {
     pub(super) fn next_or_load_more(&mut self, db: CveDatabase) {
         let candidate_count = self.candidate_count();
         if candidate_count == 0 {
-            self.list_state.select(None);
+            self.main.list_state.select(None);
             return;
         }
-        let current = self.list_state.selected().unwrap_or(0);
+        let current = self.main.list_state.selected().unwrap_or(0);
         if current + 1 >= candidate_count {
             self.start_load_more(db);
             return;
         }
         let next = self
+            .main
             .list_state
             .selected()
             .map(|index| (index + 1).min(candidate_count - 1))
             .unwrap_or(0);
         if next != current {
-            self.list_state.select(Some(next));
+            self.main.list_state.select(Some(next));
             self.reset_main_view_scroll();
         }
     }
 
     pub(super) fn move_focused_down(&mut self, db: CveDatabase) {
-        match self.focus {
+        match self.main.focus {
             PaneFocus::Left => self.next_or_load_more(db),
             PaneFocus::Right => {
-                if self.right_tab == RightPaneTab::Cve {
-                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                if self.main.right_tab == RightPaneTab::Cve {
+                    self.main.detail_scroll = self.main.detail_scroll.saturating_add(1);
                     self.clamp_detail_scroll();
                 } else {
-                    self.metadata_scroll = self.metadata_scroll.saturating_add(1);
+                    self.main.metadata_scroll = self.main.metadata_scroll.saturating_add(1);
                     self.clamp_metadata_scroll();
                 }
             }
@@ -1676,14 +1537,14 @@ impl App {
     }
 
     pub(super) fn move_focused_up(&mut self) {
-        match self.focus {
+        match self.main.focus {
             PaneFocus::Left => self.previous(),
             PaneFocus::Right => {
-                if self.right_tab == RightPaneTab::Cve {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                if self.main.right_tab == RightPaneTab::Cve {
+                    self.main.detail_scroll = self.main.detail_scroll.saturating_sub(1);
                     self.clamp_detail_scroll();
                 } else {
-                    self.metadata_scroll = self.metadata_scroll.saturating_sub(1);
+                    self.main.metadata_scroll = self.main.metadata_scroll.saturating_sub(1);
                     self.clamp_metadata_scroll();
                 }
             }
@@ -1708,72 +1569,76 @@ impl App {
 
     pub(super) fn previous(&mut self) {
         if self.candidate_count() == 0 {
-            self.list_state.select(None);
+            self.main.list_state.select(None);
             return;
         }
         let previous = self
+            .main
             .list_state
             .selected()
             .map(|index| index.saturating_sub(1))
             .unwrap_or(0);
-        if self.list_state.selected() != Some(previous) {
-            self.list_state.select(Some(previous));
+        if self.main.list_state.selected() != Some(previous) {
+            self.main.list_state.select(Some(previous));
             self.reset_main_view_scroll();
         }
     }
 
     pub(super) fn scroll_detail_to_top(&mut self) {
-        self.detail_scroll = 0;
+        self.main.detail_scroll = 0;
     }
 
     pub(super) fn next_search_mode(&mut self) {
-        self.search_mode = self.search_mode.next();
-        self.search_mode_explicit = true;
+        self.main.search_mode = self.main.search_mode.next();
+        self.main.search_mode_explicit = true;
         self.sync_advanced_from_main();
     }
 
     pub(super) fn previous_search_mode(&mut self) {
-        self.search_mode = self.search_mode.previous();
-        self.search_mode_explicit = true;
+        self.main.search_mode = self.main.search_mode.previous();
+        self.main.search_mode_explicit = true;
         self.sync_advanced_from_main();
     }
 
     pub(super) fn push_query(&mut self, ch: char) {
-        self.query.push(ch);
+        self.main.query.push(ch);
         self.scroll_detail_to_top();
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
     }
 
     pub(super) fn backspace_query(&mut self) {
-        self.query.pop();
+        self.main.query.pop();
         self.scroll_detail_to_top();
         self.apply_prefix_mode();
         self.sync_advanced_from_main();
     }
 
     pub(super) fn move_raw_down(&mut self, line_count: usize, page_size: usize) {
-        self.raw_scroll = self.raw_scroll.saturating_add(1);
-        self.raw_scroll = self
-            .raw_scroll
+        self.raw.scroll = self.raw.scroll.saturating_add(1);
+        self.raw.scroll = self
+            .raw
+            .scroll
             .min(line_count.saturating_sub(page_size.max(MIN_PAGE_SIZE)) as u16);
     }
 
     pub(super) fn move_raw_up(&mut self) {
-        self.raw_scroll = self.raw_scroll.saturating_sub(1);
+        self.raw.scroll = self.raw.scroll.saturating_sub(1);
     }
 
     pub(super) fn move_raw_page_down(&mut self, line_count: usize, page_size: usize) {
         let page_size = page_size.max(MIN_PAGE_SIZE);
-        self.raw_scroll = self
-            .raw_scroll
+        self.raw.scroll = self
+            .raw
+            .scroll
             .saturating_add(page_size as u16)
             .min(line_count.saturating_sub(page_size) as u16);
     }
 
     pub(super) fn move_raw_page_up(&mut self, page_size: usize) {
-        self.raw_scroll = self
-            .raw_scroll
+        self.raw.scroll = self
+            .raw
+            .scroll
             .saturating_sub(page_size.max(MIN_PAGE_SIZE) as u16);
     }
 
@@ -1810,29 +1675,30 @@ impl App {
     }
 
     pub(super) fn move_cwe_to_parent(&mut self, page_size: usize) {
-        self.cwe_relation_return_id = None;
+        self.cwe.relation_return_id = None;
         let Some(selected) = self.selected_cwe() else {
             return;
         };
         let Some(parent_id) = selected.parent_id else {
-            self.status_message = Some("selected CWE has no parent".to_owned());
+            self.overlay.status_message = Some("selected CWE has no parent".to_owned());
             return;
         };
         let return_id = selected.id;
         if !self.select_cwe_by_id(parent_id, page_size) {
-            self.status_message = Some(format!("parent CWE-{parent_id} is not in current results"));
+            self.overlay.status_message =
+                Some(format!("parent CWE-{parent_id} is not in current results"));
             return;
         }
-        self.cwe_relation_return_id = Some(return_id);
+        self.cwe.relation_return_id = Some(return_id);
     }
 
     pub(super) fn move_cwe_to_relation_return(&mut self, page_size: usize) {
-        let Some(return_id) = self.cwe_relation_return_id.take() else {
-            self.status_message = Some("no CWE relation return target".to_owned());
+        let Some(return_id) = self.cwe.relation_return_id.take() else {
+            self.overlay.status_message = Some("no CWE relation return target".to_owned());
             return;
         };
         if !self.select_cwe_by_id(return_id, page_size) {
-            self.status_message = Some(format!(
+            self.overlay.status_message = Some(format!(
                 "return target CWE-{return_id} is not in current results"
             ));
         }
@@ -1843,17 +1709,18 @@ impl App {
             return;
         };
         let sibling_id = self
-            .cwe_results
+            .cwe
+            .results
             .iter()
             .filter(|cwe| cwe.parent_id == selected.parent_id && cwe.id < selected.id)
             .map(|cwe| cwe.id)
             .max();
         let Some(sibling_id) = sibling_id else {
-            self.status_message =
+            self.overlay.status_message =
                 Some("selected CWE has no previous sibling in current results".to_owned());
             return;
         };
-        self.cwe_relation_return_id = None;
+        self.cwe.relation_return_id = None;
         self.select_cwe_by_id(sibling_id, page_size);
     }
 
@@ -1862,122 +1729,128 @@ impl App {
             return;
         };
         let sibling_id = self
-            .cwe_results
+            .cwe
+            .results
             .iter()
             .filter(|cwe| cwe.parent_id == selected.parent_id && cwe.id > selected.id)
             .map(|cwe| cwe.id)
             .min();
         let Some(sibling_id) = sibling_id else {
-            self.status_message =
+            self.overlay.status_message =
                 Some("selected CWE has no next sibling in current results".to_owned());
             return;
         };
-        self.cwe_relation_return_id = None;
+        self.cwe.relation_return_id = None;
         self.select_cwe_by_id(sibling_id, page_size);
     }
 
     fn select_cwe_by_id(&mut self, id: i32, page_size: usize) -> bool {
-        let Some(index) = self.cwe_results.iter().position(|cwe| cwe.id == id) else {
+        let Some(index) = self.cwe.results.iter().position(|cwe| cwe.id == id) else {
             return false;
         };
-        self.cwe_selected = index;
+        self.cwe.selected = index;
         self.scroll_cwe_selection_into_view(page_size);
-        self.cwe_detail_scroll = 0;
-        self.status_message = None;
+        self.cwe.detail_scroll = 0;
+        self.overlay.status_message = None;
         true
     }
 
     fn move_cwe_page(&mut self, direction: PageDirection, step: usize, page_size: usize) {
-        if self.cwe_results.is_empty() {
-            self.cwe_selected = 0;
-            self.cwe_scroll = 0;
-            self.cwe_detail_scroll = 0;
+        if self.cwe.results.is_empty() {
+            self.cwe.selected = 0;
+            self.cwe.scroll = 0;
+            self.cwe.detail_scroll = 0;
             return;
         }
 
-        self.cwe_selected = match direction {
-            PageDirection::Up => self.cwe_selected.saturating_sub(step),
+        self.cwe.selected = match direction {
+            PageDirection::Up => self.cwe.selected.saturating_sub(step),
             PageDirection::Down => self
-                .cwe_selected
+                .cwe
+                .selected
                 .saturating_add(step)
-                .min(self.cwe_results.len() - 1),
+                .min(self.cwe.results.len() - 1),
         };
         self.scroll_cwe_selection_into_view(page_size);
-        self.cwe_detail_scroll = 0;
-        self.cwe_relation_return_id = None;
+        self.cwe.detail_scroll = 0;
+        self.cwe.relation_return_id = None;
     }
 
     fn scroll_cwe_selection_into_view(&mut self, page_size: usize) {
         let page_size = page_size.max(MIN_PAGE_SIZE);
-        if self.cwe_selected < self.cwe_scroll as usize {
-            self.cwe_scroll = self.cwe_selected as u16;
-        } else if self.cwe_selected >= self.cwe_scroll as usize + page_size {
-            self.cwe_scroll =
-                self.cwe_selected
+        if self.cwe.selected < self.cwe.scroll as usize {
+            self.cwe.scroll = self.cwe.selected as u16;
+        } else if self.cwe.selected >= self.cwe.scroll as usize + page_size {
+            self.cwe.scroll =
+                self.cwe
+                    .selected
                     .saturating_sub(page_size - 1)
-                    .min(self.cwe_results.len().saturating_sub(page_size)) as u16;
+                    .min(self.cwe.results.len().saturating_sub(page_size)) as u16;
         }
         self.clamp_cwe_scroll(page_size);
     }
 
     fn clamp_cwe_scroll(&mut self, page_size: usize) {
         let page_size = page_size.max(MIN_PAGE_SIZE);
-        let max_scroll = self.cwe_results.len().saturating_sub(page_size) as u16;
-        self.cwe_scroll = self.cwe_scroll.min(max_scroll);
+        let max_scroll = self.cwe.results.len().saturating_sub(page_size) as u16;
+        self.cwe.scroll = self.cwe.scroll.min(max_scroll);
     }
 
     pub(super) fn move_cwe_detail_down(&mut self, line_count: usize, page_size: usize) {
         let page_size = page_size.max(MIN_PAGE_SIZE);
-        self.cwe_detail_scroll = self
-            .cwe_detail_scroll
+        self.cwe.detail_scroll = self
+            .cwe
+            .detail_scroll
             .saturating_add(1)
             .min(line_count.saturating_sub(page_size) as u16);
     }
 
     pub(super) fn move_cwe_detail_up(&mut self) {
-        self.cwe_detail_scroll = self.cwe_detail_scroll.saturating_sub(1);
+        self.cwe.detail_scroll = self.cwe.detail_scroll.saturating_sub(1);
     }
 
     pub(super) fn move_cwe_detail_page_down(&mut self, line_count: usize, page_size: usize) {
         let page_size = page_size.max(MIN_PAGE_SIZE);
-        self.cwe_detail_scroll = self
-            .cwe_detail_scroll
+        self.cwe.detail_scroll = self
+            .cwe
+            .detail_scroll
             .saturating_add(page_size as u16)
             .min(line_count.saturating_sub(page_size) as u16);
     }
 
     pub(super) fn move_cwe_detail_page_up(&mut self, page_size: usize) {
-        self.cwe_detail_scroll = self
-            .cwe_detail_scroll
+        self.cwe.detail_scroll = self
+            .cwe
+            .detail_scroll
             .saturating_sub(page_size.max(MIN_PAGE_SIZE) as u16);
     }
 
     pub(super) fn sync_main_from_advanced(&mut self) {
-        self.query = self.advanced.query.clone();
-        self.search_mode = self.advanced.query_mode;
-        self.search_mode_explicit = true;
-        self.state_scope = self.advanced.state_scope;
+        self.main.query = self.main.advanced.query.clone();
+        self.main.search_mode = self.main.advanced.query_mode;
+        self.main.search_mode_explicit = true;
+        self.main.state_scope = self.main.advanced.state_scope;
         self.scroll_detail_to_top();
     }
 
     pub(super) fn sync_advanced_from_main(&mut self) {
-        self.advanced.query = self.query.clone();
-        self.advanced.query_mode = self.search_mode;
-        self.advanced.state_scope = self.state_scope;
+        self.main.advanced.query = self.main.query.clone();
+        self.main.advanced.query_mode = self.main.search_mode;
+        self.main.advanced.state_scope = self.main.state_scope;
     }
 
     pub(super) fn apply_prefix_mode(&mut self) {
-        if self.search_mode_explicit {
+        if self.main.search_mode_explicit {
             return;
         }
-        self.search_mode =
-            SearchMode::from_query_prefix(&self.query).unwrap_or(SearchMode::FreeText);
+        self.main.search_mode =
+            SearchMode::from_query_prefix(&self.main.query).unwrap_or(SearchMode::FreeText);
     }
 
     fn main_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
         CveAdvancedSearch {
-            query: option_string(&self.query),
-            query_mode: Some(self.search_mode.into()),
+            query: option_string(&self.main.query),
+            query_mode: Some(self.main.search_mode.into()),
             published_from: None,
             published_to: None,
             cwe: None,
@@ -1987,8 +1860,8 @@ impl App {
             package_version: None,
             vendor: None,
             vendor_exact: None,
-            kev_only: self.display.kev_only,
-            state_scope: self.state_scope,
+            kev_only: self.main.display.kev_only,
+            state_scope: self.main.state_scope,
             sort_order,
         }
     }
@@ -1999,12 +1872,12 @@ impl App {
         request: SearchRequest,
         error_prefix: &str,
     ) {
-        self.exhausted = false;
-        self.total_results = None;
+        self.main.exhausted = false;
+        self.main.total_results = None;
         self.start_pending_search(
             db,
             request,
-            self.limit,
+            self.main.limit,
             0,
             SearchKind::Replace,
             error_prefix,
@@ -2021,7 +1894,7 @@ impl App {
         error_prefix: &str,
     ) {
         self.abort_search();
-        self.status_message = None;
+        self.overlay.status_message = None;
         self.arm_search_timeout();
         let count = (matches!(&kind, SearchKind::Replace) && request.should_count()).then(|| {
             PendingCount {
@@ -2030,9 +1903,9 @@ impl App {
             }
         });
         let continuation =
-            matches!(&kind, SearchKind::Append { .. }).then_some(self.search_continuation);
+            matches!(&kind, SearchKind::Append { .. }).then_some(self.main.search_continuation);
         let error_prefix = error_prefix.to_owned();
-        self.search = Some(PendingSearch {
+        self.tasks.search = Some(PendingSearch {
             kind,
             count,
             timed_out_once: false,
@@ -2048,65 +1921,68 @@ impl App {
     }
 
     fn start_cwe_search(&mut self, db: Option<CveDatabase>) {
-        if let Some(task) = self.cwe_task.take() {
+        if let Some(task) = self.tasks.cwe.take() {
             task.abort();
         }
-        self.cwe_scroll = 0;
-        self.cwe_relation_return_id = None;
+        self.cwe.scroll = 0;
+        self.cwe.relation_return_id = None;
         let Some(db) = db else {
-            self.status_message = Some("database is unavailable".to_owned());
-            self.cwe_results.clear();
+            self.overlay.status_message = Some("database is unavailable".to_owned());
+            self.cwe.results.clear();
             return;
         };
-        let query = self.cwe_query.clone();
+        let query = self.cwe.query.clone();
         let statuses = self
             .selected_cwe_status_labels()
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
         let capec_id = self
-            .cwe_capec_filter
+            .cwe
+            .capec_filter
             .trim()
             .trim_start_matches("CAPEC-")
             .parse()
             .ok();
-        self.cwe_task = Some(tokio::spawn(search_cwe_entries(
+        self.tasks.cwe = Some(tokio::spawn(search_cwe_entries(
             db, query, statuses, capec_id,
         )));
     }
 
     fn start_capec_search(&mut self, db: Option<CveDatabase>) {
-        if !self.capec_catalog.is_empty() {
+        if !self.capec.catalog.is_empty() {
             self.apply_capec_filters();
             return;
         }
-        if self.capec_task.is_some() {
+        if self.tasks.capec.is_some() {
             return;
         }
         let Some(db) = db else {
-            self.capec_results.clear();
-            self.capec_tree_paths.clear();
-            self.capec_tree_prefixes.clear();
+            self.capec.results.clear();
+            self.capec.tree_paths.clear();
+            self.capec.tree_prefixes.clear();
             return;
         };
-        self.capec_task = Some(tokio::spawn(search_capec_entries(
+        self.tasks.capec = Some(tokio::spawn(search_capec_entries(
             db,
             CapecSearchFilters::default(),
         )));
     }
 
     fn apply_capec_filters(&mut self) {
-        let query = self.capec_query.trim().to_ascii_lowercase();
-        let status = self.capec_status_filter.trim();
-        let abstraction = self.capec_type_filter.trim();
+        let query = self.capec.query.trim().to_ascii_lowercase();
+        let status = self.capec.status_filter.trim();
+        let abstraction = self.capec.type_filter.trim();
         let cwe_id = self
-            .capec_cwe_filter
+            .capec
+            .cwe_filter
             .trim()
             .trim_start_matches("CWE-")
             .parse::<i32>()
             .ok();
         let matched = self
-            .capec_catalog
+            .capec
+            .catalog
             .iter()
             .filter(|entry| {
                 (query.is_empty()
@@ -2125,32 +2001,32 @@ impl App {
             })
             .map(|entry| entry.id)
             .collect::<HashSet<_>>();
-        let tree = filter_capec_tree(project_capec_tree(self.capec_catalog.clone()), &matched);
-        self.capec_results = tree.entries;
-        self.capec_tree_paths = tree.paths;
-        self.capec_tree_prefixes = tree.prefixes;
-        self.capec_scroll = 0;
-        self.capec_selected = 0;
-        self.capec_detail_scroll = 0;
-        self.capec_relation_return_path = None;
+        let tree = filter_capec_tree(project_capec_tree(self.capec.catalog.clone()), &matched);
+        self.capec.results = tree.entries;
+        self.capec.tree_paths = tree.paths;
+        self.capec.tree_prefixes = tree.prefixes;
+        self.capec.scroll = 0;
+        self.capec.selected = 0;
+        self.capec.detail_scroll = 0;
+        self.capec.relation_return_path = None;
     }
 
     fn move_focused_page(&mut self, db: CveDatabase, direction: PageDirection, amount: PageAmount) {
-        match self.focus {
+        match self.main.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, Some(db)),
             PaneFocus::Right => self.move_right_page(direction, amount),
         }
     }
 
     fn move_focused_page_without_db(&mut self, direction: PageDirection, amount: PageAmount) {
-        match self.focus {
+        match self.main.focus {
             PaneFocus::Left => self.move_candidate_page(direction, amount, None),
             PaneFocus::Right => self.move_right_page(direction, amount),
         }
     }
 
     fn move_right_page(&mut self, direction: PageDirection, amount: PageAmount) {
-        if self.right_tab == RightPaneTab::Cve {
+        if self.main.right_tab == RightPaneTab::Cve {
             self.move_detail_page(direction, amount);
         } else {
             self.move_metadata_page(direction, amount);
@@ -2165,18 +2041,18 @@ impl App {
     ) {
         let candidate_count = self.candidate_count();
         if candidate_count == 0 {
-            self.list_state.select(None);
+            self.main.list_state.select(None);
             return;
         }
 
-        let current = self.list_state.selected().unwrap_or(0);
+        let current = self.main.list_state.selected().unwrap_or(0);
         let step = self.left_step(amount);
         let next = match direction {
             PageDirection::Up => current.saturating_sub(step),
             PageDirection::Down => current.saturating_add(step).min(candidate_count - 1),
         };
         if next != current {
-            self.list_state.select(Some(next));
+            self.main.list_state.select(Some(next));
             self.reset_main_view_scroll();
         }
         if matches!(direction, PageDirection::Down)
@@ -2189,152 +2065,73 @@ impl App {
 
     fn move_detail_page(&mut self, direction: PageDirection, amount: PageAmount) {
         let step = self.right_step(amount) as u16;
-        self.detail_scroll = match direction {
-            PageDirection::Up => self.detail_scroll.saturating_sub(step),
-            PageDirection::Down => self.detail_scroll.saturating_add(step),
+        self.main.detail_scroll = match direction {
+            PageDirection::Up => self.main.detail_scroll.saturating_sub(step),
+            PageDirection::Down => self.main.detail_scroll.saturating_add(step),
         };
         self.clamp_detail_scroll();
     }
 
     fn move_metadata_page(&mut self, direction: PageDirection, amount: PageAmount) {
         let step = self.metadata_step(amount) as u16;
-        self.metadata_scroll = match direction {
-            PageDirection::Up => self.metadata_scroll.saturating_sub(step),
-            PageDirection::Down => self.metadata_scroll.saturating_add(step),
+        self.main.metadata_scroll = match direction {
+            PageDirection::Up => self.main.metadata_scroll.saturating_sub(step),
+            PageDirection::Down => self.main.metadata_scroll.saturating_add(step),
         };
         self.clamp_metadata_scroll();
     }
 
     pub(super) fn clamp_detail_scroll(&mut self) {
-        self.detail_scroll = self.detail_scroll.min(self.max_detail_scroll());
+        self.main.detail_scroll = self.main.detail_scroll.min(self.max_detail_scroll());
     }
 
     pub(super) fn clamp_metadata_scroll(&mut self) {
-        self.metadata_scroll = self.metadata_scroll.min(self.max_metadata_scroll());
+        self.main.metadata_scroll = self.main.metadata_scroll.min(self.max_metadata_scroll());
     }
 
     fn max_detail_scroll(&self) -> u16 {
         let line_count = if let Some(cve) = self.selected() {
             Paragraph::new(crate::modes::main::detail::detail_lines(
                 cve,
-                self.display.timezone,
+                self.main.display.timezone,
                 &crate::common::DetailSearch::new(""),
-                self.detail_content_width,
+                self.main.detail_content_width,
             ))
             .wrap(Wrap { trim: false })
-            .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
+            .line_count(self.main.detail_content_width.min(u16::MAX as usize) as u16)
         } else if let Some(osv) = self.selected_osv() {
             Paragraph::new(crate::modes::main::detail::osv_detail_lines(
                 osv,
-                self.display.timezone,
+                self.main.display.timezone,
                 &crate::common::DetailSearch::new(""),
-                self.detail_content_width,
+                self.main.detail_content_width,
             ))
             .wrap(Wrap { trim: false })
-            .line_count(self.detail_content_width.min(u16::MAX as usize) as u16)
+            .line_count(self.main.detail_content_width.min(u16::MAX as usize) as u16)
         } else {
             1
         };
-        line_count.saturating_sub(self.right_page_size) as u16
+        line_count.saturating_sub(self.main.right_page_size) as u16
     }
 
     fn max_metadata_scroll(&self) -> u16 {
-        let line_count = match self.right_tab {
-            RightPaneTab::Cve => 1,
-            RightPaneTab::Osv => Paragraph::new(crate::modes::main::right::osv_lines(
+        let line_count = if self.main.right_tab == RightPaneTab::Cve {
+            1
+        } else {
+            Paragraph::new(crate::modes::main::right::tab_lines(
                 self,
+                self.main.right_tab,
                 &crate::common::DetailSearch::new(""),
-                self.metadata_content_width,
+                self.main.metadata_content_width,
             ))
-            .wrap(Wrap { trim: false })
-            .line_count(self.metadata_content_width.min(u16::MAX as usize) as u16),
-            RightPaneTab::Metadata => {
-                if let Some(cve) = self.selected() {
-                    metadata_line_count(
-                        cve,
-                        self.metadata_capec_ids
-                            .get(&cve.summary.cve_id)
-                            .map(Vec::as_slice),
-                        self.metadata_content_width,
-                    )
-                } else if let Some(osv) = self.selected_osv() {
-                    osv_metadata_line_count(osv, self.metadata_content_width)
-                } else {
-                    1
-                }
-            }
-            RightPaneTab::Enrichment => self.enrichment_line_count(),
+            .wrap(Wrap { trim: true })
+            .line_count(self.main.metadata_content_width.min(u16::MAX as usize) as u16)
         };
-        line_count.saturating_sub(self.metadata_page_size) as u16
-    }
-
-    fn enrichment_line_count(&self) -> usize {
-        let Some(cve) = self.selected() else {
-            return self.selected_osv().map_or(1, |_| 3);
-        };
-        let Some(enrichment) = self.enrichment.get(&cve.summary.cve_id) else {
-            return 3;
-        };
-        let width = self.metadata_content_width;
-        let mut lines = vec![
-            format!("Identifier: {}", enrichment.cve_id),
-            String::new(),
-            "Priority".to_owned(),
-        ];
-        lines.push(format!(
-            "  KEV: {}",
-            if enrichment.kev_listed {
-                "listed"
-            } else {
-                "not listed"
-            }
-        ));
-        lines.push(match (enrichment.epss, enrichment.epss_percentile) {
-            (Some(epss), Some(percentile)) => format!(
-                "  EPSS: score={epss:.5} percentile={percentile:.5} date={} model={}",
-                enrichment.epss_score_date.as_deref().unwrap_or("-"),
-                enrichment.epss_model_version.as_deref().unwrap_or("-")
-            ),
-            _ => "  EPSS: not synced".to_owned(),
-        });
-        if enrichment.kev_listed {
-            lines.push(format!(
-                "  KEV due={} ransomware={}",
-                enrichment.kev_due_date.as_deref().unwrap_or("-"),
-                enrichment
-                    .kev_known_ransomware_campaign_use
-                    .as_deref()
-                    .unwrap_or("-")
-            ));
-        }
-        let aliases = summary_values(&enrichment.aliases);
-        let osv_summaries = summary_values(&enrichment.osv_summaries);
-        let packages = summary_values(&enrichment.affected_packages);
-        append_summary_section(&mut lines, "Aliases", &aliases);
-        append_summary_section(&mut lines, "OSV Advisories", &osv_summaries);
-        append_summary_section(&mut lines, "Affected Packages", &packages);
-        lines.push(String::new());
-        lines.push("Evidence".to_owned());
-        if !aliases.is_empty() {
-            lines.push("  alias_resolution source=OSV aliases".to_owned());
-        }
-        if enrichment.kev_listed {
-            lines.push("  kev_join source=CISA KEV".to_owned());
-        }
-        if enrichment.epss.is_some() {
-            lines.push("  epss_join source=FIRST EPSS".to_owned());
-        }
-        if aliases.is_empty() && !enrichment.kev_listed && enrichment.epss.is_none() {
-            lines.push("  none".to_owned());
-        }
-        lines
-            .iter()
-            .map(|line| wrapped_line_count(line, width))
-            .sum()
+        line_count.saturating_sub(self.main.metadata_page_size) as u16
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {
-        let visible_candidates = (self.left_page_size / 2).max(MIN_PAGE_SIZE);
+        let visible_candidates = (self.main.left_page_size / 2).max(MIN_PAGE_SIZE);
         match amount {
             PageAmount::Half => (visible_candidates / 2).max(MIN_PAGE_SIZE),
             PageAmount::Full => visible_candidates,
@@ -2343,27 +2140,27 @@ impl App {
 
     fn right_step(&self, amount: PageAmount) -> usize {
         match amount {
-            PageAmount::Half => (self.right_page_size / 2).max(MIN_PAGE_SIZE),
-            PageAmount::Full => self.right_page_size.max(MIN_PAGE_SIZE),
+            PageAmount::Half => (self.main.right_page_size / 2).max(MIN_PAGE_SIZE),
+            PageAmount::Full => self.main.right_page_size.max(MIN_PAGE_SIZE),
         }
     }
 
     fn metadata_step(&self, amount: PageAmount) -> usize {
         match amount {
-            PageAmount::Half => (self.metadata_page_size / 2).max(MIN_PAGE_SIZE),
-            PageAmount::Full => self.metadata_page_size.max(MIN_PAGE_SIZE),
+            PageAmount::Half => (self.main.metadata_page_size / 2).max(MIN_PAGE_SIZE),
+            PageAmount::Full => self.main.metadata_page_size.max(MIN_PAGE_SIZE),
         }
     }
 
     fn clear_detail(&mut self) {
-        self.detail_scroll = 0;
-        self.metadata_scroll = 0;
-        self.enrichment.clear();
-        if let Some(task) = self.enrichment_task.take() {
+        self.main.detail_scroll = 0;
+        self.main.metadata_scroll = 0;
+        self.main.enrichment.clear();
+        if let Some(task) = self.tasks.enrichment.take() {
             task.handle.abort();
         }
-        self.metadata_capec_ids.clear();
-        if let Some(task) = self.metadata_capec_task.take() {
+        self.main.metadata_capec_ids.clear();
+        if let Some(task) = self.tasks.metadata_capec.take() {
             task.handle.abort();
         }
     }
@@ -2371,56 +2168,58 @@ impl App {
     fn select_candidate(&mut self, index: usize) {
         let candidate_count = self.candidate_count();
         if candidate_count == 0 {
-            self.list_state.select(None);
+            self.main.list_state.select(None);
         } else {
-            self.list_state.select(Some(index.min(candidate_count - 1)));
+            self.main
+                .list_state
+                .select(Some(index.min(candidate_count - 1)));
         }
         self.reset_main_view_scroll();
     }
 
     fn reset_main_view_scroll(&mut self) {
-        self.detail_scroll = 0;
-        self.metadata_scroll = 0;
+        self.main.detail_scroll = 0;
+        self.main.metadata_scroll = 0;
     }
 
     fn finish_failed_search(&mut self, message: String) {
-        self.search_started_at = None;
-        self.search_timeout_at = None;
-        self.show_timeout_prompt = false;
-        self.status_message = Some(message);
+        self.tasks.search_started_at = None;
+        self.tasks.search_timeout_at = None;
+        self.overlay.show_timeout_prompt = false;
+        self.overlay.status_message = Some(message);
     }
 
     fn arm_search_timeout(&mut self) {
         let now = Instant::now();
-        self.search_started_at = Some(now);
-        self.search_timeout_at = Some(now + SEARCH_TIMEOUT);
-        self.show_timeout_prompt = false;
-        self.timeout_choice = TimeoutChoice::Continue;
+        self.tasks.search_started_at = Some(now);
+        self.tasks.search_timeout_at = Some(now + SEARCH_TIMEOUT);
+        self.overlay.show_timeout_prompt = false;
+        self.overlay.timeout_choice = TimeoutChoice::Continue;
     }
 
     fn check_search_timeout(&mut self) {
-        let Some(timeout_at) = self.search_timeout_at else {
+        let Some(timeout_at) = self.tasks.search_timeout_at else {
             return;
         };
         if Instant::now() < timeout_at {
             return;
         }
-        let Some(search) = self.search.as_mut() else {
+        let Some(search) = self.tasks.search.as_mut() else {
             return;
         };
         if search.timed_out_once {
             search.handle.abort();
-            self.search = None;
-            self.search_started_at = None;
-            self.search_timeout_at = None;
-            self.show_timeout_prompt = false;
-            self.status_message = Some(format!(
+            self.tasks.search = None;
+            self.tasks.search_started_at = None;
+            self.tasks.search_timeout_at = None;
+            self.overlay.show_timeout_prompt = false;
+            self.overlay.status_message = Some(format!(
                 "search timed out after {} seconds",
                 SEARCH_TIMEOUT.as_secs() * 2
             ));
         } else {
-            self.show_timeout_prompt = true;
-            self.timeout_choice = TimeoutChoice::Continue;
+            self.overlay.show_timeout_prompt = true;
+            self.overlay.timeout_choice = TimeoutChoice::Continue;
         }
     }
 }
@@ -2437,122 +2236,6 @@ enum PageAmount {
     Full,
 }
 
-fn osv_metadata_line_count(osv: &OsvSummary, width: usize) -> usize {
-    [
-        format!("Identifier: {}", osv.osv_id),
-        format!(
-            "Schema version: {}",
-            osv.schema_version.as_deref().unwrap_or("-")
-        ),
-        format!("Published: {}", osv.published_at.as_deref().unwrap_or("-")),
-        format!("Updated: {}", osv.modified_at.as_deref().unwrap_or("-")),
-        format!("Withdrawn: {}", osv.withdrawn_at.as_deref().unwrap_or("-")),
-    ]
-    .iter()
-    .map(|line| wrapped_line_count(line, width))
-    .sum()
-}
-
-fn summary_values(value: &str) -> Vec<&str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect()
-}
-
-fn append_summary_section(lines: &mut Vec<String>, title: &str, values: &[&str]) {
-    lines.push(String::new());
-    lines.push(title.to_owned());
-    if values.is_empty() {
-        lines.push("  none".to_owned());
-    } else {
-        lines.extend(values.iter().map(|value| format!("  {value}")));
-    }
-}
-
-fn metadata_line_count(
-    cve: &CveSummaryWithDetail,
-    capec_ids: Option<&[i32]>,
-    width: usize,
-) -> usize {
-    let detail = &cve.detail;
-    let cwe_lines = detail
-        .cwes
-        .iter()
-        .map(|cwe| {
-            let description = cwe
-                .description
-                .as_deref()
-                .map(normalize_spaces)
-                .unwrap_or_default();
-            wrapped_line_count(&format!("CWE-{} {}", cwe.id, description), width)
-        })
-        .sum::<usize>()
-        .max(1);
-    let capec = match capec_ids {
-        None => "CAPEC: Loading".to_owned(),
-        Some([]) => "CAPEC: -".to_owned(),
-        Some(ids) => format!(
-            "CAPEC: {}",
-            ids.iter()
-                .map(|id| format!("CAPEC-{id}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    let capec_lines = wrapped_line_count(&capec, width);
-    let cvss_lines = detail
-        .cvss
-        .iter()
-        .map(|cvss| {
-            let score = cvss
-                .base_score
-                .map(|score| format!("{score:.1}"))
-                .unwrap_or_else(|| "-".to_owned());
-            let severity = cvss.base_severity.as_deref().unwrap_or("-");
-            let vector = cvss.vector_string.as_deref().unwrap_or("");
-            wrapped_line_count(
-                &format!("{} {} {} {}", cvss.version, score, severity, vector),
-                width,
-            )
-        })
-        .sum::<usize>()
-        .max(1);
-    let affected_lines = detail
-        .affected
-        .iter()
-        .map(|affected| {
-            let vendor = affected.vendor.as_deref().unwrap_or("-");
-            let product = affected.product.as_deref().unwrap_or("-");
-            let package = affected.package_name.as_deref().unwrap_or("-");
-            let status = affected.default_status.as_deref().unwrap_or("-");
-            let collection = affected.collection_url.as_deref().unwrap_or("");
-            let suffix = if collection.is_empty() {
-                String::new()
-            } else {
-                format!(" {collection}")
-            };
-            let component_lines = wrapped_line_count(
-                &format!("{vendor}/{product} pkg:{package} status:{status}{suffix}"),
-                width,
-            );
-            let description_lines = affected
-                .description
-                .as_deref()
-                .map(normalize_spaces)
-                .filter(|description| !description.is_empty())
-                .map(|description| {
-                    wrapped_line_count(&format!("  Description: {description}"), width)
-                })
-                .unwrap_or_default();
-            component_lines + description_lines
-        })
-        .sum::<usize>()
-        .max(1);
-    cwe_lines + capec_lines + cvss_lines + affected_lines + 2
-}
-
 fn option_string(value: &str) -> Option<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -2566,595 +2249,4 @@ fn default_cwe_status_filter() -> [bool; CWE_STATUS_COUNT] {
     let mut filter = [false; CWE_STATUS_COUNT];
     filter[0] = true;
     filter
-}
-
-struct CapecTree {
-    entries: Vec<CapecEntry>,
-    paths: Vec<Vec<i32>>,
-    prefixes: Vec<String>,
-}
-
-fn project_capec_tree(entries: Vec<CapecEntry>) -> CapecTree {
-    let by_id = entries
-        .iter()
-        .cloned()
-        .map(|entry| (entry.id, entry))
-        .collect::<HashMap<_, _>>();
-    let mut children = HashMap::<i32, Vec<i32>>::new();
-    let mut roots = Vec::new();
-    for entry in &entries {
-        if entry.parent_ids.is_empty() {
-            roots.push(entry.id);
-        }
-        for parent_id in &entry.parent_ids {
-            children.entry(*parent_id).or_default().push(entry.id);
-        }
-    }
-    roots.sort_unstable();
-    for child_ids in children.values_mut() {
-        child_ids.sort_unstable();
-    }
-    let mut tree = CapecTree {
-        entries: Vec::new(),
-        paths: Vec::new(),
-        prefixes: Vec::new(),
-    };
-    for root in roots {
-        append_capec_branch(
-            root,
-            &by_id,
-            &children,
-            &mut HashSet::new(),
-            &mut Vec::new(),
-            &mut tree,
-        );
-    }
-    let visible = tree
-        .entries
-        .iter()
-        .map(|entry| entry.id)
-        .collect::<HashSet<_>>();
-    for entry in entries {
-        if !visible.contains(&entry.id) {
-            append_capec_branch(
-                entry.id,
-                &by_id,
-                &children,
-                &mut HashSet::new(),
-                &mut Vec::new(),
-                &mut tree,
-            );
-        }
-    }
-    tree.prefixes = capec_tree_prefixes(&tree.paths);
-    tree
-}
-
-fn filter_capec_tree(tree: CapecTree, matched: &HashSet<i32>) -> CapecTree {
-    let mut visible_paths = HashSet::<Vec<i32>>::new();
-    for path in &tree.paths {
-        if path.last().is_some_and(|id| matched.contains(id)) {
-            for length in 1..=path.len() {
-                visible_paths.insert(path[..length].to_vec());
-            }
-        }
-    }
-    let mut filtered = CapecTree {
-        entries: Vec::new(),
-        paths: Vec::new(),
-        prefixes: Vec::new(),
-    };
-    for (entry, path) in tree.entries.into_iter().zip(tree.paths) {
-        if visible_paths.contains(&path) {
-            filtered.entries.push(entry);
-            filtered.paths.push(path);
-        }
-    }
-    filtered.prefixes = capec_tree_prefixes(&filtered.paths);
-    filtered
-}
-
-fn capec_tree_prefixes(paths: &[Vec<i32>]) -> Vec<String> {
-    let mut children = HashMap::<Vec<i32>, Vec<i32>>::new();
-    for path in paths {
-        if path.len() > 1 {
-            let parent = path[..path.len() - 1].to_vec();
-            let child = *path.last().expect("non-empty CAPEC path");
-            let siblings = children.entry(parent).or_default();
-            if !siblings.contains(&child) {
-                siblings.push(child);
-            }
-        }
-    }
-    paths
-        .iter()
-        .map(|path| {
-            if path.len() == 1 {
-                return String::new();
-            }
-            let mut prefix = String::new();
-            for depth in 1..path.len() - 1 {
-                let parent = path[..depth].to_vec();
-                let continues = children
-                    .get(&parent)
-                    .and_then(|siblings| siblings.last())
-                    .is_some_and(|last| *last != path[depth]);
-                prefix.push_str(if continues { "│  " } else { "   " });
-            }
-            let parent = path[..path.len() - 1].to_vec();
-            let is_last = children
-                .get(&parent)
-                .and_then(|siblings| siblings.last())
-                .is_some_and(|last| Some(last) == path.last());
-            prefix.push_str(if is_last { "└─ " } else { "├─ " });
-            prefix
-        })
-        .collect()
-}
-
-fn append_capec_branch(
-    id: i32,
-    entries: &HashMap<i32, CapecEntry>,
-    children: &HashMap<i32, Vec<i32>>,
-    seen: &mut HashSet<i32>,
-    path: &mut Vec<i32>,
-    tree: &mut CapecTree,
-) {
-    if !seen.insert(id) {
-        return;
-    }
-    if let Some(entry) = entries.get(&id) {
-        path.push(id);
-        tree.entries.push(entry.clone());
-        tree.paths.push(path.clone());
-        tree.prefixes.push(String::new());
-        if let Some(child_ids) = children.get(&id) {
-            for child_id in child_ids {
-                append_capec_branch(*child_id, entries, children, seen, path, tree);
-            }
-        }
-        path.pop();
-    }
-    seen.remove(&id);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn empty_enter_starts_a_sorted_cve_browse_search() {
-        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize_schema().await.unwrap();
-        let mut app = App::new(String::new(), 25);
-
-        app.start_search(database);
-
-        match &app.searched_request {
-            SearchRequest::Advanced {
-                options,
-                include_cve,
-                include_osv,
-                ..
-            } => {
-                assert_eq!(options.sort_order, CveSummarySortOrder::PublishedDesc);
-                assert!(options.query.is_none());
-                assert!(*include_cve);
-                assert!(!include_osv);
-            }
-            SearchRequest::Query { .. } => panic!("empty Enter must browse CVEs"),
-        }
-        app.abort_search();
-    }
-
-    #[tokio::test]
-    async fn search_modes_and_display_apply_preserve_the_selected_sort() {
-        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize_schema().await.unwrap();
-        let mut app = App::new("CVE-2099".to_owned(), 25);
-        app.display.sort_field = crate::display::SortField::Updated;
-        app.display.sort_direction = crate::display::SortDirection::Asc;
-
-        app.start_search(database.clone());
-        match &app.searched_request {
-            SearchRequest::Query {
-                term, sort_order, ..
-            } => {
-                assert_eq!(term, &SearchTerm::CvePrefix("CVE-2099".to_owned()));
-                assert_eq!(*sort_order, CveSummarySortOrder::UpdatedAsc);
-            }
-            SearchRequest::Advanced { .. } => panic!("CVE prefix lost its typed search term"),
-        }
-
-        app.display.sort_field = crate::display::SortField::Score;
-        app.display.sort_direction = crate::display::SortDirection::Desc;
-        app.apply_display_settings(Some(database.clone()));
-        match &app.searched_request {
-            SearchRequest::Query {
-                term, sort_order, ..
-            } => {
-                assert_eq!(term, &SearchTerm::CvePrefix("CVE-2099".to_owned()));
-                assert_eq!(*sort_order, CveSummarySortOrder::ScoreDesc);
-            }
-            SearchRequest::Advanced { .. } => {
-                panic!("display apply must preserve the typed search request")
-            }
-        }
-
-        app.query = "GHSA-2099-example".to_owned();
-        app.display.sort_field = crate::display::SortField::RelationRank;
-        app.display.sort_direction = crate::display::SortDirection::Desc;
-        app.start_search(database);
-        match &app.searched_request {
-            SearchRequest::Query {
-                term, sort_order, ..
-            } => {
-                assert_eq!(
-                    term,
-                    &SearchTerm::Identifier("GHSA-2099-example".to_owned())
-                );
-                assert_eq!(*sort_order, CveSummarySortOrder::RelationRankDesc);
-            }
-            SearchRequest::Advanced { .. } => panic!("identifier searches must retain graph rank"),
-        }
-        app.abort_search();
-    }
-
-    #[tokio::test]
-    async fn hyphenated_product_input_stays_in_product_mode() {
-        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize_schema().await.unwrap();
-        let mut app = App::new(String::new(), 25);
-        app.next_search_mode();
-        assert_eq!(app.search_mode, SearchMode::Product);
-
-        for ch in "example-product".chars() {
-            app.push_query(ch);
-        }
-        assert_eq!(app.search_mode, SearchMode::Product);
-
-        app.start_search(database);
-        match &app.searched_request {
-            SearchRequest::Query { term, .. } => {
-                assert_eq!(term, &SearchTerm::Product("example-product".to_owned()));
-            }
-            SearchRequest::Advanced { .. } => panic!("main search lost its typed product term"),
-        }
-        app.abort_search();
-    }
-
-    #[test]
-    fn explicit_and_inferred_search_modes_are_distinct() {
-        let mut inferred = App::new(String::new(), 25);
-        for ch in "GHSA-2099-example".chars() {
-            inferred.push_query(ch);
-        }
-        assert_eq!(inferred.search_mode, SearchMode::Identifier);
-        while !inferred.query.is_empty() {
-            inferred.backspace_query();
-        }
-        assert_eq!(inferred.search_mode, SearchMode::FreeText);
-
-        let mut explicit = App::new(String::new(), 25);
-        for _ in 0..6 {
-            explicit.next_search_mode();
-        }
-        assert_eq!(explicit.search_mode, SearchMode::FreeText);
-        for ch in "GHSA-2099-example".chars() {
-            explicit.push_query(ch);
-        }
-        assert_eq!(explicit.search_mode, SearchMode::FreeText);
-    }
-
-    #[test]
-    fn popup_cancel_restores_edited_settings_and_filters() {
-        let mut app = App::new("before".to_owned(), 25);
-
-        app.open_advanced_search(None);
-        app.advanced.query = "after".to_owned();
-        app.advanced.product = "changed-product".to_owned();
-        app.sync_main_from_advanced();
-        app.cancel_advanced_search();
-        assert_eq!(app.query, "before");
-        assert!(app.advanced.product.is_empty());
-
-        let original_sort = app.display.sort_field;
-        app.open_display_settings();
-        app.display.sort_field = crate::display::SortField::Score;
-        app.advanced.source_cve = false;
-        app.cancel_display_settings();
-        assert_eq!(app.display.sort_field, original_sort);
-        assert!(app.advanced.source_cve);
-
-        app.capec_status_filter = "Stable".to_owned();
-        app.open_capec_filter();
-        app.capec_status_filter = "Deprecated".to_owned();
-        app.cancel_capec_filter();
-        assert_eq!(app.capec_status_filter, "Stable");
-
-        app.cwe_capec_filter = "100".to_owned();
-        app.open_cwe_status_popup();
-        app.cwe_capec_filter = "200".to_owned();
-        app.cwe_status_filter = [false; CWE_STATUS_COUNT];
-        app.cancel_cwe_status_popup();
-        assert_eq!(app.cwe_capec_filter, "100");
-        assert_eq!(app.cwe_status_filter, default_cwe_status_filter());
-    }
-
-    #[test]
-    fn maintenance_requires_confirmation_before_it_can_start() {
-        let mut app = App::new(String::new(), 25);
-        app.open_maintenance();
-
-        assert!(!app.maintenance_confirming);
-        app.confirm_maintenance_choice();
-        assert!(app.maintenance_confirming);
-        app.cancel_maintenance_confirmation();
-        assert!(!app.maintenance_confirming);
-
-        app.maintenance_choice = MaintenanceChoice::Cancel;
-        app.confirm_maintenance_choice();
-        assert!(!app.show_maintenance);
-    }
-
-    #[tokio::test]
-    async fn mixed_source_sort_pages_only_append_to_the_loaded_order() {
-        let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize_schema().await.unwrap();
-        database
-            .import_cve_raw_jsons(vec![
-                r#"{"cveMetadata":{"cveId":"CVE-2099-300","state":"PUBLISHED","datePublished":"2099-03-01T00:00:00Z","dateUpdated":"2099-03-01T00:00:00Z"},"containers":{"cna":{"title":"timelineproof newest"}}}"#.to_owned(),
-                r#"{"cveMetadata":{"cveId":"CVE-2099-100","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"timelineproof older"}}}"#.to_owned(),
-            ])
-            .await
-            .unwrap();
-        database
-            .import_osv_records(vec![
-                qanvuli_core::database::OsvRawRecord {
-                    source_path: None,
-                    raw_json: r#"{"schema_version":"1.7.5","id":"GHSA-2099-middle","published":"2099-02-01T00:00:00Z","modified":"2099-04-01T00:00:00Z","summary":"timelineproof middle","affected":[]}"#.to_owned(),
-                },
-                qanvuli_core::database::OsvRawRecord {
-                    source_path: None,
-                    raw_json: r#"{"schema_version":"1.7.5","id":"ALSA-2098-oldest","published":"2098-12-01T00:00:00Z","modified":"2099-02-01T00:00:00Z","summary":"timelineproof oldest","affected":[]}"#.to_owned(),
-                },
-            ])
-            .await
-            .unwrap();
-        let request = SearchRequest::Query {
-            term: SearchTerm::FreeText("timelineproof".to_owned()),
-            state_scope: CveStateScope::PublishedOnly,
-            kev_only: false,
-            sort_order: CveSummarySortOrder::PublishedDesc,
-        };
-        let mut app = App::new("test".to_owned(), 25);
-        app.searched_request = request.clone();
-        let expected = [
-            "CVE-2099-300",
-            "GHSA-2099-middle",
-            "CVE-2099-100",
-            "ALSA-2098-oldest",
-        ];
-        for offset in 0..expected.len() {
-            let kind = if offset == 0 {
-                SearchKind::Replace
-            } else {
-                SearchKind::Append {
-                    select_offset: app.candidate_count(),
-                }
-            };
-            app.start_pending_search(
-                database.clone(),
-                request.clone(),
-                1,
-                app.search_offset,
-                kind,
-                "pagination test failed",
-            );
-            for _ in 0..100_000 {
-                app.poll_search().await.unwrap();
-                if !app.searching() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-            assert!(!app.searching(), "search task did not finish");
-            assert_eq!(app.search_offset, offset as u64 + 1);
-            assert_eq!(app.exhausted, offset + 1 == expected.len());
-
-            let loaded = app
-                .candidates
-                .iter()
-                .map(|candidate| match candidate {
-                    SearchCandidate::Cve(cve) => cve.summary.cve_id.as_str(),
-                    SearchCandidate::Osv(osv) => osv.osv_id.as_str(),
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(loaded, expected[..=offset]);
-        }
-
-        app.select_candidate(1);
-        assert_eq!(app.selected_osv().unwrap().osv_id, "GHSA-2099-middle");
-        app.select_candidate(2);
-        assert_eq!(app.selected().unwrap().summary.cve_id, "CVE-2099-100");
-
-        for (sort_order, expected) in [
-            (
-                CveSummarySortOrder::UpdatedDesc,
-                [
-                    "GHSA-2099-middle",
-                    "CVE-2099-300",
-                    "ALSA-2098-oldest",
-                    "CVE-2099-100",
-                ],
-            ),
-            (
-                CveSummarySortOrder::CveIdAsc,
-                [
-                    "CVE-2099-100",
-                    "CVE-2099-300",
-                    "ALSA-2098-oldest",
-                    "GHSA-2099-middle",
-                ],
-            ),
-            (
-                CveSummarySortOrder::CveIdDesc,
-                [
-                    "GHSA-2099-middle",
-                    "ALSA-2098-oldest",
-                    "CVE-2099-300",
-                    "CVE-2099-100",
-                ],
-            ),
-        ] {
-            let request = SearchRequest::Query {
-                term: SearchTerm::FreeText("timelineproof".to_owned()),
-                state_scope: CveStateScope::PublishedOnly,
-                kev_only: false,
-                sort_order,
-            };
-            let mut loaded = Vec::new();
-            for offset in 0..expected.len() {
-                let result =
-                    run_search_request(database.clone(), request.clone(), 1, offset as u64)
-                        .await
-                        .unwrap();
-                assert_eq!(result.candidates.len(), 1);
-                loaded.extend(
-                    result
-                        .candidates
-                        .into_iter()
-                        .map(|candidate| match candidate {
-                            SearchCandidate::Cve(cve) => cve.summary.cve_id,
-                            SearchCandidate::Osv(osv) => osv.osv_id,
-                        }),
-                );
-                assert_eq!(
-                    loaded.iter().map(String::as_str).collect::<Vec<_>>(),
-                    expected[..=offset],
-                    "unexpected {sort_order:?} prefix"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn candidate_and_tab_changes_reset_scroll_and_use_item_height_for_pages() {
-        let mut app = App::new(String::new(), 25);
-        app.candidates = vec![
-            SearchCandidate::Osv(test_osv("OSV-1")),
-            SearchCandidate::Osv(test_osv("OSV-2")),
-        ];
-        app.detail_scroll = 8;
-        app.metadata_scroll = 9;
-
-        app.select_candidate(1);
-        assert_eq!(app.detail_scroll, 0);
-        assert_eq!(app.metadata_scroll, 0);
-
-        app.detail_scroll = 4;
-        app.metadata_scroll = 5;
-        app.next_right_tab();
-        assert_eq!(app.detail_scroll, 0);
-        assert_eq!(app.metadata_scroll, 0);
-
-        app.left_page_size = 20;
-        assert_eq!(app.left_step(PageAmount::Full), 10);
-        assert_eq!(app.left_step(PageAmount::Half), 5);
-    }
-
-    fn test_osv(id: &str) -> OsvSummary {
-        OsvSummary {
-            osv_id: id.to_owned(),
-            schema_version: None,
-            published_at: None,
-            modified_at: None,
-            withdrawn_at: None,
-            summary: None,
-            details: None,
-            package_summary: None,
-        }
-    }
-
-    #[test]
-    fn capec_tree_projects_each_parent_path_and_stops_cycles() {
-        let entry = |id, parents| CapecEntry {
-            id,
-            name: format!("CAPEC-{id}"),
-            description: String::new(),
-            extended_description: None,
-            status: "Stable".to_owned(),
-            abstraction: "Standard".to_owned(),
-            parent_ids: parents,
-            cwe_ids: Vec::new(),
-            category_ids: Vec::new(),
-            view_ids: Vec::new(),
-            child_count: 0,
-        };
-        let rows = project_capec_tree(vec![
-            entry(1, Vec::new()),
-            entry(2, Vec::new()),
-            entry(3, vec![1, 2]),
-        ]);
-        assert_eq!(rows.entries.iter().filter(|row| row.id == 3).count(), 2);
-        assert!(rows.paths.contains(&vec![1, 3]));
-        assert!(rows.paths.contains(&vec![2, 3]));
-        assert_eq!(rows.prefixes, ["", "└─ ", "", "└─ "]);
-
-        let nested = project_capec_tree(vec![
-            entry(10, Vec::new()),
-            entry(20, vec![10]),
-            entry(30, vec![10]),
-            entry(40, vec![20]),
-        ]);
-        assert_eq!(nested.prefixes, ["", "├─ ", "│  └─ ", "└─ "]);
-        let filtered = filter_capec_tree(nested, &HashSet::from([40]));
-        assert_eq!(filtered.paths, [vec![10], vec![10, 20], vec![10, 20, 40]]);
-        assert_eq!(filtered.prefixes, ["", "└─ ", "   └─ "]);
-
-        let cyclic = project_capec_tree(vec![entry(4, vec![5]), entry(5, vec![4])]);
-        assert_eq!(cyclic.paths, [vec![4], vec![4, 5], vec![5], vec![5, 4]]);
-    }
-
-    #[test]
-    fn switches_between_cwe_and_capec_catalogs() {
-        let mut app = App::new(String::new(), 25);
-        app.toggle_cwe_list_mode(None);
-        assert_eq!(app.view_mode, ViewMode::CweList);
-        app.toggle_capec_list_mode(None);
-        assert_eq!(app.view_mode, ViewMode::CapecList);
-        app.toggle_capec_list_mode(None);
-        assert_eq!(app.view_mode, ViewMode::Normal);
-    }
-
-    #[test]
-    fn capec_typing_filters_cached_catalog_and_keeps_ancestors() {
-        let entry = |id, name: &str, parents| CapecEntry {
-            id,
-            name: name.to_owned(),
-            description: String::new(),
-            extended_description: None,
-            status: "Stable".to_owned(),
-            abstraction: "Standard".to_owned(),
-            parent_ids: parents,
-            cwe_ids: Vec::new(),
-            category_ids: Vec::new(),
-            view_ids: Vec::new(),
-            child_count: 0,
-        };
-        let mut app = App::new(String::new(), 25);
-        app.capec_catalog = vec![
-            entry(1, "Root", Vec::new()),
-            entry(2, "Target child", vec![1]),
-            entry(3, "Other child", vec![1]),
-        ];
-
-        for ch in "target".chars() {
-            app.push_capec_query(ch, None);
-        }
-
-        assert!(app.capec_task.is_none());
-        assert_eq!(app.capec_tree_paths, [vec![1], vec![1, 2]]);
-        assert_eq!(app.capec_tree_prefixes, ["", "└─ "]);
-    }
 }

@@ -19,7 +19,7 @@ impl RawJsonDetailPanel {
         let content_width = area.width.saturating_sub(2) as usize;
         let page_size = area.height.saturating_sub(2) as usize;
         let line_count = wrapped_line_count(text, content_width);
-        app.raw_scroll as usize >= line_count.saturating_sub(page_size.max(1))
+        app.raw.scroll as usize >= line_count.saturating_sub(page_size.max(1))
     }
 }
 
@@ -43,14 +43,14 @@ impl DetailPanel for RawJsonDetailPanel {
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow)),
             )
-            .scroll((app.raw_scroll, 0))
+            .scroll((app.raw.scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, area);
     }
 }
 
 fn raw_json_text(app: &App) -> &str {
-    app.raw_json.as_deref().unwrap_or("Loading")
+    app.raw.json.as_deref().unwrap_or("Loading")
 }
 
 fn json_lines(text: &str, detail_search: &DetailSearch) -> Vec<Line<'static>> {

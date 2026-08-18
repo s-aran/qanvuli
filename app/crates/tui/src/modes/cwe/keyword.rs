@@ -12,20 +12,20 @@ pub(super) struct CweKeywordInput;
 
 impl KeywordInput for CweKeywordInput {
     fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
-        let cursor = if app.focus == PaneFocus::Left {
+        let cursor = if app.main.focus == PaneFocus::Left {
             "▏"
         } else {
             ""
         };
-        let input = Paragraph::new(format!("{}{cursor}", app.cwe_query)).block(
+        let input = Paragraph::new(format!("{}{cursor}", app.cwe.query)).block(
             Block::default()
                 .title(format!(
                     "CWE Search [Status: {} CAPEC: {}]",
                     app.cwe_status_summary(),
-                    if app.cwe_capec_filter.is_empty() {
+                    if app.cwe.capec_filter.is_empty() {
                         "*"
                     } else {
-                        &app.cwe_capec_filter
+                        &app.cwe.capec_filter
                     }
                 ))
                 .borders(Borders::ALL)

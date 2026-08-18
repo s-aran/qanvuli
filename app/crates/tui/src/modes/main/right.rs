@@ -18,12 +18,12 @@ pub(super) fn render(
     detail_search: &DetailSearch,
     area: Rect,
 ) {
-    if app.selected_osv().is_some() && app.right_tab == RightPaneTab::Osv {
-        app.right_tab = RightPaneTab::Cve;
+    if app.selected_osv().is_some() && app.main.right_tab == RightPaneTab::Osv {
+        app.main.right_tab = RightPaneTab::Cve;
     }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(focus_style(app.focus == PaneFocus::Right));
+        .border_style(focus_style(app.main.focus == PaneFocus::Right));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let rows = Layout::default()
@@ -32,17 +32,27 @@ pub(super) fn render(
         .split(inner);
     frame.render_widget(tab_title(app), rows[0]);
 
-    match app.right_tab {
+    match app.main.right_tab {
         RightPaneTab::Cve => detail::MainDetailPanel.render(frame, app, detail_search, rows[1]),
-        RightPaneTab::Osv => render_lines(
+        tab => render_lines(
             frame,
             app,
-            osv_lines(app, detail_search, rows[1].width.max(1) as usize),
+            tab_lines(app, tab, detail_search, rows[1].width.max(1) as usize),
             rows[1],
         ),
-        RightPaneTab::Metadata => render_lines(
-            frame,
-            app,
+    }
+}
+
+pub(crate) fn tab_lines(
+    app: &App,
+    tab: RightPaneTab,
+    detail_search: &DetailSearch,
+    width: usize,
+) -> Vec<Line<'static>> {
+    match tab {
+        RightPaneTab::Cve => Vec::new(),
+        RightPaneTab::Osv => osv_lines(app, detail_search, width),
+        RightPaneTab::Metadata => {
             if let Some(osv) = app.selected_osv() {
                 metadata::osv_metadata_lines(osv, detail_search)
             } else {
@@ -51,12 +61,9 @@ pub(super) fn render(
                     app.selected_metadata_capec_ids(),
                     detail_search,
                 )
-            },
-            rows[1],
-        ),
-        RightPaneTab::Enrichment => {
-            render_lines(frame, app, enrichment_lines(app, detail_search), rows[1])
+            }
         }
+        RightPaneTab::Enrichment => enrichment_lines(app, detail_search),
     }
 }
 
@@ -64,7 +71,7 @@ fn tab_title(app: &App) -> Tabs<'static> {
     let tabs = visible_tabs(app);
     let selected = tabs
         .iter()
-        .position(|tab| *tab == app.right_tab)
+        .position(|tab| *tab == app.main.right_tab)
         .unwrap_or_default();
     let titles = tabs
         .into_iter()
@@ -74,7 +81,7 @@ fn tab_title(app: &App) -> Tabs<'static> {
             } else {
                 tab.title()
             };
-            if app.right_tab == tab {
+            if app.main.right_tab == tab {
                 Line::from(Span::styled(
                     title,
                     Style::default()
@@ -109,7 +116,7 @@ fn render_lines(
 ) {
     app.clamp_metadata_scroll();
     let paragraph = Paragraph::new(lines)
-        .scroll((app.metadata_scroll, 0))
+        .scroll((app.main.metadata_scroll, 0))
         .wrap(Wrap { trim: true });
     frame.render_widget(paragraph, area);
 }
@@ -125,7 +132,7 @@ fn enrichment_lines(app: &App, detail_search: &DetailSearch) -> Vec<Line<'static
     let Some(cve) = app.selected() else {
         return vec![Line::from("No result")];
     };
-    let Some(enrichment) = app.enrichment.get(&cve.summary.cve_id) else {
+    let Some(enrichment) = app.main.enrichment.get(&cve.summary.cve_id) else {
         return vec![
             highlighted_line(
                 &format!("Identifier: {}", cve.summary.cve_id),
@@ -146,7 +153,7 @@ pub(crate) fn osv_lines(
     let Some(cve) = app.selected() else {
         return vec![Line::from("No result")];
     };
-    let Some(advisories) = app.linked_osv.get(&cve.summary.cve_id) else {
+    let Some(advisories) = app.main.linked_osv.get(&cve.summary.cve_id) else {
         return vec![Line::from("No linked OSV advisories")];
     };
     let mut lines = Vec::new();
@@ -160,7 +167,7 @@ pub(crate) fn osv_lines(
         ));
         lines.extend(detail::osv_detail_lines(
             advisory,
-            app.display.timezone,
+            app.main.display.timezone,
             detail_search,
             width,
         ));
@@ -285,7 +292,7 @@ mod tests {
     #[test]
     fn osv_result_hides_the_linked_osv_tab() {
         let mut app = App::new(String::new(), 25);
-        app.candidates.push(SearchCandidate::Osv(OsvSummary {
+        app.main.candidates.push(SearchCandidate::Osv(OsvSummary {
             osv_id: "GHSA-2099-only".to_owned(),
             schema_version: None,
             published_at: None,
@@ -295,7 +302,7 @@ mod tests {
             details: None,
             package_summary: None,
         }));
-        app.list_state.select(Some(0));
+        app.main.list_state.select(Some(0));
 
         assert_eq!(
             visible_tabs(&app),
@@ -306,8 +313,8 @@ mod tests {
             ]
         );
         app.next_right_tab();
-        assert_eq!(app.right_tab, RightPaneTab::Metadata);
+        assert_eq!(app.main.right_tab, RightPaneTab::Metadata);
         app.previous_right_tab();
-        assert_eq!(app.right_tab, RightPaneTab::Cve);
+        assert_eq!(app.main.right_tab, RightPaneTab::Cve);
     }
 }

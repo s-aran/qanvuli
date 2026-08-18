@@ -51,7 +51,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
 
 pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = centered_size(74, 16, frame.area());
-    let form = &app.advanced;
+    let form = &app.main.advanced;
     let lines = vec![
         advanced_line(
             form,
@@ -156,7 +156,7 @@ fn scope_entry_line(
 
 pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
     let area = centered_size(74, 20, frame.area());
-    let display = &app.display;
+    let display = &app.main.display;
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title("Settings")
@@ -164,7 +164,7 @@ pub(crate) fn draw_display(frame: &mut ratatui::Frame<'_>, app: &App) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let form = &app.advanced;
+    let form = &app.main.advanced;
     let entries = form.scope_entries();
     let active =
         |entry| display.source_focus && entries.get(form.scope_cursor).copied() == Some(entry);
@@ -261,11 +261,11 @@ pub(crate) fn draw_timeout_prompt(frame: &mut ratatui::Frame<'_>, app: &App) {
             buttons: vec![
                 ActionButton {
                     label: "Continue",
-                    active: app.timeout_choice == TimeoutChoice::Continue,
+                    active: app.overlay.timeout_choice == TimeoutChoice::Continue,
                 },
                 ActionButton {
                     label: "Cancel",
-                    active: app.timeout_choice == TimeoutChoice::Cancel,
+                    active: app.overlay.timeout_choice == TimeoutChoice::Cancel,
                 },
             ],
         }
@@ -304,7 +304,7 @@ pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
                 Constraint::Length(1),
             ])
             .split(inner);
-        let progress = app.maintenance_progress.as_ref();
+        let progress = app.overlay.maintenance_progress.as_ref();
         let total = progress.map(|progress| progress.total_files).unwrap_or(0);
         let written = progress.map(|progress| progress.written_files).unwrap_or(0);
         let failed = progress.map(|progress| progress.failed_files).unwrap_or(0);
@@ -337,8 +337,8 @@ pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
         return;
     }
 
-    if app.maintenance_confirming {
-        let operation = match app.maintenance_choice {
+    if app.overlay.maintenance_confirming {
+        let operation = match app.overlay.maintenance_choice {
             MaintenanceChoice::Init => "initialize and rebuild",
             MaintenanceChoice::Update => "update",
             MaintenanceChoice::Cancel => "cancel",
@@ -362,26 +362,26 @@ pub(crate) fn draw_maintenance(frame: &mut ratatui::Frame<'_>, app: &App) {
         Line::from(""),
         RadioOption {
             label: "Initialize",
-            selected: app.maintenance_choice == MaintenanceChoice::Init,
+            selected: app.overlay.maintenance_choice == MaintenanceChoice::Init,
             active_color: Color::Magenta,
         }
         .line(),
         RadioOption {
             label: "Update",
-            selected: app.maintenance_choice == MaintenanceChoice::Update,
+            selected: app.overlay.maintenance_choice == MaintenanceChoice::Update,
             active_color: Color::Magenta,
         }
         .line(),
         RadioOption {
             label: "Cancel",
-            selected: app.maintenance_choice == MaintenanceChoice::Cancel,
+            selected: app.overlay.maintenance_choice == MaintenanceChoice::Cancel,
             active_color: Color::Magenta,
         }
         .line(),
         Line::from(""),
         Checkbox {
             label: "Keep downloaded zip files".to_owned(),
-            checked: app.maintenance_keep_downloads,
+            checked: app.overlay.maintenance_keep_downloads,
             active: false,
             active_color: Color::Magenta,
         }

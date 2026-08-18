@@ -33,7 +33,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
     detail::CweDetailPanel.render(frame, app, detail_search, body[1]);
 
     frame.render_widget(Paragraph::new(status::CweStatusLine.text(app)), main[2]);
-    if app.show_cwe_status {
+    if app.cwe.show_status {
         status_filter::render(frame, app);
     }
 }

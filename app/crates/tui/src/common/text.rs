@@ -10,20 +10,32 @@ pub(crate) fn highlighted_line(text: &str, detail_search: &DetailSearch) -> Line
     highlight_rich_line(Line::from(text.to_owned()), detail_search)
 }
 
-pub(crate) fn rich_text_lines(
+#[derive(Clone, Copy)]
+pub(crate) enum Markup {
+    Html,
+    Markdown,
+}
+
+pub(crate) fn markup_lines(
     text: &str,
     width: usize,
+    markup: Markup,
     detail_search: &DetailSearch,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let lines = if looks_like_html(text) && !looks_like_markdown(text) {
-        html_lines(text, width).unwrap_or_else(|| markdown_lines(text, width))
-    } else {
-        markdown_lines(text, width)
+    let lines = match markup {
+        Markup::Html => html_lines(text, width).unwrap_or_else(|| plain_lines(text)),
+        Markup::Markdown => markdown_lines(text, width),
     };
     lines
         .into_iter()
         .map(|line| highlight_rich_line(line, detail_search))
+        .collect()
+}
+
+fn plain_lines(text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .map(|line| Line::from(line.to_owned()))
         .collect()
 }
 
@@ -80,108 +92,6 @@ fn html_style(annotations: &[RichAnnotation]) -> Style {
             };
             style.patch(annotation_style)
         })
-}
-
-fn looks_like_html(text: &str) -> bool {
-    const TAGS: &[&str] = &[
-        "a",
-        "b",
-        "blockquote",
-        "body",
-        "br",
-        "code",
-        "dd",
-        "del",
-        "div",
-        "dl",
-        "dt",
-        "em",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "h5",
-        "h6",
-        "head",
-        "hr",
-        "html",
-        "i",
-        "img",
-        "li",
-        "ol",
-        "p",
-        "pre",
-        "s",
-        "span",
-        "strike",
-        "strong",
-        "table",
-        "tbody",
-        "td",
-        "tfoot",
-        "th",
-        "thead",
-        "tr",
-        "ul",
-    ];
-    let bytes = text.as_bytes();
-    let mut index = 0;
-    while let Some(offset) = text[index..].find('<') {
-        let mut start = index + offset + 1;
-        if bytes.get(start) == Some(&b'/') {
-            start += 1;
-        }
-        let mut end = start;
-        while bytes.get(end).is_some_and(u8::is_ascii_alphanumeric) {
-            end += 1;
-        }
-        if end > start
-            && bytes
-                .get(end)
-                .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
-            && TAGS
-                .iter()
-                .any(|tag| text[start..end].eq_ignore_ascii_case(tag))
-        {
-            return true;
-        }
-        index = start.min(text.len());
-    }
-    false
-}
-
-fn looks_like_markdown(text: &str) -> bool {
-    text.lines().any(|line| {
-        let line = line.trim_start();
-        line.starts_with("# ")
-            || line.starts_with("## ")
-            || line.starts_with("### ")
-            || line.starts_with("#### ")
-            || line.starts_with("##### ")
-            || line.starts_with("###### ")
-            || line.starts_with("> ")
-            || line.starts_with("- ")
-            || line.starts_with("* ")
-            || line.starts_with("+ ")
-            || line.starts_with("```")
-            || line.starts_with("~~~")
-            || ordered_list_item(line)
-    }) || text.contains("](")
-        || has_paired_marker(text, "**")
-        || has_paired_marker(text, "__")
-        || has_paired_marker(text, "~~")
-        || has_paired_marker(text, "`")
-}
-
-fn ordered_list_item(line: &str) -> bool {
-    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0 && line.as_bytes().get(digits..digits + 2) == Some(b". ")
-}
-
-fn has_paired_marker(text: &str, marker: &str) -> bool {
-    text.find(marker)
-        .and_then(|start| text[start + marker.len()..].find(marker))
-        .is_some()
 }
 
 fn highlight_rich_line(line: Line<'static>, detail_search: &DetailSearch) -> Line<'static> {
@@ -250,9 +160,7 @@ fn search_match_style() -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DetailSearch, highlight_rich_line, looks_like_html, looks_like_markdown, rich_text_lines,
-    };
+    use super::{DetailSearch, Markup, highlight_rich_line, markup_lines};
     use ratatui::{
         style::{Color, Modifier, Style},
         text::{Line, Span},
@@ -268,7 +176,12 @@ mod tests {
 
     #[test]
     fn renders_markdown_without_markup_symbols() {
-        let lines = rich_text_lines("# Heading\n\n**important**", 40, &DetailSearch::new(""));
+        let lines = markup_lines(
+            "# Heading\n\n**important**",
+            40,
+            Markup::Markdown,
+            &DetailSearch::new(""),
+        );
 
         assert_eq!(text(&lines), "Headingimportant");
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
@@ -278,9 +191,10 @@ mod tests {
 
     #[test]
     fn renders_html_with_rich_annotations() {
-        let lines = rich_text_lines(
+        let lines = markup_lines(
             "<p><strong>important</strong> <a href='https://example.com'>link</a></p>",
             40,
+            Markup::Html,
             &DetailSearch::new(""),
         );
 
@@ -295,11 +209,17 @@ mod tests {
 
     #[test]
     fn wraps_rich_text_to_the_requested_terminal_width() {
-        for source in [
-            "A **long Markdown** sentence that must wrap.",
-            "<p>A <strong>long HTML</strong> sentence that must wrap.</p>",
+        for (source, markup) in [
+            (
+                "A **long Markdown** sentence that must wrap.",
+                Markup::Markdown,
+            ),
+            (
+                "<p>A <strong>long HTML</strong> sentence that must wrap.</p>",
+                Markup::Html,
+            ),
         ] {
-            let lines = rich_text_lines(source, 12, &DetailSearch::new(""));
+            let lines = markup_lines(source, 12, markup, &DetailSearch::new(""));
 
             assert!(lines.len() > 1, "source was not wrapped: {source}");
             assert!(
@@ -310,19 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn only_treats_recognized_tags_as_html() {
-        assert!(looks_like_html("<P class='notice'>text</P>"));
-        assert!(!looks_like_html("Use the <placeholder> value"));
-        assert!(!looks_like_html("1 < 2"));
-    }
-
-    #[test]
-    fn markdown_takes_precedence_over_html_inside_a_code_fence() {
+    fn markdown_can_contain_html_inside_a_code_fence() {
         let source = "## Details\n\n```html\n<p>example</p>\n```";
-        assert!(looks_like_html(source));
-        assert!(looks_like_markdown(source));
-
-        let lines = rich_text_lines(source, 40, &DetailSearch::new(""));
+        let lines = markup_lines(source, 40, Markup::Markdown, &DetailSearch::new(""));
         let rendered = text(&lines);
 
         assert!(rendered.contains("Details"));
@@ -332,21 +242,6 @@ mod tests {
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.content.contains("Details") && span.style.add_modifier.contains(Modifier::BOLD)
         }));
-    }
-
-    #[test]
-    fn pure_html_still_uses_the_html_renderer() {
-        let source = "<div>Details <strong>important</strong></div>";
-        assert!(looks_like_html(source));
-        assert!(!looks_like_markdown(source));
-
-        let lines = rich_text_lines(source, 40, &DetailSearch::new(""));
-
-        assert_eq!(
-            text(&lines).split_whitespace().collect::<Vec<_>>(),
-            ["Details", "important"]
-        );
-        assert!(!text(&lines).contains('<'));
     }
 
     #[test]

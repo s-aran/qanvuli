@@ -14,20 +14,20 @@ impl KeywordInput for MainKeywordInput {
     fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         let input_title = format!(
             "Search [{}] - limit {}",
-            app.search_mode.footer_text(),
-            app.limit
+            app.main.search_mode.footer_text(),
+            app.main.limit
         );
-        let cursor = if app.focus == PaneFocus::Left {
+        let cursor = if app.main.focus == PaneFocus::Left {
             "▏"
         } else {
             ""
         };
-        let input = Paragraph::new(format!("{}{cursor}", app.query))
+        let input = Paragraph::new(format!("{}{cursor}", app.main.query))
             .block(
                 Block::default()
                     .title(input_title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.search_mode.color())),
+                    .border_style(Style::default().fg(app.main.search_mode.color())),
             )
             .style(Style::default().add_modifier(Modifier::BOLD));
         frame.render_widget(input, area);

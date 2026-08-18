@@ -240,30 +240,24 @@ async fn run_search_request_at(
             osv_families,
             ecosystems,
         } => {
-            let include_osv = include_osv
-                && package_version_query(&options).is_none()
-                && !options.kev_only
-                && !has_cve_only_advanced_filters(&options);
-            let page = source_page(limit, position, include_cve && include_osv);
+            let plan = AdvancedSearchPlan::new(
+                &options,
+                include_cve,
+                include_osv,
+                &osv_families,
+                ecosystems.as_deref(),
+            );
+            let page = source_page(limit, position, plan.has_both_sources());
             let osv_db = independent_database(&db).await;
-            let (rows, osv_rows) = tokio::try_join!(
-                search_advanced_cves(
+            let (rows, osv_rows) = plan
+                .fetch(
                     &db,
-                    &options,
-                    include_cve,
+                    &osv_db,
                     page.fetch_limit,
                     page.cve_offset,
-                ),
-                search_advanced_osv(
-                    &osv_db,
-                    &options,
-                    include_osv,
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    page.fetch_limit,
                     page.osv_offset,
                 )
-            )?;
+                .await?;
             finish_search_result(&db, &osv_db, rows, osv_rows, options.sort_order, page).await
         }
     }
@@ -506,114 +500,6 @@ async fn attach_search_data(
     Ok((rows, enrichment, linked_osv))
 }
 
-async fn search_advanced_cves(
-    db: &CveDatabase,
-    options: &CveAdvancedSearch,
-    include_cve: bool,
-    limit: u64,
-    offset: u64,
-) -> Result<Vec<CveSummary>, String> {
-    if !include_cve {
-        return Ok(Vec::new());
-    }
-    if let Some((ecosystem, package, version)) = package_version_query(options) {
-        let findings = db
-            .query_package_matches(&ecosystem, &package, &version, None)
-            .await
-            .map_err(|err| err.to_string())?;
-        let cve_ids = findings
-            .into_iter()
-            .filter(|finding| finding.affected.status == "affected")
-            .flat_map(|finding| finding.cve_ids)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        db.cve_summaries_by_ids_sorted(
-            &cve_ids,
-            options.state_scope,
-            options.sort_order,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|err| err.to_string())
-    } else {
-        db.search_cve_summaries_advanced(options, limit, offset)
-            .await
-            .map_err(|err| err.to_string())
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn search_advanced_osv(
-    db: &CveDatabase,
-    options: &CveAdvancedSearch,
-    include_osv: bool,
-    osv_families: &[String],
-    ecosystems: Option<&[String]>,
-    limit: u64,
-    offset: u64,
-) -> Result<Vec<OsvSummary>, String> {
-    let osv_text_query = advanced_osv_text_query(options);
-    if package_version_query(options).is_some()
-        || options.kev_only
-        || !include_osv
-        || has_cve_only_advanced_filters(options)
-    {
-        return Ok(Vec::new());
-    }
-    if let Some(package) = osv_package_query(options) {
-        db.search_osv_summaries_scoped_by_package_and_text_sorted(
-            osv_text_query,
-            osv_families,
-            ecosystems,
-            package,
-            options.sort_order,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|err| err.to_string())
-    } else if uses_osv_text_fts(options, osv_families, ecosystems) {
-        db.search_osv_summaries_free_text_sorted(
-            options.query.as_deref().unwrap_or_default(),
-            options.sort_order,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|err| err.to_string())
-    } else if let Some(package_name) = options
-        .product_exact
-        .as_deref()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        db.search_osv_summaries_scoped_by_exact_package_sorted(
-            osv_text_query,
-            osv_families,
-            ecosystems,
-            package_name,
-            options.sort_order,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|err| err.to_string())
-    } else {
-        db.search_osv_summaries_scoped_sorted(
-            osv_text_query,
-            osv_families,
-            ecosystems,
-            options.sort_order,
-            limit,
-            offset,
-        )
-        .await
-        .map_err(|err| err.to_string())
-    }
-}
-
 async fn search_osv_by_term(
     db: &CveDatabase,
     term: &SearchTerm,
@@ -652,6 +538,342 @@ async fn search_osv_by_term(
     }
 }
 
+struct AdvancedSearchPlan<'a> {
+    cve: CveSearchPlan<'a>,
+    osv: OsvSearchPlan<'a>,
+}
+
+impl<'a> AdvancedSearchPlan<'a> {
+    fn new(
+        options: &'a CveAdvancedSearch,
+        include_cve: bool,
+        include_osv: bool,
+        osv_families: &'a [String],
+        ecosystems: Option<&'a [String]>,
+    ) -> Self {
+        Self {
+            cve: CveSearchPlan::new(options, include_cve),
+            osv: OsvSearchPlan::new(
+                options,
+                include_osv,
+                OsvScope {
+                    families: osv_families,
+                    ecosystems,
+                },
+            ),
+        }
+    }
+
+    fn has_both_sources(&self) -> bool {
+        !self.cve.is_disabled() && !self.osv.is_disabled()
+    }
+
+    async fn fetch(
+        &self,
+        cve_db: &CveDatabase,
+        osv_db: &CveDatabase,
+        limit: u64,
+        cve_offset: u64,
+        osv_offset: u64,
+    ) -> Result<(Vec<CveSummary>, Vec<OsvSummary>), String> {
+        tokio::try_join!(
+            self.cve.fetch(cve_db, limit, cve_offset),
+            self.osv.fetch(osv_db, limit, osv_offset),
+        )
+    }
+
+    async fn count(&self, db: &CveDatabase) -> Result<u64, String> {
+        let cve = self.cve.count(db).await?;
+        let osv = self.osv.count(db).await?;
+        Ok(cve + osv)
+    }
+}
+
+enum CveSearchPlan<'a> {
+    Disabled,
+    Advanced(&'a CveAdvancedSearch),
+    PackageVersion {
+        options: &'a CveAdvancedSearch,
+        ecosystem: &'a str,
+        package: &'a str,
+        version: &'a str,
+    },
+}
+
+impl<'a> CveSearchPlan<'a> {
+    fn new(options: &'a CveAdvancedSearch, include_cve: bool) -> Self {
+        if !include_cve {
+            Self::Disabled
+        } else if let Some((ecosystem, package, version)) = package_version_query(options) {
+            Self::PackageVersion {
+                options,
+                ecosystem,
+                package,
+                version,
+            }
+        } else {
+            Self::Advanced(options)
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    async fn fetch(
+        &self,
+        db: &CveDatabase,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<CveSummary>, String> {
+        match self {
+            Self::Disabled => Ok(Vec::new()),
+            Self::Advanced(options) => db
+                .search_cve_summaries_advanced(options, limit, offset)
+                .await
+                .map_err(|err| err.to_string()),
+            Self::PackageVersion {
+                options,
+                ecosystem,
+                package,
+                version,
+            } => {
+                let cve_ids = affected_package_cve_ids(db, ecosystem, package, version).await?;
+                db.cve_summaries_by_ids_sorted(
+                    &cve_ids,
+                    options.state_scope,
+                    options.sort_order,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string())
+            }
+        }
+    }
+
+    async fn count(&self, db: &CveDatabase) -> Result<u64, String> {
+        match self {
+            Self::Disabled => Ok(0),
+            Self::Advanced(options) => db
+                .count_cve_summaries_advanced(options)
+                .await
+                .map_err(|err| err.to_string()),
+            Self::PackageVersion {
+                ecosystem,
+                package,
+                version,
+                ..
+            } => Ok(affected_package_cve_ids(db, ecosystem, package, version)
+                .await?
+                .len() as u64),
+        }
+    }
+}
+
+async fn affected_package_cve_ids(
+    db: &CveDatabase,
+    ecosystem: &str,
+    package: &str,
+    version: &str,
+) -> Result<Vec<String>, String> {
+    Ok(db
+        .query_package_matches(ecosystem, package, version, None)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .filter(|finding| finding.affected.status == "affected")
+        .flat_map(|finding| finding.cve_ids)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect())
+}
+
+#[derive(Clone, Copy)]
+struct OsvScope<'a> {
+    families: &'a [String],
+    ecosystems: Option<&'a [String]>,
+}
+
+enum OsvSearchPlan<'a> {
+    Disabled,
+    PackageAndText {
+        text: Option<&'a str>,
+        package: &'a str,
+        scope: OsvScope<'a>,
+        sort_order: CveSummarySortOrder,
+    },
+    FreeText {
+        query: &'a str,
+        sort_order: CveSummarySortOrder,
+    },
+    ExactPackage {
+        text: Option<&'a str>,
+        package: &'a str,
+        scope: OsvScope<'a>,
+        sort_order: CveSummarySortOrder,
+    },
+    Scoped {
+        text: Option<&'a str>,
+        scope: OsvScope<'a>,
+        sort_order: CveSummarySortOrder,
+    },
+}
+
+impl<'a> OsvSearchPlan<'a> {
+    fn new(options: &'a CveAdvancedSearch, include_osv: bool, scope: OsvScope<'a>) -> Self {
+        if package_version_query(options).is_some()
+            || options.kev_only
+            || !include_osv
+            || has_cve_only_advanced_filters(options)
+        {
+            return Self::Disabled;
+        }
+        let text = advanced_osv_text_query(options);
+        if let Some(package) = osv_package_query(options) {
+            Self::PackageAndText {
+                text,
+                package,
+                scope,
+                sort_order: options.sort_order,
+            }
+        } else if uses_osv_text_fts(options, scope.families, scope.ecosystems) {
+            Self::FreeText {
+                query: options.query.as_deref().unwrap_or_default(),
+                sort_order: options.sort_order,
+            }
+        } else if let Some(package) = options
+            .product_exact
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            Self::ExactPackage {
+                text,
+                package,
+                scope,
+                sort_order: options.sort_order,
+            }
+        } else {
+            Self::Scoped {
+                text,
+                scope,
+                sort_order: options.sort_order,
+            }
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    async fn fetch(
+        &self,
+        db: &CveDatabase,
+        limit: u64,
+        offset: u64,
+    ) -> Result<Vec<OsvSummary>, String> {
+        match self {
+            Self::Disabled => Ok(Vec::new()),
+            Self::PackageAndText {
+                text,
+                package,
+                scope,
+                sort_order,
+            } => db
+                .search_osv_summaries_scoped_by_package_and_text_sorted(
+                    *text,
+                    scope.families,
+                    scope.ecosystems,
+                    package,
+                    *sort_order,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+            Self::FreeText { query, sort_order } => db
+                .search_osv_summaries_free_text_sorted(query, *sort_order, limit, offset)
+                .await
+                .map_err(|err| err.to_string()),
+            Self::ExactPackage {
+                text,
+                package,
+                scope,
+                sort_order,
+            } => db
+                .search_osv_summaries_scoped_by_exact_package_sorted(
+                    *text,
+                    scope.families,
+                    scope.ecosystems,
+                    package,
+                    *sort_order,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+            Self::Scoped {
+                text,
+                scope,
+                sort_order,
+            } => db
+                .search_osv_summaries_scoped_sorted(
+                    *text,
+                    scope.families,
+                    scope.ecosystems,
+                    *sort_order,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+        }
+    }
+
+    async fn count(&self, db: &CveDatabase) -> Result<u64, String> {
+        match self {
+            Self::Disabled => Ok(0),
+            Self::PackageAndText {
+                text,
+                package,
+                scope,
+                ..
+            } => db
+                .count_osv_summaries_scoped_by_package_and_text(
+                    *text,
+                    scope.families,
+                    scope.ecosystems,
+                    package,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+            Self::FreeText { query, .. } => db
+                .count_osv_summaries_free_text(query)
+                .await
+                .map_err(|err| err.to_string()),
+            Self::ExactPackage {
+                text,
+                package,
+                scope,
+                ..
+            } => db
+                .count_osv_summaries_scoped_by_exact_package(
+                    *text,
+                    scope.families,
+                    scope.ecosystems,
+                    package,
+                )
+                .await
+                .map_err(|err| err.to_string()),
+            Self::Scoped { text, scope, .. } => db
+                .count_osv_summaries_scoped(*text, scope.families, scope.ecosystems)
+                .await
+                .map_err(|err| err.to_string()),
+        }
+    }
+}
+
 pub(crate) async fn run_count_request(
     db: CveDatabase,
     request: SearchRequest,
@@ -686,66 +908,15 @@ pub(crate) async fn run_count_request(
             osv_families,
             ecosystems,
         } => {
-            let osv_text_query = advanced_osv_text_query(&options);
-            let cve = if include_cve {
-                if let Some((ecosystem, package, version)) = package_version_query(&options) {
-                    let findings = db
-                        .query_package_matches(&ecosystem, &package, &version, None)
-                        .await
-                        .map_err(|err| err.to_string())?;
-                    findings
-                        .into_iter()
-                        .filter(|finding| finding.affected.status == "affected")
-                        .flat_map(|finding| finding.cve_ids)
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len() as u64
-                } else {
-                    db.count_cve_summaries_advanced(&options)
-                        .await
-                        .map_err(|err| err.to_string())?
-                }
-            } else {
-                0
-            };
-            let osv = if package_version_query(&options).is_some()
-                || options.kev_only
-                || !include_osv
-                || has_cve_only_advanced_filters(&options)
-            {
-                0
-            } else if let Some(package) = osv_package_query(&options) {
-                db.count_osv_summaries_scoped_by_package_and_text(
-                    osv_text_query,
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    package,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            } else if uses_osv_text_fts(&options, &osv_families, ecosystems.as_deref()) {
-                db.count_osv_summaries_free_text(options.query.as_deref().unwrap_or_default())
-                    .await
-                    .map_err(|err| err.to_string())?
-            } else if let Some(package_name) = options
-                .product_exact
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-            {
-                db.count_osv_summaries_scoped_by_exact_package(
-                    osv_text_query,
-                    &osv_families,
-                    ecosystems.as_deref(),
-                    package_name,
-                )
-                .await
-                .map_err(|err| err.to_string())?
-            } else {
-                db.count_osv_summaries_scoped(osv_text_query, &osv_families, ecosystems.as_deref())
-                    .await
-                    .map_err(|err| err.to_string())?
-            };
-            Ok(cve + osv)
+            AdvancedSearchPlan::new(
+                &options,
+                include_cve,
+                include_osv,
+                &osv_families,
+                ecosystems.as_deref(),
+            )
+            .count(&db)
+            .await
         }
     }
 }
@@ -797,7 +968,7 @@ fn osv_package_query(options: &CveAdvancedSearch) -> Option<&str> {
 }
 
 /// Package matching requires ecosystem, name, and version.
-fn package_version_query(options: &CveAdvancedSearch) -> Option<(String, String, String)> {
+fn package_version_query(options: &CveAdvancedSearch) -> Option<(&str, &str, &str)> {
     let ecosystem = options.package_ecosystem.as_deref()?.trim();
     let package = options
         .product_exact
@@ -806,7 +977,7 @@ fn package_version_query(options: &CveAdvancedSearch) -> Option<(String, String,
         .trim();
     let version = options.package_version.as_deref()?.trim();
     (!ecosystem.is_empty() && !package.is_empty() && !version.is_empty())
-        .then(|| (ecosystem.to_owned(), package.to_owned(), version.to_owned()))
+        .then_some((ecosystem, package, version))
 }
 
 /// A plain free-text query can use OSV's FTS5 projection. Other advanced filters still need
@@ -1425,7 +1596,7 @@ mod tests {
                 package_version: Some("1.10.2".to_owned()),
                 ..Default::default()
             }),
-            Some(("npm".to_owned(), "jquery".to_owned(), "1.10.2".to_owned()))
+            Some(("npm", "jquery", "1.10.2"))
         );
     }
 

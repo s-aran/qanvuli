@@ -47,20 +47,21 @@ impl ResultList for CandidateList {
                     .title(format!(
                         "Candidates ({}/{})",
                         app.candidate_count(),
-                        app.total_results
+                        app.main
+                            .total_results
                             .map(|total| total.to_string())
                             .unwrap_or_else(|| "?".to_owned())
                     ))
                     .borders(Borders::ALL)
-                    .border_style(focus_style(app.focus == PaneFocus::Left)),
+                    .border_style(focus_style(app.main.focus == PaneFocus::Left)),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        frame.render_stateful_widget(list, area, &mut app.list_state);
+        frame.render_stateful_widget(list, area, &mut app.main.list_state);
     }
 }
 
 fn candidate_sort_key(app: &App, candidate: &SearchCandidate) -> Option<String> {
-    let timestamp = match (app.display.sort_field, candidate) {
+    let timestamp = match (app.main.display.sort_field, candidate) {
         (SortField::Published, SearchCandidate::Cve(cve)) => {
             Some(cve.summary.published_at.as_str())
         }
@@ -70,9 +71,9 @@ fn candidate_sort_key(app: &App, candidate: &SearchCandidate) -> Option<String> 
         _ => None,
     };
     if let Some(timestamp) = timestamp {
-        return Some(format_timestamp(timestamp, app.display.timezone));
+        return Some(format_timestamp(timestamp, app.main.display.timezone));
     }
-    if app.display.sort_field == SortField::Score {
+    if app.main.display.sort_field == SortField::Score {
         return Some(match candidate {
             SearchCandidate::Cve(cve) => cve
                 .detail

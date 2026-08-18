@@ -31,7 +31,7 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
             app.move_full_page_up();
         }
         KeyCode::PageUp => app.move_full_page_up(),
-        KeyCode::F(1) | KeyCode::Char('?') => app.show_help = true,
+        KeyCode::F(1) | KeyCode::Char('?') => app.overlay.show_help = true,
         KeyCode::F(2) => app.next_search_mode(),
         KeyCode::F(3) => {
             app.open_advanced_search(db);
@@ -52,14 +52,14 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
         }
         KeyCode::Tab => app.toggle_focus(),
         KeyCode::BackTab => app.previous_focus(),
-        KeyCode::Left if app.focus == PaneFocus::Right => app.previous_right_tab(),
-        KeyCode::Right if app.focus == PaneFocus::Right => app.next_right_tab(),
+        KeyCode::Left if app.main.focus == PaneFocus::Right => app.previous_right_tab(),
+        KeyCode::Right if app.main.focus == PaneFocus::Right => app.next_right_tab(),
         KeyCode::Left => app.previous_search_mode(),
         KeyCode::Right => app.next_search_mode(),
-        KeyCode::Backspace if app.focus == PaneFocus::Left => {
+        KeyCode::Backspace if app.main.focus == PaneFocus::Left => {
             app.backspace_query();
         }
-        KeyCode::Char(ch) if app.focus == PaneFocus::Left => {
+        KeyCode::Char(ch) if app.main.focus == PaneFocus::Left => {
             app.push_query(ch);
         }
         KeyCode::Down => {
@@ -81,14 +81,14 @@ mod tests {
     #[test]
     fn typing_while_reading_the_right_pane_does_not_edit_the_query() {
         let mut app = App::new("stable".to_owned(), 25);
-        app.focus = PaneFocus::Right;
+        app.main.focus = PaneFocus::Right;
 
         handle_key(
             &mut app,
             None,
             &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
         );
-        assert_eq!(app.query, "stable");
+        assert_eq!(app.main.query, "stable");
 
         handle_key(
             &mut app,
@@ -96,7 +96,7 @@ mod tests {
             &KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
         );
 
-        assert_eq!(app.query, "stable");
+        assert_eq!(app.main.query, "stable");
     }
 
     #[test]
@@ -109,7 +109,7 @@ mod tests {
             &KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
         );
 
-        assert!(app.show_help);
-        assert!(app.query.is_empty());
+        assert!(app.overlay.show_help);
+        assert!(app.main.query.is_empty());
     }
 }

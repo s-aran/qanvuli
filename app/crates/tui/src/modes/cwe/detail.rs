@@ -33,9 +33,9 @@ impl DetailPanel for CweDetailPanel {
                 Block::default()
                     .title(title)
                     .borders(Borders::ALL)
-                    .border_style(focus_style(app.focus == PaneFocus::Right)),
+                    .border_style(focus_style(app.main.focus == PaneFocus::Right)),
             )
-            .scroll((app.cwe_detail_scroll, 0))
+            .scroll((app.cwe.detail_scroll, 0))
             .wrap(Wrap { trim: true });
         frame.render_widget(detail, area);
     }

@@ -26,23 +26,24 @@ struct CweTreePrefixEntry {
 impl ResultList for CweList {
     fn render(&self, frame: &mut ratatui::Frame<'_>, app: &mut App, area: Rect) {
         let block = Block::default()
-            .title(format!("CWE ({})", app.cwe_results.len()))
+            .title(format!("CWE ({})", app.cwe.results.len()))
             .borders(Borders::ALL)
-            .border_style(focus_style(app.focus == PaneFocus::Left));
+            .border_style(focus_style(app.main.focus == PaneFocus::Left));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
         let items = if app.cwe_searching() {
             vec![Line::from("Loading")]
-        } else if app.cwe_results.is_empty() {
+        } else if app.cwe.results.is_empty() {
             vec![Line::from("No CWE")]
         } else {
-            let prefixes = CweTreePrefixes::new(&app.cwe_results);
-            let start = (app.cwe_scroll as usize).min(app.cwe_results.len());
+            let prefixes = CweTreePrefixes::new(&app.cwe.results);
+            let start = (app.cwe.scroll as usize).min(app.cwe.results.len());
             let end = start
                 .saturating_add(inner.height as usize)
-                .min(app.cwe_results.len());
-            app.cwe_results
+                .min(app.cwe.results.len());
+            app.cwe
+                .results
                 .get(start..end)
                 .unwrap_or_default()
                 .iter()
@@ -56,7 +57,7 @@ impl ResultList for CweList {
                         .unwrap_or_default();
                     let status = cwe.status.as_deref().unwrap_or("-");
                     let prefix = prefixes.prefix(cwe);
-                    let style = if index == app.cwe_selected {
+                    let style = if index == app.cwe.selected {
                         Style::default().add_modifier(Modifier::REVERSED)
                     } else {
                         Style::default()

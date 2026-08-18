@@ -18,20 +18,20 @@ pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(format!(
         "{}CAPEC ID: {}",
-        if app.cwe_status_cursor == CWE_CAPEC_CURSOR {
+        if app.cwe.status_cursor == CWE_CAPEC_CURSOR {
             "> "
         } else {
             "  "
         },
-        app.cwe_capec_filter
+        app.cwe.capec_filter
     )));
     lines.push(Line::from(""));
     for (index, status) in CWE_STATUSES.iter().enumerate() {
         lines.push(
             Checkbox {
                 label: status.label().to_owned(),
-                checked: app.cwe_status_filter[index],
-                active: app.cwe_status_cursor == index,
+                checked: app.cwe.status_filter[index],
+                active: app.cwe.status_cursor == index,
                 active_color: Color::Yellow,
             }
             .line(),
@@ -43,11 +43,11 @@ pub(super) fn render(frame: &mut ratatui::Frame<'_>, app: &App) {
             buttons: vec![
                 ActionButton {
                     label: "Select All",
-                    active: app.cwe_status_cursor == CWE_STATUSES.len(),
+                    active: app.cwe.status_cursor == CWE_STATUSES.len(),
                 },
                 ActionButton {
                     label: "Clear All",
-                    active: app.cwe_status_cursor == CWE_STATUSES.len() + 1,
+                    active: app.cwe.status_cursor == CWE_STATUSES.len() + 1,
                 },
             ],
         }

@@ -39,7 +39,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     if let Some(db) = db.as_ref() {
         update_db_as_of(&mut app, db).await;
     }
-    if !app.query.is_empty()
+    if !app.main.query.is_empty()
         && let Some(db) = db.as_ref()
     {
         app.start_search(db.clone());
@@ -108,7 +108,7 @@ async fn run_loop(
             continue;
         }
 
-        if app.show_timeout_prompt {
+        if app.overlay.show_timeout_prompt {
             match key.code {
                 KeyCode::Enter => app.confirm_timeout_choice(),
                 KeyCode::Esc => app.cancel_timed_out_search(),
@@ -123,16 +123,16 @@ async fn run_loop(
             continue;
         }
 
-        if app.show_help {
+        if app.overlay.show_help {
             match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => app.show_help = false,
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => app.overlay.show_help = false,
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 _ => {}
             }
             continue;
         }
 
-        if app.show_advanced {
+        if app.overlay.show_advanced {
             match key.code {
                 KeyCode::Esc => app.cancel_advanced_search(),
                 KeyCode::Enter => {
@@ -142,38 +142,38 @@ async fn run_loop(
                     app.apply_advanced_search();
                 }
                 KeyCode::Backspace => {
-                    app.advanced.backspace();
+                    app.main.advanced.backspace();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Char(' ') if app.advanced.active_field_accepts_text() => {
-                    app.advanced.push(' ');
+                KeyCode::Char(' ') if app.main.advanced.active_field_accepts_text() => {
+                    app.main.advanced.push(' ');
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char(' ') => {
-                    app.advanced.toggle_current();
+                    app.main.advanced.toggle_current();
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                KeyCode::Tab | KeyCode::Down => app.advanced.next_field(),
-                KeyCode::BackTab | KeyCode::Up => app.advanced.previous_field(),
-                KeyCode::Char(']') if app.advanced.active_field == AdvancedField::Query => {
-                    app.advanced.query_mode = app.advanced.query_mode.next();
+                KeyCode::Tab | KeyCode::Down => app.main.advanced.next_field(),
+                KeyCode::BackTab | KeyCode::Up => app.main.advanced.previous_field(),
+                KeyCode::Char(']') if app.main.advanced.active_field == AdvancedField::Query => {
+                    app.main.advanced.query_mode = app.main.advanced.query_mode.next();
                     app.sync_main_from_advanced();
                 }
-                KeyCode::Char('[') if app.advanced.active_field == AdvancedField::Query => {
-                    app.advanced.query_mode = app.advanced.query_mode.previous();
+                KeyCode::Char('[') if app.main.advanced.active_field == AdvancedField::Query => {
+                    app.main.advanced.query_mode = app.main.advanced.query_mode.previous();
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char(']') => {
-                    app.advanced.next_value();
+                    app.main.advanced.next_value();
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char('[') => {
-                    app.advanced.previous_value();
+                    app.main.advanced.previous_value();
                     app.sync_main_from_advanced();
                 }
                 KeyCode::Char(ch) => {
-                    app.advanced.push(ch);
+                    app.main.advanced.push(ch);
                     app.sync_main_from_advanced();
                 }
                 _ => {}
@@ -181,75 +181,90 @@ async fn run_loop(
             continue;
         }
 
-        if app.show_display {
+        if app.overlay.show_display {
             match key.code {
                 KeyCode::Esc => app.cancel_display_settings(),
                 KeyCode::Enter => app.apply_display_settings(db.as_ref().cloned()),
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
-                KeyCode::PageDown => app.display.scroll = app.display.scroll.saturating_add(8),
-                KeyCode::PageUp => app.display.scroll = app.display.scroll.saturating_sub(8),
+                KeyCode::PageDown => {
+                    app.main.display.scroll = app.main.display.scroll.saturating_add(8)
+                }
+                KeyCode::PageUp => {
+                    app.main.display.scroll = app.main.display.scroll.saturating_sub(8)
+                }
                 KeyCode::Tab | KeyCode::Down => {
-                    if app.display.source_focus {
-                        if app.advanced.scope_cursor + 1 >= app.advanced.scope_entries().len() {
-                            app.display.source_focus = false;
-                            app.display.active_field = crate::display::DisplayField::SortField;
-                            app.display.scroll = 0;
+                    if app.main.display.source_focus {
+                        if app.main.advanced.scope_cursor + 1
+                            >= app.main.advanced.scope_entries().len()
+                        {
+                            app.main.display.source_focus = false;
+                            app.main.display.active_field = crate::display::DisplayField::SortField;
+                            app.main.display.scroll = 0;
                         } else {
-                            app.advanced.next_scope();
-                            app.display.scroll = app.advanced.scope_cursor.saturating_add(5);
+                            app.main.advanced.next_scope();
+                            app.main.display.scroll =
+                                app.main.advanced.scope_cursor.saturating_add(5);
                         }
-                    } else if app.display.active_field == crate::display::DisplayField::KevOnly {
-                        app.display.source_focus = true;
-                        app.advanced.scope_cursor = 0;
-                        app.display.scroll = 5;
+                    } else if app.main.display.active_field == crate::display::DisplayField::KevOnly
+                    {
+                        app.main.display.source_focus = true;
+                        app.main.advanced.scope_cursor = 0;
+                        app.main.display.scroll = 5;
                     } else {
-                        app.display.next_field();
+                        app.main.display.next_field();
                     }
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    if app.display.source_focus {
-                        if app.advanced.scope_cursor == 0 {
-                            app.display.source_focus = false;
-                            app.display.active_field = crate::display::DisplayField::KevOnly;
-                            app.display.scroll = 0;
+                    if app.main.display.source_focus {
+                        if app.main.advanced.scope_cursor == 0 {
+                            app.main.display.source_focus = false;
+                            app.main.display.active_field = crate::display::DisplayField::KevOnly;
+                            app.main.display.scroll = 0;
                         } else {
-                            app.advanced.previous_scope();
-                            app.display.scroll = app.advanced.scope_cursor.saturating_add(5);
+                            app.main.advanced.previous_scope();
+                            app.main.display.scroll =
+                                app.main.advanced.scope_cursor.saturating_add(5);
                         }
                     } else {
-                        app.display.previous_field();
+                        app.main.display.previous_field();
                     }
                 }
                 KeyCode::Left | KeyCode::Char('[') => {
-                    if app.display.source_focus {
-                        app.advanced.toggle_scope_current();
+                    if app.main.display.source_focus {
+                        app.main.advanced.toggle_scope_current();
                     } else {
-                        app.display.previous_value();
+                        app.main.display.previous_value();
                     }
                 }
                 KeyCode::Right | KeyCode::Char(']') => {
-                    if app.display.source_focus {
-                        app.advanced.toggle_scope_current();
+                    if app.main.display.source_focus {
+                        app.main.advanced.toggle_scope_current();
                     } else {
-                        app.display.next_value();
+                        app.main.display.next_value();
                     }
                 }
-                KeyCode::Backspace if app.display.source_focus => {
-                    app.advanced.backspace_scope_filter()
+                KeyCode::Backspace if app.main.display.source_focus => {
+                    app.main.advanced.backspace_scope_filter()
                 }
-                KeyCode::Char(' ') if app.display.source_focus => {
-                    app.advanced.toggle_scope_current()
+                KeyCode::Char(' ') if app.main.display.source_focus => {
+                    app.main.advanced.toggle_scope_current()
                 }
-                KeyCode::Char('a') if app.display.source_focus => app.advanced.select_all_scope(),
-                KeyCode::Char('x') if app.display.source_focus => app.advanced.clear_all_scope(),
-                KeyCode::Char(ch) if app.display.source_focus => app.advanced.push_scope_filter(ch),
+                KeyCode::Char('a') if app.main.display.source_focus => {
+                    app.main.advanced.select_all_scope()
+                }
+                KeyCode::Char('x') if app.main.display.source_focus => {
+                    app.main.advanced.clear_all_scope()
+                }
+                KeyCode::Char(ch) if app.main.display.source_focus => {
+                    app.main.advanced.push_scope_filter(ch)
+                }
                 _ => {}
             }
             continue;
         }
 
-        if app.show_maintenance {
-            if app.maintenance_confirming {
+        if app.overlay.show_maintenance {
+            if app.overlay.maintenance_confirming {
                 match key.code {
                     KeyCode::Enter | KeyCode::Char('y') => {
                         start_selected_maintenance(db_url, db, app).await;
@@ -275,15 +290,15 @@ async fn run_loop(
                 KeyCode::Char(' ') | KeyCode::Char('k') => {
                     app.toggle_maintenance_keep_downloads();
                 }
-                KeyCode::Char('i') => app.maintenance_choice = MaintenanceChoice::Init,
-                KeyCode::Char('u') => app.maintenance_choice = MaintenanceChoice::Update,
-                KeyCode::Char('c') => app.maintenance_choice = MaintenanceChoice::Cancel,
+                KeyCode::Char('i') => app.overlay.maintenance_choice = MaintenanceChoice::Init,
+                KeyCode::Char('u') => app.overlay.maintenance_choice = MaintenanceChoice::Update,
+                KeyCode::Char('c') => app.overlay.maintenance_choice = MaintenanceChoice::Cancel,
                 _ => {}
             }
             continue;
         }
 
-        if app.detail_search_input {
+        if app.overlay.detail_search_input {
             match key.code {
                 KeyCode::Esc => app.close_detail_search(),
                 KeyCode::Enter => app.close_detail_search(),
@@ -295,7 +310,7 @@ async fn run_loop(
             continue;
         }
 
-        if app.show_cwe_status {
+        if app.cwe.show_status {
             match key.code {
                 KeyCode::Esc => app.cancel_cwe_status_popup(),
                 KeyCode::Enter => {
@@ -306,10 +321,10 @@ async fn run_loop(
                 KeyCode::Char('c') | KeyCode::Char('d') if is_ctrl_quit(&key) => break,
                 KeyCode::Down | KeyCode::Tab => app.next_cwe_status(),
                 KeyCode::Up | KeyCode::BackTab => app.previous_cwe_status(),
-                KeyCode::Backspace if app.cwe_status_cursor == crate::app::CWE_CAPEC_CURSOR => {
+                KeyCode::Backspace if app.cwe.status_cursor == crate::app::CWE_CAPEC_CURSOR => {
                     app.backspace_cwe_capec_filter()
                 }
-                KeyCode::Char(ch) if app.cwe_status_cursor == crate::app::CWE_CAPEC_CURSOR => {
+                KeyCode::Char(ch) if app.cwe.status_cursor == crate::app::CWE_CAPEC_CURSOR => {
                     app.push_cwe_capec_filter(ch)
                 }
                 KeyCode::Char(' ') => app.toggle_current_cwe_status(),
@@ -320,87 +335,88 @@ async fn run_loop(
             continue;
         }
 
-        if app.show_capec_filter {
+        if app.capec.show_filter {
             match key.code {
                 KeyCode::Esc => app.cancel_capec_filter(),
                 KeyCode::Enter => app.apply_capec_filter(db.as_ref().cloned()),
                 KeyCode::Tab | KeyCode::Down => {
-                    app.capec_filter_field = (app.capec_filter_field + 1) % 3;
+                    app.capec.filter_field = (app.capec.filter_field + 1) % 3;
                 }
                 KeyCode::BackTab | KeyCode::Up => {
-                    app.capec_filter_field = (app.capec_filter_field + 2) % 3;
+                    app.capec.filter_field = (app.capec.filter_field + 2) % 3;
                 }
-                KeyCode::Backspace => match app.capec_filter_field {
+                KeyCode::Backspace => match app.capec.filter_field {
                     0 => {
-                        app.capec_status_filter.pop();
+                        app.capec.status_filter.pop();
                     }
                     1 => {
-                        app.capec_type_filter.pop();
+                        app.capec.type_filter.pop();
                     }
                     _ => {
-                        app.capec_cwe_filter.pop();
+                        app.capec.cwe_filter.pop();
                     }
                 },
-                KeyCode::Char(ch) => match app.capec_filter_field {
-                    0 => app.capec_status_filter.push(ch),
-                    1 => app.capec_type_filter.push(ch),
-                    _ => app.capec_cwe_filter.push(ch),
+                KeyCode::Char(ch) => match app.capec.filter_field {
+                    0 => app.capec.status_filter.push(ch),
+                    1 => app.capec.type_filter.push(ch),
+                    _ => app.capec.cwe_filter.push(ch),
                 },
                 _ => {}
             }
             continue;
         }
 
-        if app.show_capec_taxonomy {
+        if app.capec.show_taxonomy {
             match key.code {
-                KeyCode::Esc => app.show_capec_taxonomy = false,
+                KeyCode::Esc => app.capec.show_taxonomy = false,
                 KeyCode::Tab | KeyCode::BackTab => {
-                    app.capec_taxonomy_tab = (app.capec_taxonomy_tab + 1) % 2;
-                    app.capec_taxonomy_scroll = 0;
-                    app.capec_taxonomy_selected = 0;
+                    app.capec.taxonomy_tab = (app.capec.taxonomy_tab + 1) % 2;
+                    app.capec.taxonomy_scroll = 0;
+                    app.capec.taxonomy_selected = 0;
                 }
                 KeyCode::Left => {
-                    app.capec_taxonomy_section = (app.capec_taxonomy_section + 3) % 4;
-                    app.capec_taxonomy_scroll = 0;
+                    app.capec.taxonomy_section = (app.capec.taxonomy_section + 3) % 4;
+                    app.capec.taxonomy_scroll = 0;
                 }
                 KeyCode::Right => {
-                    app.capec_taxonomy_section = (app.capec_taxonomy_section + 1) % 4;
-                    app.capec_taxonomy_scroll = 0;
+                    app.capec.taxonomy_section = (app.capec.taxonomy_section + 1) % 4;
+                    app.capec.taxonomy_scroll = 0;
                 }
                 KeyCode::Up => {
-                    app.capec_taxonomy_selected = app.capec_taxonomy_selected.saturating_sub(1)
+                    app.capec.taxonomy_selected = app.capec.taxonomy_selected.saturating_sub(1)
                 }
                 KeyCode::Down => {
-                    let count = app.capec_taxonomy.as_ref().map_or(0, |detail| {
-                        if app.capec_taxonomy_tab == 0 {
+                    let count = app.capec.taxonomy.as_ref().map_or(0, |detail| {
+                        if app.capec.taxonomy_tab == 0 {
                             detail.categories.len()
                         } else {
                             detail.views.len()
                         }
                     });
-                    app.capec_taxonomy_selected = app
-                        .capec_taxonomy_selected
+                    app.capec.taxonomy_selected = app
+                        .capec
+                        .taxonomy_selected
                         .saturating_add(1)
                         .min(count.saturating_sub(1));
                 }
                 KeyCode::PageUp => {
-                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_sub(10)
+                    app.capec.taxonomy_scroll = app.capec.taxonomy_scroll.saturating_sub(10)
                 }
                 KeyCode::PageDown => {
-                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_add(10)
+                    app.capec.taxonomy_scroll = app.capec.taxonomy_scroll.saturating_add(10)
                 }
                 KeyCode::Char('u') if is_ctrl(&key, 'u') => {
-                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_sub(5)
+                    app.capec.taxonomy_scroll = app.capec.taxonomy_scroll.saturating_sub(5)
                 }
                 KeyCode::Char('d') if is_ctrl(&key, 'd') => {
-                    app.capec_taxonomy_scroll = app.capec_taxonomy_scroll.saturating_add(5)
+                    app.capec.taxonomy_scroll = app.capec.taxonomy_scroll.saturating_add(5)
                 }
                 _ => {}
             }
             continue;
         }
 
-        if app.view_mode == ViewMode::RawJson {
+        if app.raw.view_mode == ViewMode::RawJson {
             if modes::raw_json::handler::handle_key(
                 app,
                 db.as_ref().cloned(),
@@ -412,7 +428,7 @@ async fn run_loop(
             continue;
         }
 
-        if app.view_mode == ViewMode::CweList {
+        if app.raw.view_mode == ViewMode::CweList {
             if modes::cwe::handler::handle_key(
                 app,
                 db.as_ref().cloned(),
@@ -424,7 +440,7 @@ async fn run_loop(
             continue;
         }
 
-        if app.view_mode == ViewMode::CapecList {
+        if app.raw.view_mode == ViewMode::CapecList {
             if modes::capec::handler::handle_key(
                 app,
                 db.as_ref().cloned(),
@@ -446,12 +462,12 @@ async fn run_loop(
 }
 
 async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, app: &mut App) {
-    let keep_downloads = app.maintenance_keep_downloads;
-    match app.maintenance_choice {
+    let keep_downloads = app.overlay.maintenance_keep_downloads;
+    match app.overlay.maintenance_choice {
         MaintenanceChoice::Cancel => app.close_maintenance(),
         MaintenanceChoice::Update => {
             if let Err(err) = close_db_before_maintenance(db, app, "update").await {
-                app.status_message = Some(err);
+                app.overlay.status_message = Some(err);
                 app.close_maintenance();
                 return;
             }
@@ -468,7 +484,7 @@ async fn start_selected_maintenance(db_url: &str, db: &mut Option<CveDatabase>, 
         }
         MaintenanceChoice::Init => {
             if let Err(err) = close_db_before_maintenance(db, app, "init").await {
-                app.status_message = Some(err);
+                app.overlay.status_message = Some(err);
                 app.close_maintenance();
                 return;
             }
@@ -497,10 +513,10 @@ async fn close_db_before_maintenance(
             .await
             .map_err(|err| format!("failed to close database before {operation}: {err}"))?;
     }
-    app.candidates.clear();
-    app.linked_osv.clear();
-    app.enrichment.clear();
-    app.total_results = None;
+    app.main.candidates.clear();
+    app.main.linked_osv.clear();
+    app.main.enrichment.clear();
+    app.main.total_results = None;
     Ok(())
 }
 
@@ -508,7 +524,8 @@ async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>
     if let Some(current_db) = db.take()
         && let Err(err) = connection::close(current_db).await
     {
-        app.status_message = Some(format!("failed to close stale database connection: {err}"));
+        app.overlay.status_message =
+            Some(format!("failed to close stale database connection: {err}"));
     }
     match connection::connect(db_url).await {
         Ok(reconnected) => {
@@ -516,16 +533,16 @@ async fn refresh_db_after_maintenance(db_url: &str, db: &mut Option<CveDatabase>
             *db = Some(reconnected);
         }
         Err(err) => {
-            app.status_message = Some(format!("{err}; database is unavailable"));
+            app.overlay.status_message = Some(format!("{err}; database is unavailable"));
         }
     }
 }
 
 async fn update_db_as_of(app: &mut App, db: &CveDatabase) {
     match connection::latest_data_timestamp(db).await {
-        Ok(value) => app.db_as_of = value,
+        Ok(value) => app.main.db_as_of = value,
         Err(err) => {
-            app.status_message = Some(err);
+            app.overlay.status_message = Some(err);
         }
     }
 }
@@ -574,13 +591,14 @@ mod tests {
     async fn close_db_before_maintenance_drops_connection_and_clears_search_state() {
         let mut db = Some(CveDatabase::connect("sqlite::memory:").await.unwrap());
         let mut app = App::new("django".to_owned(), 30);
-        app.candidates
+        app.main
+            .candidates
             .push(SearchCandidate::Osv(test_osv("GHSA-before-maintenance")));
-        app.linked_osv.insert(
+        app.main.linked_osv.insert(
             "CVE-before-maintenance".to_owned(),
             vec![test_osv("GHSA-linked-before-maintenance")],
         );
-        app.enrichment.insert(
+        app.main.enrichment.insert(
             "CVE-before-maintenance".to_owned(),
             EnrichedCveSummary {
                 cve_id: "CVE-before-maintenance".to_owned(),
@@ -598,18 +616,18 @@ mod tests {
                 epss_model_version: None,
             },
         );
-        app.total_results = Some(42);
-        app.status_message = Some("existing status".to_owned());
+        app.main.total_results = Some(42);
+        app.overlay.status_message = Some("existing status".to_owned());
 
         close_db_before_maintenance(&mut db, &mut app, "update")
             .await
             .unwrap();
 
         assert!(db.is_none());
-        assert!(app.candidates.is_empty());
-        assert!(app.linked_osv.is_empty());
-        assert!(app.enrichment.is_empty());
-        assert_eq!(app.total_results, None);
+        assert!(app.main.candidates.is_empty());
+        assert!(app.main.linked_osv.is_empty());
+        assert!(app.main.enrichment.is_empty());
+        assert_eq!(app.main.total_results, None);
     }
 
     #[tokio::test]
@@ -622,9 +640,12 @@ mod tests {
 
         assert!(app.poll_maintenance().await);
         assert!(!app.maintenance_running());
-        assert_eq!(app.status_message.as_deref(), Some("update completed"));
-        assert!(app.maintenance_progress.is_none());
-        assert!(!app.show_maintenance);
+        assert_eq!(
+            app.overlay.status_message.as_deref(),
+            Some("update completed")
+        );
+        assert!(app.overlay.maintenance_progress.is_none());
+        assert!(!app.overlay.show_maintenance);
     }
 
     #[tokio::test]
@@ -637,8 +658,11 @@ mod tests {
 
         assert!(app.poll_maintenance().await);
         assert!(!app.maintenance_running());
-        assert_eq!(app.status_message.as_deref(), Some("init failed: boom"));
-        assert!(app.maintenance_progress.is_none());
-        assert!(!app.show_maintenance);
+        assert_eq!(
+            app.overlay.status_message.as_deref(),
+            Some("init failed: boom")
+        );
+        assert!(app.overlay.maintenance_progress.is_none());
+        assert!(!app.overlay.show_maintenance);
     }
 }
