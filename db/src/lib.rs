@@ -30,10 +30,11 @@ pub use database::package_eval::{
     versions_equivalent,
 };
 pub use database::sqlx_database::{
-    OsvImportStats, SqlxAffected, SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary,
-    SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase, SqlxDatabaseStatus,
-    SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
-    SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState,
+    OsvImportStats, SqlxAffected, SqlxAffectedComponentSearch, SqlxCveDetail, SqlxCveReference,
+    SqlxCveSearch, SqlxCveSummary, SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe,
+    SqlxDatabase, SqlxDatabaseStatus, SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge,
+    SqlxIdentifierResolution, SqlxKev, SqlxKevEntry, SqlxOsvSummary, SqlxPackageFinding,
+    SqlxSourceSyncState,
 };
 /// Shared database handle used by application crates.
 pub type CveDatabase = SqlxDatabase;

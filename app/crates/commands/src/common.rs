@@ -1652,11 +1652,13 @@ pub async fn apply_delta_updates_with_progress(
             db.clone(),
             "update",
             &path,
-            max_chunks,
-            false,
-            true,
-            None,
-            progress,
+            CveZipImportOptions {
+                max_chunks,
+                bulk_replace: false,
+                rebuild_after: true,
+                index_started: None,
+                progress,
+            },
         )
         .await?;
         db.mark_cve_asset_applied(
@@ -1709,11 +1711,13 @@ pub async fn apply_delta_updates_with_progress(
                 db.clone(),
                 "update",
                 &path,
-                max_chunks,
-                false,
-                false,
-                None,
-                progress.clone(),
+                CveZipImportOptions {
+                    max_chunks,
+                    bulk_replace: false,
+                    rebuild_after: false,
+                    index_started: None,
+                    progress: progress.clone(),
+                },
             )
             .await?;
             db.mark_cve_asset_applied(&asset.name, &asset.url)
@@ -1788,7 +1792,19 @@ pub async fn import_cve_zip(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, true, None, None).await
+    import_cve_zip_with_mode(
+        db,
+        label,
+        asset_path,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: false,
+            rebuild_after: true,
+            index_started: None,
+            progress: None,
+        },
+    )
+    .await
 }
 
 /// Imports CVE JSON from a ZIP archive while reporting progress.
@@ -1803,11 +1819,13 @@ pub async fn import_cve_zip_with_progress(
         db,
         label,
         asset_path,
-        max_chunks,
-        false,
-        true,
-        None,
-        Some(progress),
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: false,
+            rebuild_after: true,
+            index_started: None,
+            progress: Some(progress),
+        },
     )
     .await
 }
@@ -1819,7 +1837,19 @@ pub async fn import_cve_zip_bulk(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, true, true, None, None).await
+    import_cve_zip_with_mode(
+        db,
+        label,
+        asset_path,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: true,
+            rebuild_after: true,
+            index_started: None,
+            progress: None,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn import_cve_zip_bulk_with_index_signal(
@@ -1834,25 +1864,38 @@ pub(crate) async fn import_cve_zip_bulk_with_index_signal(
         db,
         label,
         asset_path,
-        max_chunks,
-        true,
-        true,
-        Some(index_started),
-        progress,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: true,
+            rebuild_after: true,
+            index_started: Some(index_started),
+            progress,
+        },
     )
     .await
+}
+
+struct CveZipImportOptions {
+    max_chunks: Option<usize>,
+    bulk_replace: bool,
+    rebuild_after: bool,
+    index_started: Option<oneshot::Sender<()>>,
+    progress: Option<IngestProgressCallback>,
 }
 
 async fn import_cve_zip_with_mode(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
-    max_chunks: Option<usize>,
-    bulk_replace: bool,
-    rebuild_after: bool,
-    index_started: Option<oneshot::Sender<()>>,
-    progress: Option<IngestProgressCallback>,
+    options: CveZipImportOptions,
 ) -> Result<usize, String> {
+    let CveZipImportOptions {
+        max_chunks,
+        bulk_replace,
+        rebuild_after,
+        index_started,
+        progress,
+    } = options;
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
     let entries = storage.entries();

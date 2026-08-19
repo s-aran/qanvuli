@@ -591,6 +591,18 @@ pub struct SqlxCveSearch {
     pub sort_order: CveSummarySortOrder,
 }
 
+/// Parameters for the name-based CVE fallback used by package searches.
+#[derive(Clone, Debug)]
+pub struct SqlxAffectedComponentSearch {
+    pub vendor: Option<String>,
+    pub component: String,
+    pub published_since: Option<String>,
+    pub updated_since: Option<String>,
+    pub state_scope: CveStateScope,
+    pub limit: u64,
+    pub offset: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, sqlx::FromRow)]
 pub struct SqlxCwe {
     pub id: i64,

@@ -153,16 +153,18 @@ impl GitHubReleaseFile {
                 break;
             }
             let end = (start + chunk_size - 1).min(content_range.total - 1);
-            tasks.spawn(download_range(
-                self.url.clone(),
-                path.to_path_buf(),
-                start,
-                end,
-                content_range.total,
-                validator.clone(),
-                written.clone(),
-                progress.clone(),
-            ));
+            tasks.spawn(download_range(RangeDownload {
+                url: self.url.clone(),
+                path: path.to_path_buf(),
+                range: ContentRange {
+                    start,
+                    end,
+                    total: content_range.total,
+                },
+                validator: validator.clone(),
+                written_total: written.clone(),
+                progress: progress.clone(),
+            }));
         }
         while let Some(result) = tasks.join_next().await {
             match result {
@@ -239,16 +241,25 @@ fn parse_content_range(value: &str) -> Option<ContentRange> {
     (start <= end && end < total).then_some(ContentRange { start, end, total })
 }
 
-async fn download_range(
+struct RangeDownload {
     url: String,
     path: std::path::PathBuf,
-    start: u64,
-    end: u64,
-    total: u64,
+    range: ContentRange,
     validator: Option<String>,
     written_total: Arc<AtomicU64>,
     progress: Option<DownloadProgressCallback>,
-) -> Result<(), String> {
+}
+
+async fn download_range(download: RangeDownload) -> Result<(), String> {
+    let RangeDownload {
+        url,
+        path,
+        range,
+        validator,
+        written_total,
+        progress,
+    } = download;
+    let ContentRange { start, end, total } = range;
     let client = reqwest::Client::builder()
         .http1_only()
         .build()

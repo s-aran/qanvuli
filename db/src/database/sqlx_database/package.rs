@@ -3,18 +3,17 @@ use super::*;
 impl SqlxDatabase {
     pub async fn search_cve_summaries_by_affected_component_with_state_scope(
         &self,
-        vendor: Option<&str>,
-        component: &str,
-        published_since: Option<&str>,
-        updated_since: Option<&str>,
-        state_scope: CveStateScope,
-        limit: u64,
-        offset: u64,
+        search: SqlxAffectedComponentSearch,
     ) -> Result<Vec<CveSummary>, sqlx::Error> {
-        let vendor = vendor.map(str::to_owned);
-        let component = component.to_owned();
-        let published_since = published_since.map(str::to_owned);
-        let updated_since = updated_since.map(str::to_owned);
+        let SqlxAffectedComponentSearch {
+            vendor,
+            component,
+            published_since,
+            updated_since,
+            state_scope,
+            limit,
+            offset,
+        } = search;
         let include_rejected = state_scope == CveStateScope::IncludeRejected;
         self.writer
             .with_connection(|connection| {
