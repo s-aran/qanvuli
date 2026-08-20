@@ -15,7 +15,8 @@ use super::{
 use crate::{
     AffectedStatus, CveAffectedDetail, CveAffectedVersionDetail, CveCvssDetail, CveCweDetail,
     CveDetail, CveStateScope, CveSummary, CveSummarySortOrder, CveSummaryWithDetail,
-    EnrichedFinding, FindingEnrichment, OsvRawRecord, PackageQuery, PrioritySignals,
+    EnrichedFinding, FindingEnrichment, OsvRawRecord, PackageQuery, PrioritySignals, SsvcInfo,
+    SsvcSearch,
 };
 use md5::{Digest, Md5};
 use qanvuli_models::cwe::WeaknessCatalog;
@@ -32,6 +33,7 @@ mod cve;
 mod maintenance;
 mod osv;
 mod package;
+mod ssvc;
 
 #[cfg(test)]
 mod tests;
@@ -545,6 +547,7 @@ pub struct SqlxCveDetail {
     pub references: Vec<SqlxCveReference>,
     pub epss: Option<SqlxEpss>,
     pub kev: Option<SqlxKev>,
+    pub ssvc: Vec<SsvcInfo>,
     pub osv_advisories: Vec<SqlxOsvSummary>,
 }
 
@@ -584,6 +587,7 @@ pub struct SqlxCveSearch {
     pub vendor_exact: Option<String>,
     pub product_exact: Option<String>,
     pub cvss: SqlxCvssSearch,
+    pub ssvc: SsvcSearch,
     pub published_since: Option<String>,
     pub published_until: Option<String>,
     pub updated_since: Option<String>,
@@ -791,6 +795,7 @@ impl From<SqlxCveSummaryWithDetail> for CveSummaryWithDetail {
                             .collect(),
                     })
                     .collect(),
+                ssvc: detail.ssvc,
             },
         }
     }

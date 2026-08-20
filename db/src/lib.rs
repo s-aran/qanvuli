@@ -19,6 +19,7 @@ mod epss;
 mod identifiers;
 mod kev;
 mod osv;
+mod ssvc;
 
 pub use capec::*;
 pub use common::detect_identifier_type;
@@ -42,3 +43,4 @@ pub use epss::*;
 pub use identifiers::*;
 pub use kev::*;
 pub use osv::*;
+pub use ssvc::*;

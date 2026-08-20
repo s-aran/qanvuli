@@ -121,6 +121,7 @@ mod tests {
             }],
             cvss: Vec::new(),
             affected: Vec::new(),
+            ssvc: Vec::new(),
         };
         let lines = metadata_lines(Some(&detail), Some(&[63, 85]), &DetailSearch::new(""))
             .into_iter()

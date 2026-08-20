@@ -70,6 +70,11 @@ fn advanced_cve_filters(options: &CveAdvancedSearch) -> SqlxCveSearch {
         product_like: options.product.as_ref().map(|v| format!("%{v}%")),
         vendor_exact: options.vendor_exact.clone(),
         product_exact: options.product_exact.clone(),
+        ssvc: crate::SsvcSearch {
+            exploitation: options.ssvc_exploitation,
+            automatable: options.ssvc_automatable,
+            technical_impact: options.ssvc_technical_impact,
+        },
         sort_order: options.sort_order,
         ..Default::default()
     };

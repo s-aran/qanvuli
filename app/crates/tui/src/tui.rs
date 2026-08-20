@@ -614,6 +614,9 @@ mod tests {
                 epss_percentile: None,
                 epss_score_date: None,
                 epss_model_version: None,
+                ssvc_exploitation: None,
+                ssvc_automatable: None,
+                ssvc_technical_impact: None,
             },
         );
         app.main.total_results = Some(42);

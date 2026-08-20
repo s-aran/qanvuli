@@ -1,3 +1,4 @@
+use super::ssvc::replace_ssvc_for_cves;
 use super::*;
 
 impl SqlxDatabase {
@@ -287,6 +288,7 @@ impl SqlxDatabase {
             && filters.cvss.max_score.is_none()
             && filters.cvss.severity.is_none()
             && filters.cvss.version.is_none()
+            && filters.ssvc.is_empty()
             && filters.published_since.is_none()
             && filters.published_until.is_none()
             && filters.updated_since.is_none()
@@ -347,6 +349,13 @@ impl SqlxDatabase {
             }
             if kev_only {
                 query.push(" AND EXISTS (SELECT 1 FROM kev_entries WHERE kev_entries.cve_id=c.cve_id)");
+            }
+            if !filters.ssvc.is_empty() {
+                query.push(" AND EXISTS (SELECT 1 FROM ssvc_assessments AS ssvc WHERE ssvc.cve_id=c.cve_id");
+                if let Some(value) = filters.ssvc.exploitation { query.push(" AND ssvc.exploitation=").push_bind(value.as_str()); }
+                if let Some(value) = filters.ssvc.automatable { query.push(" AND ssvc.automatable=").push_bind(value.as_str()); }
+                if let Some(value) = filters.ssvc.technical_impact { query.push(" AND ssvc.technical_impact=").push_bind(value.as_str()); }
+                query.push(")");
             }
             let has_affected = filters.vendor_like.is_some() || filters.product_like.is_some() || filters.vendor_exact.is_some() || filters.product_exact.is_some();
             if has_affected {
@@ -454,6 +463,19 @@ impl SqlxDatabase {
                     }
                     if kev_only {
                         query.push(" AND EXISTS (SELECT 1 FROM kev_entries WHERE kev_entries.cve_id=c.cve_id)");
+                    }
+                    if !filters.ssvc.is_empty() {
+                        query.push(" AND EXISTS (SELECT 1 FROM ssvc_assessments AS ssvc WHERE ssvc.cve_id=c.cve_id");
+                        if let Some(value) = filters.ssvc.exploitation {
+                            query.push(" AND ssvc.exploitation=").push_bind(value.as_str());
+                        }
+                        if let Some(value) = filters.ssvc.automatable {
+                            query.push(" AND ssvc.automatable=").push_bind(value.as_str());
+                        }
+                        if let Some(value) = filters.ssvc.technical_impact {
+                            query.push(" AND ssvc.technical_impact=").push_bind(value.as_str());
+                        }
+                        query.push(")");
                     }
                     let has_affected = filters.vendor_like.is_some()
                         || filters.product_like.is_some()
@@ -572,8 +594,10 @@ impl SqlxDatabase {
                 .unwrap_or_default();
             let epss = sqlx::query_as("SELECT epss, percentile, score_date, model_version FROM epss_current WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
             let kev = sqlx::query_as("SELECT vendor_project, product, vulnerability_name, COALESCE(date_added, '') AS date_added, due_date FROM kev_entries WHERE cve_id=?").bind(&cve_id).fetch_optional(&mut *connection).await?;
+            let ssvc_rows: Vec<super::ssvc::SsvcRow> = sqlx::query_as("SELECT cve_id, provider, role, version, assessed_at, exploitation, automatable, technical_impact, fetched_at FROM ssvc_assessments WHERE cve_id=? ORDER BY provider, role").bind(&cve_id).fetch_all(&mut *connection).await?;
+            let ssvc = ssvc_rows.into_iter().map(super::ssvc::ssvc_info).collect::<Result<Vec<_>, _>>()?;
             let osv_advisories = sqlx::query_as("SELECT advisory.osv_id, advisory.published_at, COALESCE(advisory.modified_at, '') AS modified_at, advisory.summary, advisory.details, advisory.withdrawn_at, (SELECT group_concat(COALESCE(package.ecosystem, '') || ':' || COALESCE(package.package_name, ''), ', ') FROM osv_affected_packages AS package WHERE package.osv_id=advisory.osv_id) AS package_summary FROM osv_aliases AS alias JOIN osv_advisories AS advisory ON advisory.osv_id=alias.osv_id WHERE alias.alias_id=? ORDER BY advisory.modified_at DESC, advisory.osv_id").bind(&cve_id).fetch_all(&mut *connection).await?;
-            Ok(Some(SqlxCveDetail { cvss, cwes, affected, references, epss, kev, osv_advisories }))
+            Ok(Some(SqlxCveDetail { cvss, cwes, affected, references, epss, kev, ssvc, osv_advisories }))
         })).await
     }
 
@@ -677,6 +701,15 @@ impl SqlxDatabase {
             for (cve_id, vendor_project, product, vulnerability_name, date_added, due_date) in kev_rows {
                 if let Some(id) = ids_by_cve.get(&cve_id) {
                     details.get_mut(id).expect("known parent").kev = Some(SqlxKev { vendor_project, product, vulnerability_name, date_added, due_date });
+                }
+            }
+            let ssvc_rows: Vec<super::ssvc::SsvcRow> = sqlx::query_as(
+                "SELECT cve_id, provider, role, version, assessed_at, exploitation, automatable, technical_impact, fetched_at FROM ssvc_assessments WHERE cve_id IN (SELECT value FROM json_each(?)) ORDER BY provider, role",
+            ).bind(&requested_json).fetch_all(&mut *connection).await?;
+            for row in ssvc_rows {
+                let cve_id = row.0.clone();
+                if let Some(id) = ids_by_cve.get(&cve_id) {
+                    details.get_mut(id).expect("known parent").ssvc.push(super::ssvc::ssvc_info(row)?);
                 }
             }
             let osv_rows: Vec<BatchedOsvRow> = sqlx::query_as(
@@ -974,6 +1007,7 @@ impl SqlxDatabase {
                             Self::delete_existing_cve_children(&mut transaction, &records).await?;
                         }
                         Self::insert_cve_children(&mut transaction, &records, &cve_ids).await?;
+                        replace_ssvc_for_cves(&mut transaction, &records, bulk_init).await?;
                     }
                     if update_search {
                         rebuild_cve_search(&mut transaction).await?;

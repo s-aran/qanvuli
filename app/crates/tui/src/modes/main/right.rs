@@ -211,6 +211,22 @@ fn render_enrichment(
     } else {
         lines.push(Line::from("  EPSS: not synced"));
     }
+    if enrichment.ssvc_exploitation.is_some()
+        || enrichment.ssvc_automatable.is_some()
+        || enrichment.ssvc_technical_impact.is_some()
+    {
+        lines.push(highlighted_line(
+            &format!(
+                "  SSVC: exploitation={} automatable={} technical-impact={}",
+                enrichment.ssvc_exploitation.as_deref().unwrap_or("-"),
+                enrichment.ssvc_automatable.as_deref().unwrap_or("-"),
+                enrichment.ssvc_technical_impact.as_deref().unwrap_or("-")
+            ),
+            detail_search,
+        ));
+    } else {
+        lines.push(Line::from("  SSVC: not synced"));
+    }
     if enrichment.kev_listed {
         lines.push(highlighted_line(
             &format!(
@@ -269,7 +285,14 @@ fn render_enrichment(
     if enrichment.epss.is_some() {
         lines.push(Line::from("  epss_join source=FIRST EPSS"));
     }
-    if aliases.is_empty() && !enrichment.kev_listed && enrichment.epss.is_none() {
+    if enrichment.ssvc_exploitation.is_some() {
+        lines.push(Line::from("  ssvc_join source=CVE ADP"));
+    }
+    if aliases.is_empty()
+        && !enrichment.kev_listed
+        && enrichment.epss.is_none()
+        && enrichment.ssvc_exploitation.is_none()
+    {
         lines.push(Line::from("  none"));
     }
     lines

@@ -5,6 +5,7 @@ use crate::{
     epss::EpssInfo,
     identifiers::SourceSyncState,
     kev::KevInfo,
+    ssvc::SsvcInfo,
 };
 use serde::Serialize;
 use std::time::Duration;
@@ -34,6 +35,7 @@ pub struct EnrichmentDatabaseStatus {
     pub osv_record_count: i64,
     pub kev_entry_count: i64,
     pub epss_current_count: i64,
+    pub ssvc_assessment_count: i64,
     pub identifier_node_count: i64,
     pub identifier_edge_count: i64,
 }
@@ -75,6 +77,7 @@ pub struct EnrichedCve {
     pub affected_packages: Vec<AffectedPackageSummary>,
     pub kev: Option<KevInfo>,
     pub epss: Option<EpssInfo>,
+    pub ssvc: Vec<SsvcInfo>,
     pub severity: Vec<CveCvssDetail>,
     pub cwe: Vec<String>,
     pub evidence: Vec<Evidence>,
@@ -97,6 +100,9 @@ pub struct EnrichedCveSummary {
     pub epss_percentile: Option<f64>,
     pub epss_score_date: Option<String>,
     pub epss_model_version: Option<String>,
+    pub ssvc_exploitation: Option<String>,
+    pub ssvc_automatable: Option<String>,
+    pub ssvc_technical_impact: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]

@@ -6,6 +6,7 @@ pub mod cwe;
 pub mod epss;
 pub mod kev;
 pub mod osv;
+pub mod ssvc;
 
 use anyhow::{Error, Result, anyhow};
 use cve::{

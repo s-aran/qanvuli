@@ -349,7 +349,7 @@ fn is_empty_osv_database_dir(database_dir: &str) -> bool {
     database_dir.is_empty() || database_dir.eq_ignore_ascii_case("empty")
 }
 
-/// Synchronizes KEV and EPSS.
+/// Synchronizes enrichment feeds that are distributed separately from CVE records.
 pub async fn sync_risk_feeds(
     db: SqlxDatabase,
     label: &str,
@@ -2434,7 +2434,7 @@ mod tests {
             zip::write::SimpleFileOptions::default(),
         )
         .unwrap();
-        zip.write_all(br#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"SQLx fixture"}}}"#)
+        zip.write_all(br#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"SQLx fixture"},"adp":[{"providerMetadata":{"shortName":"CISA-ADP"},"metrics":[{"other":{"type":"ssvc","content":{"id":"CVE-2099-0001","role":"CISA Coordinator","version":"2.0.3","timestamp":"2099-01-01T00:00:00Z","options":[{"Exploitation":"poc"},{"Automatable":"yes"},{"Technical Impact":"total"}]}}}]}]}}"#)
             .unwrap();
         zip.finish().unwrap();
         let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
@@ -2453,6 +2453,7 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(database.ssvc_assessment_count().await.unwrap(), 1);
         database.close().await.unwrap();
         let _ = std::fs::remove_file(zip_path);
     }

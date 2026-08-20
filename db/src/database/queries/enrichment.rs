@@ -127,7 +127,10 @@ impl SqlxDatabase {
                    COALESCE((SELECT group_concat(COALESCE(p.ecosystem, '') || ':' || COALESCE(p.package_name, ''), ', ') FROM osv_aliases x JOIN osv_affected_packages p ON p.osv_id=x.osv_id WHERE x.alias_id=j.value), '') AS affected_packages,
                    EXISTS(SELECT 1 FROM kev_entries k WHERE k.cve_id=j.value) AS kev_listed,
                    k.date_added AS kev_date_added, k.due_date AS kev_due_date, k.known_ransomware_campaign_use AS kev_known_ransomware_campaign_use,
-                   e.epss, e.percentile AS epss_percentile, e.score_date AS epss_score_date, e.model_version AS epss_model_version
+                   e.epss, e.percentile AS epss_percentile, e.score_date AS epss_score_date, e.model_version AS epss_model_version,
+                   (SELECT exploitation FROM ssvc_assessments s WHERE s.cve_id=j.value ORDER BY assessed_at DESC LIMIT 1) AS ssvc_exploitation,
+                   (SELECT automatable FROM ssvc_assessments s WHERE s.cve_id=j.value ORDER BY assessed_at DESC LIMIT 1) AS ssvc_automatable,
+                   (SELECT technical_impact FROM ssvc_assessments s WHERE s.cve_id=j.value ORDER BY assessed_at DESC LIMIT 1) AS ssvc_technical_impact
                    FROM json_each(?) j
                    LEFT JOIN kev_entries k ON k.cve_id=j.value
                    LEFT JOIN epss_current e ON e.cve_id=j.value
@@ -142,19 +145,22 @@ impl SqlxDatabase {
                 kev_known_ransomware_campaign_use: row.try_get("kev_known_ransomware_campaign_use")?,
                 epss: row.try_get("epss")?, epss_percentile: row.try_get("epss_percentile")?,
                 epss_score_date: row.try_get("epss_score_date")?, epss_model_version: row.try_get("epss_model_version")?,
+                ssvc_exploitation: row.try_get("ssvc_exploitation")?,
+                ssvc_automatable: row.try_get("ssvc_automatable")?,
+                ssvc_technical_impact: row.try_get("ssvc_technical_impact")?,
             })).collect()
         })).await
     }
 
     pub async fn database_status_enriched(&self) -> Result<DatabaseStatus, sqlx::Error> {
         self.writer.with_connection(|connection| Box::pin(async move {
-            let row = sqlx::query("SELECT (SELECT COUNT(*) FROM cve) cve_count, (SELECT COUNT(*) FROM cve WHERE state=0) published_count, (SELECT COUNT(*) FROM cve WHERE state=1) rejected_count, (SELECT COUNT(*) FROM cwe) cwe_count, (SELECT COUNT(*) FROM cve_affected) affected_count, (SELECT COUNT(*) FROM cve_cvss) cvss_count, (SELECT MAX(updated_at) FROM cve) latest_cve_updated_at, (SELECT zip_datetime FROM cve_zip_file ORDER BY zip_datetime DESC LIMIT 1) latest_zip_datetime, (SELECT zip_filename FROM cve_zip_file ORDER BY zip_datetime DESC LIMIT 1) latest_zip_filename, (SELECT COUNT(*) FROM osv_advisories) osv_record_count, (SELECT COUNT(*) FROM kev_entries) kev_entry_count, (SELECT COUNT(*) FROM epss_current) epss_current_count, (SELECT COUNT(*) FROM vulnerability_identifiers) identifier_node_count, (SELECT COUNT(*) FROM vulnerability_identifier_edges) identifier_edge_count").fetch_one(&mut *connection).await?;
+            let row = sqlx::query("SELECT (SELECT COUNT(*) FROM cve) cve_count, (SELECT COUNT(*) FROM cve WHERE state=0) published_count, (SELECT COUNT(*) FROM cve WHERE state=1) rejected_count, (SELECT COUNT(*) FROM cwe) cwe_count, (SELECT COUNT(*) FROM cve_affected) affected_count, (SELECT COUNT(*) FROM cve_cvss) cvss_count, (SELECT MAX(updated_at) FROM cve) latest_cve_updated_at, (SELECT zip_datetime FROM cve_zip_file ORDER BY zip_datetime DESC LIMIT 1) latest_zip_datetime, (SELECT zip_filename FROM cve_zip_file ORDER BY zip_datetime DESC LIMIT 1) latest_zip_filename, (SELECT COUNT(*) FROM osv_advisories) osv_record_count, (SELECT COUNT(*) FROM kev_entries) kev_entry_count, (SELECT COUNT(*) FROM epss_current) epss_current_count, (SELECT COUNT(*) FROM ssvc_assessments) ssvc_assessment_count, (SELECT COUNT(*) FROM vulnerability_identifiers) identifier_node_count, (SELECT COUNT(*) FROM vulnerability_identifier_edges) identifier_edge_count").fetch_one(&mut *connection).await?;
             let source_rows = sqlx::query("SELECT source, display_name, source_type, default_filename, raw_format FROM db_sources ORDER BY source").fetch_all(&mut *connection).await?;
             let sources = source_rows.into_iter().map(|r| Ok(DbSource { source:r.try_get("source")?, display_name:r.try_get("display_name")?, source_type:r.try_get("source_type")?, default_filename:r.try_get("default_filename")?, raw_format:r.try_get("raw_format")? })).collect::<Result<Vec<_>, sqlx::Error>>()?;
             Ok(DatabaseStatus {
                 cve: CveDatabaseStatus { cve_count:row.try_get("cve_count")?, published_count:row.try_get("published_count")?, rejected_count:row.try_get("rejected_count")?, cwe_count:row.try_get("cwe_count")?, affected_count:row.try_get("affected_count")?, cvss_count:row.try_get("cvss_count")?, latest_cve_updated_at:row.try_get("latest_cve_updated_at")?, latest_zip_datetime:row.try_get("latest_zip_datetime")?, latest_zip_filename:row.try_get("latest_zip_filename")? },
                 sources,
-                enrichment: EnrichmentDatabaseStatus { osv_record_count:row.try_get("osv_record_count")?, kev_entry_count:row.try_get("kev_entry_count")?, epss_current_count:row.try_get("epss_current_count")?, identifier_node_count:row.try_get("identifier_node_count")?, identifier_edge_count:row.try_get("identifier_edge_count")? },
+                enrichment: EnrichmentDatabaseStatus { osv_record_count:row.try_get("osv_record_count")?, kev_entry_count:row.try_get("kev_entry_count")?, epss_current_count:row.try_get("epss_current_count")?, ssvc_assessment_count:row.try_get("ssvc_assessment_count")?, identifier_node_count:row.try_get("identifier_node_count")?, identifier_edge_count:row.try_get("identifier_edge_count")? },
             })
         })).await
     }
@@ -186,6 +192,10 @@ impl SqlxDatabase {
                     .map(|item| format!("CWE-{}", item.id))
                     .collect()
             })
+            .unwrap_or_default();
+        let ssvc = cve
+            .as_ref()
+            .map(|row| row.detail.ssvc.clone())
             .unwrap_or_default();
         let id = cve_id.to_owned();
         let (aliases, advisories, packages, kev, epss, source_sync) = self.writer.with_connection(|connection| Box::pin(async move {
@@ -224,6 +234,7 @@ impl SqlxDatabase {
             affected_packages: packages,
             kev,
             epss,
+            ssvc,
             severity,
             cwe,
             evidence,

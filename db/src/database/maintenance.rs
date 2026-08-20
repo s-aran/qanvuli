@@ -453,6 +453,7 @@ pub(crate) async fn check_required_schema(
         "kev_entries",
         "epss_raw_records",
         "epss_current",
+        "ssvc_assessments",
         "vulnerability_identifiers",
         "vulnerability_identifier_edges",
         "identifier_components",
@@ -478,6 +479,7 @@ pub(crate) async fn check_required_schema(
         "idx_osv_range_events_range",
         "idx_identifier_edges_to",
         "idx_identifier_edges_from",
+        "idx_ssvc_decision_points",
     ] {
         let found: Option<String> =
             sqlx::query_scalar("SELECT name FROM sqlite_master WHERE name = ? LIMIT 1")
@@ -697,6 +699,22 @@ pub(crate) async fn check_required_schema(
             ][..],
             "SELECT name FROM pragma_table_info('epss_current')",
         ),
+        (
+            "ssvc_assessments",
+            &[
+                "cve_id",
+                "provider",
+                "role",
+                "version",
+                "assessed_at",
+                "exploitation",
+                "automatable",
+                "technical_impact",
+                "fetched_at",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('ssvc_assessments')",
+        ),
     ] {
         let actual: Vec<String> = sqlx::query_scalar(pragma)
             .fetch_all(&mut *connection)
@@ -738,6 +756,10 @@ pub(crate) async fn check_required_schema(
         (
             "idx_osv_range_events_range",
             &["range_id", "event_order"][..],
+        ),
+        (
+            "idx_ssvc_decision_points",
+            &["exploitation", "automatable", "technical_impact", "cve_id"][..],
         ),
     ] {
         let actual: Vec<String> =
@@ -806,6 +828,7 @@ pub(crate) async fn check_required_schema(
         ),
         ("kev_entries", "raw_record_id", "kev_raw_records", "id"),
         ("epss_current", "raw_record_id", "epss_raw_records", "id"),
+        ("ssvc_assessments", "cve_id", "cve", "cve_id"),
     ] {
         let rows = sqlx::query("SELECT * FROM pragma_foreign_key_list(?)")
             .bind(table)

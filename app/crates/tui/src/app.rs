@@ -1861,6 +1861,9 @@ impl App {
             vendor: None,
             vendor_exact: None,
             kev_only: self.main.display.kev_only,
+            ssvc_exploitation: None,
+            ssvc_automatable: None,
+            ssvc_technical_impact: None,
             state_scope: self.main.state_scope,
             sort_order,
         }

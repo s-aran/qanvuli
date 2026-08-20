@@ -955,6 +955,9 @@ fn has_cve_only_advanced_filters(options: &CveAdvancedSearch) -> bool {
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         || options.kev_only
+        || options.ssvc_exploitation.is_some()
+        || options.ssvc_automatable.is_some()
+        || options.ssvc_technical_impact.is_some()
 }
 
 fn osv_package_query(options: &CveAdvancedSearch) -> Option<&str> {

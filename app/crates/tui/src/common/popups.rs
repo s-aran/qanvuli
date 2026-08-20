@@ -50,7 +50,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
 }
 
 pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let area = centered_size(74, 16, frame.area());
+    let area = centered_size(74, 19, frame.area());
     let form = &app.main.advanced;
     let lines = vec![
         advanced_line(
@@ -103,6 +103,30 @@ pub(crate) fn draw_advanced(frame: &mut ratatui::Frame<'_>, app: &App) {
             AdvancedField::StateScope,
             "State",
             form.state_scope.label(),
+        ),
+        advanced_line(
+            form,
+            AdvancedField::SsvcExploitation,
+            "SSVC exploitation",
+            form.ssvc_exploitation
+                .map(|value| value.as_str())
+                .unwrap_or("any"),
+        ),
+        advanced_line(
+            form,
+            AdvancedField::SsvcAutomatable,
+            "SSVC automatable",
+            form.ssvc_automatable
+                .map(|value| value.as_str())
+                .unwrap_or("any"),
+        ),
+        advanced_line(
+            form,
+            AdvancedField::SsvcTechnicalImpact,
+            "SSVC technical impact",
+            form.ssvc_technical_impact
+                .map(|value| value.as_str())
+                .unwrap_or("any"),
         ),
         Line::from(""),
         Line::from(

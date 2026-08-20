@@ -20,6 +20,7 @@ pub mod database {
         SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase, SqlxDatabaseStatus, SqlxEpss,
         SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
         SqlxOsvRange, SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState, SqlxVersionMatch,
+        SsvcAutomatable, SsvcExploitation, SsvcInfo, SsvcSearch, SsvcTechnicalImpact,
         cve_state_label, detect_identifier_type, ecosystem_identity_key, evaluate_sqlx_osv_version,
         is_concrete_package_version, normalize_package_name, package_identity_purl,
         parse_package_purl, versions_equivalent,

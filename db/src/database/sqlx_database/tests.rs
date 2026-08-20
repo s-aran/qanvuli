@@ -112,7 +112,7 @@ async fn initializes_and_checks_a_new_database_on_one_writer() {
     database.check_full_foreign_keys().await.unwrap();
     database.check_full_cve_search().await.unwrap();
     database.check_full_osv_search().await.unwrap();
-    assert_eq!(SqlxDatabase::schema_version(), 10);
+    assert_eq!(SqlxDatabase::schema_version(), 11);
 }
 
 #[tokio::test]
@@ -2964,5 +2964,93 @@ async fn osv_cursor_advances_only_after_a_complete_retryable_sync() {
     assert_eq!(
         completed,
         ("success".to_owned(), "2099-01-02T00:00:00Z".to_owned(), 1)
+    );
+}
+
+#[tokio::test]
+async fn ssvc_is_extracted_from_cve_adp_updated_and_searchable() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    assert_eq!(
+        database
+            .import_cve_raw_jsons(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-03T00:00:00Z"},"containers":{"cna":{"title":"CVE-2099-0001"},"adp":[{"providerMetadata":{"shortName":"CISA-ADP"},"metrics":[{"other":{"type":"ssvc","content":{"id":"CVE-2099-0001","role":"CISA Coordinator","version":"2.0.3","timestamp":"2099-01-03T00:00:00Z","options":[{"Exploitation":"active"},{"Automatable":"yes"},{"Technical Impact":"total"}]}}}]}]}}"#.to_owned(),
+                r#"{"cveMetadata":{"cveId":"CVE-2099-0002","state":"PUBLISHED","datePublished":"2099-01-02T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"CVE-2099-0002"}}}"#.to_owned(),
+            ])
+            .await
+            .unwrap(),
+        2
+    );
+
+    let stored = database.ssvc_assessments("CVE-2099-0001").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].exploitation,
+        Some(crate::SsvcExploitation::Active)
+    );
+    assert_eq!(
+        database
+            .cve_detail("CVE-2099-0001")
+            .await
+            .unwrap()
+            .unwrap()
+            .ssvc,
+        stored
+    );
+
+    let filters = SqlxCveSearch {
+        ssvc: crate::SsvcSearch {
+            exploitation: Some(crate::SsvcExploitation::Active),
+            automatable: Some(crate::SsvcAutomatable::Yes),
+            technical_impact: Some(crate::SsvcTechnicalImpact::Total),
+        },
+        ..Default::default()
+    };
+    let rows = database
+        .search_cves_advanced(filters.clone(), false, 25, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.cve_id.as_str())
+            .collect::<Vec<_>>(),
+        ["CVE-2099-0001"]
+    );
+    assert_eq!(
+        database
+            .count_cves_advanced_with_kev(filters, false, false)
+            .await
+            .unwrap(),
+        1
+    );
+
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-04T00:00:00Z"},"containers":{"cna":{"title":"updated without SSVC"}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(database.ssvc_assessment_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn bulk_cve_initialization_extracts_ssvc_without_a_separate_feed() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database.prepare_cve_bulk_load().await.unwrap();
+    assert_eq!(
+        database
+            .import_cve_raw_jsons_bulk_init(vec![
+                r#"{"cveMetadata":{"cveId":"CVE-2099-0100","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"bulk SSVC fixture"},"adp":[{"providerMetadata":{"shortName":"CISA-ADP"},"metrics":[{"other":{"type":"ssvc","content":{"id":"CVE-2099-0100","role":"CISA Coordinator","version":"2.0.3","timestamp":"2099-01-01T00:00:00Z","options":[{"Exploitation":"poc"},{"Automatable":"no"},{"Technical Impact":"partial"}]}}}]}]}}"#.to_owned(),
+            ])
+            .await
+            .unwrap(),
+        1
+    );
+    let stored = database.ssvc_assessments("CVE-2099-0100").await.unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].exploitation,
+        Some(crate::SsvcExploitation::PublicPoc)
     );
 }
