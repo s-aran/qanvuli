@@ -46,7 +46,10 @@ pub mod ingest {
 /// Vulnerability data models returned by the public API.
 pub mod model {
     pub use qanvuli_models::{
-        RawCveStatusRecord, capec::AttackPatternCatalog, cwe::WeaknessCatalog,
+        RawCveStatusRecord,
+        capec::AttackPatternCatalog,
+        cve::published::cvss_vector::{CvssVectorMetric, explain_cvss_vector},
+        cwe::WeaknessCatalog,
     };
     pub use qanvuli_models::{
         capec::read_capec_catalog_xml,
