@@ -1228,6 +1228,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enriched_cve_returns_normalized_ssvc_assessments() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0201","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-02T00:00:00Z"},"containers":{"cna":{"title":"SSVC MCP fixture","descriptions":[{"lang":"en","value":"SSVC MCP contract test"}],"affected":[]},"adp":[{"providerMetadata":{"shortName":"CISA-ADP"},"metrics":[{"other":{"type":"ssvc","content":{"timestamp":"2099-01-03T00:00:00Z","id":"CVE-2099-0201","options":[{"Exploitation":"active"},{"Automatable":"yes"},{"Technical Impact":"total"}],"role":"CISA Coordinator","version":"2.0.3"}}}]}]}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let result = get_enriched_cve(&db, "CVE-2099-0201").await.unwrap();
+        let (payload, _) = call_result_payload(result);
+
+        assert_eq!(payload["ssvc"][0]["provider"], "CISA-ADP");
+        assert_eq!(payload["ssvc"][0]["role"], "CISA Coordinator");
+        assert_eq!(payload["ssvc"][0]["version"], "2.0.3");
+        assert_eq!(payload["ssvc"][0]["exploitation"], "active");
+        assert_eq!(payload["ssvc"][0]["automatable"], "yes");
+        assert_eq!(payload["ssvc"][0]["technical_impact"], "total");
+    }
+
+    #[tokio::test]
     async fn recent_updates_default_to_compact_risk_triage_with_full_details_available() {
         let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
         db.initialize_schema().await.unwrap();

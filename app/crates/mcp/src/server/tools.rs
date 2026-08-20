@@ -254,7 +254,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Fetch one CVE with local OSV aliases, affected packages, CISA KEV, FIRST EPSS, CVSS/CWE details, evidence, and source sync status."
+        description = "Fetch one CVE with normalized CISA SSVC assessments, local OSV aliases, affected packages, CISA KEV, FIRST EPSS, CVSS/CWE details, evidence, and source sync status."
     )]
     pub(crate) async fn get_enriched_cve(
         &self,
