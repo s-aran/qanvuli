@@ -174,6 +174,14 @@ qanvuli tui openssl
 - `Esc`: ポップアップを閉じる、または現在のモードを終了
 - `Ctrl-C`: 終了
 
+## CVSS 計算
+
+CVSS v2.0、v3.0、v3.1、またはv4.0 Vectorの各メトリクスを説明し、データベースを使わずにスコアと深刻度を計算します。
+
+```bash
+qanvuli cvss 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L'
+```
+
 ## SBOM 検索
 
 ```bash

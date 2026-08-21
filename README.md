@@ -176,6 +176,14 @@ Common keys:
 - `Esc`: close a popup or leave the current mode
 - `Ctrl-C`: quit
 
+## CVSS calculator
+
+Explain the metrics in a CVSS v2.0, v3.0, v3.1, or v4.0 vector and calculate its score and severity without a database:
+
+```bash
+qanvuli cvss 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L'
+```
+
 ## SBOM search
 
 ```bash

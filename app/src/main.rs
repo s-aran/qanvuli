@@ -32,6 +32,9 @@ fn run() -> Result<(), String> {
         print_help()?;
         return Ok(());
     }
+    if let Command::Cvss(args) = &command {
+        return qanvuli_app_commands::cvss::run(args);
+    }
     #[cfg(feature = "mcp")]
     if matches!(command, Command::Mcp) {
         return qanvuli_app_mcp::run(db_url);
@@ -84,6 +87,7 @@ fn run() -> Result<(), String> {
             Command::Query(args) => qanvuli_app_commands::query::run(&db_url, args).await,
             Command::Db(args) => qanvuli_app_commands::db::run(&db_url, args).await,
             Command::Cwe(args) => qanvuli_app_commands::cwe::run(&db_url, args).await,
+            Command::Cvss(args) => qanvuli_app_commands::cvss::run(&args),
             Command::Capec(args) => qanvuli_app_commands::capec::run(&db_url, args).await,
             Command::Search(args) => qanvuli_app_commands::search::run(&db_url, args).await,
             #[cfg(feature = "tui")]
@@ -244,6 +248,8 @@ enum Command {
     Db(qanvuli_app_commands::db::Args),
     /// Search the CWE catalog.
     Cwe(qanvuli_app_commands::cwe::Args),
+    /// Explain and calculate a CVSS vector.
+    Cvss(qanvuli_app_commands::cvss::Args),
     /// Search the CAPEC catalog.
     Capec(qanvuli_app_commands::capec::Args),
     /// Search CVE and OSV records.

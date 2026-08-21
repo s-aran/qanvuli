@@ -48,7 +48,9 @@ pub mod model {
     pub use qanvuli_models::{
         RawCveStatusRecord,
         capec::AttackPatternCatalog,
-        cve::published::cvss_vector::{CvssVectorMetric, explain_cvss_vector},
+        cve::published::cvss_vector::{
+            CvssScore, CvssVectorMetric, explain_cvss_vector, score_cvss_vector,
+        },
         cwe::WeaknessCatalog,
     };
     pub use qanvuli_models::{

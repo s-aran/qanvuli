@@ -6,6 +6,66 @@ pub struct CvssVectorMetric {
     pub value: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct CvssScore {
+    pub version: String,
+    pub score: f64,
+    pub severity: &'static str,
+}
+
+/// Calculate the score represented by a CVSS v2.0, v3.0, v3.1, or v4.0 vector.
+pub fn score_cvss_vector(vector: &str) -> Result<CvssScore, String> {
+    let vector = vector.trim();
+    if vector.is_empty() {
+        return Err("CVSS vector is empty".to_owned());
+    }
+
+    let (version, parsed_vector) = if let Some(vector) = vector.strip_prefix("CVSS:2.0/") {
+        ("2.0", vector)
+    } else if vector.starts_with("CVSS:3.0/") {
+        ("3.0", vector)
+    } else if vector.starts_with("CVSS:3.1/") {
+        ("3.1", vector)
+    } else if vector.starts_with("CVSS:4.0/") {
+        ("4.0", vector)
+    } else if let Some(header) = vector.strip_prefix("CVSS:") {
+        let version = header.split('/').next().unwrap_or(header);
+        return Err(format!(
+            "unsupported CVSS version `{version}`; supported versions are 2.0, 3.0, 3.1, and 4.0"
+        ));
+    } else {
+        ("2.0", vector)
+    };
+
+    let parsed = parsed_vector
+        .parse::<polycvss::Vector>()
+        .map_err(|error| format!("invalid CVSS {version} vector `{vector}`: {error}"))?;
+    let score = f64::from(parsed.base_score());
+
+    Ok(CvssScore {
+        version: version.to_owned(),
+        score,
+        severity: severity(version, score),
+    })
+}
+
+fn severity(version: &str, score: f64) -> &'static str {
+    if version == "2.0" {
+        return match score {
+            score if score < 4.0 => "LOW",
+            score if score < 7.0 => "MEDIUM",
+            _ => "HIGH",
+        };
+    }
+    match score {
+        0.0 => "NONE",
+        score if score < 4.0 => "LOW",
+        score if score < 7.0 => "MEDIUM",
+        score if score < 9.0 => "HIGH",
+        _ => "CRITICAL",
+    }
+}
+
 pub fn explain_cvss_vector(version: &str, vector: &str) -> Vec<CvssVectorMetric> {
     let vector_version = vector
         .strip_prefix("CVSS:")
@@ -276,5 +336,53 @@ mod tests {
                 value: "Q".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn calculates_cvss_v3_1_base_score() {
+        let score = score_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L").unwrap();
+
+        assert_eq!(score.version, "3.1");
+        assert_eq!(score.score, 6.3);
+        assert_eq!(score.severity, "MEDIUM");
+    }
+
+    #[test]
+    fn calculates_changed_scope_score_with_roundup() {
+        let score = score_cvss_vector("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:H").unwrap();
+
+        assert_eq!(score.score, 9.9);
+        assert_eq!(score.severity, "CRITICAL");
+    }
+
+    #[test]
+    fn rejects_incomplete_and_invalid_vectors() {
+        assert!(score_cvss_vector("CVSS:5.0/AV:N").is_err());
+        assert!(score_cvss_vector("CVSS:3.1/AV:N").is_err());
+        assert!(score_cvss_vector("CVSS:3.1/AV:N/AV:A/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L").is_err());
+    }
+
+    #[test]
+    fn calculates_cvss_v2_base_score_with_or_without_prefix() {
+        for vector in [
+            "AV:N/AC:L/Au:N/C:C/I:C/A:C",
+            "CVSS:2.0/AV:N/AC:L/Au:N/C:C/I:C/A:C",
+        ] {
+            let score = score_cvss_vector(vector).unwrap();
+            assert_eq!(score.version, "2.0");
+            assert_eq!(score.score, 10.0);
+            assert_eq!(score.severity, "HIGH");
+        }
+    }
+
+    #[test]
+    fn calculates_cvss_v4_score() {
+        let score =
+            score_cvss_vector("CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N")
+                .unwrap();
+
+        assert_eq!(score.version, "4.0");
+        assert_eq!(score.score, 6.9);
+        assert_eq!(score.severity, "MEDIUM");
     }
 }

@@ -2314,6 +2314,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "polycvss"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c72d064793cf89e1143b5eab68225f1118d5f88648bb503e2fd27bae12c13de"
+
+[[package]]
 name = "portable-atomic"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2500,6 +2506,7 @@ dependencies = [
  "chrono",
  "glob",
  "once_cell",
+ "polycvss",
  "qanvuli-utils",
  "quick-xml",
  "serde",
