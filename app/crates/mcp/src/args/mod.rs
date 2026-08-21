@@ -196,6 +196,12 @@ pub(crate) struct CvssArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AnalyzeCvssVectorArgs {
+    /// Complete CVSS v2.0, v3.0, v3.1, or v4.0 vector, including its CVSS version prefix.
+    pub(crate) vector: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ProductCvssArgs {
     /// Affected vendor substring to search for.
     pub(crate) vendor: Option<String>,

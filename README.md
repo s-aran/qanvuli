@@ -204,6 +204,8 @@ qanvuli mcp
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
 
+The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
+
 Batch package queries and recent-update lists return compact, decision-preserving summaries by default. They retain vulnerability/review state and risk signals; request `verbosity="full"` only for selected packages or CVEs that need findings, CWE, CVSS vectors, or affected-version details.
 
 OSV coverage is not a guarantee that a package has no CVEs. Check CVE List and vendor advisories for critical or end-of-life packages.

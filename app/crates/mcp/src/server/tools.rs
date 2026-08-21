@@ -111,6 +111,18 @@ impl CveSearchServer {
         .await
     }
 
+    #[tool(
+        description = "Validate and analyze a complete CVSS v2.0, v3.0, v3.1, or v4.0 vector. Returns its base score, base severity, and expanded metrics without querying the database."
+    )]
+    pub(crate) async fn analyze_cvss_vector(
+        &self,
+        Parameters(args): Parameters<AnalyzeCvssVectorArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let value =
+            response::analyze_cvss_vector(&args.vector).map_err(crate::common::error::mcp_error)?;
+        response::tool_result(value)
+    }
+
     #[tool(description = "Search CVEs by affected vendor or product and minimum CVSS score.")]
     pub(crate) async fn search_product_by_cvss(
         &self,

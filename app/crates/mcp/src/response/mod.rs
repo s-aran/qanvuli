@@ -3,12 +3,13 @@ use qanvuli_core::database::{
     CveAffectedDetail, CveCvssDetail, CveCweDetail, CveReference, CveSummary, CveSummaryWithDetail,
     cve_state_label,
 };
-use qanvuli_core::model::RawCveStatusRecord;
+use qanvuli_core::model::{RawCveStatusRecord, explain_cvss_vector, score_cvss_vector};
 use rmcp::model::{CallToolResult, ContentBlock};
 use simd_json::{OwnedValue as Value, json};
 
 pub(crate) const DESC_PREVIEW_CHARS: usize = 280;
 pub(crate) const MAX_RESULT_BYTES: usize = 40_000;
+const MAX_CVSS_VECTOR_BYTES: usize = 1_024;
 
 pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorData> {
     let value = if encoded_len(&value)? > MAX_RESULT_BYTES {
@@ -23,6 +24,46 @@ pub(crate) fn tool_result(value: Value) -> Result<CallToolResult, rmcp::ErrorDat
     let text = simd_json::to_string(&value)
         .map_err(|err| mcp_error(format!("failed to encode tool result: {err}")))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+pub(crate) fn analyze_cvss_vector(vector: &str) -> Result<Value, String> {
+    let vector = vector.trim();
+    if vector.len() > MAX_CVSS_VECTOR_BYTES {
+        return Err(format!(
+            "CVSS vector exceeds the {MAX_CVSS_VECTOR_BYTES}-byte input limit"
+        ));
+    }
+    if !vector.starts_with("CVSS:") {
+        return Err(
+            "CVSS vector must include a supported version prefix such as `CVSS:3.1/`".to_owned(),
+        );
+    }
+
+    let score = score_cvss_vector(vector)?;
+    let explained = explain_cvss_vector(&score.version, vector);
+    let metrics = vector
+        .split('/')
+        .skip(1)
+        .filter_map(|metric| metric.split_once(':'))
+        .zip(explained)
+        .map(|((code, raw_value), metric)| {
+            json!({
+                "code": code,
+                "raw_value": raw_value,
+                "name": metric.name,
+                "value": metric.value,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "input_vector": vector,
+        "version": score.version,
+        "score_type": "base",
+        "base_score": score.score,
+        "base_severity": score.severity,
+        "metrics": metrics,
+    }))
 }
 
 fn encoded_len(value: &Value) -> Result<usize, rmcp::ErrorData> {
@@ -370,6 +411,40 @@ mod tests {
     fn preview_is_character_based_and_marks_truncation() {
         assert_eq!(preview("あいうえお", 3), "あいう…");
         assert_eq!(preview("short", 280), "short");
+    }
+
+    #[test]
+    fn analyzes_cvss_vector_as_structured_data() {
+        let value = analyze_cvss_vector(" CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L ").unwrap();
+        let Value::Object(object) = value else {
+            panic!("object result")
+        };
+
+        assert_eq!(object.get("version"), Some(&json!("3.1")));
+        assert_eq!(object.get("score_type"), Some(&json!("base")));
+        assert_eq!(object.get("base_score"), Some(&json!(6.3)));
+        assert_eq!(object.get("base_severity"), Some(&json!("MEDIUM")));
+        let Some(Value::Array(metrics)) = object.get("metrics") else {
+            panic!("metrics array")
+        };
+        assert_eq!(metrics[0]["code"], json!("AV"));
+        assert_eq!(metrics[0]["raw_value"], json!("N"));
+        assert_eq!(metrics[0]["name"], json!("Attack Vector"));
+        assert_eq!(metrics[0]["value"], json!("Network"));
+    }
+
+    #[test]
+    fn cvss_analysis_requires_a_version_prefix() {
+        let error = analyze_cvss_vector("AV:N/AC:L/Au:N/C:C/I:C/A:C").unwrap_err();
+
+        assert!(error.contains("version prefix"));
+    }
+
+    #[test]
+    fn cvss_analysis_rejects_invalid_vectors() {
+        let error = analyze_cvss_vector("CVSS:3.1/AV:N").unwrap_err();
+
+        assert!(error.contains("invalid CVSS 3.1 vector"));
     }
 
     #[test]
