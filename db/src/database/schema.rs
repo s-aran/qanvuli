@@ -2,7 +2,7 @@
 
 use sqlx::{Connection, SqliteConnection};
 
-pub(crate) const SCHEMA_VERSION: i64 = 10;
+pub(crate) const SCHEMA_VERSION: i64 = 11;
 
 pub(crate) async fn suspend_cve_search_sync(
     _connection: &mut SqliteConnection,
@@ -333,6 +333,19 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             fetched_at TEXT NOT NULL,
             raw_record_id INTEGER NOT NULL REFERENCES epss_raw_records(id)
         );
+        CREATE TABLE IF NOT EXISTS ssvc_assessments (
+            cve_id TEXT NOT NULL REFERENCES cve(cve_id) ON DELETE CASCADE,
+            provider TEXT NOT NULL,
+            role TEXT NOT NULL,
+            version TEXT NOT NULL,
+            assessed_at TEXT NOT NULL,
+            exploitation TEXT CHECK(exploitation IS NULL OR exploitation IN ('none', 'poc', 'active')),
+            automatable TEXT CHECK(automatable IS NULL OR automatable IN ('no', 'yes')),
+            technical_impact TEXT CHECK(technical_impact IS NULL OR technical_impact IN ('partial', 'total')),
+            fetched_at TEXT NOT NULL,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY(cve_id, provider, role)
+        );
         CREATE TABLE IF NOT EXISTS vulnerability_identifiers (
             identifier TEXT PRIMARY KEY NOT NULL,
             identifier_type TEXT NOT NULL,
@@ -381,6 +394,9 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE INDEX IF NOT EXISTS idx_capec_view_category_category ON capec_view_category(category_id, view_id);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages(ecosystem COLLATE NOCASE, package_name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_osv_id ON osv_affected_packages(osv_id);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_asc ON osv_advisories(published_at IS NULL, published_at ASC, osv_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_desc ON osv_advisories(published_at IS NULL, published_at DESC, osv_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_osv_modified_osv_id ON osv_advisories(modified_at, osv_id);
         CREATE INDEX IF NOT EXISTS idx_osv_raw_records_content_hash ON osv_raw_records(content_hash);
         CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases(alias_id);
         CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search(cve_id);
@@ -389,14 +405,16 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges(to_identifier);
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_from ON vulnerability_identifier_edges(from_identifier);
         CREATE INDEX IF NOT EXISTS idx_identifier_components_component ON identifier_components(component_id);
+        CREATE INDEX IF NOT EXISTS idx_ssvc_decision_points ON ssvc_assessments(exploitation, automatable, technical_impact, cve_id);
 
         INSERT OR IGNORE INTO db_sources(source, display_name, source_type, default_filename, raw_format) VALUES
             ('CVE', 'CVE List V5', 'vulnerability_db', 'all_CVEs_at_midnight.zip', 'json'),
             ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json'),
             ('KEV', 'CISA Known Exploited Vulnerabilities', 'enrichment', 'known_exploited_vulnerabilities.json', 'json'),
-            ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv');
+            ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv'),
+            ('SSVC', 'CVE ADP SSVC assessments', 'enrichment', 'CVE ADP containers', 'json');
 
-        INSERT INTO schema_meta(rowid, version) VALUES(1, 10);
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 11);
         "#,
     )
     .execute(&mut *transaction)

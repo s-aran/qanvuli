@@ -2,7 +2,89 @@
 
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection};
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::Instant;
+
+const BULK_CACHE_MIN_KIB: u64 = 8 * 1024;
+const BULK_CACHE_MAX_KIB: u64 = 256 * 1024;
+const BULK_CACHE_FALLBACK_KIB: u64 = 64 * 1024;
+const BULK_CACHE_AVAILABLE_MEMORY_DIVISOR: u64 = 16;
+
+fn bulk_cache_size_kib() -> u64 {
+    bulk_cache_size_kib_for_available(available_memory_kib())
+}
+
+fn bulk_cache_size_kib_for_available(available_kib: Option<u64>) -> u64 {
+    available_kib
+        .map(|available| available / BULK_CACHE_AVAILABLE_MEMORY_DIVISOR)
+        .unwrap_or(BULK_CACHE_FALLBACK_KIB)
+        .clamp(BULK_CACHE_MIN_KIB, BULK_CACHE_MAX_KIB)
+}
+
+async fn configure_bulk_memory(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let cache_kib = bulk_cache_size_kib();
+    qanvuli_utils::logging::stderr(format_args!(
+        "bulk load: SQLite page cache limited to {cache_kib} KiB"
+    ));
+    let pragma = format!("PRAGMA cache_size=-{cache_kib}");
+    // `cache_kib` is an internally computed, bounded integer rather than user input.
+    sqlx::query(sqlx::AssertSqlSafe(pragma.as_str()))
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn available_memory_kib() -> Option<u64> {
+    let host_available = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_mem_available_kib(&contents));
+    match (host_available, cgroup_v2_available_kib()) {
+        (Some(host), Some(cgroup)) => Some(host.min(cgroup)),
+        (host, cgroup) => host.or(cgroup),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn available_memory_kib() -> Option<u64> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn parse_mem_available_kib(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let value = line.strip_prefix("MemAvailable:")?;
+        value.split_whitespace().next()?.parse().ok()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_v2_available_kib() -> Option<u64> {
+    let cgroup_membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    let cgroup_path = cgroup_membership
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?;
+    let root = Path::new("/sys/fs/cgroup");
+    let mut directory = root.join(cgroup_path.trim_start_matches('/'));
+    let mut available_bytes: Option<u64> = None;
+    loop {
+        let limit = read_u64_file(&directory.join("memory.max"));
+        let current = read_u64_file(&directory.join("memory.current"));
+        if let (Some(limit), Some(current)) = (limit, current) {
+            let headroom = limit.saturating_sub(current);
+            available_bytes = Some(available_bytes.map_or(headroom, |value| value.min(headroom)));
+        }
+        if directory == root || !directory.pop() || !directory.starts_with(root) {
+            break;
+        }
+    }
+    available_bytes.map(|bytes| bytes / 1024)
+}
+
+#[cfg(target_os = "linux")]
+fn read_u64_file(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
 
 async fn run_timed_stage(
     connection: &mut SqliteConnection,
@@ -33,13 +115,15 @@ async fn run_timed_stage(
 pub(crate) async fn prepare_cve_bulk_load(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
+    // Index and search-projection rebuilds materialize large sort/grouping B-trees. Keeping
+    // those in memory can exceed a small host's memory limit after the full CVE archive has
+    // been loaded. Use disk-backed temporary storage and a bounded page cache.
     sqlx::raw_sql(
         r#"
         PRAGMA foreign_keys=OFF;
         PRAGMA journal_mode=MEMORY;
         PRAGMA synchronous=OFF;
-        PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-400000;
+        PRAGMA temp_store=FILE;
         PRAGMA locking_mode=EXCLUSIVE;
         DROP INDEX IF EXISTS idx_read_json_file_filename;
         DROP INDEX IF EXISTS idx_cve_published_at_cve_id;
@@ -53,6 +137,7 @@ pub(crate) async fn prepare_cve_bulk_load(
     )
     .execute(&mut *connection)
     .await?;
+    configure_bulk_memory(connection).await?;
     Ok(())
 }
 
@@ -116,7 +201,7 @@ pub(crate) async fn finish_cve_bulk_load_with_index_signal(
         ),
         (
             "durability restore",
-            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA locking_mode=NORMAL; PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA locking_mode=NORMAL; PRAGMA temp_store=DEFAULT; PRAGMA cache_size=-2000; PRAGMA wal_checkpoint(TRUNCATE)",
         ),
     ] {
         run_timed_stage(connection, label, sql).await?;
@@ -127,19 +212,22 @@ pub(crate) async fn finish_cve_bulk_load_with_index_signal(
 pub(crate) async fn prepare_osv_bulk_load(
     connection: &mut SqliteConnection,
 ) -> Result<(), sqlx::Error> {
+    // OSV index creation has the same peak-memory characteristics as the CVE rebuild above.
     sqlx::raw_sql(
         r#"
         PRAGMA foreign_keys=OFF;
         PRAGMA journal_mode=MEMORY;
         PRAGMA synchronous=OFF;
-        PRAGMA temp_store=MEMORY;
-        PRAGMA cache_size=-400000;
+        PRAGMA temp_store=FILE;
         PRAGMA locking_mode=EXCLUSIVE;
         DROP INDEX IF EXISTS idx_osv_raw_records_content_hash;
         DROP INDEX IF EXISTS idx_osv_aliases_alias;
         DROP INDEX IF EXISTS idx_osv_cve_search_cve_id;
         DROP INDEX IF EXISTS idx_osv_affected_packages_lookup;
         DROP INDEX IF EXISTS idx_osv_affected_packages_osv_id;
+        DROP INDEX IF EXISTS idx_osv_published_asc;
+        DROP INDEX IF EXISTS idx_osv_published_desc;
+        DROP INDEX IF EXISTS idx_osv_modified_osv_id;
         DROP INDEX IF EXISTS idx_osv_ranges_package;
         DROP INDEX IF EXISTS idx_osv_range_events_range;
         DROP INDEX IF EXISTS idx_identifier_edges_to;
@@ -148,6 +236,7 @@ pub(crate) async fn prepare_osv_bulk_load(
     )
     .execute(&mut *connection)
     .await?;
+    configure_bulk_memory(connection).await?;
     Ok(())
 }
 
@@ -170,6 +259,9 @@ pub(crate) async fn finish_osv_bulk_load(
         CREATE INDEX IF NOT EXISTS idx_osv_cve_search_cve_id ON osv_cve_search(cve_id);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_lookup ON osv_affected_packages(ecosystem COLLATE NOCASE, package_name COLLATE NOCASE);
         CREATE INDEX IF NOT EXISTS idx_osv_affected_packages_osv_id ON osv_affected_packages(osv_id);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_asc ON osv_advisories(published_at IS NULL, published_at ASC, osv_id ASC);
+        CREATE INDEX IF NOT EXISTS idx_osv_published_desc ON osv_advisories(published_at IS NULL, published_at DESC, osv_id DESC);
+        CREATE INDEX IF NOT EXISTS idx_osv_modified_osv_id ON osv_advisories(modified_at, osv_id);
         CREATE INDEX IF NOT EXISTS idx_osv_ranges_package ON osv_ranges(affected_package_id);
         CREATE INDEX IF NOT EXISTS idx_osv_range_events_range ON osv_range_events(range_id, event_order);
         CREATE INDEX IF NOT EXISTS idx_identifier_edges_to ON vulnerability_identifier_edges(to_identifier);
@@ -229,6 +321,14 @@ pub(crate) async fn finish_osv_bulk_load(
         .await
         .map_err(|error| {
             sqlx::Error::Protocol(format!("failed to restore OSV synchronous mode: {error}"))
+        })?;
+    sqlx::raw_sql("PRAGMA temp_store=DEFAULT; PRAGMA cache_size=-2000;")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "failed to restore OSV temporary-storage settings: {error}"
+            ))
         })?;
     Ok(())
 }
@@ -447,6 +547,7 @@ pub(crate) async fn check_required_schema(
         "kev_entries",
         "epss_raw_records",
         "epss_current",
+        "ssvc_assessments",
         "vulnerability_identifiers",
         "vulnerability_identifier_edges",
         "identifier_components",
@@ -472,6 +573,7 @@ pub(crate) async fn check_required_schema(
         "idx_osv_range_events_range",
         "idx_identifier_edges_to",
         "idx_identifier_edges_from",
+        "idx_ssvc_decision_points",
     ] {
         let found: Option<String> =
             sqlx::query_scalar("SELECT name FROM sqlite_master WHERE name = ? LIMIT 1")
@@ -691,6 +793,22 @@ pub(crate) async fn check_required_schema(
             ][..],
             "SELECT name FROM pragma_table_info('epss_current')",
         ),
+        (
+            "ssvc_assessments",
+            &[
+                "cve_id",
+                "provider",
+                "role",
+                "version",
+                "assessed_at",
+                "exploitation",
+                "automatable",
+                "technical_impact",
+                "fetched_at",
+                "raw_json",
+            ][..],
+            "SELECT name FROM pragma_table_info('ssvc_assessments')",
+        ),
     ] {
         let actual: Vec<String> = sqlx::query_scalar(pragma)
             .fetch_all(&mut *connection)
@@ -732,6 +850,10 @@ pub(crate) async fn check_required_schema(
         (
             "idx_osv_range_events_range",
             &["range_id", "event_order"][..],
+        ),
+        (
+            "idx_ssvc_decision_points",
+            &["exploitation", "automatable", "technical_impact", "cve_id"][..],
         ),
     ] {
         let actual: Vec<String> =
@@ -800,6 +922,7 @@ pub(crate) async fn check_required_schema(
         ),
         ("kev_entries", "raw_record_id", "kev_raw_records", "id"),
         ("epss_current", "raw_record_id", "epss_raw_records", "id"),
+        ("ssvc_assessments", "cve_id", "cve", "cve_id"),
     ] {
         let rows = sqlx::query("SELECT * FROM pragma_foreign_key_list(?)")
             .bind(table)
@@ -1030,6 +1153,60 @@ pub(crate) async fn check_osv_search_full(
 mod tests {
     use super::*;
     use sqlx::Connection;
+
+    async fn assert_memory_bounded_bulk_settings(connection: &mut SqliteConnection) {
+        let temp_store: i64 = sqlx::query_scalar("PRAGMA temp_store")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+
+        assert_eq!(temp_store, 1, "bulk temporary storage must be file-backed");
+        assert!(
+            (-(BULK_CACHE_MAX_KIB as i64)..=-(BULK_CACHE_MIN_KIB as i64)).contains(&cache_size),
+            "bulk page cache must remain bounded: {cache_size}"
+        );
+    }
+
+    #[test]
+    fn bulk_cache_tracks_available_memory_with_safe_bounds() {
+        assert_eq!(bulk_cache_size_kib_for_available(None), 64 * 1024);
+        assert_eq!(bulk_cache_size_kib_for_available(Some(32 * 1024)), 8 * 1024);
+        assert_eq!(
+            bulk_cache_size_kib_for_available(Some(1024 * 1024)),
+            64 * 1024
+        );
+        assert_eq!(
+            bulk_cache_size_kib_for_available(Some(16 * 1024 * 1024)),
+            256 * 1024
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_available_memory() {
+        assert_eq!(
+            parse_mem_available_kib("MemTotal: 2000000 kB\nMemAvailable: 750000 kB\n"),
+            Some(750_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn cve_bulk_load_uses_memory_bounded_sqlite_settings() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        prepare_cve_bulk_load(&mut connection).await.unwrap();
+        assert_memory_bounded_bulk_settings(&mut connection).await;
+    }
+
+    #[tokio::test]
+    async fn osv_bulk_load_uses_memory_bounded_sqlite_settings() {
+        let mut connection = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+        prepare_osv_bulk_load(&mut connection).await.unwrap();
+        assert_memory_bounded_bulk_settings(&mut connection).await;
+    }
 
     #[tokio::test]
     async fn detects_foreign_key_violations_on_the_same_connection() {

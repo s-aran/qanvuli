@@ -10,6 +10,7 @@ pub mod cvss_v2_0;
 pub mod cvss_v3_0;
 pub mod cvss_v3_1;
 pub mod cvss_v4_0;
+pub mod cvss_vector;
 pub mod impact;
 pub mod metric;
 pub mod other;

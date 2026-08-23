@@ -6,6 +6,9 @@ pub(crate) async fn connect(db_url: &str) -> Result<SqlxDatabase, String> {
     db.check_required_schema()
         .await
         .map_err(|error| format!("database rebuild required before opening TUI: {error}"))?;
+    db.ensure_osv_sort_indexes()
+        .await
+        .map_err(|error| format!("failed to prepare TUI sort indexes: {error}"))?;
     Ok(db)
 }
 

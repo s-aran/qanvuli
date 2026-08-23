@@ -1,6 +1,7 @@
 //! Public CVE DTOs and UI search options. These contain only external identifiers and never
 //! SQLite row IDs.
 
+use crate::{SsvcAutomatable, SsvcExploitation, SsvcTechnicalImpact};
 use serde::{Serialize, Serializer};
 
 #[derive(Clone, Debug, Serialize)]
@@ -38,6 +39,7 @@ pub struct CveDetail {
     pub cwes: Vec<CveCweDetail>,
     pub cvss: Vec<CveCvssDetail>,
     pub affected: Vec<CveAffectedDetail>,
+    pub ssvc: Vec<crate::SsvcInfo>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -103,6 +105,9 @@ pub struct CveAdvancedSearch {
     pub vendor: Option<String>,
     pub vendor_exact: Option<String>,
     pub kev_only: bool,
+    pub ssvc_exploitation: Option<SsvcExploitation>,
+    pub ssvc_automatable: Option<SsvcAutomatable>,
+    pub ssvc_technical_impact: Option<SsvcTechnicalImpact>,
     pub state_scope: CveStateScope,
     pub sort_order: CveSummarySortOrder,
 }

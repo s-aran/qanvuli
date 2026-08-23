@@ -21,7 +21,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
         .split(frame.area());
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(main[0]);
     let left = Layout::default()
         .direction(Direction::Vertical)
@@ -40,7 +40,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame<'_>, app: &mut App, detail_search:
 
     let footer = Paragraph::new(status::MainStatusLine.text(app)).style(
         Style::default()
-            .fg(app.search_mode.color())
+            .fg(app.main.search_mode.color())
             .add_modifier(Modifier::BOLD),
     );
     frame.render_widget(footer, main[1]);

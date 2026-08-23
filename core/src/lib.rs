@@ -15,12 +15,13 @@ pub mod database {
         CveReference, CveRiskSummary, CveStateScope, CveSummary, CveSummarySortOrder,
         CveSummaryWithDetail, CweEntry, EnrichedCveSummary, EnrichedFinding, Evidence,
         FindingEnrichment, ImportSummary, OsvImportStats, OsvRawRecord, OsvSummary, PackageQuery,
-        ParsedPackagePurl, PrioritySignals, SqlxAffected, SqlxCveDetail, SqlxCveReference,
-        SqlxCveSearch, SqlxCveSummary, SqlxCveSummaryWithDetail, SqlxCvss, SqlxCvssSearch, SqlxCwe,
-        SqlxDatabase, SqlxDatabaseStatus, SqlxEpss, SqlxEpssRisk, SqlxIdentifierEdge,
-        SqlxIdentifierResolution, SqlxKev, SqlxKevEntry, SqlxOsvRange, SqlxOsvSummary,
-        SqlxPackageFinding, SqlxSourceSyncState, SqlxVersionMatch, cve_state_label,
-        detect_identifier_type, ecosystem_identity_key, evaluate_sqlx_osv_version,
+        ParsedPackagePurl, PrioritySignals, SqlxAffected, SqlxAffectedComponentSearch,
+        SqlxCveDetail, SqlxCveReference, SqlxCveSearch, SqlxCveSummary, SqlxCveSummaryWithDetail,
+        SqlxCvss, SqlxCvssSearch, SqlxCwe, SqlxDatabase, SqlxDatabaseStatus, SqlxEpss,
+        SqlxEpssRisk, SqlxIdentifierEdge, SqlxIdentifierResolution, SqlxKev, SqlxKevEntry,
+        SqlxOsvRange, SqlxOsvSummary, SqlxPackageFinding, SqlxSourceSyncState, SqlxVersionMatch,
+        SsvcAutomatable, SsvcExploitation, SsvcInfo, SsvcSearch, SsvcTechnicalImpact,
+        cve_state_label, detect_identifier_type, ecosystem_identity_key, evaluate_sqlx_osv_version,
         is_concrete_package_version, normalize_package_name, package_identity_purl,
         parse_package_purl, versions_equivalent,
     };
@@ -45,7 +46,12 @@ pub mod ingest {
 /// Vulnerability data models returned by the public API.
 pub mod model {
     pub use qanvuli_models::{
-        RawCveStatusRecord, capec::AttackPatternCatalog, cwe::WeaknessCatalog,
+        RawCveStatusRecord,
+        capec::AttackPatternCatalog,
+        cve::published::cvss_vector::{
+            CvssScore, CvssVectorMetric, explain_cvss_vector, score_cvss_vector,
+        },
+        cwe::WeaknessCatalog,
     };
     pub use qanvuli_models::{
         capec::read_capec_catalog_xml,

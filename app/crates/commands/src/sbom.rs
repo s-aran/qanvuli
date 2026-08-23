@@ -1,8 +1,8 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, close_database, connect_database, print_json};
 use qanvuli_core::database::{
-    CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery, SqlxDatabase,
-    ecosystem_identity_key, is_concrete_package_version, normalize_package_name,
-    parse_package_purl,
+    CveStateScope, CveSummary, CveSummaryWithDetail, EnrichedFinding, PackageQuery,
+    SqlxAffectedComponentSearch, SqlxDatabase, ecosystem_identity_key, is_concrete_package_version,
+    normalize_package_name, parse_package_purl,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -263,13 +263,15 @@ async fn search_package(
         for component in package.search_names().into_iter().take(8) {
             let cves = db
                 .search_cve_summaries_by_affected_component_with_state_scope(
-                    None,
-                    &component,
-                    date_filter.published_since.as_deref(),
-                    date_filter.updated_since.as_deref(),
-                    state_scope,
-                    per_package_limit,
-                    0,
+                    SqlxAffectedComponentSearch {
+                        vendor: None,
+                        component: component.clone(),
+                        published_since: date_filter.published_since.clone(),
+                        updated_since: date_filter.updated_since.clone(),
+                        state_scope,
+                        limit: per_package_limit,
+                        offset: 0,
+                    },
                 )
                 .await
                 .map_err(|err| format!("failed to search `{component}`: {err}"))?;

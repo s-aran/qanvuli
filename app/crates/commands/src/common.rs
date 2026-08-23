@@ -6,14 +6,12 @@ use qanvuli_core::model::OSV_DATABASE_SOURCE_PREFIXES;
 use qanvuli_core::{
     database::{OsvRawRecord, SqlxDatabase},
     ingest::{
-        CapecCatalogFile, CveRelease, CweCatalogFile, GitHubReleaseFile, JsonStorage, OSV_ALL_ZIP,
-        OsvDownloadError, OsvGcsSource, ZipStorage, download_epss_current_csv, download_kev_json,
-        parse_modified_id_csv,
+        CveRelease, GitHubReleaseFile, JsonStorage, OSV_ALL_ZIP, OsvDownloadError, OsvGcsSource,
+        ZipStorage, download_epss_current_csv, download_kev_json, parse_modified_id_csv,
     },
-    model::{is_known_osv_database_prefix, read_capec_catalog_xml, read_cwe_catalog_zip},
+    model::is_known_osv_database_prefix,
 };
 use qanvuli_utils::github::DownloadProgressCallback;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io::Read;
@@ -22,7 +20,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
+mod catalog;
 pub mod database;
+
+pub use catalog::{download_latest_cwe_catalog, sync_capec_catalog, sync_cwe_catalog};
 pub use database::{
     close_database, connect_database, default_db_connection_string, print_json, redact_database_url,
 };
@@ -48,15 +49,6 @@ const INGEST_CHUNK_SIZE: usize = 20_000;
 const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
 const OSV_IMPORT_PIPELINE_CAPACITY: usize = 1;
 const OSV_IMPORT_HEARTBEAT: Duration = Duration::from_secs(10);
-const CWE_ETAG_METADATA_KEY: &str = "cwe_catalog:etag";
-const CWE_LAST_MODIFIED_METADATA_KEY: &str = "cwe_catalog:last_modified";
-const CWE_STORAGE_VERSION_METADATA_KEY: &str = "cwe_catalog:storage_version";
-const CWE_STORAGE_VERSION: &str = "2";
-const CAPEC_ETAG_METADATA_KEY: &str = "capec_catalog:etag";
-const CAPEC_LAST_MODIFIED_METADATA_KEY: &str = "capec_catalog:last_modified";
-const CAPEC_HASH_METADATA_KEY: &str = "capec_catalog:sha256";
-const CAPEC_STORAGE_VERSION_METADATA_KEY: &str = "capec_catalog:storage_version";
-const CAPEC_STORAGE_VERSION: &str = "1";
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(crate) const CVE_DELTA_CURSOR_METADATA_KEY: &str = "cve_delta_cursor";
 const CVE_DAILY_UPDATE_AFTER: TimeDelta = TimeDelta::hours(24);
@@ -349,7 +341,7 @@ fn is_empty_osv_database_dir(database_dir: &str) -> bool {
     database_dir.is_empty() || database_dir.eq_ignore_ascii_case("empty")
 }
 
-/// Synchronizes KEV and EPSS.
+/// Synchronizes enrichment feeds that are distributed separately from CVE records.
 pub async fn sync_risk_feeds(
     db: SqlxDatabase,
     label: &str,
@@ -612,7 +604,6 @@ async fn import_osv_zips(
     mode: OsvImportMode,
 ) -> Result<usize, String> {
     let initial_replacement = mode == OsvImportMode::InitialReplacement;
-    let completion_cursor = completion_cursor.to_owned();
     db.begin_osv_sync()
         .await
         .map_err(|error| format!("failed to begin OSV sync: {error}"))?;
@@ -621,12 +612,8 @@ async fn import_osv_zips(
             .await
             .map_err(|error| format!("failed to prepare OSV bulk load: {error}"))?;
     }
-    let mut imported = 0usize;
-    let mut changed = 0usize;
-    let mut inserted = 0usize;
-    let mut updated = 0usize;
-    let mut unchanged = 0usize;
-    let mut import_error = None;
+
+    let mut totals = OsvImportTotals::default();
     let mut seen_osv_ids = AHashSet::new();
     for (path_index, path) in paths.iter().enumerate() {
         eprintln!(
@@ -635,153 +622,226 @@ async fn import_osv_zips(
             paths.len(),
             path.display()
         );
-        // One queued batch overlaps ZIP reading with SQLite writes without retaining several
-        // batches of raw and parsed advisory JSON at once.
-        let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
-        let path = path.clone();
-        let selection = selection.cloned();
-        let target_osv_ids = target_osv_ids.cloned();
-        let skip_osv_ids = seen_osv_ids.clone();
-        let reader = tokio::task::spawn_blocking(move || {
-            read_osv_zip_batches(
-                &path,
-                target_osv_ids.as_ref(),
-                selection.as_ref(),
-                Some(&skip_osv_ids),
-                sender,
-            )
-        });
-        while let Some(batch) = receiver.recv().await {
-            let batch = match batch {
-                Ok(batch) => batch,
-                Err(error) => {
-                    import_error = Some(error);
-                    break;
-                }
-            };
-            let batch_started = Instant::now();
-            let batch_size = batch.records.len();
-            let import_future = async {
-                if initial_replacement {
-                    db.import_osv_records_bulk_init(batch.records)
-                        .await
-                        .map(|examined| qanvuli_core::database::OsvImportStats {
-                            examined,
-                            inserted: examined,
-                            updated: 0,
-                            unchanged: 0,
-                        })
-                } else {
-                    db.import_osv_records_incremental_with_stats(batch.records)
-                        .await
-                }
-            };
-            tokio::pin!(import_future);
-            let mut heartbeat = tokio::time::interval(OSV_IMPORT_HEARTBEAT);
-            heartbeat.tick().await;
-            let import_result = loop {
-                tokio::select! {
-                    result = &mut import_future => break result,
-                    _ = heartbeat.tick() => {
-                        eprintln!(
-                            "osv: importing batch of {batch_size} records; elapsed {:?}...",
-                            batch_started.elapsed()
-                        );
-                    }
-                }
-            };
-            match import_result {
-                Ok(stats) => {
-                    imported += stats.examined;
-                    changed += stats.changed();
-                    inserted += stats.inserted;
-                    updated += stats.updated;
-                    unchanged += stats.unchanged;
-                    let batch_elapsed = batch_started.elapsed();
-                    let records_per_second = stats.examined as f64 / batch_elapsed.as_secs_f64();
-                    let mode = if initial_replacement {
-                        "full-init"
-                    } else {
-                        "incremental"
-                    };
-                    eprintln!(
-                        "osv: mode={mode}, examined={imported}, inserted={inserted}, updated={updated}, unchanged={unchanged} (batch={} in {:?}, {:.0} records/s)",
-                        stats.examined, batch_elapsed, records_per_second,
-                    );
-                }
-                Err(error) => {
-                    import_error = Some(format!("failed to import OSV batch: {error}"));
-                    break;
-                }
-            }
-        }
-        // Dropping the receiver first unblocks a reader waiting on bounded backpressure.
-        drop(receiver);
-        let reader_result = reader
-            .await
-            .map_err(|_| "OSV zip reader task panicked".to_owned());
-        if import_error.is_none() {
-            match reader_result {
-                Ok(Ok(read_osv_ids)) => seen_osv_ids.extend(read_osv_ids),
-                Ok(Err(error)) | Err(error) => import_error = Some(error),
-            }
-        }
-        if import_error.is_some() {
-            break;
+        let read_osv_ids = import_osv_path(
+            &db,
+            path,
+            selection,
+            target_osv_ids,
+            &seen_osv_ids,
+            initial_replacement,
+            &mut totals,
+        )
+        .await;
+        match read_osv_ids {
+            Ok(ids) => seen_osv_ids.extend(ids),
+            Err(error) => return fail_osv_import(&db, initial_replacement, error).await,
         }
     }
-    let result = async {
-        if let Some(error) = import_error {
-            return Err(error);
-        }
-        eprintln!("osv: rebuilding deferred indexes and search data");
-        let index_started = Instant::now();
-        if initial_replacement {
-            db.finish_osv_bulk_load()
-                .await
-                .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
-        } else if changed > 0 {
-            eprintln!("osv: incrementally updated search rows for {changed} changed record(s)");
+
+    if let Err(error) =
+        finish_osv_import(&db, completion_cursor, initial_replacement, &totals).await
+    {
+        return fail_osv_import(&db, initial_replacement, error).await;
+    }
+    Ok(totals.examined)
+}
+
+#[derive(Default)]
+struct OsvImportTotals {
+    examined: usize,
+    changed: usize,
+    inserted: usize,
+    updated: usize,
+    unchanged: usize,
+}
+
+impl OsvImportTotals {
+    fn record(
+        &mut self,
+        stats: &qanvuli_core::database::OsvImportStats,
+        elapsed: Duration,
+        initial_replacement: bool,
+    ) {
+        self.examined += stats.examined;
+        self.changed += stats.changed();
+        self.inserted += stats.inserted;
+        self.updated += stats.updated;
+        self.unchanged += stats.unchanged;
+        let records_per_second = stats.examined as f64 / elapsed.as_secs_f64();
+        let mode = if initial_replacement {
+            "full-init"
         } else {
-            eprintln!(
-                "osv: all {unchanged} examined records were unchanged; search writes skipped"
-            );
-        }
+            "incremental"
+        };
         eprintln!(
-            "osv: index/search maintenance completed in {:?}",
-            index_started.elapsed()
+            "osv: mode={mode}, examined={}, inserted={}, updated={}, unchanged={} (batch={} in {:?}, {:.0} records/s)",
+            self.examined,
+            self.inserted,
+            self.updated,
+            self.unchanged,
+            stats.examined,
+            elapsed,
+            records_per_second,
         );
-        if let Err(error) = db.check_search_integrity_quick().await {
-            // Older incremental imports assigned a fresh FTS rowid on every OSV
-            // update. Rebuild once to repair that stale projection; current writes
-            // preserve the advisory rowid and no longer require this recovery.
-            if !error.to_string().contains("OSV text FTS") {
-                return Err(format!("failed OSV database check: {error}"));
-            }
-            eprintln!("osv: repairing stale OSV search projection");
-            db.rebuild_osv_search().await.map_err(|repair_error| {
-                format!("failed to repair OSV search projection: {repair_error}")
-            })?;
-            db.check_search_integrity_quick()
-                .await
-                .map_err(|repair_error| {
-                    format!("failed OSV database check after repair: {repair_error}")
-                })?;
-        }
-        db.complete_osv_sync(&completion_cursor)
-            .await
-            .map_err(|error| format!("failed to advance OSV cursor: {error}"))?;
-        Ok::<(), String>(())
     }
-    .await;
-    if let Err(error) = result {
-        if initial_replacement {
-            let _ = db.finish_osv_bulk_load().await;
+}
+
+async fn import_osv_path(
+    db: &SqlxDatabase,
+    path: &Path,
+    selection: Option<&OsvImportSelection>,
+    target_osv_ids: Option<&AHashSet<String>>,
+    seen_osv_ids: &AHashSet<String>,
+    initial_replacement: bool,
+    totals: &mut OsvImportTotals,
+) -> Result<AHashSet<String>, String> {
+    // One queued batch overlaps ZIP reading with SQLite writes without retaining several
+    // batches of raw and parsed advisory JSON at once.
+    let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
+    let path = path.to_path_buf();
+    let selection = selection.cloned();
+    let target_osv_ids = target_osv_ids.cloned();
+    let skip_osv_ids = seen_osv_ids.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        read_osv_zip_batches(
+            &path,
+            target_osv_ids.as_ref(),
+            selection.as_ref(),
+            Some(&skip_osv_ids),
+            sender,
+        )
+    });
+
+    let mut import_error = None;
+    while let Some(batch) = receiver.recv().await {
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(error) => {
+                import_error = Some(error);
+                break;
+            }
+        };
+        match import_osv_batch(db, batch, initial_replacement).await {
+            Ok((stats, elapsed)) => totals.record(&stats, elapsed, initial_replacement),
+            Err(error) => {
+                import_error = Some(error);
+                break;
+            }
         }
-        let _ = db.fail_osv_sync(&error).await;
+    }
+
+    // Dropping the receiver first unblocks a reader waiting on bounded backpressure.
+    drop(receiver);
+    let reader_result = reader
+        .await
+        .map_err(|_| "OSV zip reader task panicked".to_owned());
+    if let Some(error) = import_error {
         return Err(error);
     }
-    Ok(imported)
+    reader_result?
+}
+
+async fn import_osv_batch(
+    db: &SqlxDatabase,
+    batch: OsvImportBatch,
+    initial_replacement: bool,
+) -> Result<(qanvuli_core::database::OsvImportStats, Duration), String> {
+    let started = Instant::now();
+    let batch_size = batch.records.len();
+    let import_future = async {
+        if initial_replacement {
+            db.import_osv_records_bulk_init(batch.records)
+                .await
+                .map(|examined| qanvuli_core::database::OsvImportStats {
+                    examined,
+                    inserted: examined,
+                    updated: 0,
+                    unchanged: 0,
+                })
+        } else {
+            db.import_osv_records_incremental_with_stats(batch.records)
+                .await
+        }
+    };
+    tokio::pin!(import_future);
+    let mut heartbeat = tokio::time::interval(OSV_IMPORT_HEARTBEAT);
+    heartbeat.tick().await;
+    let stats = loop {
+        tokio::select! {
+            result = &mut import_future => break result,
+            _ = heartbeat.tick() => {
+                eprintln!(
+                    "osv: importing batch of {batch_size} records; elapsed {:?}...",
+                    started.elapsed()
+                );
+            }
+        }
+    }
+    .map_err(|error| format!("failed to import OSV batch: {error}"))?;
+    Ok((stats, started.elapsed()))
+}
+
+async fn finish_osv_import(
+    db: &SqlxDatabase,
+    completion_cursor: &str,
+    initial_replacement: bool,
+    totals: &OsvImportTotals,
+) -> Result<(), String> {
+    eprintln!("osv: rebuilding deferred indexes and search data");
+    let index_started = Instant::now();
+    if initial_replacement {
+        db.finish_osv_bulk_load()
+            .await
+            .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
+    } else if totals.changed > 0 {
+        eprintln!(
+            "osv: incrementally updated search rows for {} changed record(s)",
+            totals.changed
+        );
+    } else {
+        eprintln!(
+            "osv: all {} examined records were unchanged; search writes skipped",
+            totals.unchanged
+        );
+    }
+    eprintln!(
+        "osv: index/search maintenance completed in {:?}",
+        index_started.elapsed()
+    );
+    ensure_osv_search_integrity(db).await?;
+    db.complete_osv_sync(completion_cursor)
+        .await
+        .map_err(|error| format!("failed to advance OSV cursor: {error}"))
+}
+
+async fn ensure_osv_search_integrity(db: &SqlxDatabase) -> Result<(), String> {
+    let Err(error) = db.check_search_integrity_quick().await else {
+        return Ok(());
+    };
+    // Older incremental imports assigned a fresh FTS rowid on every OSV update. Rebuild once to
+    // repair that stale projection; current writes preserve the advisory rowid.
+    if !error.to_string().contains("OSV text FTS") {
+        return Err(format!("failed OSV database check: {error}"));
+    }
+    eprintln!("osv: repairing stale OSV search projection");
+    db.rebuild_osv_search()
+        .await
+        .map_err(|error| format!("failed to repair OSV search projection: {error}"))?;
+    db.check_search_integrity_quick()
+        .await
+        .map_err(|error| format!("failed OSV database check after repair: {error}"))
+}
+
+async fn fail_osv_import<T>(
+    db: &SqlxDatabase,
+    initial_replacement: bool,
+    error: String,
+) -> Result<T, String> {
+    if initial_replacement {
+        let _ = db.finish_osv_bulk_load().await;
+    }
+    let _ = db.fail_osv_sync(&error).await;
+    Err(error)
 }
 
 fn read_osv_zip_batches(
@@ -1207,12 +1267,12 @@ pub fn remove_processed_zip(path: &Path) -> Result<(), String> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CveArchiveOwnership {
+pub enum CveArchiveOwnership {
     UserSupplied,
     Downloaded,
 }
 
-pub(crate) fn cleanup_processed_cve_archive(
+pub fn cleanup_processed_cve_archive(
     path: &Path,
     ownership: CveArchiveOwnership,
     keep_downloads: bool,
@@ -1252,287 +1312,6 @@ fn local_assets(kind: ReleaseAssetKind) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
     candidates.sort();
     candidates
-}
-
-pub async fn download_latest_cwe_catalog() -> Result<PathBuf, String> {
-    let catalog = CweCatalogFile::default();
-    eprintln!("cwe: downloading {}", catalog.url);
-    let path = temporary_zip_file_path(&catalog.name, None).map_err(|err| {
-        format!(
-            "failed to prepare temporary download path for {}: {err}",
-            catalog.name
-        )
-    })?;
-    catalog
-        .download_to(&path)
-        .await
-        .map_err(|err| format!("failed to download {}: {err}", catalog.name))?;
-    eprintln!("cwe: ready {}", path.display());
-    Ok(path)
-}
-
-/// Synchronizes the CWE catalog.
-pub async fn sync_cwe_catalog(db: SqlxDatabase) -> Result<(), String> {
-    #[cfg(test)]
-    if let Some(path) = local_test_cwe_catalog_path() {
-        eprintln!("cwe: using local {}", path.display());
-        let count = import_cwe_catalog(db, &path).await?;
-        eprintln!("cwe: upserted {count} CWE master rows");
-        return Ok(());
-    }
-
-    let catalog_file = CweCatalogFile::default();
-    let storage_is_current = db
-        .metadata_value(CWE_STORAGE_VERSION_METADATA_KEY)
-        .await
-        .map_err(|error| format!("failed to read CWE storage metadata: {error}"))?
-        .as_deref()
-        == Some(CWE_STORAGE_VERSION);
-    let (etag, last_modified) = if storage_is_current {
-        let etag = db
-            .metadata_value(CWE_ETAG_METADATA_KEY)
-            .await
-            .map_err(|error| format!("failed to read CWE ETag metadata: {error}"))?;
-        let last_modified = db
-            .metadata_value(CWE_LAST_MODIFIED_METADATA_KEY)
-            .await
-            .map_err(|error| format!("failed to read CWE Last-Modified metadata: {error}"))?;
-        (etag, last_modified)
-    } else {
-        eprintln!("cwe: rebuilding catalog metadata for SQLx storage v{CWE_STORAGE_VERSION}");
-        (None, None)
-    };
-    eprintln!("cwe: checking {}", catalog_file.url);
-    let path = temporary_zip_file_path(&catalog_file.name, None).map_err(|error| {
-        format!(
-            "failed to prepare temporary download path for {}: {error}",
-            catalog_file.name
-        )
-    })?;
-    let mut candidates = vec![path];
-    if let Ok(fallback) =
-        temporary_zip_file_path_in(binary_temporary_directory(), &catalog_file.name)
-        && !candidates.contains(&fallback)
-    {
-        candidates.push(fallback);
-    }
-    let mut download = None;
-    let mut download_errors = Vec::new();
-    for (index, candidate) in candidates.iter().enumerate() {
-        if index > 0 {
-            eprintln!("cwe: retrying download in {}", candidate.display());
-        }
-        match catalog_file
-            .download_if_changed_to(candidate, etag.as_deref(), last_modified.as_deref())
-            .await
-        {
-            Ok(result) => {
-                download = Some(result);
-                break;
-            }
-            Err(error) => {
-                let _ = std::fs::remove_file(candidate);
-                download_errors.push(format!("{}: {error}", candidate.display()));
-            }
-        }
-    }
-    let download = match download {
-        Some(download) => download,
-        None => {
-            let errors = download_errors.join("; ");
-            if let Some(path) = local_cwe_catalog_path(&catalog_file.name) {
-                eprintln!(
-                    "cwe: remote update unavailable ({errors}); loading existing local catalog {}",
-                    path.display()
-                );
-                let count = import_cwe_catalog(db, &path).await?;
-                eprintln!("cwe: loaded {count} CWE master rows from local catalog");
-                return Ok(());
-            }
-            return Err(format!("failed to update {}: {errors}", catalog_file.name));
-        }
-    };
-    let Some(path) = download.path else {
-        eprintln!("cwe: catalog unchanged");
-        return Ok(());
-    };
-    let count = import_cwe_catalog(db.clone(), &path).await?;
-    let _ = std::fs::remove_file(&path);
-    if let Some(etag) = download.etag {
-        db.set_metadata_value(CWE_ETAG_METADATA_KEY, &etag)
-            .await
-            .map_err(|error| format!("failed to write CWE ETag metadata: {error}"))?;
-    }
-    if let Some(last_modified) = download.last_modified {
-        db.set_metadata_value(CWE_LAST_MODIFIED_METADATA_KEY, &last_modified)
-            .await
-            .map_err(|error| format!("failed to write CWE Last-Modified metadata: {error}"))?;
-    }
-    eprintln!("cwe: upserted {count} CWE master rows");
-    Ok(())
-}
-
-async fn import_cwe_catalog(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
-    let catalog = read_cwe_catalog_zip(path)
-        .map_err(|error| format!("failed to read CWE catalog {}: {error}", path.display()))?;
-    let count = db
-        .upsert_cwe_catalog(&catalog)
-        .await
-        .map_err(|error| format!("failed to write CWE catalog: {error}"))?;
-    db.set_metadata_value(CWE_STORAGE_VERSION_METADATA_KEY, CWE_STORAGE_VERSION)
-        .await
-        .map_err(|error| format!("failed to write CWE storage metadata: {error}"))?;
-    Ok(count)
-}
-
-fn local_cwe_catalog_path(filename: &str) -> Option<PathBuf> {
-    let current_dir_path = PathBuf::from(filename);
-    if current_dir_path.exists() {
-        return Some(current_dir_path);
-    }
-
-    let executable_path = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(filename)));
-    executable_path.filter(|path| path.exists())
-}
-
-pub async fn sync_capec_catalog(db: SqlxDatabase) -> Result<(), String> {
-    #[cfg(test)]
-    if let Some(path) = local_test_capec_catalog_path() {
-        let count = import_capec_catalog(db, &path).await?;
-        eprintln!("capec: replaced {count} attack patterns");
-        return Ok(());
-    }
-
-    let catalog = CapecCatalogFile::default();
-    let storage_is_current = db
-        .metadata_value(CAPEC_STORAGE_VERSION_METADATA_KEY)
-        .await
-        .map_err(|error| format!("failed to read CAPEC storage metadata: {error}"))?
-        .as_deref()
-        == Some(CAPEC_STORAGE_VERSION);
-    let (etag, last_modified, previous_hash) = if storage_is_current {
-        (
-            db.metadata_value(CAPEC_ETAG_METADATA_KEY)
-                .await
-                .map_err(|error| format!("failed to read CAPEC ETag: {error}"))?,
-            db.metadata_value(CAPEC_LAST_MODIFIED_METADATA_KEY)
-                .await
-                .map_err(|error| format!("failed to read CAPEC Last-Modified: {error}"))?,
-            db.metadata_value(CAPEC_HASH_METADATA_KEY)
-                .await
-                .map_err(|error| format!("failed to read CAPEC hash: {error}"))?,
-        )
-    } else {
-        (None, None, None)
-    };
-
-    let path = temporary_zip_file_path(&catalog.name, None)?;
-    eprintln!("capec: checking {}", catalog.url);
-    let download = match catalog
-        .download_if_changed_as(&path, etag.as_deref(), last_modified.as_deref())
-        .await
-    {
-        Ok(download) => download,
-        Err(error) => {
-            let _ = std::fs::remove_file(&path);
-            if let Some(local) = local_catalog_path(&catalog.name) {
-                eprintln!(
-                    "capec: remote update unavailable ({error}); loading {}",
-                    local.display()
-                );
-                let count = import_capec_catalog(db, &local).await?;
-                eprintln!("capec: replaced {count} attack patterns");
-                return Ok(());
-            }
-            return Err(format!("failed to update {}: {error}", catalog.name));
-        }
-    };
-    let Some(path) = download.path else {
-        eprintln!("capec: catalog unchanged");
-        return Ok(());
-    };
-
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("failed to hash {}: {error}", path.display()))?;
-    let digest = Sha256::digest(&bytes);
-    let mut hash = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(hash, "{byte:02x}").expect("writing SHA-256 to a String cannot fail");
-    }
-    if previous_hash.as_deref() == Some(hash.as_str()) {
-        let _ = std::fs::remove_file(&path);
-        store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;
-        eprintln!("capec: downloaded content is unchanged");
-        return Ok(());
-    }
-
-    let count = import_capec_catalog(db.clone(), &path).await?;
-    let _ = std::fs::remove_file(&path);
-    store_capec_download_metadata(&db, download.etag, download.last_modified, &hash).await?;
-    db.set_metadata_value(CAPEC_STORAGE_VERSION_METADATA_KEY, CAPEC_STORAGE_VERSION)
-        .await
-        .map_err(|error| format!("failed to write CAPEC storage metadata: {error}"))?;
-    eprintln!("capec: replaced {count} attack patterns");
-    Ok(())
-}
-
-async fn import_capec_catalog(db: SqlxDatabase, path: &Path) -> Result<usize, String> {
-    let catalog = read_capec_catalog_xml(path)
-        .map_err(|error| format!("failed to read CAPEC catalog {}: {error}", path.display()))?;
-    db.replace_capec_catalog(&catalog)
-        .await
-        .map_err(|error| format!("failed to write CAPEC catalog: {error}"))
-}
-
-async fn store_capec_download_metadata(
-    db: &SqlxDatabase,
-    etag: Option<String>,
-    last_modified: Option<String>,
-    hash: &str,
-) -> Result<(), String> {
-    if let Some(etag) = etag {
-        db.set_metadata_value(CAPEC_ETAG_METADATA_KEY, &etag)
-            .await
-            .map_err(|error| format!("failed to write CAPEC ETag: {error}"))?;
-    }
-    if let Some(last_modified) = last_modified {
-        db.set_metadata_value(CAPEC_LAST_MODIFIED_METADATA_KEY, &last_modified)
-            .await
-            .map_err(|error| format!("failed to write CAPEC Last-Modified: {error}"))?;
-    }
-    db.set_metadata_value(CAPEC_HASH_METADATA_KEY, hash)
-        .await
-        .map_err(|error| format!("failed to write CAPEC hash: {error}"))
-}
-
-fn local_catalog_path(filename: &str) -> Option<PathBuf> {
-    let current = PathBuf::from(filename);
-    if current.exists() {
-        return Some(current);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(filename)))
-        .filter(|path| path.exists())
-}
-
-#[cfg(test)]
-fn local_test_capec_catalog_path() -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("capec_latest.xml");
-    path.exists().then_some(path)
-}
-
-#[cfg(test)]
-fn local_test_cwe_catalog_path() -> Option<PathBuf> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../..")
-        .join("cwec_latest.xml.zip");
-    path.exists().then_some(path)
 }
 
 pub async fn latest_asset(kind: ReleaseAssetKind) -> Result<GitHubReleaseFile, String> {
@@ -1652,13 +1431,23 @@ pub async fn apply_delta_updates_with_progress(
             db.clone(),
             "update",
             &path,
-            max_chunks,
-            false,
-            true,
-            None,
-            progress,
+            CveZipImportOptions {
+                max_chunks,
+                bulk_replace: false,
+                rebuild_after: true,
+                index_started: None,
+                progress,
+            },
         )
         .await?;
+        db.mark_cve_asset_applied(
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("local-cve.zip"),
+            "local",
+        )
+        .await
+        .map_err(|error| format!("failed to record local delta asset: {error}"))?;
         return Ok(vec![path]);
     }
 
@@ -1701,11 +1490,13 @@ pub async fn apply_delta_updates_with_progress(
                 db.clone(),
                 "update",
                 &path,
-                max_chunks,
-                false,
-                false,
-                None,
-                progress.clone(),
+                CveZipImportOptions {
+                    max_chunks,
+                    bulk_replace: false,
+                    rebuild_after: false,
+                    index_started: None,
+                    progress: progress.clone(),
+                },
             )
             .await?;
             db.mark_cve_asset_applied(&asset.name, &asset.url)
@@ -1741,8 +1532,8 @@ pub async fn apply_delta_updates_with_progress(
     Ok(paths)
 }
 
-/// Refreshes all enrichment sources.
-pub async fn sync_all_enrichment_sources_after_update(
+/// Refreshes OSV using the stored selection plus any newly requested coverage.
+pub async fn sync_osv_after_update(
     db: &SqlxDatabase,
     label: &str,
     requested_osv_additions: Option<&OsvImportSelection>,
@@ -1755,8 +1546,22 @@ pub async fn sync_all_enrichment_sources_after_update(
         .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
     let selection =
         requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
-    sync_osv(db.clone(), label, selection).await?;
-    sync_risk_feeds(db.clone(), label, true).await.map(|_| ())
+    sync_osv(db.clone(), label, selection).await.map(|_| ())
+}
+
+/// Refreshes the catalogs and enrichment sources used by a normal update.
+pub async fn sync_all_enrichment_sources_after_update(
+    db: &SqlxDatabase,
+    label: &str,
+    requested_osv_additions: Option<&OsvImportSelection>,
+    cve_changed: bool,
+) -> Result<(), String> {
+    sync_cwe_catalog(db.clone()).await?;
+    sync_capec_catalog(db.clone()).await?;
+    sync_osv_after_update(db, label, requested_osv_additions).await?;
+    sync_risk_feeds(db.clone(), label, cve_changed)
+        .await
+        .map(|_| ())
 }
 
 /// Imports CVE JSON from a ZIP archive.
@@ -1766,7 +1571,19 @@ pub async fn import_cve_zip(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, false, true, None, None).await
+    import_cve_zip_with_mode(
+        db,
+        label,
+        asset_path,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: false,
+            rebuild_after: true,
+            index_started: None,
+            progress: None,
+        },
+    )
+    .await
 }
 
 /// Imports CVE JSON from a ZIP archive while reporting progress.
@@ -1781,11 +1598,13 @@ pub async fn import_cve_zip_with_progress(
         db,
         label,
         asset_path,
-        max_chunks,
-        false,
-        true,
-        None,
-        Some(progress),
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: false,
+            rebuild_after: true,
+            index_started: None,
+            progress: Some(progress),
+        },
     )
     .await
 }
@@ -1797,7 +1616,19 @@ pub async fn import_cve_zip_bulk(
     asset_path: &Path,
     max_chunks: Option<usize>,
 ) -> Result<usize, String> {
-    import_cve_zip_with_mode(db, label, asset_path, max_chunks, true, true, None, None).await
+    import_cve_zip_with_mode(
+        db,
+        label,
+        asset_path,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: true,
+            rebuild_after: true,
+            index_started: None,
+            progress: None,
+        },
+    )
+    .await
 }
 
 pub(crate) async fn import_cve_zip_bulk_with_index_signal(
@@ -1812,25 +1643,38 @@ pub(crate) async fn import_cve_zip_bulk_with_index_signal(
         db,
         label,
         asset_path,
-        max_chunks,
-        true,
-        true,
-        Some(index_started),
-        progress,
+        CveZipImportOptions {
+            max_chunks,
+            bulk_replace: true,
+            rebuild_after: true,
+            index_started: Some(index_started),
+            progress,
+        },
     )
     .await
+}
+
+struct CveZipImportOptions {
+    max_chunks: Option<usize>,
+    bulk_replace: bool,
+    rebuild_after: bool,
+    index_started: Option<oneshot::Sender<()>>,
+    progress: Option<IngestProgressCallback>,
 }
 
 async fn import_cve_zip_with_mode(
     db: SqlxDatabase,
     label: &str,
     asset_path: &Path,
-    max_chunks: Option<usize>,
-    bulk_replace: bool,
-    rebuild_after: bool,
-    index_started: Option<oneshot::Sender<()>>,
-    progress: Option<IngestProgressCallback>,
+    options: CveZipImportOptions,
 ) -> Result<usize, String> {
+    let CveZipImportOptions {
+        max_chunks,
+        bulk_replace,
+        rebuild_after,
+        index_started,
+        progress,
+    } = options;
     let storage = ZipStorage::new(asset_path.to_string_lossy().to_string())
         .map_err(|error| format!("{label}: failed to open {}: {error}", asset_path.display()))?;
     let entries = storage.entries();
@@ -2024,544 +1868,4 @@ fn normalize_timestamp(value: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ingest_progress_uses_bounded_chunk_count() {
-        assert_eq!(ingest_chunk_count(0, None), 0);
-        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE, None), 1);
-        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE + 1, None), 2);
-        assert_eq!(ingest_chunk_count(INGEST_CHUNK_SIZE * 10, Some(3)), 3);
-    }
-
-    #[test]
-    fn full_cve_filename_provides_a_safe_delta_cursor() {
-        assert_eq!(
-            cve_full_asset_cursor(Path::new("2026-07-18_all_CVEs_at_midnight.zip.zip"))
-                .unwrap()
-                .to_rfc3339(),
-            "2026-07-18T00:00:00+00:00"
-        );
-        assert!(cve_full_asset_cursor(Path::new("delta.zip")).is_none());
-    }
-
-    #[test]
-    fn cve_remote_update_kind_uses_hourly_through_exactly_24_hours() {
-        let cursor = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        assert_eq!(
-            cve_remote_update_kind(cursor, cursor + TimeDelta::hours(24)),
-            CveRemoteUpdateKind::Hourly
-        );
-        assert_eq!(
-            cve_remote_update_kind(
-                cursor,
-                cursor + TimeDelta::hours(24) + TimeDelta::seconds(1)
-            ),
-            CveRemoteUpdateKind::DailyThenHourly
-        );
-    }
-
-    #[test]
-    fn cve_remote_update_kind_uses_full_at_two_weeks() {
-        let cursor = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        assert_eq!(
-            cve_remote_update_kind(cursor, cursor + TimeDelta::days(14) - TimeDelta::seconds(1)),
-            CveRemoteUpdateKind::DailyThenHourly
-        );
-        assert_eq!(
-            cve_remote_update_kind(cursor, cursor + TimeDelta::days(14)),
-            CveRemoteUpdateKind::Full
-        );
-    }
-
-    #[test]
-    fn cve_archive_cleanup_respects_ownership_and_keep() {
-        let directory = std::env::temp_dir().join(format!(
-            "qanvuli-cve-archive-ownership-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-
-        let local = directory.join("local.zip");
-        std::fs::write(&local, b"local").unwrap();
-        cleanup_processed_cve_archive(&local, CveArchiveOwnership::UserSupplied, false).unwrap();
-        assert!(local.exists());
-
-        let kept_download = directory.join("kept.zip");
-        std::fs::write(&kept_download, b"download").unwrap();
-        cleanup_processed_cve_archive(&kept_download, CveArchiveOwnership::Downloaded, true)
-            .unwrap();
-        assert!(kept_download.exists());
-
-        let removed_download = directory.join("removed.zip");
-        std::fs::write(&removed_download, b"download").unwrap();
-        cleanup_processed_cve_archive(&removed_download, CveArchiveOwnership::Downloaded, false)
-            .unwrap();
-        assert!(!removed_download.exists());
-
-        let _ = std::fs::remove_dir_all(directory);
-    }
-
-    #[tokio::test]
-    async fn remote_delta_update_requires_a_cursor_from_full_init() {
-        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize().await.unwrap();
-
-        let error = apply_delta_updates(&database, None, None)
-            .await
-            .unwrap_err();
-
-        assert!(error.contains("CVE delta cursor is missing"));
-    }
-
-    #[test]
-    fn downloaded_osv_selection_removes_temporary_zips_when_dropped() {
-        let path = std::env::temp_dir().join(format!(
-            "qanvuli-osv-prefetch-{}-{}.zip",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::write(&path, b"temporary").unwrap();
-        let download = DownloadedOsvSelection {
-            label: "test".to_owned(),
-            selection: OsvImportSelection::default_init(false, &[]),
-            cursor: Utc::now().to_rfc3339(),
-            target_osv_ids: None,
-            zip_paths: vec![path.clone()],
-            download_elapsed: Duration::ZERO,
-            ready_at: Instant::now(),
-        };
-
-        drop(download);
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn default_database_is_in_current_working_directory() {
-        let db_url = default_db_connection_string().unwrap();
-        let db_path = database::sqlite_file_path(&db_url).unwrap();
-
-        assert_eq!(db_path, std::env::current_dir().unwrap().join("db.sqlite"));
-    }
-
-    #[test]
-    fn zip_download_capacity_includes_safety_margin() {
-        let payload = 556_000_000;
-        assert_eq!(
-            zip_download_required_bytes(payload),
-            payload + ZIP_DOWNLOAD_FREE_SPACE_MARGIN_BYTES
-        );
-        assert!(zip_download_required_bytes(payload) > 722_000_000);
-        assert_eq!(zip_download_required_bytes(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn temporary_storage_selection_checks_known_fallback_capacity() {
-        assert_eq!(
-            choose_temporary_storage(Some(100), Some(200), Some(50)),
-            Ok(TemporaryStorageChoice::Primary)
-        );
-        assert_eq!(
-            choose_temporary_storage(Some(100), Some(50), Some(200)),
-            Ok(TemporaryStorageChoice::Fallback)
-        );
-        assert_eq!(
-            choose_temporary_storage(Some(100), Some(50), None),
-            Ok(TemporaryStorageChoice::Fallback)
-        );
-        assert_eq!(
-            choose_temporary_storage(Some(100), None, Some(50)),
-            Ok(TemporaryStorageChoice::Primary)
-        );
-        assert_eq!(
-            choose_temporary_storage(Some(100), Some(50), Some(75)),
-            Err((100, 50, 75))
-        );
-    }
-
-    #[test]
-    fn redact_database_url_removes_embedded_credentials() {
-        let redacted = redact_database_url("postgres://alice:super-secret@example.test/qanvuli");
-
-        assert_eq!(redacted, "postgres://REDACTED@example.test/qanvuli");
-        assert!(!redacted.contains("super-secret"));
-        assert!(!redacted.contains("alice"));
-    }
-
-    #[test]
-    fn remove_processed_zip_deletes_existing_file() {
-        let path = std::env::temp_dir().join(format!(
-            "qanvuli-processed-zip-{}-{}.zip",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::write(&path, b"zip").unwrap();
-
-        remove_processed_zip(&path).unwrap();
-
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn osv_selection_resolves_gcs_database_dirs_from_modified_paths() {
-        let selection =
-            OsvImportSelection::default_init(false, &["ghsa".to_owned(), "pysec".to_owned()]);
-        let rows = vec![
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "PyPI/GHSA-73jc-5mrq-prw7.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "RubyGems/GHSA-8p34-64r3-mwg8.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "PyPI/PYSEC-2026-1.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "crates.io/RUSTSEC-2026-1.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "[EMPTY]/GHSA-empty.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "empty/GHSA-lowercase-empty.json".to_owned(),
-            },
-        ];
-
-        let database_dirs = osv_database_dirs_for_selection(&selection, &rows);
-
-        assert_eq!(
-            database_dirs.get("PyPI"),
-            Some(&BTreeSet::from(["GHSA".to_owned(), "PYSEC".to_owned()]))
-        );
-        assert_eq!(
-            database_dirs.get("RubyGems"),
-            Some(&BTreeSet::from(["GHSA".to_owned()]))
-        );
-        assert_eq!(
-            database_dirs.get("[EMPTY]"),
-            Some(&BTreeSet::from(["GHSA".to_owned()]))
-        );
-        assert!(!database_dirs.contains_key("crates.io"));
-        assert!(!database_dirs.contains_key("empty"));
-    }
-
-    #[test]
-    fn osv_cursor_selects_only_newer_matching_object_paths() {
-        let selection = OsvImportSelection::default_init(false, &["pysec".to_owned()]);
-        let rows = vec![
-            OsvModifiedId {
-                modified_at: "2026-07-06T23:59:59Z".to_owned(),
-                object_path: "PyPI/PYSEC-2026-old.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:00Z".to_owned(),
-                object_path: "PyPI/GHSA-equal.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-07T00:00:01+00:00".to_owned(),
-                object_path: "PyPI/PYSEC-2026-new.json".to_owned(),
-            },
-            OsvModifiedId {
-                modified_at: "2026-07-08T00:00:00Z".to_owned(),
-                object_path: "crates.io/RUSTSEC-2026-new.json".to_owned(),
-            },
-        ];
-
-        assert_eq!(
-            osv_target_paths_since(&selection, &rows, "2026-07-07T00:00:00Z"),
-            AHashSet::from(["PyPI/PYSEC-2026-new.json".to_owned()])
-        );
-    }
-
-    #[test]
-    fn osv_and_ghsa_are_always_included_in_osv_selection() {
-        let selection = OsvImportSelection::default_init(false, &["pysec".to_owned()]);
-        assert!(selection.matches_id("OSV-2024-1"));
-        assert!(selection.matches_id("GHSA-aaaa-bbbb-cccc"));
-        assert!(selection.matches_id("PYSEC-2024-1"));
-
-        let restored = OsvImportSelection::from_metadata(Some("OSV")).unwrap();
-        assert!(restored.matches_id("GHSA-aaaa-bbbb-cccc"));
-
-        assert!(!metadata_includes_required_osv_prefixes("OSV"));
-        assert!(metadata_includes_required_osv_prefixes("OSV,GHSA"));
-        assert!(metadata_includes_required_osv_prefixes("all"));
-    }
-
-    #[test]
-    fn osv_zip_reader_skips_seen_and_duplicate_osv_ids() {
-        use std::io::Write;
-
-        let zip_path = std::env::temp_dir().join(format!(
-            "qanvuli-osv-reader-dedupe-{}-{}.zip",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default();
-        for (name, raw_json) in [
-            ("GHSA-skip.json", r#"{"id":"GHSA-skip"}"#),
-            ("GHSA-keep.json", r#"{"id":"GHSA-keep"}"#),
-            ("nested/GHSA-keep.json", r#"{"id":"GHSA-keep"}"#),
-        ] {
-            zip.start_file(name, options).unwrap();
-            zip.write_all(raw_json.as_bytes()).unwrap();
-        }
-        zip.finish().unwrap();
-
-        let selection = OsvImportSelection::default_init(false, &["ghsa".to_owned()]);
-        let skip_osv_ids = AHashSet::from(["GHSA-SKIP".to_owned()]);
-        let (batch_tx, mut batch_rx) = mpsc::channel(8);
-        read_osv_zip_batches(
-            &zip_path,
-            None,
-            Some(&selection),
-            Some(&skip_osv_ids),
-            batch_tx,
-        )
-        .unwrap();
-        let mut batches = Vec::new();
-        while let Ok(batch) = batch_rx.try_recv() {
-            batches.push(batch.unwrap());
-        }
-
-        assert_eq!(
-            batches
-                .iter()
-                .map(|batch| batch.records.len())
-                .sum::<usize>(),
-            1
-        );
-
-        let _ = std::fs::remove_file(zip_path);
-    }
-
-    #[tokio::test]
-    async fn sqlx_zip_ingest_imports_cve_and_builds_stable_search() {
-        use qanvuli_core::database::SqlxDatabase;
-        use std::io::Write;
-
-        let zip_path = std::env::temp_dir().join(format!(
-            "qanvuli-sqlx-ingest-{}-{}.zip",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file(
-            "CVE-2099-0001.json",
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
-        zip.write_all(br#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"SQLx fixture"}}}"#)
-            .unwrap();
-        zip.finish().unwrap();
-        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize().await.unwrap();
-        assert_eq!(
-            import_cve_zip(database.clone(), "test", &zip_path, None)
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            database
-                .search_cves("fixture", false, 10)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        database.close().await.unwrap();
-        let _ = std::fs::remove_file(zip_path);
-    }
-
-    #[tokio::test]
-    async fn osv_zip_import_advances_cursor_after_validation() {
-        use qanvuli_core::database::SqlxDatabase;
-        use std::io::Write;
-
-        let zip_path = std::env::temp_dir().join(format!(
-            "qanvuli-sqlx-osv-{}-{}.zip",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let file = std::fs::File::create(&zip_path).unwrap();
-        let mut zip = zip::ZipWriter::new(file);
-        zip.start_file(
-            "GHSA-TEST-0001.json",
-            zip::write::SimpleFileOptions::default(),
-        )
-        .unwrap();
-        zip.write_all(include_bytes!(
-            "../../../../fixtures/osv/GHSA-TEST-0001.json"
-        ))
-        .unwrap();
-        zip.finish().unwrap();
-        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize().await.unwrap();
-        assert_eq!(
-            import_osv_zip(database.clone(), &zip_path, None, "2099-01-02T00:00:00Z")
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            database.begin_osv_sync().await.unwrap(),
-            Some("2099-01-02T00:00:00Z".to_owned())
-        );
-        database.close().await.unwrap();
-        let _ = std::fs::remove_file(zip_path);
-    }
-
-    #[tokio::test]
-    async fn normal_osv_update_uses_incremental_upsert_for_changed_and_new_records() {
-        use qanvuli_core::database::SqlxDatabase;
-        use std::io::Write;
-
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let initial_zip = std::env::temp_dir().join(format!("qanvuli-osv-initial-{nonce}.zip"));
-        let update_zip = std::env::temp_dir().join(format!("qanvuli-osv-update-{nonce}.zip"));
-        let options = zip::write::SimpleFileOptions::default();
-        let mut zip = zip::ZipWriter::new(std::fs::File::create(&initial_zip).unwrap());
-        zip.start_file("GHSA-2099-existing.json", options).unwrap();
-        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-existing","modified":"2099-01-01T00:00:00Z","summary":"before"}"#).unwrap();
-        zip.finish().unwrap();
-
-        let mut zip = zip::ZipWriter::new(std::fs::File::create(&update_zip).unwrap());
-        zip.start_file("GHSA-2099-existing.json", options).unwrap();
-        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-existing","modified":"2099-01-02T00:00:00Z","summary":"after"}"#).unwrap();
-        zip.start_file("GHSA-2099-new.json", options).unwrap();
-        zip.write_all(br#"{"schema_version":"1.8.0","id":"GHSA-2099-new","modified":"2099-01-02T00:00:00Z","summary":"new"}"#).unwrap();
-        zip.finish().unwrap();
-
-        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize().await.unwrap();
-        import_osv_zip(database.clone(), &initial_zip, None, "2099-01-01T00:00:00Z")
-            .await
-            .unwrap();
-        assert_eq!(
-            import_osv_zip(database.clone(), &update_zip, None, "2099-01-02T00:00:00Z")
-                .await
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            database
-                .find_osv_summary("GHSA-2099-existing")
-                .await
-                .unwrap()
-                .unwrap()
-                .summary
-                .as_deref(),
-            Some("after")
-        );
-        assert!(
-            database
-                .find_osv_summary("GHSA-2099-new")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert_eq!(
-            database.begin_osv_sync().await.unwrap().as_deref(),
-            Some("2099-01-02T00:00:00Z")
-        );
-        database.close().await.unwrap();
-        let _ = std::fs::remove_file(initial_zip);
-        let _ = std::fs::remove_file(update_zip);
-    }
-
-    #[tokio::test]
-    async fn sqlx_osv_zip_failure_keeps_cursor_and_retry_is_idempotent() {
-        use qanvuli_core::database::SqlxDatabase;
-        use std::io::Write;
-
-        let directory = std::env::temp_dir();
-        let nonce = format!(
-            "{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        );
-        let failing_zip = directory.join(format!("qanvuli-osv-failing-{nonce}.zip"));
-        let retry_zip = directory.join(format!("qanvuli-osv-retry-{nonce}.zip"));
-        let mut zip = zip::ZipWriter::new(std::fs::File::create(&failing_zip).unwrap());
-        let options = zip::write::SimpleFileOptions::default();
-        for index in 0..OSV_IMPORT_BATCH_SIZE {
-            let id = format!("GHSA-2099-retry-{index:04}");
-            zip.start_file(format!("{id}.json"), options).unwrap();
-            zip.write_all(
-                format!(
-                    r#"{{"schema_version":"1.8.0","id":"{id}","modified":"2099-01-01T00:00:00Z"}}"#
-                )
-                .as_bytes(),
-            )
-            .unwrap();
-        }
-        zip.start_file("GHSA-2099-invalid.json", options).unwrap();
-        zip.write_all(br#"{"schema_version":"1.7.3","id":"GHSA-2099-invalid"}"#)
-            .unwrap();
-        zip.finish().unwrap();
-
-        let mut zip = zip::ZipWriter::new(std::fs::File::create(&retry_zip).unwrap());
-        zip.start_file("GHSA-2099-retry-0000.json", options)
-            .unwrap();
-        zip.write_all(
-            br#"{"schema_version":"1.8.0","id":"GHSA-2099-retry-0000","modified":"2099-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-        zip.finish().unwrap();
-
-        let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
-        database.initialize().await.unwrap();
-        assert!(
-            import_osv_zip(database.clone(), &failing_zip, None, "2099-01-02T00:00:00Z")
-                .await
-                .is_err()
-        );
-        let state = database.source_sync_states().await.unwrap().pop().unwrap();
-        assert_eq!(state.status, "failed");
-        assert_eq!(state.last_cursor, None);
-
-        assert_eq!(
-            import_osv_zip(database.clone(), &retry_zip, None, "2099-01-02T00:00:00Z")
-                .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            database.begin_osv_sync().await.unwrap(),
-            Some("2099-01-02T00:00:00Z".to_owned())
-        );
-        assert!(
-            database
-                .find_osv_summary("GHSA-2099-retry-0000")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        database.close().await.unwrap();
-        let _ = std::fs::remove_file(failing_zip);
-        let _ = std::fs::remove_file(retry_zip);
-    }
-}
+mod tests;

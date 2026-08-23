@@ -1,6 +1,6 @@
 use crate::{
     app::{App, PaneFocus},
-    common::{DetailSearch, focus_style, highlighted_line},
+    common::{DetailSearch, Markup, focus_style, highlighted_line, markup_lines},
     display::TimeZone,
     traits::detail::DetailPanel,
     utils::datetime::format_timestamp,
@@ -24,10 +24,11 @@ impl DetailPanel for MainDetailPanel {
         detail_search: &DetailSearch,
         area: Rect,
     ) {
+        let content_width = area.width.saturating_sub(2).max(1) as usize;
         let detail = if let Some(cve) = app.selected() {
-            detail_lines(cve, app.display.timezone, detail_search)
+            detail_lines(cve, app.main.display.timezone, detail_search, content_width)
         } else if let Some(osv) = app.selected_osv() {
-            osv_detail_lines(osv, app.display.timezone, detail_search)
+            osv_detail_lines(osv, app.main.display.timezone, detail_search, content_width)
         } else {
             vec![Line::from("No results")]
         };
@@ -48,9 +49,9 @@ impl DetailPanel for MainDetailPanel {
                 Block::default()
                     .title(detail_title)
                     .borders(Borders::ALL)
-                    .border_style(focus_style(app.focus == PaneFocus::Right)),
+                    .border_style(focus_style(app.main.focus == PaneFocus::Right)),
             )
-            .scroll((app.detail_scroll, 0))
+            .scroll((app.main.detail_scroll, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(detail, area);
     }
@@ -60,6 +61,7 @@ pub(crate) fn osv_detail_lines(
     osv: &OsvSummary,
     timezone: TimeZone,
     detail_search: &DetailSearch,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let timestamp = |label: &str, value: Option<&str>| {
         highlighted_line(
@@ -72,7 +74,7 @@ pub(crate) fn osv_detail_lines(
             detail_search,
         )
     };
-    vec![
+    let mut lines = vec![
         highlighted_line(
             &format!("Product: {}", osv.package_summary.as_deref().unwrap_or("-")),
             detail_search,
@@ -81,22 +83,32 @@ pub(crate) fn osv_detail_lines(
         timestamp("Updated", osv.modified_at.as_deref()),
         timestamp("Withdrawn", osv.withdrawn_at.as_deref()),
         Line::from(""),
-        // summary
-        highlighted_line(osv.summary.as_deref().unwrap_or("-"), detail_search),
-        Line::from(""),
-        // details
-        highlighted_line(osv.details.as_deref().unwrap_or("-"), detail_search),
-    ]
+    ];
+    lines.extend(markup_lines(
+        osv.summary.as_deref().unwrap_or("-"),
+        width,
+        Markup::Markdown,
+        detail_search,
+    ));
+    lines.push(Line::from(""));
+    lines.extend(markup_lines(
+        osv.details.as_deref().unwrap_or("-"),
+        width,
+        Markup::Markdown,
+        detail_search,
+    ));
+    lines
 }
 
 pub(crate) fn detail_lines(
     cve: &CveSummaryWithDetail,
     timezone: TimeZone,
     detail_search: &DetailSearch,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let summary = &cve.summary;
     let (products, vendors) = product_vendor_summaries(&cve.detail.affected);
-    vec![
+    let mut lines = vec![
         highlighted_line(&format!("Product: {products}"), detail_search),
         highlighted_line(&format!("Vendor: {vendors}"), detail_search),
         highlighted_line(
@@ -116,11 +128,14 @@ pub(crate) fn detail_lines(
         Line::from(""),
         highlighted_line(&summary.title, detail_search),
         Line::from(""),
-        highlighted_line(
-            summary.description_en.as_deref().unwrap_or_default(),
-            detail_search,
-        ),
-    ]
+    ];
+    lines.extend(markup_lines(
+        summary.description_en.as_deref().unwrap_or_default(),
+        width,
+        Markup::Html,
+        detail_search,
+    ));
+    lines
 }
 
 fn product_vendor_summaries(affected: &[CveAffectedDetail]) -> (String, String) {

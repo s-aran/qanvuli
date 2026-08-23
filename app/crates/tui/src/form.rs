@@ -1,5 +1,6 @@
 use qanvuli_core::database::{
-    CveAdvancedQueryMode, CveAdvancedSearch, CveStateScope, CveSummarySortOrder,
+    CveAdvancedQueryMode, CveAdvancedSearch, CveStateScope, CveSummarySortOrder, SsvcAutomatable,
+    SsvcExploitation, SsvcTechnicalImpact,
 };
 
 use super::mode::SearchMode;
@@ -18,6 +19,9 @@ pub(super) struct AdvancedForm {
     pub(super) vendor: String,
     pub(super) vendor_exact: bool,
     pub(super) state_scope: CveStateScope,
+    pub(super) ssvc_exploitation: Option<SsvcExploitation>,
+    pub(super) ssvc_automatable: Option<SsvcAutomatable>,
+    pub(super) ssvc_technical_impact: Option<SsvcTechnicalImpact>,
     pub(super) active_field: AdvancedField,
     pub(super) source_cve: bool,
     pub(super) source_osv: bool,
@@ -39,6 +43,9 @@ pub(super) enum AdvancedField {
     Vendor,
     VendorExact,
     StateScope,
+    SsvcExploitation,
+    SsvcAutomatable,
+    SsvcTechnicalImpact,
 }
 
 impl Default for AdvancedForm {
@@ -56,6 +63,9 @@ impl Default for AdvancedForm {
             vendor: String::new(),
             vendor_exact: false,
             state_scope: CveStateScope::PublishedOnly,
+            ssvc_exploitation: None,
+            ssvc_automatable: None,
+            ssvc_technical_impact: None,
             active_field: AdvancedField::Query,
             source_cve: true,
             source_osv: true,
@@ -176,7 +186,10 @@ impl AdvancedForm {
             AdvancedField::Vendor => Some(&mut self.vendor),
             AdvancedField::ProductExact
             | AdvancedField::VendorExact
-            | AdvancedField::StateScope => None,
+            | AdvancedField::StateScope
+            | AdvancedField::SsvcExploitation
+            | AdvancedField::SsvcAutomatable
+            | AdvancedField::SsvcTechnicalImpact => None,
         }
     }
 
@@ -193,6 +206,15 @@ impl AdvancedForm {
             AdvancedField::ProductExact => self.product_exact = !self.product_exact,
             AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
             AdvancedField::StateScope => self.state_scope = self.state_scope.next(),
+            AdvancedField::SsvcExploitation => {
+                self.ssvc_exploitation = next_exploitation(self.ssvc_exploitation)
+            }
+            AdvancedField::SsvcAutomatable => {
+                self.ssvc_automatable = next_automatable(self.ssvc_automatable)
+            }
+            AdvancedField::SsvcTechnicalImpact => {
+                self.ssvc_technical_impact = next_technical_impact(self.ssvc_technical_impact)
+            }
             _ => {}
         }
     }
@@ -202,6 +224,15 @@ impl AdvancedForm {
             AdvancedField::ProductExact => self.product_exact = !self.product_exact,
             AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
             AdvancedField::StateScope => self.state_scope = self.state_scope.previous(),
+            AdvancedField::SsvcExploitation => {
+                self.ssvc_exploitation = previous_exploitation(self.ssvc_exploitation)
+            }
+            AdvancedField::SsvcAutomatable => {
+                self.ssvc_automatable = previous_automatable(self.ssvc_automatable)
+            }
+            AdvancedField::SsvcTechnicalImpact => {
+                self.ssvc_technical_impact = previous_technical_impact(self.ssvc_technical_impact)
+            }
             _ => {}
         }
     }
@@ -211,6 +242,9 @@ impl AdvancedForm {
             AdvancedField::ProductExact => self.product_exact = !self.product_exact,
             AdvancedField::VendorExact => self.vendor_exact = !self.vendor_exact,
             AdvancedField::StateScope => self.state_scope = self.state_scope.next(),
+            AdvancedField::SsvcExploitation
+            | AdvancedField::SsvcAutomatable
+            | AdvancedField::SsvcTechnicalImpact => self.next_value(),
             _ => {}
         }
     }
@@ -246,6 +280,9 @@ impl AdvancedForm {
             vendor: (!self.vendor_exact).then(|| vendor.clone()).flatten(),
             vendor_exact: self.vendor_exact.then_some(vendor).flatten(),
             kev_only: false,
+            ssvc_exploitation: self.ssvc_exploitation,
+            ssvc_automatable: self.ssvc_automatable,
+            ssvc_technical_impact: self.ssvc_technical_impact,
             state_scope: self.state_scope,
             sort_order,
         }
@@ -307,13 +344,16 @@ impl AdvancedField {
             Self::InstalledVersion => Self::Vendor,
             Self::Vendor => Self::VendorExact,
             Self::VendorExact => Self::StateScope,
-            Self::StateScope => Self::Query,
+            Self::StateScope => Self::SsvcExploitation,
+            Self::SsvcExploitation => Self::SsvcAutomatable,
+            Self::SsvcAutomatable => Self::SsvcTechnicalImpact,
+            Self::SsvcTechnicalImpact => Self::Query,
         }
     }
 
     fn previous(self) -> Self {
         match self {
-            Self::Query => Self::StateScope,
+            Self::Query => Self::SsvcTechnicalImpact,
             Self::PublishedFrom => Self::Query,
             Self::PublishedTo => Self::PublishedFrom,
             Self::Cwe => Self::PublishedTo,
@@ -324,7 +364,60 @@ impl AdvancedField {
             Self::Vendor => Self::InstalledVersion,
             Self::VendorExact => Self::Vendor,
             Self::StateScope => Self::VendorExact,
+            Self::SsvcExploitation => Self::StateScope,
+            Self::SsvcAutomatable => Self::SsvcExploitation,
+            Self::SsvcTechnicalImpact => Self::SsvcAutomatable,
         }
+    }
+}
+
+fn next_exploitation(value: Option<SsvcExploitation>) -> Option<SsvcExploitation> {
+    match value {
+        None => Some(SsvcExploitation::None),
+        Some(SsvcExploitation::None) => Some(SsvcExploitation::PublicPoc),
+        Some(SsvcExploitation::PublicPoc) => Some(SsvcExploitation::Active),
+        Some(SsvcExploitation::Active) => None,
+    }
+}
+
+fn previous_exploitation(value: Option<SsvcExploitation>) -> Option<SsvcExploitation> {
+    match value {
+        None => Some(SsvcExploitation::Active),
+        Some(SsvcExploitation::None) => None,
+        Some(SsvcExploitation::PublicPoc) => Some(SsvcExploitation::None),
+        Some(SsvcExploitation::Active) => Some(SsvcExploitation::PublicPoc),
+    }
+}
+
+fn next_automatable(value: Option<SsvcAutomatable>) -> Option<SsvcAutomatable> {
+    match value {
+        None => Some(SsvcAutomatable::No),
+        Some(SsvcAutomatable::No) => Some(SsvcAutomatable::Yes),
+        Some(SsvcAutomatable::Yes) => None,
+    }
+}
+
+fn previous_automatable(value: Option<SsvcAutomatable>) -> Option<SsvcAutomatable> {
+    match value {
+        None => Some(SsvcAutomatable::Yes),
+        Some(SsvcAutomatable::No) => None,
+        Some(SsvcAutomatable::Yes) => Some(SsvcAutomatable::No),
+    }
+}
+
+fn next_technical_impact(value: Option<SsvcTechnicalImpact>) -> Option<SsvcTechnicalImpact> {
+    match value {
+        None => Some(SsvcTechnicalImpact::Partial),
+        Some(SsvcTechnicalImpact::Partial) => Some(SsvcTechnicalImpact::Total),
+        Some(SsvcTechnicalImpact::Total) => None,
+    }
+}
+
+fn previous_technical_impact(value: Option<SsvcTechnicalImpact>) -> Option<SsvcTechnicalImpact> {
+    match value {
+        None => Some(SsvcTechnicalImpact::Total),
+        Some(SsvcTechnicalImpact::Partial) => None,
+        Some(SsvcTechnicalImpact::Total) => Some(SsvcTechnicalImpact::Partial),
     }
 }
 
@@ -470,5 +563,33 @@ mod tests {
                 .any(|entry| matches!(entry, ScopeEntry::Advisory(_)))
         );
         assert_eq!(form.selected_advisories(), vec!["GHSA"]);
+    }
+
+    #[test]
+    fn ssvc_fields_cycle_and_reach_search_options() {
+        let mut form = AdvancedForm {
+            active_field: AdvancedField::SsvcExploitation,
+            ..AdvancedForm::default()
+        };
+        form.next_value();
+        form.next_value();
+        form.next_value();
+        assert_eq!(form.ssvc_exploitation, Some(SsvcExploitation::Active));
+        form.active_field = AdvancedField::SsvcAutomatable;
+        form.next_value();
+        form.next_value();
+        assert_eq!(form.ssvc_automatable, Some(SsvcAutomatable::Yes));
+        form.active_field = AdvancedField::SsvcTechnicalImpact;
+        form.next_value();
+        form.next_value();
+        assert_eq!(form.ssvc_technical_impact, Some(SsvcTechnicalImpact::Total));
+
+        let options = form.to_search_options(CveSummarySortOrder::PublishedDesc);
+        assert_eq!(options.ssvc_exploitation, Some(SsvcExploitation::Active));
+        assert_eq!(options.ssvc_automatable, Some(SsvcAutomatable::Yes));
+        assert_eq!(
+            options.ssvc_technical_impact,
+            Some(SsvcTechnicalImpact::Total)
+        );
     }
 }

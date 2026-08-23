@@ -8,6 +8,8 @@ qanvuli builds and searches a local vulnerability database. It combines CVE List
 
 The project provides a CLI, terminal UI, Rust API, and MCP server. Searches run locally after the source feeds have been imported.
 
+API documentation: [English](./docs/API.md) · [日本語](./docs/API.ja.md)
+
 ## Features
 
 - Build a database from the complete CVE archive and selected enrichment feeds.
@@ -174,6 +176,14 @@ Common keys:
 - `Esc`: close a popup or leave the current mode
 - `Ctrl-C`: quit
 
+## CVSS calculator
+
+Explain the metrics in a CVSS v2.0, v3.0, v3.1, or v4.0 vector and calculate its score and severity without a database:
+
+```bash
+qanvuli cvss 'CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:L/A:L'
+```
+
 ## SBOM search
 
 ```bash
@@ -193,6 +203,8 @@ qanvuli mcp
 ```
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
+
+The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
 
 Batch package queries and recent-update lists return compact, decision-preserving summaries by default. They retain vulnerability/review state and risk signals; request `verbosity="full"` only for selected packages or CVEs that need findings, CWE, CVSS vectors, or affected-version details.
 

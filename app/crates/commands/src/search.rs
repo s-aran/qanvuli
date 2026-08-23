@@ -1,5 +1,8 @@
 use super::common::{DEFAULT_LIMIT, DateFilter, connect_database, print_json};
-use qanvuli_core::database::{SqlxCveSearch, SqlxCvssSearch};
+use qanvuli_core::database::{
+    SqlxCveSearch, SqlxCvssSearch, SsvcAutomatable, SsvcExploitation, SsvcSearch,
+    SsvcTechnicalImpact,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 enum SearchSource {
@@ -56,6 +59,15 @@ pub struct Args {
     /// CVSS version.
     #[arg(long = "cvss-version")]
     cvss_version: Option<String>,
+    /// Filter by SSVC exploitation: none, poc, or active.
+    #[arg(long = "ssvc-exploitation")]
+    ssvc_exploitation: Option<SsvcExploitation>,
+    /// Filter by whether SSVC marks exploitation as automatable: no or yes.
+    #[arg(long = "ssvc-automatable")]
+    ssvc_automatable: Option<SsvcAutomatable>,
+    /// Filter by SSVC technical impact: partial or total.
+    #[arg(long = "ssvc-technical-impact")]
+    ssvc_technical_impact: Option<SsvcTechnicalImpact>,
     /// Include records published on or after this date.
     #[arg(long)]
     published_since: Option<String>,
@@ -159,6 +171,9 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             || args.max_score.is_some()
             || args.severity.is_some()
             || args.cvss_version.is_some()
+            || args.ssvc_exploitation.is_some()
+            || args.ssvc_automatable.is_some()
+            || args.ssvc_technical_impact.is_some()
             || args.published_since.is_some()
             || args.updated_since.is_some()
             || args.include_rejected
@@ -199,6 +214,7 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     }
     let filters = SqlxCveSearch {
         text: args.text.clone(),
+        cve_id_prefix: None,
         cwe_ids: args.cwe_ids.clone(),
         capec_ids: args.capec_ids.clone(),
         vendor_like: args.vendor_like().map(|value| format!("%{value}%")),
@@ -213,6 +229,11 @@ pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
             max_score: args.max_score,
             severity: args.severity.clone(),
             version: args.cvss_version.clone(),
+        },
+        ssvc: SsvcSearch {
+            exploitation: args.ssvc_exploitation,
+            automatable: args.ssvc_automatable,
+            technical_impact: args.ssvc_technical_impact,
         },
         published_since: date_filter.published_since,
         published_until: None,
@@ -255,6 +276,13 @@ fn option_text(value: Option<&str>) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct SearchCli {
+        #[command(flatten)]
+        args: Args,
+    }
 
     #[test]
     fn exact_flag_routes_vendor_and_product_to_exact_filters() {
@@ -291,5 +319,23 @@ mod tests {
         };
         assert_eq!(args.vendor_like(), None);
         assert_eq!(args.vendor_exact(), Some("exact"));
+    }
+
+    #[test]
+    fn parses_ssvc_filters() {
+        let args = SearchCli::try_parse_from([
+            "search",
+            "--ssvc-exploitation",
+            "active",
+            "--ssvc-automatable",
+            "yes",
+            "--ssvc-technical-impact",
+            "total",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(args.ssvc_exploitation, Some(SsvcExploitation::Active));
+        assert_eq!(args.ssvc_automatable, Some(SsvcAutomatable::Yes));
+        assert_eq!(args.ssvc_technical_impact, Some(SsvcTechnicalImpact::Total));
     }
 }

@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 #[derive(Clone, Debug)]
 pub(crate) struct SqliteWriter {
     connection: Arc<Mutex<SqliteConnection>>,
+    database_url: Arc<str>,
 }
 
 impl SqliteWriter {
@@ -34,7 +35,19 @@ impl SqliteWriter {
             .await?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            database_url: Arc::from(database_url),
         })
+    }
+
+    /// Opens another connection to the same file-backed database so independent reads do not
+    /// queue behind this connection. An in-memory URL names a database per connection, so keep
+    /// sharing the original connection in that case.
+    pub(crate) async fn independent_connection(&self) -> Result<Self, sqlx::Error> {
+        let url = self.database_url.as_ref();
+        if url.contains(":memory:") || url.to_ascii_lowercase().contains("mode=memory") {
+            return Ok(self.clone());
+        }
+        Self::connect(url).await
     }
 
     pub(crate) async fn with_connection<T>(
@@ -173,28 +186,52 @@ mod tests {
 
     #[tokio::test]
     async fn every_writer_connection_enforces_foreign_keys() {
-        let writer = SqliteWriter::connect("sqlite::memory:").await.unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-writer-connections-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let database_url = format!(
+            "sqlite:///{}?mode=rwc",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let writer = SqliteWriter::connect(&database_url).await.unwrap();
         writer.initialize_schema().await.unwrap();
-        let enabled: i64 = writer
-            .with_connection(|connection| {
-                Box::pin(async move {
-                    sqlx::query_scalar("PRAGMA foreign_keys")
-                        .fetch_one(connection)
-                        .await
+        let independent = writer.independent_connection().await.unwrap();
+        assert!(!Arc::ptr_eq(&writer.connection, &independent.connection));
+
+        for connection in [&writer, &independent] {
+            let enabled: i64 = connection
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query_scalar("PRAGMA foreign_keys")
+                            .fetch_one(connection)
+                            .await
+                    })
                 })
-            })
-            .await
-            .unwrap();
-        assert_eq!(enabled, 1);
-        let rejected = writer
-            .with_connection(|connection| {
-                Box::pin(async move {
-                    sqlx::query("INSERT INTO cve_affected (cve_db_id, version_text, raw_json) VALUES (999, '', '{}')")
-                        .execute(connection)
-                        .await
+                .await
+                .unwrap();
+            assert_eq!(enabled, 1);
+            let rejected = connection
+                .with_connection(|connection| {
+                    Box::pin(async move {
+                        sqlx::query("INSERT INTO cve_affected (cve_db_id, version_text, raw_json) VALUES (999, '', '{}')")
+                            .execute(connection)
+                            .await
+                    })
                 })
-            })
-            .await;
-        assert!(rejected.is_err());
+                .await;
+            assert!(rejected.is_err());
+        }
+
+        independent.close().await.unwrap();
+        writer.close().await.unwrap();
+        for candidate in [
+            path.clone(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
     }
 }

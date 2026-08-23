@@ -143,9 +143,18 @@ impl SortField {
         match self {
             Self::Published => "published",
             Self::Updated => "updated",
-            Self::CveId => "a-z",
-            Self::RelationRank => "relation rank",
-            Self::Score => "score",
+            Self::CveId => "source / identifier",
+            Self::RelationRank => "per-source rank",
+            Self::Score => "CVSS score",
+        }
+    }
+
+    pub(super) fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::CveId => Some("CVE and OSV are grouped, then identifiers are sorted."),
+            Self::RelationRank => Some("Ranks are compared within each data source."),
+            Self::Score => Some("OSV has no CVSS score and is listed after CVE."),
+            Self::Published | Self::Updated => None,
         }
     }
 }

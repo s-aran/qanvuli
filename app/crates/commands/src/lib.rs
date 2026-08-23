@@ -12,6 +12,7 @@ macro_rules! eprintln {
 
 pub mod capec;
 pub mod common;
+pub mod cvss;
 pub mod cwe;
 pub mod db;
 pub mod download_cve;
