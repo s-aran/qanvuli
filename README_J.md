@@ -1,5 +1,5 @@
 <div align="center">
-    <img src="./design/logo.svg" width="12%" height="12%" alt="qanvuli logo">
+    <img src="./design/logo.svg" width="21%" height="21%" alt="qanvuli logo">
 </div>
 
 # qanvuli
