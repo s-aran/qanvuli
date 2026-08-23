@@ -12,7 +12,7 @@ once_cell = "1.21"
 serde = { version = "1.0", features = ["derive", "serde_derive"] }
 serde_json = "1.0"
 serde_valid = { version = "2.0", features = ["toml"] }
-simd-json = { version = "0.17", features = ["ahash"] }
+simd-json = { version = "0.18", features = ["ahash"] }
 strum = { version = "0.28", features = ["derive"] }
 thiserror = "2.0"
 toml = { version = "1.1", features = ["fast_hash"] }
