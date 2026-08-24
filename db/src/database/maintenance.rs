@@ -2,6 +2,8 @@
 
 use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqliteConnection};
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::time::Instant;
 
 const BULK_CACHE_MIN_KIB: u64 = 8 * 1024;
