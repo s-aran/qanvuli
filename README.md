@@ -204,6 +204,8 @@ qanvuli mcp
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
 
+MCP searches use four independent SQLite read connections by default so concurrent tool calls do not queue behind one slow query. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. Database updates remain exclusive.
+
 The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
 
 Batch package queries and recent-update lists return compact, decision-preserving summaries by default. They retain vulnerability/review state and risk signals; request `verbosity="full"` only for selected packages or CVEs that need findings, CWE, CVSS vectors, or affected-version details.

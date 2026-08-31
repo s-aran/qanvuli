@@ -24,28 +24,70 @@ use simd_json::{
     prelude::{ValueAsArray, ValueAsObject, ValueAsScalar},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 const BATCH_COVERAGE_NOTICE: &str = "osv_covered=false means OSV has no local coverage; it does not prove there are no CVEs. Cross-check end-of-life or critical packages with the CVE List and vendor advisories.";
+const DEFAULT_MCP_READ_CONNECTIONS: usize = 4;
+const MAX_MCP_READ_CONNECTIONS: usize = 8;
+const MCP_READ_CONNECTIONS_ENV: &str = "QANVULI_MCP_READ_CONNECTIONS";
+
+struct DatabasePool {
+    // Connections are process-local infrastructure, not MCP session state. Each tool call remains
+    // self-contained and may run on any reader.
+    writer: CveDatabase,
+    readers: Vec<CveDatabase>,
+    next_reader: AtomicUsize,
+    access: RwLock<()>,
+}
+
+pub(crate) struct DbReadGuard<'a> {
+    database: &'a CveDatabase,
+    _permit: RwLockReadGuard<'a, ()>,
+}
+
+impl Deref for DbReadGuard<'_> {
+    type Target = CveDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+    }
+}
+
+pub(crate) struct DbWriteGuard<'a> {
+    database: &'a CveDatabase,
+    _permit: RwLockWriteGuard<'a, ()>,
+}
+
+impl Deref for DbWriteGuard<'_> {
+    type Target = CveDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DbProvider {
     db_url: String,
-    db: Arc<OnceCell<CveDatabase>>,
+    pool: Arc<OnceCell<DatabasePool>>,
 }
 
 impl DbProvider {
     pub(crate) fn new(db_url: String) -> Self {
         Self {
             db_url,
-            db: Arc::new(OnceCell::new()),
+            pool: Arc::new(OnceCell::new()),
         }
     }
 
-    pub(crate) async fn get(&self) -> Result<&CveDatabase, McpError> {
-        self.db
+    async fn pool(&self) -> Result<&DatabasePool, McpError> {
+        self.pool
             .get_or_try_init(|| async {
                 let db = CveDatabase::connect(&self.db_url).await.map_err(|err| {
                     mcp_error(format!(
@@ -58,10 +100,55 @@ impl DbProvider {
                         "database rebuild required before MCP startup: {err}"
                     ))
                 })?;
-                Ok(db)
+                let read_connections = mcp_read_connections();
+                let mut readers = Vec::with_capacity(read_connections);
+                for _ in 0..read_connections {
+                    readers.push(db.independent_read_connection().await.map_err(|err| {
+                        mcp_error(format!(
+                            "failed to open MCP database read connection: {err}"
+                        ))
+                    })?);
+                }
+                Ok(DatabasePool {
+                    writer: db,
+                    readers,
+                    next_reader: AtomicUsize::new(0),
+                    access: RwLock::new(()),
+                })
             })
             .await
     }
+
+    pub(crate) async fn read(&self) -> Result<DbReadGuard<'_>, McpError> {
+        let pool = self.pool().await?;
+        let permit = pool.access.read().await;
+        let index = pool.next_reader.fetch_add(1, Ordering::Relaxed) % pool.readers.len();
+        Ok(DbReadGuard {
+            database: &pool.readers[index],
+            _permit: permit,
+        })
+    }
+
+    pub(crate) async fn write(&self) -> Result<DbWriteGuard<'_>, McpError> {
+        let pool = self.pool().await?;
+        let permit = pool.access.write().await;
+        Ok(DbWriteGuard {
+            database: &pool.writer,
+            _permit: permit,
+        })
+    }
+}
+
+fn mcp_read_connections() -> usize {
+    let value = std::env::var(MCP_READ_CONNECTIONS_ENV).ok();
+    parse_mcp_read_connections(value.as_deref())
+}
+
+fn parse_mcp_read_connections(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MCP_READ_CONNECTIONS)
+        .clamp(1, MAX_MCP_READ_CONNECTIONS)
 }
 
 pub(crate) async fn paged_search_result(
@@ -1207,6 +1294,15 @@ pub(crate) async fn apply_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_read_connection_count_is_bounded_and_has_a_safe_default() {
+        assert_eq!(parse_mcp_read_connections(None), 4);
+        assert_eq!(parse_mcp_read_connections(Some("invalid")), 4);
+        assert_eq!(parse_mcp_read_connections(Some("0")), 1);
+        assert_eq!(parse_mcp_read_connections(Some("3")), 3);
+        assert_eq!(parse_mcp_read_connections(Some("99")), 8);
+    }
 
     fn call_result_payload(result: CallToolResult) -> (serde_json::Value, usize) {
         let value = serde_json::to_value(result).unwrap();

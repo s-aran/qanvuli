@@ -18,6 +18,13 @@ impl SqlxDatabase {
         })
     }
 
+    /// Opens an independent query-only connection tuned for interactive reads.
+    pub async fn independent_read_connection(&self) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            writer: self.writer.independent_read_connection().await?,
+        })
+    }
+
     pub async fn initialize(&self) -> Result<(), sqlx::Error> {
         self.writer.initialize_schema().await
     }
