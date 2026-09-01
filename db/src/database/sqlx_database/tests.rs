@@ -1748,6 +1748,35 @@ async fn fts_indexes_cve_description_references_and_osv_details() {
 }
 
 #[tokio::test]
+async fn affected_search_preserves_substring_fallback_behind_fts_fast_path() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-affected-search","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Affected search fixture","affected":[{"vendor":"Microsoft","product":"Windows Server","versions":[{"version":"1","status":"affected"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+    for product in ["Windows", "indows"] {
+        let rows = database
+            .search_cves_by_affected(
+                Some("Microsoft".to_owned()),
+                Some(product.to_owned()),
+                false,
+                false,
+                false,
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "product query {product}");
+        assert_eq!(rows[0].cve_id, "CVE-2099-affected-search");
+    }
+}
+
+#[tokio::test]
 async fn combined_search_joins_cwe_affected_and_cvss_filters_with_and() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();

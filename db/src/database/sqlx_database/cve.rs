@@ -185,8 +185,34 @@ impl SqlxDatabase {
         let vendor = vendor.map(|value| if exact { value } else { format!("%{value}%") });
         let product_rank = product.clone();
         let product = product.map(|value| if exact { value } else { format!("%{value}%") });
+        let product_fts = product_rank
+            .as_deref()
+            .and_then(fts_query)
+            .map(|query| format!("product_text : ({query})"));
         self.writer.with_connection(|connection| Box::pin(async move {
-            sqlx::query_as("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve AS c JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE (? OR c.state=0) AND (? OR affected.collection_url NOT LIKE '%wordpress.org%') AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND (? IS NULL OR CASE WHEN ? THEN (affected.product=? OR affected.package_name=?) ELSE (affected.product LIKE ? OR affected.package_name LIKE ?) END) GROUP BY c.id ORDER BY MIN(CASE WHEN ? IS NULL THEN 0 WHEN affected.product=? OR affected.package_name=? THEN 0 WHEN affected.product LIKE ? || ' %' OR affected.product LIKE '% ' || ? OR affected.product LIKE ? || '-%' OR affected.product LIKE '%-' || ? OR affected.package_name LIKE ? || ' %' OR affected.package_name LIKE '% ' || ? OR affected.package_name LIKE ? || '-%' OR affected.package_name LIKE '%-' || ? THEN 1 ELSE 2 END), c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
+            if let Some(product_fts) = product_fts {
+                // Exact and word-boundary product matches always sort ahead of plain substring
+                // matches. The existing affected FTS projection can therefore produce the page
+                // without scanning every affected row when it contains enough high-rank matches.
+                let fast: Vec<SqlxCveSummary> = sqlx::query_as("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve_affected_summary_fts AS fts CROSS JOIN cve AS c ON c.cve_id=fts.cve_id JOIN cve_affected AS affected ON affected.cve_db_id=c.id WHERE cve_affected_summary_fts MATCH ? AND (? OR c.state=0) AND (? OR affected.collection_url NOT LIKE '%wordpress.org%') AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND (? IS NULL OR CASE WHEN ? THEN (affected.product=? OR affected.package_name=?) ELSE (affected.product LIKE ? OR affected.package_name LIKE ?) END) GROUP BY c.id HAVING MIN(CASE WHEN ? IS NULL THEN 0 WHEN affected.product=? OR affected.package_name=? THEN 0 WHEN affected.product LIKE ? || ' %' OR affected.product LIKE '% ' || ? OR affected.product LIKE ? || '-%' OR affected.product LIKE '%-' || ? OR affected.package_name LIKE ? || ' %' OR affected.package_name LIKE '% ' || ? OR affected.package_name LIKE ? || '-%' OR affected.package_name LIKE '%-' || ? THEN 1 ELSE 2 END) < 2 ORDER BY MIN(CASE WHEN ? IS NULL THEN 0 WHEN affected.product=? OR affected.package_name=? THEN 0 WHEN affected.product LIKE ? || ' %' OR affected.product LIKE '% ' || ? OR affected.product LIKE ? || '-%' OR affected.product LIKE '%-' || ? OR affected.package_name LIKE ? || ' %' OR affected.package_name LIKE '% ' || ? OR affected.package_name LIKE ? || '-%' OR affected.package_name LIKE '%-' || ? THEN 1 ELSE 2 END), c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
+                    .bind(product_fts)
+                    .bind(include_rejected)
+                    .bind(!exclude_wordpress_collection)
+                    .bind(&vendor).bind(exact).bind(&vendor).bind(&vendor)
+                    .bind(&product).bind(exact).bind(&product).bind(&product).bind(&product).bind(&product)
+                    .bind(&product_rank).bind(&product_rank).bind(&product_rank)
+                    .bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank)
+                    .bind(&product_rank).bind(&product_rank).bind(&product_rank)
+                    .bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank).bind(&product_rank)
+                    .bind(limit.max(1)).bind(offset.max(0)).fetch_all(&mut *connection).await?;
+                if fast.len() >= limit.max(1) as usize {
+                    return Ok(fast);
+                }
+            }
+            // SQLite otherwise prefers the CVE ordering side of this join and performs an
+            // indexed affected-row lookup for every CVE. CROSS JOIN fixes the loop order so the
+            // affected projection is scanned once and only matching CVEs are loaded and sorted.
+            sqlx::query_as("SELECT c.cve_id, c.state, c.published_at, c.updated_at, c.title, c.description_en FROM cve_affected AS affected CROSS JOIN cve AS c ON c.id=affected.cve_db_id WHERE (? OR c.state=0) AND (? OR affected.collection_url NOT LIKE '%wordpress.org%') AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND (? IS NULL OR CASE WHEN ? THEN (affected.product=? OR affected.package_name=?) ELSE (affected.product LIKE ? OR affected.package_name LIKE ?) END) GROUP BY c.id ORDER BY MIN(CASE WHEN ? IS NULL THEN 0 WHEN affected.product=? OR affected.package_name=? THEN 0 WHEN affected.product LIKE ? || ' %' OR affected.product LIKE '% ' || ? OR affected.product LIKE ? || '-%' OR affected.product LIKE '%-' || ? OR affected.package_name LIKE ? || ' %' OR affected.package_name LIKE '% ' || ? OR affected.package_name LIKE ? || '-%' OR affected.package_name LIKE '%-' || ? THEN 1 ELSE 2 END), c.updated_at DESC, c.cve_id DESC LIMIT ? OFFSET ?")
                 .bind(include_rejected)
                 .bind(!exclude_wordpress_collection)
                 .bind(&vendor).bind(exact).bind(&vendor).bind(&vendor)
