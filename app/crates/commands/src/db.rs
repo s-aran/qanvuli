@@ -11,11 +11,19 @@ pub struct Args {
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Show database and source status.
-    Status,
+    Status(StatusArgs),
     /// Check database integrity.
     Check(CheckArgs),
     /// Rebuild and verify search indexes.
     RebuildSearch,
+}
+
+#[derive(Debug, clap::Args)]
+struct StatusArgs {
+    /// Emit machine-readable JSON. Status output is JSON by default; this flag is accepted for
+    /// explicit scripting intent and compatibility with other qanvuli commands.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -32,7 +40,8 @@ struct CheckArgs {
 pub async fn run(db_url: &str, args: Args) -> Result<(), String> {
     let db = connect_database(db_url).await?;
     match args.command {
-        Command::Status => {
+        Command::Status(status_args) => {
+            let _json = status_args.json;
             db.check_required_schema()
                 .await
                 .map_err(|error| format!("database rebuild required or check failed: {error}"))?;

@@ -223,6 +223,53 @@ impl SqlxDatabase {
         })).await
     }
 
+    /// Searches an exact product/package identity using the CVE component key, which ignores
+    /// case and the common `-`, `_`, `.`, and whitespace separators.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_cves_by_affected_product_key(
+        &self,
+        vendor: Option<String>,
+        vendor_exact: bool,
+        product: String,
+        exclude_wordpress_collection: bool,
+        include_rejected: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<SqlxCveSummary>, sqlx::Error> {
+        let vendor = vendor.map(|value| {
+            if vendor_exact {
+                value
+            } else {
+                format!("%{value}%")
+            }
+        });
+        let product_key = normalize_cve_component_name(&product);
+        self.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let product = sql_normalized_cve_component_name("affected.product");
+                    let package = sql_normalized_cve_component_name("affected.package_name");
+                    let statement = format!(
+                        "SELECT c.cve_id,c.state,c.published_at,c.updated_at,c.title,c.description_en FROM cve_affected AS affected CROSS JOIN cve AS c ON c.id=affected.cve_db_id WHERE (? OR c.state=0) AND (? OR affected.collection_url NOT LIKE '%wordpress.org%') AND (? IS NULL OR CASE WHEN ? THEN affected.vendor=? ELSE affected.vendor LIKE ? END) AND ({product}=? OR {package}=?) GROUP BY c.id ORDER BY c.updated_at DESC,c.cve_id DESC LIMIT ? OFFSET ?"
+                    );
+                    sqlx::query_as(sqlx::AssertSqlSafe(statement))
+                        .bind(include_rejected)
+                        .bind(!exclude_wordpress_collection)
+                        .bind(&vendor)
+                        .bind(vendor_exact)
+                        .bind(&vendor)
+                        .bind(&vendor)
+                        .bind(&product_key)
+                        .bind(&product_key)
+                        .bind(limit.max(1))
+                        .bind(offset.max(0))
+                        .fetch_all(connection)
+                        .await
+                })
+            })
+            .await
+    }
+
     /// Searches normalized CVSS fields with optional score, severity, and version filters.
     pub async fn search_cves_by_cvss(
         &self,

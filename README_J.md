@@ -147,6 +147,7 @@ qanvuli query package --ecosystem crates.io --name time --version 0.1.0
 
 ```bash
 qanvuli db status
+qanvuli db status --json
 qanvuli db check
 qanvuli db check --scan
 qanvuli db check --full

@@ -137,6 +137,7 @@ Use `--pretty` for indented JSON.
 
 ```bash
 qanvuli db status
+qanvuli db status --json
 qanvuli db check
 qanvuli db check --scan
 qanvuli db check --full

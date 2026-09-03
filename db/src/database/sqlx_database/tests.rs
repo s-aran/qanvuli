@@ -2453,6 +2453,62 @@ async fn package_query_evaluates_npm_and_pypi_ranges_and_normalizes_names() {
 }
 
 #[tokio::test]
+async fn package_query_enriches_kev_epss_and_matches_cve_separator_variants() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Django REST framework fixture","affected":[{"vendor":"example","product":"django-rest-framework","packageName":"django-rest-framework","collectionURL":"https://pypi.org/project/django-rest-framework","defaultStatus":"unaffected","versions":[{"version":"< 3.17.2","status":"affected","versionType":"python"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+    database
+        .import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-enriched","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-0001"],"affected":[{"package":{"ecosystem":"PyPI","name":"djangorestframework"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"3.17.2"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+    database
+        .import_kev_json(include_str!("../../../../fixtures/kev/kev-test.json").to_owned())
+        .await
+        .unwrap();
+    database
+        .import_epss_csv(include_str!("../../../../fixtures/epss/epss-test.csv").to_owned())
+        .await
+        .unwrap();
+
+    let findings = database
+        .query_package_enriched_with_evidence("PyPI", "djangorestframework", "3.16.0", None, false)
+        .await
+        .unwrap();
+    assert!(findings.iter().any(|finding| finding.source == "cve-list"));
+    let osv = findings
+        .iter()
+        .find(|finding| finding.primary_id == "GHSA-2099-enriched")
+        .unwrap();
+    assert_eq!(osv.enrichment.kev_status, "available");
+    assert_eq!(osv.enrichment.epss_status, "available");
+    assert!(osv.priority_signals.known_exploited);
+    assert_eq!(osv.priority_signals.suggested_priority, "critical");
+
+    let exact = database
+        .search_cve_summaries_by_vendor_product_exact_with_state_scope(
+            None,
+            None,
+            None,
+            Some("django_rest.framework"),
+            false,
+            crate::CveStateScope::PublishedOnly,
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact[0].cve_id, "CVE-2099-0001");
+}
+
+#[tokio::test]
 async fn package_query_accepts_purl_without_confirming_an_unverified_name_match() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();

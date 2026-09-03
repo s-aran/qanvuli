@@ -505,6 +505,33 @@ pub(crate) async fn query_package_enriched(
     }))
 }
 
+pub(crate) async fn evaluate_affected(
+    db: &CveDatabase,
+    cve_id: &str,
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+) -> Result<CallToolResult, McpError> {
+    let findings = db
+        .query_package_enriched_with_evidence(ecosystem, name, version, None, true)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    let finding = findings
+        .into_iter()
+        .find(|finding| finding.source == "cve-list" && finding.primary_id == cve_id);
+    let affected = finding
+        .as_ref()
+        .is_some_and(|finding| finding.affected.status == "affected");
+    response::tool_result(json!({
+        "cve_id": cve_id,
+        "ecosystem": ecosystem,
+        "name": name,
+        "version": version,
+        "affected": affected,
+        "evaluation": finding,
+    }))
+}
+
 pub(crate) async fn query_packages_enriched(
     db: &CveDatabase,
     packages: Vec<crate::args::PackageQueryArgs>,
@@ -533,8 +560,11 @@ pub(crate) async fn query_packages_enriched(
             purl: package.purl.clone(),
         })
         .collect::<Vec<_>>();
-    let findings_by_package = db
+    let mut findings_by_package = db
         .query_package_matches_batch(&queries)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    db.enrich_package_finding_batches(&mut findings_by_package)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     let coverage = db
@@ -616,6 +646,12 @@ pub(crate) async fn query_packages_enriched(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let confirmed_advisory_ids = confirmed_findings
+            .iter()
+            .map(|finding| finding.primary_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let risk = confirmed_cve_ids
             .iter()
             .filter_map(|cve_id| risks_by_cve.get(cve_id).cloned())
@@ -623,6 +659,7 @@ pub(crate) async fn query_packages_enriched(
         let summary = batch_summary(
             &package,
             confirmed_cve_ids,
+            confirmed_advisory_ids,
             &risk,
             !confirmed_findings.is_empty(),
             include_fixed.then(|| fixed_versions_from_refs(&confirmed_findings)),
@@ -682,6 +719,7 @@ struct BatchPackageSummary {
     version: String,
     vulnerable: bool,
     cve_ids: Vec<String>,
+    advisory_ids: Vec<String>,
     max_cvss: Option<f64>,
     max_epss: Option<f64>,
     kev: bool,
@@ -699,6 +737,7 @@ struct BatchPackageSummary {
 fn batch_summary(
     package: &crate::args::PackageQueryArgs,
     cve_ids: Vec<String>,
+    advisory_ids: Vec<String>,
     risk: &[CveRiskSummary],
     vulnerable: bool,
     fixed_versions: Option<Vec<String>>,
@@ -710,6 +749,7 @@ fn batch_summary(
         version: package.version.clone(),
         vulnerable,
         cve_ids,
+        advisory_ids,
         max_cvss: risk
             .iter()
             .filter_map(|summary| summary.max_cvss_score)
@@ -1142,6 +1182,22 @@ pub(crate) async fn get_cwe(db: &CveDatabase, cwe_id: i32) -> Result<CallToolRes
     response::tool_result(json!(entry))
 }
 
+pub(crate) async fn get_cwes(
+    db: &CveDatabase,
+    cwe_ids: &[i32],
+) -> Result<CallToolResult, McpError> {
+    let requested = cwe_ids.len();
+    let entries = db
+        .find_cwe_entries(&cwe_ids[..requested.min(200)])
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!({
+        "requested": requested,
+        "truncated": requested > 200,
+        "entries": entries,
+    }))
+}
+
 pub(crate) async fn search_capec_catalog(
     db: &CveDatabase,
     args: CapecCatalogArgs,
@@ -1518,6 +1574,7 @@ mod tests {
         let summary = batch_summary(
             &package,
             vec!["CVE-2099-0001".to_owned(), "CVE-2099-0002".to_owned()],
+            vec!["GHSA-2099-related".to_owned()],
             &risk,
             true,
             None,
@@ -1541,6 +1598,7 @@ mod tests {
         };
         let summary = batch_summary(
             &package,
+            Vec::new(),
             Vec::new(),
             &[],
             false,

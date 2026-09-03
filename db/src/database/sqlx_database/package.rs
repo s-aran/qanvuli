@@ -305,12 +305,13 @@ impl SqlxDatabase {
                 // CVE List supplements OSV for package advisories that have not
                 // been mirrored into OSV. package_name is authoritative when it
                 // exists; product is the documented fallback for older records.
-                let normalized_cve_name = sql_normalized_package_name(
+                let normalized_cve_name = sql_normalized_cve_component_name(
                     "COALESCE(NULLIF(affected.package_name, ''), affected.product)",
-                    "input.ecosystem",
                 );
+                let normalized_input_name =
+                    sql_normalized_cve_component_name("input.package_name");
                 let cve_statement = format!(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON {normalized_cve_name}=input.package_name JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id"
+                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON {normalized_cve_name}={normalized_input_name} JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id"
                 );
                 let cve_candidates: Vec<CvePackageCandidate> = sqlx::query_as(sqlx::AssertSqlSafe(cve_statement))
                 .bind(&input_json)

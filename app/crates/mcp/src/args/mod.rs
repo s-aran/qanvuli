@@ -430,6 +430,12 @@ pub(crate) struct GetEnrichedCveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetCwesArgs {
+    /// Up to 200 CWE IDs, as numbers or strings such as CWE-79.
+    pub(crate) cwe_ids: Vec<CweArgValue>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GetEnrichedOsvArgs {
     /// Exact OSV advisory ID, such as GHSA-abcd-efgh-ijkl or RUSTSEC-2026-0001.
     pub(crate) osv_id: String,
@@ -456,6 +462,18 @@ pub(crate) struct QueryPackageEnrichedArgs {
     /// Include verbose OSV/alias/KEV/EPSS match evidence. Defaults to false.
     #[serde(default, deserialize_with = "deserialize_optional_primitive")]
     pub(crate) include_evidence: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct EvaluateAffectedArgs {
+    /// Exact CVE ID to evaluate.
+    pub(crate) cve_id: String,
+    /// Package ecosystem used for version comparison, such as npm or PyPI.
+    pub(crate) ecosystem: String,
+    /// Product or package name. Common separators are ignored for the CVE List join.
+    pub(crate) name: String,
+    /// Installed package version.
+    pub(crate) version: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -498,6 +516,12 @@ pub(crate) struct UpdateDbArgs {
     /// Additional OSV JSON filename/advisory prefixes from all.zip, case-insensitive.
     /// Examples: GHSA, PYSEC, RUSTSEC, GO, UBUNTU.
     pub(crate) osv_prefixes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetUpdateStatusArgs {
+    /// Job ID returned by update_db.
+    pub(crate) job_id: String,
 }
 
 impl CweArgs {

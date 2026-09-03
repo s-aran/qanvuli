@@ -4,8 +4,9 @@ use super::{
     maintenance::rebuild_cve_search,
     package_eval::{
         CveVersionChange, CveVersionRange, OsvRange, ecosystem_identity_key,
-        evaluate_cve_version_ranges, evaluate_version, normalize_package_name,
-        package_identity_from_purl, package_identity_purl, parse_package_purl, versions_equivalent,
+        evaluate_cve_version_ranges, evaluate_version, normalize_cve_component_name,
+        normalize_package_name, package_identity_from_purl, package_identity_purl,
+        parse_package_purl, versions_equivalent,
     },
     schema,
     search::fts_query,
@@ -80,6 +81,12 @@ pub(super) fn sql_normalized_package_name(name: &str, ecosystem: &str) -> String
         format!("replace(replace(replace(lower({name}), '-', '_'), '.', '_'), ' ', '_')");
     format!(
         "CASE lower({ecosystem}) WHEN 'pypi' THEN {pypi} WHEN 'nuget' THEN lower({name}) WHEN 'github actions' THEN lower({name}) WHEN 'pub' THEN {pub_name} ELSE {name} END"
+    )
+}
+
+pub(super) fn sql_normalized_cve_component_name(name: &str) -> String {
+    format!(
+        "replace(replace(replace(replace(replace(replace(replace(lower({name}), '-', ''), '_', ''), '.', ''), ' ', ''), char(9), ''), char(10), ''), char(13), '')"
     )
 }
 

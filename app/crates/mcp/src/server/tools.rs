@@ -336,6 +336,24 @@ impl CveSearchServer {
     }
 
     #[tool(
+        description = "Evaluate one installed package version against one CVE List affected record. Handles inline constraints, lessThan/lessThanOrEqual, and unaffected entries on the server."
+    )]
+    pub(crate) async fn evaluate_affected(
+        &self,
+        Parameters(args): Parameters<EvaluateAffectedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db_guard = self.db.read().await?;
+        db::evaluate_affected(
+            &db_guard,
+            &args.cve_id,
+            &args.ecosystem,
+            &args.name,
+            &args.version,
+        )
+        .await
+    }
+
+    #[tool(
         description = "Batch-query up to 200 package/version tuples. Compact summaries are the default and retain vulnerability, review, CVE, CVSS, EPSS, KEV, coverage, and optional fixed-version signals. Set verbosity='full' only for packages that need findings. Evidence is omitted by default."
     )]
     pub(crate) async fn query_packages_enriched(
@@ -430,6 +448,22 @@ impl CveSearchServer {
         let db = &*db_guard;
         let cwe_id = cwe_arg_to_i32(args.cwe_id)?;
         db::get_cwe(db, cwe_id).await
+    }
+
+    #[tool(
+        description = "Fetch up to 200 CWE catalog entries, including related CAPEC IDs, in one call."
+    )]
+    pub(crate) async fn get_cwes(
+        &self,
+        Parameters(args): Parameters<GetCwesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db_guard = self.db.read().await?;
+        let cwe_ids = args
+            .cwe_ids
+            .into_iter()
+            .map(cwe_arg_to_i32)
+            .collect::<Result<Vec<_>, _>>()?;
+        db::get_cwes(&db_guard, &cwe_ids).await
     }
 
     #[tool(
@@ -536,22 +570,59 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Apply a local CVE delta or download current updates, then refresh enrichment data. This changes the database and may access upstream feeds."
+        description = "Start a background database update and immediately return a job ID. Poll get_update_status for running, success, or failed state and progress."
     )]
     pub(crate) async fn update_db(
         &self,
         Parameters(args): Parameters<UpdateDbArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db_guard = self.db.write().await?;
-        let db = &*db_guard;
-        db::apply_updates(
-            db,
-            args.zip,
-            args.max_chunks,
-            args.osv_all.unwrap_or(false),
-            args.osv_prefixes.as_deref().unwrap_or(&[]),
+        let job = self.update_jobs.create().await;
+        let job_id = job.job_id.clone();
+        let db_provider = self.db.clone();
+        let jobs = self.update_jobs.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let db_guard = db_provider.write().await?;
+                jobs.set_updating(&job_id).await;
+                db::apply_updates(
+                    &db_guard,
+                    args.zip,
+                    args.max_chunks,
+                    args.osv_all.unwrap_or(false),
+                    args.osv_prefixes.as_deref().unwrap_or(&[]),
+                )
+                .await?;
+                Ok::<(), McpError>(())
+            }
+            .await;
+            jobs.finish(&job_id, result.err().map(|error| error.to_string()))
+                .await;
+        });
+        response::tool_result(json!({
+            "job_id": job.job_id,
+            "status": job.status,
+            "stage": job.stage,
+            "progress": {
+                "completed_steps": job.completed_steps,
+                "total_steps": job.total_steps,
+            },
+        }))
+    }
+
+    #[tool(description = "Return status and progress for a background update_db job.")]
+    pub(crate) async fn get_update_status(
+        &self,
+        Parameters(args): Parameters<GetUpdateStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let job = self
+            .update_jobs
+            .get(&args.job_id)
+            .await
+            .ok_or_else(|| McpError::invalid_params("unknown update job ID", None))?;
+        response::tool_result(
+            simd_json::serde::to_owned_value(job)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
         )
-        .await
     }
 }
 
