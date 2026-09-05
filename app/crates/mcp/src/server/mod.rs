@@ -20,8 +20,8 @@ pub(crate) struct UpdateJobSnapshot {
     pub(crate) stage: String,
     pub(crate) completed_steps: u8,
     pub(crate) total_steps: u8,
-    pub(crate) created_at_unix_ms: u128,
-    pub(crate) finished_at_unix_ms: Option<u128>,
+    pub(crate) created_at_unix_ms: u64,
+    pub(crate) finished_at_unix_ms: Option<u64>,
     pub(crate) error: Option<String>,
 }
 
@@ -85,11 +85,12 @@ impl UpdateJobs {
     }
 }
 
-fn unix_ms() -> u128 {
-    SystemTime::now()
+fn unix_ms() -> u64 {
+    let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
+        .as_millis();
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone)]
@@ -146,5 +147,13 @@ mod tests {
         let failed = jobs.get(&failed.job_id).await.unwrap();
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.error.as_deref(), Some("fixture failure"));
+    }
+
+    #[tokio::test]
+    async fn update_job_snapshots_are_supported_by_the_mcp_json_encoder() {
+        let snapshot = UpdateJobs::new().create().await;
+
+        simd_json::serde::to_owned_value(snapshot)
+            .expect("update job timestamps must use JSON-compatible integers");
     }
 }

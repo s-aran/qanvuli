@@ -516,20 +516,74 @@ pub(crate) async fn evaluate_affected(
         .query_package_enriched_with_evidence(ecosystem, name, version, None, true)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
-    let finding = findings
+    let mut evaluations = findings
         .into_iter()
-        .find(|finding| finding.source == "cve-list" && finding.primary_id == cve_id);
-    let affected = finding
-        .as_ref()
-        .is_some_and(|finding| finding.affected.status == "affected");
+        .filter(|finding| {
+            finding.primary_id.eq_ignore_ascii_case(cve_id)
+                || finding
+                    .cve_ids
+                    .iter()
+                    .chain(&finding.aliases)
+                    .any(|alias| alias.eq_ignore_ascii_case(cve_id))
+        })
+        .collect::<Vec<_>>();
+    evaluations.sort_by(|left, right| {
+        affected_status_rank(&right.affected.status)
+            .cmp(&affected_status_rank(&left.affected.status))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.primary_id.cmp(&right.primary_id))
+    });
+    let evaluation = evaluations.first();
+    let evaluation_status = evaluation
+        .map(|finding| finding.affected.status.as_str())
+        .unwrap_or("unknown");
+    let affected = match evaluation_status {
+        "affected" => Some(true),
+        "not_affected" => Some(false),
+        _ => None,
+    };
+    let normalized_id = cve_id.to_ascii_uppercase();
+    let is_cve = normalized_id.starts_with("CVE-");
+    let cve_found = if is_cve {
+        Some(
+            db.find_cve_summary_with_detail(&normalized_id)
+                .await
+                .map_err(|err| mcp_error(err.to_string()))?
+                .is_some(),
+        )
+    } else {
+        None
+    };
+    let directly_found = if is_cve {
+        cve_found == Some(true)
+    } else {
+        db.find_enriched_osv(&normalized_id)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?
+            .is_some()
+    };
+    let identifier_found = directly_found || !evaluations.is_empty();
     response::tool_result(json!({
         "cve_id": cve_id,
+        "vulnerability_id": cve_id,
         "ecosystem": ecosystem,
         "name": name,
         "version": version,
         "affected": affected,
-        "evaluation": finding,
+        "status": evaluation_status,
+        "identifier_found": identifier_found,
+        "cve_found": cve_found,
+        "evaluation": evaluation,
+        "evaluations": evaluations,
     }))
+}
+
+fn affected_status_rank(status: &str) -> u8 {
+    match status {
+        "affected" => 2,
+        "not_affected" => 1,
+        _ => 0,
+    }
 }
 
 pub(crate) async fn query_packages_enriched(
@@ -697,9 +751,12 @@ pub(crate) async fn query_packages_enriched(
         }
         results.push(result);
     }
+    let request_capped = requested > 200;
     response::tool_result(json!({
         "requested": requested,
-        "truncated": requested > 200,
+        "request_capped": request_capped,
+        "truncated": request_capped,
+        "truncated_reasons": if request_capped { vec!["request_cap"] } else { Vec::<&str>::new() },
         "status": status,
         "verbosity": verbosity,
         "coverage_notice": BATCH_COVERAGE_NOTICE,
@@ -1522,6 +1579,92 @@ mod tests {
             payload["findings"][0]["evidence"].as_array().unwrap().len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_affected_uses_osv_aliases_and_preserves_unknown() {
+        use qanvuli_core::database::OsvRawRecord;
+
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0301","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"OSV alias fixture","affected":[]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+        db.import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-alias-test","aliases":["CVE-2099-0301","PYSEC-2099-301"],"modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"PyPI","name":"example"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+
+        for vulnerability_id in ["CVE-2099-0301", "GHSA-2099-alias-test", "PYSEC-2099-301"] {
+            let result = evaluate_affected(&db, vulnerability_id, "PyPI", "example", "1.0.0")
+                .await
+                .unwrap();
+            let (payload, _) = call_result_payload(result);
+            assert_eq!(payload["affected"], true, "{vulnerability_id}");
+            assert_eq!(payload["status"], "affected", "{vulnerability_id}");
+            assert_eq!(payload["evaluation"]["source"], "osv", "{vulnerability_id}");
+            assert_eq!(
+                payload["evaluation"]["aliases_status"], "available",
+                "{vulnerability_id}"
+            );
+        }
+
+        let batch = query_packages_enriched(
+            &db,
+            vec![crate::args::PackageQueryArgs {
+                ecosystem: "PyPI".to_owned(),
+                package: "example".to_owned(),
+                version: "1.0.0".to_owned(),
+                purl: None,
+            }],
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let (batch, _) = call_result_payload(batch);
+        assert_eq!(batch["results"][0]["summary"]["vulnerable"], true);
+        assert_eq!(
+            batch["results"][0]["summary"]["cve_ids"][0],
+            "CVE-2099-0301"
+        );
+
+        let missing = evaluate_affected(&db, "CVE-2099-9999", "PyPI", "example", "1.0.0")
+            .await
+            .unwrap();
+        let (missing, _) = call_result_payload(missing);
+        assert!(missing["affected"].is_null());
+        assert_eq!(missing["status"], "unknown");
+        assert_eq!(missing["identifier_found"], false);
+        assert_eq!(missing["cve_found"], false);
+    }
+
+    #[tokio::test]
+    async fn evaluate_affected_accepts_cve_package_name_without_collection_url() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0302","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"packageName fixture","affected":[{"vendor":"example","product":"example","packageName":"example","versions":[{"version":"0","status":"affected","versionType":"python","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let result = evaluate_affected(&db, "CVE-2099-0302", "PyPI", "example", "1.0.0")
+            .await
+            .unwrap();
+        let (payload, _) = call_result_payload(result);
+
+        assert_eq!(payload["affected"], true);
+        assert_eq!(payload["status"], "affected");
+        assert_eq!(payload["evaluation"]["source"], "cve-list");
+        assert_eq!(payload["evaluation"]["affected"]["confidence"], "medium");
     }
 
     #[test]

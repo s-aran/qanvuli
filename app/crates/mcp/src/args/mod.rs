@@ -95,6 +95,7 @@ pub(crate) struct CweArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
+#[schemars(inline)]
 pub(crate) enum CweArgValue {
     Number(i32),
     String(String),
@@ -466,19 +467,22 @@ pub(crate) struct QueryPackageEnrichedArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct EvaluateAffectedArgs {
-    /// Exact CVE ID to evaluate.
+    /// CVE, OSV, GHSA, RUSTSEC, PYSEC, or GO advisory ID to evaluate.
     pub(crate) cve_id: String,
     /// Package ecosystem used for version comparison, such as npm or PyPI.
     pub(crate) ecosystem: String,
     /// Product or package name. Common separators are ignored for the CVE List join.
+    #[serde(alias = "package")]
     pub(crate) name: String,
     /// Installed package version.
     pub(crate) version: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[schemars(inline)]
 pub(crate) struct PackageQueryArgs {
     pub(crate) ecosystem: String,
+    #[serde(alias = "name")]
     pub(crate) package: String,
     pub(crate) version: String,
     pub(crate) purl: Option<String>,

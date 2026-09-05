@@ -27,8 +27,11 @@ pub struct Args {
     #[arg(long, value_name = "N")]
     max_chunks: Option<usize>,
     /// Keep an automatically downloaded CVE archive after import. Has no effect on --zip.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "eager_cleanup")]
     keep: bool,
+    /// Remove owned download archives as soon as each import phase succeeds.
+    #[arg(short = 'C', long = "eager-cleanup", conflicts_with = "keep")]
+    eager_cleanup: bool,
     /// Delete existing database files before building. A failure then leaves no usable database.
     #[arg(short = 'D', long = "delete-existing", verbatim_doc_comment)]
     delete_existing: bool,
@@ -178,6 +181,8 @@ async fn run_with_progress(
     let asset_for_build = asset_path.clone();
     let progress_for_build = progress.clone();
     let max_chunks = args.max_chunks;
+    let eager_cleanup = args.eager_cleanup;
+    let archive_ownership_for_build = archive_ownership;
     let build_result = async move {
         emit_init_progress(
             &progress_for_build,
@@ -206,7 +211,9 @@ async fn run_with_progress(
             progress_for_build.clone(),
         )
         .await;
-        let osv_download_result = finish_cve_import(cve_result, osv_download_task).await?;
+        if let Err(error) = cve_result {
+            return Err(abort_osv_prefetch(error, osv_download_task).await);
+        }
         if max_chunks.is_none() {
             let cve_delta_cursor = cve_delta_cursor.ok_or_else(|| {
                 "cannot determine the full CVE archive timestamp from its release or filename"
@@ -220,6 +227,15 @@ async fn run_with_progress(
                 .await
                 .map_err(|error| format!("failed to store CVE delta cursor: {error}"))?;
         }
+        if eager_cleanup {
+            cleanup_processed_cve_archive(&asset_for_build, archive_ownership_for_build, false)
+                .map_err(|error| {
+                    format!("failed to eagerly remove processed CVE archive: {error}")
+                })?;
+        }
+        let osv_download_result = osv_download_task
+            .await
+            .map_err(|error| format!("OSV download task failed: {error}"))?;
         emit_init_progress(
             &progress_for_build,
             &asset_for_build.display().to_string(),
@@ -241,6 +257,7 @@ async fn run_with_progress(
             db_for_build.clone(),
             osv_download_result?,
             OsvImportMode::InitialReplacement,
+            eager_cleanup,
         )
         .await?;
         emit_init_progress(
@@ -305,23 +322,16 @@ async fn run_with_progress(
     Ok(())
 }
 
-async fn finish_cve_import<T, U>(
-    cve_result: Result<U, String>,
+async fn abort_osv_prefetch<T>(
+    cve_error: String,
     osv_download_task: tokio::task::JoinHandle<Result<T, String>>,
-) -> Result<Result<T, String>, String>
+) -> String
 where
     T: Send + 'static,
 {
-    match cve_result {
-        Ok(_) => osv_download_task
-            .await
-            .map_err(|error| format!("OSV download task failed: {error}")),
-        Err(error) => {
-            osv_download_task.abort();
-            let _ = osv_download_task.await;
-            Err(error)
-        }
-    }
+    osv_download_task.abort();
+    let _ = osv_download_task.await;
+    cve_error
 }
 
 fn with_candidate_cleanup(error: String, candidate: &std::path::Path) -> String {
@@ -440,6 +450,27 @@ mod tests {
     }
 
     #[test]
+    fn eager_cleanup_uses_uppercase_c_and_conflicts_with_keep() {
+        assert!(
+            InitCli::try_parse_from(["init", "-C"])
+                .unwrap()
+                .args
+                .eager_cleanup
+        );
+        assert!(
+            InitCli::try_parse_from(["init", "--eager-cleanup"])
+                .unwrap()
+                .args
+                .eager_cleanup
+        );
+        assert!(InitCli::try_parse_from(["init", "-C", "--keep"]).is_err());
+
+        let help = InitCli::command().render_long_help().to_string();
+        assert!(help.contains("-C, --eager-cleanup"));
+        assert!(help.contains("as soon as each import phase succeeds"));
+    }
+
+    #[test]
     fn init_local_zip_is_preserved_after_successful_processing_without_keep() {
         let path = std::env::temp_dir().join(format!(
             "qanvuli-init-user-owned-{}-{}.zip",
@@ -515,12 +546,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let error = finish_cve_import(
-            Err::<(), _>("CVE import failed".to_owned()),
-            osv_download_task,
-        )
-        .await
-        .unwrap_err();
+        let error = abort_osv_prefetch("CVE import failed".to_owned(), osv_download_task).await;
 
         assert_eq!(error, "CVE import failed");
         assert!(dropped.load(Ordering::SeqCst));

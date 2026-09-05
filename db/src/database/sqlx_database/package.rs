@@ -240,7 +240,7 @@ impl SqlxDatabase {
                         sqlx::Error::Protocol(format!("failed to encode OSV IDs: {error}"))
                     })?;
                     let alias_rows: Vec<(String, String)> = sqlx::query_as(
-                        "SELECT osv_id, alias_id FROM osv_aliases WHERE alias_id LIKE 'CVE-%' AND osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id",
+                        "SELECT osv_id, alias_id FROM osv_aliases WHERE osv_id IN (SELECT value FROM json_each(?)) ORDER BY osv_id, alias_id",
                     )
                     .bind(osv_ids_json)
                     .fetch_all(&mut *connection)
@@ -297,8 +297,14 @@ impl SqlxDatabase {
                         .collect::<BTreeSet<_>>()
                         .into_iter()
                         .collect::<Vec<_>>();
+                    let aliases = aliases_by_osv.get(&osv_id).cloned().unwrap_or_default();
+                    let cve_ids = aliases
+                        .iter()
+                        .filter(|alias| alias.to_ascii_uppercase().starts_with("CVE-"))
+                        .cloned()
+                        .collect();
                     output[output_index].push(EnrichedFinding {
-                        source: "osv".to_owned(), primary_id: osv_id.clone(), cve_ids: aliases_by_osv.get(&osv_id).cloned().unwrap_or_default(), aliases: Vec::new(), aliases_status: "not_queried".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions_status: "available".to_owned(), priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: !fixed_versions.is_empty(), affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, fixed_versions, enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
+                        source: "osv".to_owned(), primary_id: osv_id.clone(), cve_ids, aliases, aliases_status: "available".to_owned(), package: query.clone(), affected: affected.clone(), fixed_versions_status: "available".to_owned(), priority_signals: PrioritySignals { known_exploited: false, epss_percentile: None, has_fixed_version: !fixed_versions.is_empty(), affected_confidence: affected.confidence, suggested_priority: "unknown".to_owned(), reasons: Vec::new(), enrichment_status: "not_queried".to_owned() }, fixed_versions, enrichment: FindingEnrichment { kev: None, kev_status: "not_queried".to_owned(), epss: None, epss_status: "not_queried".to_owned() }, evidence: Vec::new(), evidence_status: "not_queried".to_owned()
                     });
                 }
 
@@ -361,6 +367,9 @@ impl SqlxDatabase {
                         default_status.as_deref(),
                         &versions,
                     );
+                    if identity == CvePackageIdentity::Probable && matched.status == "affected" {
+                        matched.confidence = "medium".to_owned();
+                    }
                     if identity == CvePackageIdentity::Ambiguous
                         && matched.status != "not_affected"
                     {

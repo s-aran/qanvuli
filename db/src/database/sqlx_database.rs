@@ -368,10 +368,12 @@ pub(crate) fn cve_stored_versions(raw_json: &str) -> Result<Vec<CveStoredVersion
 }
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CvePackageIdentity {
     /// The CNA supplied a package name and its collection identifies the queried ecosystem.
     Confirmed,
+    /// The CNA supplied an exact package name, but no ecosystem-specific collection URL.
+    Probable,
     /// Product-only CVE records cannot distinguish a library from a same-named product.
     Ambiguous,
     /// The collection positively identifies a different package ecosystem or product catalog.
@@ -434,15 +436,19 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
 
 fn cve_package_identity(
     ecosystem: &str,
-    _package_name: Option<&str>,
+    package_name: Option<&str>,
     _product: Option<&str>,
     collection_url: Option<&str>,
 ) -> CvePackageIdentity {
     let Some(collection_url) = collection_url else {
-        // `packageName` is more useful than product, but is not a purl and
-        // does not itself state an ecosystem.  Retain it for review without
-        // presenting it as a verified package vulnerability.
-        return CvePackageIdentity::Ambiguous;
+        // The surrounding query has already matched a normalized package name.
+        // packageName is stronger evidence than a product-only record, although
+        // it still does not prove the ecosystem without a collection URL.
+        return if package_name.is_some_and(|name| !name.trim().is_empty()) {
+            CvePackageIdentity::Probable
+        } else {
+            CvePackageIdentity::Ambiguous
+        };
     };
     let Some(collection_host) = collection_url_host(collection_url) else {
         return CvePackageIdentity::Excluded;

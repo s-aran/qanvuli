@@ -336,7 +336,7 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Evaluate one installed package version against one CVE List affected record. Handles inline constraints, lessThan/lessThanOrEqual, and unaffected entries on the server."
+        description = "Evaluate one installed package version against a CVE or OSV-family advisory ID using all matching local sources. Returns affected=true/false only for a decisive evaluation and null with status='unknown' otherwise."
     )]
     pub(crate) async fn evaluate_affected(
         &self,

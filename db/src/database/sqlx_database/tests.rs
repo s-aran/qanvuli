@@ -100,6 +100,18 @@ fn cve_package_identity_uses_collection_url_host_boundaries() {
     }
 }
 
+#[test]
+fn cve_package_identity_distinguishes_package_names_from_product_only_records() {
+    assert_eq!(
+        cve_package_identity("PyPI", Some("example"), Some("example"), None),
+        CvePackageIdentity::Probable
+    );
+    assert_eq!(
+        cve_package_identity("PyPI", None, Some("example"), None),
+        CvePackageIdentity::Ambiguous
+    );
+}
+
 #[tokio::test]
 async fn initializes_and_checks_a_new_database_on_one_writer() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
