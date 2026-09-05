@@ -60,6 +60,7 @@ Use an existing CVE archive or reduce peak disk use:
 ```bash
 qanvuli init --zip ./data/all-cves.zip
 qanvuli init --delete-existing
+qanvuli init --eager-cleanup
 qanvuli init --no-progress
 ```
 
@@ -68,6 +69,8 @@ qanvuli init --no-progress
 An archive supplied with `init --zip` is a user-owned local file and is never removed automatically. `--keep` applies only to the CVE archive downloaded automatically when `--zip` is omitted.
 
 `--delete-existing` (`-D`) deletes stale `*.qanvuli-new-*` replacement candidates and the active database before downloading and building the replacement. This minimizes peak disk usage, but can disrupt another running initialization and any later failure leaves no usable database. Use it only after confirming no other `qanvuli init` is running.
+
+`--eager-cleanup` (`-C`) removes automatically downloaded CVE and OSV archives as soon as their respective import phases succeed, reducing peak disk usage during the remaining initialization phases. Automatically downloaded CWE and CAPEC files are already removed after import. User-supplied `--zip` archives are never removed. `--eager-cleanup` cannot be combined with `--keep`.
 
 Apply unapplied remote CVE deltas and refresh enrichment feeds:
 
