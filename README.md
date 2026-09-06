@@ -155,7 +155,7 @@ Rebuild cross-source identifier links from imported OSV relations:
 qanvuli graph rebuild
 ```
 
-Database files are derived artifacts. Unsupported schemas are not patched in place; rebuild them with `qanvuli init`.
+Database files are derived artifacts. Unsupported schemas are not patched in place; rebuild them with `qanvuli init`. Schema 12 adds indexed normalized package identities and PURLs; databases from schema 11 require this rebuild.
 
 ## Terminal UI
 
@@ -208,7 +208,7 @@ qanvuli mcp
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
 
-MCP searches use four independent SQLite read connections by default so concurrent tool calls do not queue behind one slow query. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. Database updates remain exclusive.
+MCP searches use four independent SQLite read connections by default so concurrent tool calls do not queue behind one slow query. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. One update runs at a time; additional update requests are rejected with the active job ID. The most recent 64 job records are retained. File-backed WAL readers remain available during downloads and see committed update batches; multiple reads are not a snapshot of the entire update. HTTP downloads have a 15-second connection deadline, a 60-second idle read deadline, and a one-hour total deadline (blocking downloads use the connection and total deadlines).
 
 The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
 
