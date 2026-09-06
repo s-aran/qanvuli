@@ -8,7 +8,7 @@ qanvuli は、ローカルで利用できる脆弱性データベースを構築
 
 CLI、ターミナル UI、Rust API、MCP サーバーから利用できます。データを取り込んだ後は、ネットワークに接続せずにローカルで検索できます。
 
-API ドキュメント: [English](./docs/API.md) · [日本語](./docs/API.ja.md)
+API ドキュメント: [English](./docs/API.md) · [日本語](./docs/API_J.md)
 
 ## 主な機能
 
