@@ -56,6 +56,7 @@ async fn initialized_database() -> TemporaryDatabase {
                 "schema_version": "1.8.0",
                 "id": "PYSEC-2099-mcp-stdio",
                 "modified": "2099-01-01T00:00:00Z",
+                "aliases": ["CVE-2099-0001"],
                 "affected": [{
                     "package": {
                         "ecosystem": "PyPI",
@@ -81,6 +82,20 @@ async fn initialized_database() -> TemporaryDatabase {
         )
         .await
         .expect("MCP CVE fixture should import");
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"MCP enrichment fixture"}}}"#.to_owned(),
+        )
+        .await
+        .expect("MCP enrichment CVE fixture should import");
+    database
+        .import_kev_json(include_str!("../fixtures/kev/kev-test.json").to_owned())
+        .await
+        .expect("MCP KEV fixture should import");
+    database
+        .import_epss_csv(include_str!("../fixtures/epss/epss-test.csv").to_owned())
+        .await
+        .expect("MCP EPSS fixture should import");
     database
         .close()
         .await
@@ -194,11 +209,56 @@ fn assert_lists_enriched_package_tool(response: &Value) {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("tools/list result is malformed: {response:#?}"));
+    for expected in [
+        "query_package_enriched",
+        "evaluate_affected",
+        "get_cwes",
+        "get_update_status",
+    ] {
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(expected)),
+            "{expected} was not listed: {tools:#?}"
+        );
+    }
+
+    let tool_schema = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|tool| tool.get("inputSchema"))
+            .unwrap_or_else(|| panic!("{name} input schema was not listed: {tools:#?}"))
+    };
+    let batch_schema = tool_schema("query_packages_enriched");
     assert!(
-        tools.iter().any(|tool| {
-            tool.get("name").and_then(Value::as_str) == Some("query_package_enriched")
-        }),
-        "query_package_enriched was not listed: {tools:#?}"
+        batch_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&Value::from("packages")))
+    );
+    let package_items = &batch_schema["properties"]["packages"]["items"];
+    assert!(package_items["properties"]["package"].is_object());
+    assert!(
+        package_items["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&Value::from("package")))
+    );
+
+    let evaluate_schema = tool_schema("evaluate_affected");
+    let required = evaluate_schema["required"]
+        .as_array()
+        .expect("evaluate_affected must expose required arguments");
+    for field in ["cve_id", "ecosystem", "name", "version"] {
+        assert!(
+            required.contains(&Value::from(field)),
+            "missing {field}: {required:?}"
+        );
+    }
+
+    let cwe_items = &tool_schema("get_cwes")["properties"]["cwe_ids"]["items"];
+    assert!(
+        cwe_items.get("anyOf").is_some(),
+        "CWE array element schema was empty: {cwe_items:#?}"
     );
 }
 
@@ -361,6 +421,18 @@ async fn mcp_stdio_lists_tools_recovers_from_request_error_and_exits_on_eof() {
         Some("PYSEC-2099-mcp-stdio")
     );
     assert_eq!(
+        result["findings"][0]["enrichment"]["kev_status"],
+        "available"
+    );
+    assert_eq!(
+        result["findings"][0]["enrichment"]["epss_status"],
+        "available"
+    );
+    assert_eq!(
+        result["findings"][0]["priority_signals"]["known_exploited"],
+        true
+    );
+    assert_eq!(
         result
             .pointer("/findings/0/affected/status")
             .and_then(Value::as_str),
@@ -380,6 +452,11 @@ async fn mcp_stdio_lists_tools_recovers_from_request_error_and_exits_on_eof() {
     let batch: Value = serde_json::from_str(batch_text).expect("batch result JSON");
     assert_eq!(batch["verbosity"], "summary");
     assert_eq!(batch["results"][0]["summary"]["vulnerable"], true);
+    assert_eq!(batch["results"][0]["summary"]["kev"], true);
+    assert_eq!(
+        batch["results"][0]["summary"]["advisory_ids"][0],
+        "PYSEC-2099-mcp-stdio"
+    );
     assert!(batch["results"][0].get("findings").is_none());
 
     let recent_summary_text = response_with_id(&responses, 7)
