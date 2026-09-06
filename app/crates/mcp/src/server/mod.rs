@@ -13,6 +13,8 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+const MAX_UPDATE_JOB_HISTORY: usize = 64;
+
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct UpdateJobSnapshot {
     pub(crate) job_id: String,
@@ -27,7 +29,7 @@ pub(crate) struct UpdateJobSnapshot {
 
 pub(crate) struct UpdateJobs {
     next_id: AtomicU64,
-    records: RwLock<BTreeMap<String, UpdateJobSnapshot>>,
+    records: RwLock<BTreeMap<u64, UpdateJobSnapshot>>,
 }
 
 impl UpdateJobs {
@@ -38,35 +40,57 @@ impl UpdateJobs {
         }
     }
 
-    pub(crate) async fn create(&self) -> UpdateJobSnapshot {
+    pub(crate) async fn create(&self) -> Result<UpdateJobSnapshot, rmcp::ErrorData> {
+        let mut records = self.records.write().await;
+        if let Some(job) = records.values().find(|job| job.status == "running") {
+            return Err(rmcp::ErrorData::invalid_params(
+                format!(
+                    "update already running; poll get_update_status for {}",
+                    job.job_id
+                ),
+                None,
+            ));
+        }
+        while records.len() >= MAX_UPDATE_JOB_HISTORY {
+            records.pop_first();
+        }
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now = unix_ms();
         let snapshot = UpdateJobSnapshot {
             job_id: format!("update-{now}-{sequence}"),
             status: "running".to_owned(),
-            stage: "waiting_for_exclusive_database".to_owned(),
+            stage: "waiting_for_update_writer".to_owned(),
             completed_steps: 0,
             total_steps: 2,
             created_at_unix_ms: now,
             finished_at_unix_ms: None,
             error: None,
         };
-        self.records
-            .write()
-            .await
-            .insert(snapshot.job_id.clone(), snapshot.clone());
-        snapshot
+        records.insert(sequence, snapshot.clone());
+        Ok(snapshot)
     }
 
     pub(crate) async fn set_updating(&self, job_id: &str) {
-        if let Some(job) = self.records.write().await.get_mut(job_id) {
+        if let Some(job) = self
+            .records
+            .write()
+            .await
+            .values_mut()
+            .find(|job| job.job_id == job_id)
+        {
             job.stage = "applying_updates_and_refreshing_sources".to_owned();
             job.completed_steps = 1;
         }
     }
 
     pub(crate) async fn finish(&self, job_id: &str, error: Option<String>) {
-        if let Some(job) = self.records.write().await.get_mut(job_id) {
+        if let Some(job) = self
+            .records
+            .write()
+            .await
+            .values_mut()
+            .find(|job| job.job_id == job_id)
+        {
             job.status = if error.is_some() { "failed" } else { "success" }.to_owned();
             job.stage = if error.is_some() {
                 "failed"
@@ -81,7 +105,12 @@ impl UpdateJobs {
     }
 
     pub(crate) async fn get(&self, job_id: &str) -> Option<UpdateJobSnapshot> {
-        self.records.read().await.get(job_id).cloned()
+        self.records
+            .read()
+            .await
+            .values()
+            .find(|job| job.job_id == job_id)
+            .cloned()
     }
 }
 
@@ -127,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn update_jobs_report_running_success_and_failure() {
         let jobs = UpdateJobs::new();
-        let running = jobs.create().await;
+        let running = jobs.create().await.unwrap();
         assert_eq!(running.status, "running");
         assert_eq!(running.completed_steps, 0);
 
@@ -141,7 +170,7 @@ mod tests {
         assert_eq!(success.status, "success");
         assert_eq!(success.completed_steps, success.total_steps);
 
-        let failed = jobs.create().await;
+        let failed = jobs.create().await.unwrap();
         jobs.finish(&failed.job_id, Some("fixture failure".to_owned()))
             .await;
         let failed = jobs.get(&failed.job_id).await.unwrap();
@@ -151,9 +180,27 @@ mod tests {
 
     #[tokio::test]
     async fn update_job_snapshots_are_supported_by_the_mcp_json_encoder() {
-        let snapshot = UpdateJobs::new().create().await;
+        let snapshot = UpdateJobs::new().create().await.unwrap();
 
         simd_json::serde::to_owned_value(snapshot)
             .expect("update job timestamps must use JSON-compatible integers");
+    }
+
+    #[tokio::test]
+    async fn concurrent_updates_are_rejected_and_history_is_bounded() {
+        let jobs = UpdateJobs::new();
+        let (first, second) = tokio::join!(jobs.create(), jobs.create());
+        assert_ne!(first.is_ok(), second.is_ok());
+        let running = first.or(second).unwrap();
+        jobs.finish(&running.job_id, None).await;
+        for _ in 0..MAX_UPDATE_JOB_HISTORY + 2 {
+            let job = jobs.create().await.unwrap();
+            jobs.finish(&job.job_id, None).await;
+        }
+        assert_eq!(jobs.records.read().await.len(), MAX_UPDATE_JOB_HISTORY);
+        assert!(jobs.get(&running.job_id).await.is_none());
+        let records = jobs.records.read().await;
+        assert_eq!(*records.first_key_value().unwrap().0, 4);
+        assert_eq!(*records.last_key_value().unwrap().0, 67);
     }
 }

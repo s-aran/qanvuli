@@ -33,7 +33,7 @@ impl CapecCatalogFile {
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<CapecCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
-        let mut request = reqwest::Client::new().get(&self.url);
+        let mut request = qanvuli_utils::http::client().get(&self.url);
         if let Some(etag) = etag {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
         }

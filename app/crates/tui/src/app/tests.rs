@@ -1,6 +1,30 @@
 use super::*;
 
 #[tokio::test]
+async fn metadata_completion_is_tracked_until_its_result_is_polled() {
+    let mut app = App::new(String::new(), 30);
+    app.tasks.metadata_capec = Some(PendingMetadataCapec {
+        handle: tokio::spawn(async { Ok(Vec::new()) }),
+    });
+    assert!(app.has_background_task());
+    while !app
+        .tasks
+        .metadata_capec
+        .as_ref()
+        .unwrap()
+        .handle
+        .is_finished()
+    {
+        tokio::task::yield_now().await;
+    }
+    // Rendering must still observe the final transition even though the task
+    // itself has completed and polling will remove its handle.
+    assert!(app.has_background_task());
+    app.poll_metadata_capec().await;
+    assert!(!app.has_background_task());
+}
+
+#[tokio::test]
 async fn empty_enter_starts_a_sorted_cve_browse_search() {
     let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
     database.initialize_schema().await.unwrap();

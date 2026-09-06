@@ -5,7 +5,7 @@ use std::io::Read;
 pub const FIRST_EPSS_CURRENT_CSV_URL: &str = "https://epss.cyentia.com/epss_scores-current.csv.gz";
 
 pub async fn download_epss_current_csv() -> Result<String> {
-    let bytes = reqwest::Client::builder()
+    let bytes = qanvuli_utils::http::client_builder()
         .user_agent("qanvuli")
         .build()?
         .get(FIRST_EPSS_CURRENT_CSV_URL)

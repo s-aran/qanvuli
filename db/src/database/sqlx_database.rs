@@ -90,14 +90,13 @@ pub(super) fn sql_normalized_cve_component_name(name: &str) -> String {
     )
 }
 
-fn sql_ecosystem_matches(left: &str, right: &str) -> String {
+pub(super) fn sql_ecosystem_key(left: &str) -> String {
     // Ecosystem names are ASCII case-insensitive, but an OSV ecosystem suffix
     // can contain a Maven repository URL whose path is case-sensitive.  Build
     // the same key as `ecosystem_identity_key`: lowercase only the base name.
-    let left_key = format!(
+    format!(
         "CASE WHEN instr({left}, ':')=0 THEN lower({left}) ELSE lower(substr({left}, 1, instr({left}, ':')-1)) || ':' || substr({left}, instr({left}, ':')+1) END"
-    );
-    format!("({left_key}={right} COLLATE BINARY)")
+    )
 }
 
 fn canonical_stored_ecosystem(ecosystem: &str) -> String {

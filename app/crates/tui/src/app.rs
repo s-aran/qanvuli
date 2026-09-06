@@ -18,7 +18,7 @@ use qanvuli_core::database::{
     CapecDetail, CapecEntry, CapecSearchFilters, CveAdvancedSearch, CveDatabase, CveStateScope,
     CveSummarySortOrder, CveSummaryWithDetail, CweEntry, EnrichedCveSummary, OsvSummary,
 };
-use ratatui::widgets::{ListState, Paragraph, Wrap};
+use ratatui::widgets::ListState;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
@@ -835,6 +835,7 @@ impl App {
             || self.tasks.count.is_some()
             || self.tasks.raw_json.is_some()
             || self.tasks.enrichment.is_some()
+            || self.tasks.metadata_capec.is_some()
             || self.tasks.cwe.is_some()
             || self.tasks.capec.is_some()
             || self.tasks.capec_detail.is_some()
@@ -2094,43 +2095,53 @@ impl App {
 
     fn max_detail_scroll(&self) -> u16 {
         let line_count = if let Some(cve) = self.selected() {
-            Paragraph::new(crate::modes::main::detail::detail_lines(
-                cve,
-                self.main.display.timezone,
-                &crate::common::DetailSearch::new(""),
-                self.main.detail_content_width,
-            ))
-            .wrap(Wrap { trim: false })
-            .line_count(self.main.detail_content_width.min(u16::MAX as usize) as u16)
+            crate::common::text::cached_line_count(
+                &crate::modes::main::detail::detail_lines(
+                    cve,
+                    self.main.display.timezone,
+                    &crate::common::DetailSearch::new(""),
+                    self.main.detail_content_width,
+                ),
+                self.main.detail_content_width.min(u16::MAX as usize) as u16,
+                false,
+            )
         } else if let Some(osv) = self.selected_osv() {
-            Paragraph::new(crate::modes::main::detail::osv_detail_lines(
-                osv,
-                self.main.display.timezone,
-                &crate::common::DetailSearch::new(""),
-                self.main.detail_content_width,
-            ))
-            .wrap(Wrap { trim: false })
-            .line_count(self.main.detail_content_width.min(u16::MAX as usize) as u16)
+            crate::common::text::cached_line_count(
+                &crate::modes::main::detail::osv_detail_lines(
+                    osv,
+                    self.main.display.timezone,
+                    &crate::common::DetailSearch::new(""),
+                    self.main.detail_content_width,
+                ),
+                self.main.detail_content_width.min(u16::MAX as usize) as u16,
+                false,
+            )
         } else {
             1
         };
-        line_count.saturating_sub(self.main.right_page_size) as u16
+        line_count
+            .saturating_sub(self.main.right_page_size)
+            .min(u16::MAX as usize) as u16
     }
 
     fn max_metadata_scroll(&self) -> u16 {
         let line_count = if self.main.right_tab == RightPaneTab::Cve {
             1
         } else {
-            Paragraph::new(crate::modes::main::right::tab_lines(
-                self,
-                self.main.right_tab,
-                &crate::common::DetailSearch::new(""),
-                self.main.metadata_content_width,
-            ))
-            .wrap(Wrap { trim: true })
-            .line_count(self.main.metadata_content_width.min(u16::MAX as usize) as u16)
+            crate::common::text::cached_line_count(
+                &crate::modes::main::right::tab_lines(
+                    self,
+                    self.main.right_tab,
+                    &crate::common::DetailSearch::new(""),
+                    self.main.metadata_content_width,
+                ),
+                self.main.metadata_content_width.min(u16::MAX as usize) as u16,
+                true,
+            )
         };
-        line_count.saturating_sub(self.main.metadata_page_size) as u16
+        line_count
+            .saturating_sub(self.main.metadata_page_size)
+            .min(u16::MAX as usize) as u16
     }
 
     fn left_step(&self, amount: PageAmount) -> usize {

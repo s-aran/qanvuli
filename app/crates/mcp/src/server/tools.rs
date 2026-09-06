@@ -570,13 +570,13 @@ impl CveSearchServer {
     }
 
     #[tool(
-        description = "Start a background database update and immediately return a job ID. Poll get_update_status for running, success, or failed state and progress."
+        description = "Start a background database update and immediately return a job ID. Only one update may run; another request is rejected with its active job ID. Poll get_update_status for progress. The latest 64 jobs are retained."
     )]
     pub(crate) async fn update_db(
         &self,
         Parameters(args): Parameters<UpdateDbArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let job = self.update_jobs.create().await;
+        let job = self.update_jobs.create().await?;
         let job_id = job.job_id.clone();
         let db_provider = self.db.clone();
         let jobs = self.update_jobs.clone();

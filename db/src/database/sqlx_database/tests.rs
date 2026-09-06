@@ -1,5 +1,54 @@
 use super::*;
 
+#[tokio::test]
+async fn affected_search_and_count_preserve_row_identity_and_pagination() {
+    let db = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    db.initialize_schema().await.unwrap();
+    db.writer.with_connection(|connection| Box::pin(async move {
+        sqlx::raw_sql(
+            "INSERT INTO cve (id,cve_id,state,published_at,updated_at,serial,title,reference_text,raw_json) VALUES
+             (1,'CVE-2099-1001',0,'','',0,'','','{}'),
+             (2,'CVE-2099-1002',0,'','',0,'','','{}'),
+             (3,'CVE-2099-1003',1,'','',0,'','','{}');
+             INSERT INTO cve_affected (cve_db_id,vendor,product,version_text,raw_json) VALUES
+             (1,'vendor','other','','[]'),(1,'other','product','','[]'),
+             (2,'vendor','product','','[]'),(2,'vendor','product','','[]'),
+             (3,'vendor','product','','[]');"
+        ).execute(connection).await?;
+        Ok(())
+    })).await.unwrap();
+    for prefix in [None, Some("CVE-2099-".to_owned())] {
+        for include_rejected in [false, true] {
+            let filters = SqlxCveSearch {
+                vendor_exact: Some("vendor".to_owned()),
+                product_exact: Some("product".to_owned()),
+                cve_id_prefix: prefix.clone(),
+                sort_order: CveSummarySortOrder::CveIdAsc,
+                ..Default::default()
+            };
+            let rows = db
+                .search_cves_advanced(filters.clone(), include_rejected, 10, 0)
+                .await
+                .unwrap();
+            let count = db
+                .count_cves_advanced_with_kev(filters.clone(), include_rejected, false)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), if include_rejected { 2 } else { 1 });
+            assert_eq!(count as usize, rows.len());
+            assert_eq!(rows[0].cve_id, "CVE-2099-1002");
+            let page = db
+                .search_cves_advanced(filters, include_rejected, 1, 1)
+                .await
+                .unwrap();
+            assert_eq!(page.len(), usize::from(include_rejected));
+            if include_rejected {
+                assert_eq!(page[0].cve_id, "CVE-2099-1003");
+            }
+        }
+    }
+}
+
 #[test]
 fn database_handle_is_send_and_sync_for_spawned_command_tasks() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -124,7 +173,7 @@ async fn initializes_and_checks_a_new_database_on_one_writer() {
     database.check_full_foreign_keys().await.unwrap();
     database.check_full_cve_search().await.unwrap();
     database.check_full_osv_search().await.unwrap();
-    assert_eq!(SqlxDatabase::schema_version(), 11);
+    assert_eq!(SqlxDatabase::schema_version(), 12);
 }
 
 #[tokio::test]

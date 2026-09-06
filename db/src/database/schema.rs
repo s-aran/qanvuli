@@ -2,7 +2,26 @@
 
 use sqlx::{Connection, SqliteConnection};
 
-pub(crate) const SCHEMA_VERSION: i64 = 11;
+pub(crate) const SCHEMA_VERSION: i64 = 12;
+
+pub(crate) async fn create_package_identity_indexes(
+    connection: &mut SqliteConnection,
+) -> Result<(), sqlx::Error> {
+    let ecosystem = super::sqlx_database::sql_ecosystem_key("ecosystem");
+    let name = super::sqlx_database::sql_normalized_package_name("package_name", "ecosystem");
+    for (index, key) in [
+        ("idx_osv_package_identity", name),
+        ("idx_osv_package_purl", "purl".to_owned()),
+    ] {
+        let statement = format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON osv_affected_packages({ecosystem} COLLATE BINARY, {key} COLLATE BINARY)"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *connection)
+            .await?;
+    }
+    Ok(())
+}
 
 pub(crate) async fn suspend_cve_search_sync(
     _connection: &mut SqliteConnection,
@@ -414,11 +433,12 @@ pub(crate) async fn initialize(connection: &mut SqliteConnection) -> Result<(), 
             ('EPSS', 'FIRST EPSS Current Scores', 'enrichment', 'epss_scores-current.csv', 'csv'),
             ('SSVC', 'CVE ADP SSVC assessments', 'enrichment', 'CVE ADP containers', 'json');
 
-        INSERT INTO schema_meta(rowid, version) VALUES(1, 11);
+        INSERT INTO schema_meta(rowid, version) VALUES(1, 12);
         "#,
     )
     .execute(&mut *transaction)
     .await?;
+    create_package_identity_indexes(&mut transaction).await?;
     transaction.commit().await?;
     Ok(())
 }

@@ -30,7 +30,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
 const BATCH_COVERAGE_NOTICE: &str = "osv_covered=false means OSV has no local coverage; it does not prove there are no CVEs. Cross-check end-of-life or critical packages with the CVE List and vendor advisories.";
 const DEFAULT_MCP_READ_CONNECTIONS: usize = 4;
@@ -43,12 +43,13 @@ struct DatabasePool {
     writer: CveDatabase,
     readers: Vec<CveDatabase>,
     next_reader: AtomicUsize,
-    access: RwLock<()>,
+    // Serialize updates only. WAL readers continue using committed data while
+    // the update writer is downloading or committing another batch.
+    access: Mutex<()>,
 }
 
 pub(crate) struct DbReadGuard<'a> {
     database: &'a CveDatabase,
-    _permit: RwLockReadGuard<'a, ()>,
 }
 
 impl Deref for DbReadGuard<'_> {
@@ -61,7 +62,7 @@ impl Deref for DbReadGuard<'_> {
 
 pub(crate) struct DbWriteGuard<'a> {
     database: &'a CveDatabase,
-    _permit: RwLockWriteGuard<'a, ()>,
+    _permit: MutexGuard<'a, ()>,
 }
 
 impl Deref for DbWriteGuard<'_> {
@@ -113,7 +114,7 @@ impl DbProvider {
                     writer: db,
                     readers,
                     next_reader: AtomicUsize::new(0),
-                    access: RwLock::new(()),
+                    access: Mutex::new(()),
                 })
             })
             .await
@@ -121,17 +122,15 @@ impl DbProvider {
 
     pub(crate) async fn read(&self) -> Result<DbReadGuard<'_>, McpError> {
         let pool = self.pool().await?;
-        let permit = pool.access.read().await;
         let index = pool.next_reader.fetch_add(1, Ordering::Relaxed) % pool.readers.len();
         Ok(DbReadGuard {
             database: &pool.readers[index],
-            _permit: permit,
         })
     }
 
     pub(crate) async fn write(&self) -> Result<DbWriteGuard<'_>, McpError> {
         let pool = self.pool().await?;
-        let permit = pool.access.write().await;
+        let permit = pool.access.lock().await;
         Ok(DbWriteGuard {
             database: &pool.writer,
             _permit: permit,
@@ -1407,6 +1406,52 @@ pub(crate) async fn apply_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_update_does_not_block_readers_or_allow_another_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-mcp-read-during-update-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let setup = CveDatabase::connect(&url).await.unwrap();
+        setup.initialize_schema().await.unwrap();
+        setup.close().await.unwrap();
+        let provider = DbProvider::new(url);
+        let writer = provider.write().await.unwrap();
+        // Holding this guard represents a download suspended on the network.
+        let reader = tokio::time::timeout(std::time::Duration::from_secs(1), provider.read())
+            .await
+            .unwrap()
+            .unwrap();
+        writer
+            .set_metadata_value("read-during-update", "committed")
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .metadata_value("read-during-update")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("committed")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), provider.write())
+                .await
+                .is_err()
+        );
+        drop(writer);
+        drop(provider);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn mcp_read_connection_count_is_bounded_and_has_a_safe_default() {

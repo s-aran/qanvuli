@@ -68,38 +68,17 @@ impl SqlxDatabase {
         package: &str,
         purl: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
-        validate_package_query_identity(ecosystem, package, purl)?;
-        let ecosystem = ecosystem.to_owned();
-        let ecosystem_key = ecosystem_identity_key(&ecosystem);
-        let package = normalize_package_name(&ecosystem, package);
-        let purl = purl.map(package_identity_purl);
-        let purl_base = purl.as_deref().map(purl_base_identity).map(str::to_owned);
-        self.writer
-            .with_connection(|connection| {
-                Box::pin(async move {
-                    let normalized_name =
-                        sql_normalized_package_name("package.package_name", "?");
-                    let ecosystem_matches = sql_ecosystem_matches("package.ecosystem", "?");
-                    let statement = format!(
-                        "SELECT EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=? AND (? IS NULL OR package.purl IS NULL OR package.purl=? OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=?))) OR (? IS NOT NULL AND package.purl=?)))"
-                    );
-                    // The statement shape is generated solely from fixed local
-                    // SQL fragments; all caller data remains bound parameters.
-                    let exists: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
-                    .bind(&ecosystem_key)
-                    .bind(&ecosystem)
-                    .bind(package)
-                    .bind(&purl)
-                    .bind(&purl)
-                    .bind(&purl_base)
-                    .bind(&purl)
-                    .bind(&purl)
-                    .fetch_one(connection)
-                    .await?;
-                    Ok(exists != 0)
-                })
-            })
-            .await
+        let query = PackageQuery {
+            ecosystem: ecosystem.to_owned(),
+            package: package.to_owned(),
+            version: String::new(),
+            purl: purl.map(str::to_owned),
+        };
+        Ok(self
+            .has_osv_package_advisories_batch(&[query])
+            .await?
+            .pop()
+            .unwrap_or(false))
     }
 
     /// Returns local OSV coverage for every query in order, without evaluating versions.
@@ -123,27 +102,18 @@ impl SqlxDatabase {
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
-                    let input = package_queries_json(&packages)?;
-                    let normalized_name = sql_normalized_package_name(
-                        "package.package_name",
-                        "input.ecosystem",
-                    );
-                    let ecosystem_matches =
-                        sql_ecosystem_matches("package.ecosystem", "input.ecosystem_key");
-                    let statement = format!(
-                        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.ecosystem_key') AS ecosystem_key, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl, json_extract(value, '$.purl_base') AS purl_base FROM json_each(?)) SELECT input.query_index, EXISTS(SELECT 1 FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=input.package_name AND (input.purl IS NULL OR package.purl IS NULL OR package.purl=input.purl OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=input.purl_base))) OR (input.purl IS NOT NULL AND package.purl=input.purl))) FROM input ORDER BY input.query_index"
-                    );
-                    let rows: Vec<(i64, i64)> =
-                        sqlx::query_as(sqlx::AssertSqlSafe(statement))
-                    .bind(input)
-                    .fetch_all(connection)
-                    .await?;
                     let mut coverage = vec![false; packages.len()];
-                    for (index, covered) in rows {
-                        if let Ok(index) = usize::try_from(index)
-                            && let Some(value) = coverage.get_mut(index)
-                        {
-                            *value = covered != 0;
+                    for (batch_index, batch) in
+                        packages.chunks(PACKAGE_QUERY_BATCH_SIZE).enumerate()
+                    {
+                        let statement = package_candidates_sql(true);
+                        let rows: Vec<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+                            .bind(package_queries_json(batch)?)
+                            .fetch_all(&mut *connection)
+                            .await?;
+                        for index in rows {
+                            coverage[batch_index * PACKAGE_QUERY_BATCH_SIZE + index as usize] =
+                                true;
                         }
                     }
                     Ok(coverage)
@@ -177,13 +147,7 @@ impl SqlxDatabase {
                 packages.chunks(PACKAGE_QUERY_BATCH_SIZE).enumerate()
             {
                 let input_json = package_queries_json(package_batch)?;
-                let normalized_name =
-                    sql_normalized_package_name("package.package_name", "input.ecosystem");
-                let ecosystem_matches =
-                    sql_ecosystem_matches("package.ecosystem", "input.ecosystem_key");
-                let candidate_statement = format!(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.ecosystem_key') AS ecosystem_key, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl, json_extract(value, '$.purl_base') AS purl_base FROM json_each(?)) SELECT input.query_index, package.id, package.osv_id FROM input JOIN osv_affected_packages AS package ON {ecosystem_matches} AND (({normalized_name}=input.package_name AND (input.purl IS NULL OR package.purl IS NULL OR package.purl=input.purl OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=input.purl_base))) OR (input.purl IS NOT NULL AND package.purl=input.purl)) JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY input.query_index, package.osv_id, package.id"
-                );
+                let candidate_statement = package_candidates_sql(false);
                 let candidates: Vec<(i64, i64, String)> =
                     sqlx::query_as(sqlx::AssertSqlSafe(candidate_statement))
                 .bind(&input_json)
@@ -311,14 +275,7 @@ impl SqlxDatabase {
                 // CVE List supplements OSV for package advisories that have not
                 // been mirrored into OSV. package_name is authoritative when it
                 // exists; product is the documented fallback for older records.
-                let normalized_cve_name = sql_normalized_cve_component_name(
-                    "COALESCE(NULLIF(affected.package_name, ''), affected.product)",
-                );
-                let normalized_input_name =
-                    sql_normalized_cve_component_name("input.package_name");
-                let cve_statement = format!(
-                    "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem') AS ecosystem, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected AS affected ON {normalized_cve_name}={normalized_input_name} JOIN cve AS c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id"
-                );
+                let cve_statement = cve_package_candidates_sql();
                 let cve_candidates: Vec<CvePackageCandidate> = sqlx::query_as(sqlx::AssertSqlSafe(cve_statement))
                 .bind(&input_json)
                 .fetch_all(&mut *connection)
@@ -488,18 +445,15 @@ impl SqlxDatabase {
     ) -> Result<Vec<SqlxPackageFinding>, sqlx::Error> {
         validate_package_query_identity(ecosystem, package_name, purl)?;
         let ecosystem = ecosystem.to_owned();
-        let ecosystem_key = ecosystem_identity_key(&ecosystem);
         let package_name = normalize_package_name(&ecosystem, package_name);
         let version = version.to_owned();
         let purl = purl.map(package_identity_purl);
-        let purl_base = purl.as_deref().map(purl_base_identity).map(str::to_owned);
         self.writer.with_connection(|connection| Box::pin(async move {
-            let normalized_name = sql_normalized_package_name("package.package_name", "?");
-            let ecosystem_matches = sql_ecosystem_matches("package.ecosystem", "?");
-            let statement = format!("SELECT package.id, package.osv_id FROM osv_affected_packages AS package JOIN osv_advisories AS advisory ON advisory.osv_id=package.osv_id WHERE advisory.withdrawn_at IS NULL AND {ecosystem_matches} AND (({normalized_name}=? AND (? IS NULL OR package.purl IS NULL OR package.purl=? OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=?))) OR (? IS NOT NULL AND package.purl=?)) ORDER BY package.osv_id");
-            let packages: Vec<(i64, String)> =
-                sqlx::query_as(sqlx::AssertSqlSafe(statement))
-                .bind(&ecosystem_key).bind(&ecosystem).bind(&package_name).bind(&purl).bind(&purl).bind(&purl_base).bind(&purl).bind(&purl).fetch_all(&mut *connection).await?;
+            let query = PackageQuery { ecosystem: ecosystem.clone(), package: package_name, version: version.clone(), purl };
+            let statement = package_candidates_sql(false);
+            let rows: Vec<(i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(statement))
+                .bind(package_queries_json(&[query])?).fetch_all(&mut *connection).await?;
+            let packages = rows.into_iter().map(|(_, id, osv_id)| (id, osv_id)).collect::<Vec<_>>();
             let package_ids_json = serde_json::to_string(&packages.iter().map(|(id, _)| id).collect::<Vec<_>>())
                 .map_err(|error| sqlx::Error::Protocol(format!("failed to encode OSV package IDs: {error}")))?;
             let osv_ids_json = serde_json::to_string(&packages.iter().map(|(_, id)| id).collect::<BTreeSet<_>>())
@@ -554,5 +508,119 @@ impl SqlxDatabase {
             }
             Ok(findings)
         })).await
+    }
+}
+
+// Separate the name and PURL branches so both can use their complete identity
+// index. UNION removes a package that matched both locators without merging inputs.
+fn package_candidates_sql(coverage_only: bool) -> String {
+    let ecosystem = sql_ecosystem_key("package.ecosystem");
+    let name = sql_normalized_package_name("package.package_name", "package.ecosystem");
+    let projection = if coverage_only {
+        "DISTINCT candidates.query_index"
+    } else {
+        "candidates.query_index, candidates.id, candidates.osv_id"
+    };
+    format!(
+        "WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.ecosystem_key') AS ecosystem_key, json_extract(value, '$.package') AS package_name, json_extract(value, '$.purl') AS purl, json_extract(value, '$.purl_base') AS purl_base FROM json_each(?)), candidates AS (SELECT input.query_index, package.id, package.osv_id FROM input CROSS JOIN osv_affected_packages package WHERE {ecosystem}=input.ecosystem_key COLLATE BINARY AND {name}=input.package_name COLLATE BINARY AND (input.purl IS NULL OR package.purl IS NULL OR package.purl=input.purl OR (instr(package.purl, '?')=0 AND instr(package.purl, '#')=0 AND package.purl=input.purl_base)) UNION SELECT input.query_index, package.id, package.osv_id FROM input CROSS JOIN osv_affected_packages package WHERE input.purl IS NOT NULL AND {ecosystem}=input.ecosystem_key COLLATE BINARY AND package.purl=input.purl COLLATE BINARY) SELECT {projection} FROM candidates JOIN osv_advisories advisory ON advisory.osv_id=candidates.osv_id WHERE advisory.withdrawn_at IS NULL ORDER BY candidates.query_index, candidates.osv_id, candidates.id"
+    )
+}
+
+fn cve_package_candidates_sql() -> String {
+    let name = sql_normalized_cve_component_name(
+        "COALESCE(NULLIF(affected.package_name, ''), affected.product)",
+    );
+    let input_name = sql_normalized_cve_component_name("json_extract(value, '$.package')");
+    // Schema 12 has no index for this CVE normalization. Test membership in the
+    // whole input set once per affected row, rather than once per input package.
+    // Materialize only matching IDs/names; read large JSON payloads afterwards.
+    // Joining back to input preserves duplicate queries and their original order.
+    format!(
+        "WITH input AS MATERIALIZED (SELECT CAST(key AS INTEGER) AS query_index, {input_name} AS name FROM json_each(?)), candidates AS MATERIALIZED (SELECT affected.id, {name} AS name FROM cve_affected affected WHERE {name} IN (SELECT name FROM input)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM candidates JOIN input ON candidates.name=input.name JOIN cve_affected affected ON affected.id=candidates.id JOIN cve c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index, c.cve_id, affected.id"
+    )
+}
+
+#[cfg(test)]
+mod query_plan_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cve_batch_candidates_preserve_legacy_matches_and_use_set_membership() {
+        let db = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.writer.with_connection(|connection| Box::pin(async move {
+            sqlx::raw_sql(
+                "INSERT INTO cve (id,cve_id,state,published_at,updated_at,serial,title,reference_text,raw_json) VALUES
+                 (1,'CVE-2099-1',0,'','',0,'','','{}'),
+                 (2,'CVE-2099-2',1,'','',0,'','','{}');
+                 INSERT INTO cve_affected (cve_db_id,package_name,product,version_text,raw_json) VALUES
+                 (1,'Some_Package','ignored','','[]'),
+                 (1,'','some.package','','[]'),
+                 (1,NULL,'SOME PACKAGE','','[]'),
+                 (1,'other','some-package','','[]'),
+                 (1,NULL,NULL,'','[]'),
+                 (2,'some-package','rejected','','[]');"
+            ).execute(&mut *connection).await?;
+            let queries = (0..PACKAGE_QUERY_BATCH_SIZE).map(|index| PackageQuery {
+                ecosystem: "PyPI".to_owned(),
+                package: if index % 2 == 0 { "some-package" } else { "missing" }.to_owned(),
+                version: "1.0".to_owned(), purl: None,
+            }).collect::<Vec<_>>();
+            let input = package_queries_json(&queries)?;
+            let name = sql_normalized_cve_component_name("COALESCE(NULLIF(affected.package_name, ''), affected.product)");
+            let input_name = sql_normalized_cve_component_name("input.package_name");
+            let legacy = format!("WITH input AS (SELECT CAST(key AS INTEGER) AS query_index, json_extract(value, '$.package') AS package_name FROM json_each(?)) SELECT input.query_index, c.cve_id, affected.default_status, affected.raw_json, affected.package_name, affected.product, affected.collection_url FROM input JOIN cve_affected affected ON {name}={input_name} JOIN cve c ON c.id=affected.cve_db_id WHERE c.state=0 ORDER BY input.query_index,c.cve_id,affected.id");
+            let expected: Vec<CvePackageCandidate> = sqlx::query_as(sqlx::AssertSqlSafe(legacy)).bind(&input).fetch_all(&mut *connection).await?;
+            let actual: Vec<CvePackageCandidate> = sqlx::query_as(sqlx::AssertSqlSafe(cve_package_candidates_sql())).bind(&input).fetch_all(&mut *connection).await?;
+            assert_eq!(actual, expected);
+            assert_eq!(actual.len(), 300);
+            let plan = format!("EXPLAIN QUERY PLAN {}", cve_package_candidates_sql());
+            let rows = sqlx::query(sqlx::AssertSqlSafe(plan)).bind(&input).fetch_all(&mut *connection).await?;
+            let details = rows.iter().map(|row| row.get::<String,_>("detail")).collect::<Vec<_>>().join("\n");
+            assert!(details.contains("LIST SUBQUERY"), "{details}");
+            assert!(!details.contains("CORRELATED"), "{details}");
+            assert!(details.contains("MATERIALIZE candidates"), "{details}");
+            Ok(())
+        })).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn package_lookup_seeks_both_identity_indexes() {
+        let db = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let query = PackageQuery {
+                        ecosystem: "PyPI".to_owned(),
+                        package: "example".to_owned(),
+                        version: "1.0".to_owned(),
+                        purl: Some("pkg:pypi/example".to_owned()),
+                    };
+                    for coverage in [false, true] {
+                        let plan =
+                            format!("EXPLAIN QUERY PLAN {}", package_candidates_sql(coverage));
+                        let rows = sqlx::query(sqlx::AssertSqlSafe(plan))
+                            .bind(package_queries_json(std::slice::from_ref(&query))?)
+                            .fetch_all(&mut *connection)
+                            .await?;
+                        let details = rows
+                            .iter()
+                            .map(|row| row.get::<String, _>("detail"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        for index in ["idx_osv_package_identity", "idx_osv_package_purl"] {
+                            assert!(
+                                details.contains(&format!("SEARCH package USING INDEX {index}")),
+                                "{details}"
+                            );
+                        }
+                        assert!(!details.contains("SCAN package"), "{details}");
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
     }
 }

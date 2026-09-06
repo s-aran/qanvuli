@@ -59,7 +59,11 @@ async fn run_loop(
     db: &mut Option<CveDatabase>,
     app: &mut App,
 ) -> Result<(), String> {
+    let mut redraw = true;
     loop {
+        // Capture this before polling: the last task may finish during this
+        // iteration, and its final result still needs to be painted.
+        let was_busy = app.has_background_task();
         app.poll_search().await?;
         app.poll_count().await;
         app.poll_raw_json().await;
@@ -78,24 +82,37 @@ async fn run_loop(
             tokio::task::yield_now().await;
         }
 
-        terminal
-            .draw(|frame| draw(frame, app))
-            .map_err(|err| format!("failed to draw TUI: {err}"))?;
+        if redraw || was_busy || app.has_background_task() {
+            terminal
+                .draw(|frame| draw(frame, app))
+                .map_err(|err| format!("failed to draw TUI: {err}"))?;
+            redraw = false;
+        }
 
-        if !event::poll(EVENT_POLL_MAX)
+        let poll_timeout = if app.has_background_task() {
+            EVENT_POLL_MAX
+        } else {
+            std::time::Duration::from_millis(250)
+        };
+        if !event::poll(poll_timeout)
             .map_err(|err| format!("failed to poll terminal event: {err}"))?
         {
             continue;
         }
 
-        let Event::Key(key) =
-            event::read().map_err(|err| format!("failed to read terminal event: {err}"))?
-        else {
-            continue;
-        };
+        let key =
+            match event::read().map_err(|err| format!("failed to read terminal event: {err}"))? {
+                Event::Key(key) => key,
+                Event::Resize(..) | Event::FocusGained => {
+                    redraw = true;
+                    continue;
+                }
+                _ => continue,
+            };
         if key.kind == KeyEventKind::Release {
             continue;
         }
+        redraw = true;
 
         if app.maintenance_running() {
             continue;

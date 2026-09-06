@@ -349,6 +349,7 @@ impl SqlxDatabase {
                 sqlx::Error::Protocol(format!("failed to encode CAPEC IDs: {error}"))
             })?;
         let text = filters.text.as_deref().and_then(fts_query);
+        let affected_candidates = text.is_none() && filters.cve_id_prefix.is_none() && !kev_only;
         let unfiltered = text.is_none()
             && filters.cve_id_prefix.is_none()
             && filters.cwe_ids.is_empty()
@@ -432,7 +433,13 @@ impl SqlxDatabase {
             }
             let has_affected = filters.vendor_like.is_some() || filters.product_like.is_some() || filters.vendor_exact.is_some() || filters.product_exact.is_some();
             if has_affected {
-                query.push(" AND EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id");
+                // Without a selective text/ID source, collect matching affected
+                // IDs once instead of probing the child table for every CVE.
+                query.push(if affected_candidates {
+                    " AND c.id IN (SELECT affected.cve_db_id FROM cve_affected AS affected WHERE 1=1"
+                } else {
+                    " AND EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id"
+                });
                 if let Some(value) = filters.vendor_like { query.push(" AND affected.vendor LIKE ").push_bind(value); }
                 if let Some(value) = filters.product_like { query.push(" AND affected.product LIKE ").push_bind(value); }
                 if let Some(value) = filters.vendor_exact { query.push(" AND affected.vendor=").push_bind(value); }
@@ -500,6 +507,7 @@ impl SqlxDatabase {
                 sqlx::Error::Protocol(format!("failed to encode CAPEC IDs: {error}"))
             })?;
         let text = filters.text.as_deref().and_then(fts_query);
+        let affected_candidates = text.is_none() && filters.cve_id_prefix.is_none() && !kev_only;
         self.writer
             .with_connection(|connection| {
                 Box::pin(async move {
@@ -555,7 +563,11 @@ impl SqlxDatabase {
                         || filters.vendor_exact.is_some()
                         || filters.product_exact.is_some();
                     if has_affected {
-                        query.push(" AND EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id");
+                        query.push(if affected_candidates {
+                            " AND c.id IN (SELECT affected.cve_db_id FROM cve_affected AS affected WHERE 1=1"
+                        } else {
+                            " AND EXISTS (SELECT 1 FROM cve_affected AS affected WHERE affected.cve_db_id=c.id"
+                        });
                         if let Some(value) = filters.vendor_like {
                             query.push(" AND affected.vendor LIKE ").push_bind(value);
                         }

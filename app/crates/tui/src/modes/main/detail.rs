@@ -32,7 +32,13 @@ impl DetailPanel for MainDetailPanel {
         } else {
             vec![Line::from("No results")]
         };
-        app.clamp_detail_scroll();
+        let line_count =
+            crate::common::text::cached_line_count(&detail, content_width as u16, false);
+        app.main.detail_scroll = app.main.detail_scroll.min(
+            line_count
+                .saturating_sub(app.main.right_page_size)
+                .min(u16::MAX as usize) as u16,
+        );
         let detail_title = if let Some(cve) = app.selected() {
             format!(
                 "{} [{}]",

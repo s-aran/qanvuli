@@ -34,7 +34,7 @@ impl GitHubReleaseFile {
     }
 
     pub async fn download_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let content = reqwest::Client::new()
+        let content = crate::http::client()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
             .send()
@@ -46,7 +46,7 @@ impl GitHubReleaseFile {
     }
 
     pub fn download_bytes_blocking(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let content = reqwest::blocking::Client::new()
+        let content = crate::http::blocking_client()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
             .send()?
@@ -74,7 +74,7 @@ impl GitHubReleaseFile {
         {
             return Ok(());
         }
-        let mut response = reqwest::Client::new()
+        let mut response = crate::http::client()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
             .send()
@@ -102,7 +102,7 @@ impl GitHubReleaseFile {
         path: &Path,
         progress: Option<DownloadProgressCallback>,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let probe_client = reqwest::Client::builder().http1_only().build()?;
+        let probe_client = crate::http::client_builder().http1_only().build()?;
         let probe = probe_client
             .get(&self.url)
             .header(header::USER_AGENT, "qanvuli")
@@ -190,7 +190,7 @@ impl GitHubReleaseFile {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut response = reqwest::blocking::Client::new()
+        let mut response = crate::http::blocking_client()
             .get(&self.url)
             .header(reqwest::header::USER_AGENT, "qanvuli")
             .send()?
@@ -260,7 +260,7 @@ async fn download_range(download: RangeDownload) -> Result<(), String> {
         progress,
     } = download;
     let ContentRange { start, end, total } = range;
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .http1_only()
         .build()
         .map_err(|error| format!("failed to create range download client: {error}"))?;
@@ -389,13 +389,15 @@ impl GitHub {
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         let octocrab = octocrab::instance();
-        let page = octocrab
-            .repos(&self.owner, &self.repo)
-            .releases()
-            .list()
-            .per_page(100)
-            .send()
-            .await?;
+        let page = github_request(
+            octocrab
+                .repos(&self.owner, &self.repo)
+                .releases()
+                .list()
+                .per_page(100)
+                .send(),
+        )
+        .await?;
         release_items_to_sorted_releases(page.items)
     }
 
@@ -403,18 +405,20 @@ impl GitHub {
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         let octocrab = octocrab::instance();
-        let page = octocrab
-            .repos(&self.owner, &self.repo)
-            .releases()
-            .list()
-            .per_page(100)
-            .send()
-            .await?;
+        let page = github_request(
+            octocrab
+                .repos(&self.owner, &self.repo)
+                .releases()
+                .list()
+                .per_page(100)
+                .send(),
+        )
+        .await?;
         let mut release_items = Vec::new();
         let mut page = page;
         release_items.append(&mut page.items);
         while page.next.is_some() {
-            let Some(next) = octocrab.get_page(&page.next).await? else {
+            let Some(next) = github_request(octocrab.get_page(&page.next)).await? else {
                 break;
             };
             page = next;
@@ -432,13 +436,15 @@ impl GitHub {
         cursor: DateTime<Utc>,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
         let octocrab = octocrab::instance();
-        let mut page = octocrab
-            .repos(&self.owner, &self.repo)
-            .releases()
-            .list()
-            .per_page(100)
-            .send()
-            .await?;
+        let mut page = github_request(
+            octocrab
+                .repos(&self.owner, &self.repo)
+                .releases()
+                .list()
+                .per_page(100)
+                .send(),
+        )
+        .await?;
         let mut release_items = Vec::new();
 
         loop {
@@ -451,7 +457,7 @@ impl GitHub {
             if reached_cursor || page.next.is_none() {
                 break;
             }
-            let Some(next) = octocrab.get_page(&page.next).await? else {
+            let Some(next) = github_request(octocrab.get_page(&page.next)).await? else {
                 break;
             };
             page = next;
@@ -467,6 +473,13 @@ impl GitHub {
             .build()?
             .block_on(self.list_releases())
     }
+}
+
+// Bound metadata requests too, while preserving the caller-configured Octocrab instance.
+async fn github_request<T>(
+    future: impl std::future::Future<Output = Result<T, octocrab::Error>>,
+) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(tokio::time::timeout(crate::http::READ_TIMEOUT, future).await??)
 }
 
 fn release_items_to_sorted_releases(

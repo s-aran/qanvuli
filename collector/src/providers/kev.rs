@@ -4,7 +4,7 @@ pub const CISA_KEV_JSON_URL: &str =
     "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
 
 pub async fn download_kev_json() -> Result<String> {
-    reqwest::Client::builder()
+    qanvuli_utils::http::client_builder()
         .user_agent("qanvuli")
         .build()?
         .get(CISA_KEV_JSON_URL)
