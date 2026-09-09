@@ -24,28 +24,71 @@ use simd_json::{
     prelude::{ValueAsArray, ValueAsObject, ValueAsScalar},
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::OnceCell;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use tokio::sync::{Mutex, MutexGuard, OnceCell};
 
 const BATCH_COVERAGE_NOTICE: &str = "osv_covered=false means OSV has no local coverage; it does not prove there are no CVEs. Cross-check end-of-life or critical packages with the CVE List and vendor advisories.";
+const DEFAULT_MCP_READ_CONNECTIONS: usize = 4;
+const MAX_MCP_READ_CONNECTIONS: usize = 8;
+const MCP_READ_CONNECTIONS_ENV: &str = "QANVULI_MCP_READ_CONNECTIONS";
+
+struct DatabasePool {
+    // Connections are process-local infrastructure, not MCP session state. Each tool call remains
+    // self-contained and may run on any reader.
+    writer: CveDatabase,
+    readers: Vec<CveDatabase>,
+    next_reader: AtomicUsize,
+    // Serialize updates only. WAL readers continue using committed data while
+    // the update writer is downloading or committing another batch.
+    access: Mutex<()>,
+}
+
+pub(crate) struct DbReadGuard<'a> {
+    database: &'a CveDatabase,
+}
+
+impl Deref for DbReadGuard<'_> {
+    type Target = CveDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+    }
+}
+
+pub(crate) struct DbWriteGuard<'a> {
+    database: &'a CveDatabase,
+    _permit: MutexGuard<'a, ()>,
+}
+
+impl Deref for DbWriteGuard<'_> {
+    type Target = CveDatabase;
+
+    fn deref(&self) -> &Self::Target {
+        self.database
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct DbProvider {
     db_url: String,
-    db: Arc<OnceCell<CveDatabase>>,
+    pool: Arc<OnceCell<DatabasePool>>,
 }
 
 impl DbProvider {
     pub(crate) fn new(db_url: String) -> Self {
         Self {
             db_url,
-            db: Arc::new(OnceCell::new()),
+            pool: Arc::new(OnceCell::new()),
         }
     }
 
-    pub(crate) async fn get(&self) -> Result<&CveDatabase, McpError> {
-        self.db
+    async fn pool(&self) -> Result<&DatabasePool, McpError> {
+        self.pool
             .get_or_try_init(|| async {
                 let db = CveDatabase::connect(&self.db_url).await.map_err(|err| {
                     mcp_error(format!(
@@ -58,10 +101,53 @@ impl DbProvider {
                         "database rebuild required before MCP startup: {err}"
                     ))
                 })?;
-                Ok(db)
+                let read_connections = mcp_read_connections();
+                let mut readers = Vec::with_capacity(read_connections);
+                for _ in 0..read_connections {
+                    readers.push(db.independent_read_connection().await.map_err(|err| {
+                        mcp_error(format!(
+                            "failed to open MCP database read connection: {err}"
+                        ))
+                    })?);
+                }
+                Ok(DatabasePool {
+                    writer: db,
+                    readers,
+                    next_reader: AtomicUsize::new(0),
+                    access: Mutex::new(()),
+                })
             })
             .await
     }
+
+    pub(crate) async fn read(&self) -> Result<DbReadGuard<'_>, McpError> {
+        let pool = self.pool().await?;
+        let index = pool.next_reader.fetch_add(1, Ordering::Relaxed) % pool.readers.len();
+        Ok(DbReadGuard {
+            database: &pool.readers[index],
+        })
+    }
+
+    pub(crate) async fn write(&self) -> Result<DbWriteGuard<'_>, McpError> {
+        let pool = self.pool().await?;
+        let permit = pool.access.lock().await;
+        Ok(DbWriteGuard {
+            database: &pool.writer,
+            _permit: permit,
+        })
+    }
+}
+
+fn mcp_read_connections() -> usize {
+    let value = std::env::var(MCP_READ_CONNECTIONS_ENV).ok();
+    parse_mcp_read_connections(value.as_deref())
+}
+
+fn parse_mcp_read_connections(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MCP_READ_CONNECTIONS)
+        .clamp(1, MAX_MCP_READ_CONNECTIONS)
 }
 
 pub(crate) async fn paged_search_result(
@@ -418,6 +504,87 @@ pub(crate) async fn query_package_enriched(
     }))
 }
 
+pub(crate) async fn evaluate_affected(
+    db: &CveDatabase,
+    cve_id: &str,
+    ecosystem: &str,
+    name: &str,
+    version: &str,
+) -> Result<CallToolResult, McpError> {
+    let findings = db
+        .query_package_enriched_with_evidence(ecosystem, name, version, None, true)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    let mut evaluations = findings
+        .into_iter()
+        .filter(|finding| {
+            finding.primary_id.eq_ignore_ascii_case(cve_id)
+                || finding
+                    .cve_ids
+                    .iter()
+                    .chain(&finding.aliases)
+                    .any(|alias| alias.eq_ignore_ascii_case(cve_id))
+        })
+        .collect::<Vec<_>>();
+    evaluations.sort_by(|left, right| {
+        affected_status_rank(&right.affected.status)
+            .cmp(&affected_status_rank(&left.affected.status))
+            .then_with(|| left.source.cmp(&right.source))
+            .then_with(|| left.primary_id.cmp(&right.primary_id))
+    });
+    let evaluation = evaluations.first();
+    let evaluation_status = evaluation
+        .map(|finding| finding.affected.status.as_str())
+        .unwrap_or("unknown");
+    let affected = match evaluation_status {
+        "affected" => Some(true),
+        "not_affected" => Some(false),
+        _ => None,
+    };
+    let normalized_id = cve_id.to_ascii_uppercase();
+    let is_cve = normalized_id.starts_with("CVE-");
+    let cve_found = if is_cve {
+        Some(
+            db.find_cve_summary_with_detail(&normalized_id)
+                .await
+                .map_err(|err| mcp_error(err.to_string()))?
+                .is_some(),
+        )
+    } else {
+        None
+    };
+    let directly_found = if is_cve {
+        cve_found == Some(true)
+    } else {
+        db.find_enriched_osv(&normalized_id)
+            .await
+            .map_err(|err| mcp_error(err.to_string()))?
+            .is_some()
+    };
+    let identifier_found = directly_found || !evaluations.is_empty();
+    response::tool_result(json!({
+        "cve_id": cve_id,
+        "vulnerability_id": cve_id,
+        "ecosystem": ecosystem,
+        "name": name,
+        "version": version,
+        "affected": affected,
+        "status": evaluation_status,
+        "identifier_found": identifier_found,
+        "cve_found": cve_found,
+        "evaluation": evaluation,
+        "evaluations": evaluations,
+    }))
+}
+
+fn affected_status_rank(status: &str) -> u8 {
+    match status {
+        "affected" => 2,
+        "not_affected" => 1,
+        _ => 0,
+    }
+}
+
 pub(crate) async fn query_packages_enriched(
     db: &CveDatabase,
     packages: Vec<crate::args::PackageQueryArgs>,
@@ -446,8 +613,11 @@ pub(crate) async fn query_packages_enriched(
             purl: package.purl.clone(),
         })
         .collect::<Vec<_>>();
-    let findings_by_package = db
+    let mut findings_by_package = db
         .query_package_matches_batch(&queries)
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    db.enrich_package_finding_batches(&mut findings_by_package)
         .await
         .map_err(|err| mcp_error(err.to_string()))?;
     let coverage = db
@@ -529,6 +699,12 @@ pub(crate) async fn query_packages_enriched(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
+        let confirmed_advisory_ids = confirmed_findings
+            .iter()
+            .map(|finding| finding.primary_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let risk = confirmed_cve_ids
             .iter()
             .filter_map(|cve_id| risks_by_cve.get(cve_id).cloned())
@@ -536,6 +712,7 @@ pub(crate) async fn query_packages_enriched(
         let summary = batch_summary(
             &package,
             confirmed_cve_ids,
+            confirmed_advisory_ids,
             &risk,
             !confirmed_findings.is_empty(),
             include_fixed.then(|| fixed_versions_from_refs(&confirmed_findings)),
@@ -573,9 +750,12 @@ pub(crate) async fn query_packages_enriched(
         }
         results.push(result);
     }
+    let request_capped = requested > 200;
     response::tool_result(json!({
         "requested": requested,
-        "truncated": requested > 200,
+        "request_capped": request_capped,
+        "truncated": request_capped,
+        "truncated_reasons": if request_capped { vec!["request_cap"] } else { Vec::<&str>::new() },
         "status": status,
         "verbosity": verbosity,
         "coverage_notice": BATCH_COVERAGE_NOTICE,
@@ -595,6 +775,7 @@ struct BatchPackageSummary {
     version: String,
     vulnerable: bool,
     cve_ids: Vec<String>,
+    advisory_ids: Vec<String>,
     max_cvss: Option<f64>,
     max_epss: Option<f64>,
     kev: bool,
@@ -612,6 +793,7 @@ struct BatchPackageSummary {
 fn batch_summary(
     package: &crate::args::PackageQueryArgs,
     cve_ids: Vec<String>,
+    advisory_ids: Vec<String>,
     risk: &[CveRiskSummary],
     vulnerable: bool,
     fixed_versions: Option<Vec<String>>,
@@ -623,6 +805,7 @@ fn batch_summary(
         version: package.version.clone(),
         vulnerable,
         cve_ids,
+        advisory_ids,
         max_cvss: risk
             .iter()
             .filter_map(|summary| summary.max_cvss_score)
@@ -1055,6 +1238,22 @@ pub(crate) async fn get_cwe(db: &CveDatabase, cwe_id: i32) -> Result<CallToolRes
     response::tool_result(json!(entry))
 }
 
+pub(crate) async fn get_cwes(
+    db: &CveDatabase,
+    cwe_ids: &[i32],
+) -> Result<CallToolResult, McpError> {
+    let requested = cwe_ids.len();
+    let entries = db
+        .find_cwe_entries(&cwe_ids[..requested.min(200)])
+        .await
+        .map_err(|err| mcp_error(err.to_string()))?;
+    response::tool_result(json!({
+        "requested": requested,
+        "truncated": requested > 200,
+        "entries": entries,
+    }))
+}
+
 pub(crate) async fn search_capec_catalog(
     db: &CveDatabase,
     args: CapecCatalogArgs,
@@ -1207,6 +1406,61 @@ pub(crate) async fn apply_updates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_update_does_not_block_readers_or_allow_another_writer() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-mcp-read-during-update-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = format!(
+            "sqlite://{}?mode=rwc",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let setup = CveDatabase::connect(&url).await.unwrap();
+        setup.initialize_schema().await.unwrap();
+        setup.close().await.unwrap();
+        let provider = DbProvider::new(url);
+        let writer = provider.write().await.unwrap();
+        // Holding this guard represents a download suspended on the network.
+        let reader = tokio::time::timeout(std::time::Duration::from_secs(1), provider.read())
+            .await
+            .unwrap()
+            .unwrap();
+        writer
+            .set_metadata_value("read-during-update", "committed")
+            .await
+            .unwrap();
+        assert_eq!(
+            reader
+                .metadata_value("read-during-update")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("committed")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), provider.write())
+                .await
+                .is_err()
+        );
+        drop(writer);
+        drop(provider);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mcp_read_connection_count_is_bounded_and_has_a_safe_default() {
+        assert_eq!(parse_mcp_read_connections(None), 4);
+        assert_eq!(parse_mcp_read_connections(Some("invalid")), 4);
+        assert_eq!(parse_mcp_read_connections(Some("0")), 1);
+        assert_eq!(parse_mcp_read_connections(Some("3")), 3);
+        assert_eq!(parse_mcp_read_connections(Some("99")), 8);
+    }
 
     fn call_result_payload(result: CallToolResult) -> (serde_json::Value, usize) {
         let value = serde_json::to_value(result).unwrap();
@@ -1372,6 +1626,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn evaluate_affected_uses_osv_aliases_and_preserves_unknown() {
+        use qanvuli_core::database::OsvRawRecord;
+
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0301","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"OSV alias fixture","affected":[]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+        db.import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-alias-test","aliases":["CVE-2099-0301","PYSEC-2099-301"],"modified":"2099-01-01T00:00:00Z","affected":[{"package":{"ecosystem":"PyPI","name":"example"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"2.0.0"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+
+        for vulnerability_id in ["CVE-2099-0301", "GHSA-2099-alias-test", "PYSEC-2099-301"] {
+            let result = evaluate_affected(&db, vulnerability_id, "PyPI", "example", "1.0.0")
+                .await
+                .unwrap();
+            let (payload, _) = call_result_payload(result);
+            assert_eq!(payload["affected"], true, "{vulnerability_id}");
+            assert_eq!(payload["status"], "affected", "{vulnerability_id}");
+            assert_eq!(payload["evaluation"]["source"], "osv", "{vulnerability_id}");
+            assert_eq!(
+                payload["evaluation"]["aliases_status"], "available",
+                "{vulnerability_id}"
+            );
+        }
+
+        let batch = query_packages_enriched(
+            &db,
+            vec![crate::args::PackageQueryArgs {
+                ecosystem: "PyPI".to_owned(),
+                package: "example".to_owned(),
+                version: "1.0.0".to_owned(),
+                purl: None,
+            }],
+            None,
+            false,
+            None,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let (batch, _) = call_result_payload(batch);
+        assert_eq!(batch["results"][0]["summary"]["vulnerable"], true);
+        assert_eq!(
+            batch["results"][0]["summary"]["cve_ids"][0],
+            "CVE-2099-0301"
+        );
+
+        let missing = evaluate_affected(&db, "CVE-2099-9999", "PyPI", "example", "1.0.0")
+            .await
+            .unwrap();
+        let (missing, _) = call_result_payload(missing);
+        assert!(missing["affected"].is_null());
+        assert_eq!(missing["status"], "unknown");
+        assert_eq!(missing["identifier_found"], false);
+        assert_eq!(missing["cve_found"], false);
+    }
+
+    #[tokio::test]
+    async fn evaluate_affected_accepts_cve_package_name_without_collection_url() {
+        let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+        db.initialize_schema().await.unwrap();
+        db.import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0302","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"packageName fixture","affected":[{"vendor":"example","product":"example","packageName":"example","versions":[{"version":"0","status":"affected","versionType":"python","lessThan":"2.0.0"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+        let result = evaluate_affected(&db, "CVE-2099-0302", "PyPI", "example", "1.0.0")
+            .await
+            .unwrap();
+        let (payload, _) = call_result_payload(result);
+
+        assert_eq!(payload["affected"], true);
+        assert_eq!(payload["status"], "affected");
+        assert_eq!(payload["evaluation"]["source"], "cve-list");
+        assert_eq!(payload["evaluation"]["affected"]["confidence"], "medium");
+    }
+
     #[test]
     fn batch_summary_aggregates_all_related_cves() {
         let package = crate::args::PackageQueryArgs {
@@ -1422,6 +1762,7 @@ mod tests {
         let summary = batch_summary(
             &package,
             vec!["CVE-2099-0001".to_owned(), "CVE-2099-0002".to_owned()],
+            vec!["GHSA-2099-related".to_owned()],
             &risk,
             true,
             None,
@@ -1445,6 +1786,7 @@ mod tests {
         };
         let summary = batch_summary(
             &package,
+            Vec::new(),
             Vec::new(),
             &[],
             false,

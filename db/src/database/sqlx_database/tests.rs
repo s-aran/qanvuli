@@ -1,5 +1,54 @@
 use super::*;
 
+#[tokio::test]
+async fn affected_search_and_count_preserve_row_identity_and_pagination() {
+    let db = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    db.initialize_schema().await.unwrap();
+    db.writer.with_connection(|connection| Box::pin(async move {
+        sqlx::raw_sql(
+            "INSERT INTO cve (id,cve_id,state,published_at,updated_at,serial,title,reference_text,raw_json) VALUES
+             (1,'CVE-2099-1001',0,'','',0,'','','{}'),
+             (2,'CVE-2099-1002',0,'','',0,'','','{}'),
+             (3,'CVE-2099-1003',1,'','',0,'','','{}');
+             INSERT INTO cve_affected (cve_db_id,vendor,product,version_text,raw_json) VALUES
+             (1,'vendor','other','','[]'),(1,'other','product','','[]'),
+             (2,'vendor','product','','[]'),(2,'vendor','product','','[]'),
+             (3,'vendor','product','','[]');"
+        ).execute(connection).await?;
+        Ok(())
+    })).await.unwrap();
+    for prefix in [None, Some("CVE-2099-".to_owned())] {
+        for include_rejected in [false, true] {
+            let filters = SqlxCveSearch {
+                vendor_exact: Some("vendor".to_owned()),
+                product_exact: Some("product".to_owned()),
+                cve_id_prefix: prefix.clone(),
+                sort_order: CveSummarySortOrder::CveIdAsc,
+                ..Default::default()
+            };
+            let rows = db
+                .search_cves_advanced(filters.clone(), include_rejected, 10, 0)
+                .await
+                .unwrap();
+            let count = db
+                .count_cves_advanced_with_kev(filters.clone(), include_rejected, false)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), if include_rejected { 2 } else { 1 });
+            assert_eq!(count as usize, rows.len());
+            assert_eq!(rows[0].cve_id, "CVE-2099-1002");
+            let page = db
+                .search_cves_advanced(filters, include_rejected, 1, 1)
+                .await
+                .unwrap();
+            assert_eq!(page.len(), usize::from(include_rejected));
+            if include_rejected {
+                assert_eq!(page[0].cve_id, "CVE-2099-1003");
+            }
+        }
+    }
+}
+
 #[test]
 fn database_handle_is_send_and_sync_for_spawned_command_tasks() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -100,6 +149,18 @@ fn cve_package_identity_uses_collection_url_host_boundaries() {
     }
 }
 
+#[test]
+fn cve_package_identity_distinguishes_package_names_from_product_only_records() {
+    assert_eq!(
+        cve_package_identity("PyPI", Some("example"), Some("example"), None),
+        CvePackageIdentity::Probable
+    );
+    assert_eq!(
+        cve_package_identity("PyPI", None, Some("example"), None),
+        CvePackageIdentity::Ambiguous
+    );
+}
+
 #[tokio::test]
 async fn initializes_and_checks_a_new_database_on_one_writer() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
@@ -112,7 +173,7 @@ async fn initializes_and_checks_a_new_database_on_one_writer() {
     database.check_full_foreign_keys().await.unwrap();
     database.check_full_cve_search().await.unwrap();
     database.check_full_osv_search().await.unwrap();
-    assert_eq!(SqlxDatabase::schema_version(), 11);
+    assert_eq!(SqlxDatabase::schema_version(), 12);
 }
 
 #[tokio::test]
@@ -1748,6 +1809,35 @@ async fn fts_indexes_cve_description_references_and_osv_details() {
 }
 
 #[tokio::test]
+async fn affected_search_preserves_substring_fallback_behind_fts_fast_path() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-affected-search","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Affected search fixture","affected":[{"vendor":"Microsoft","product":"Windows Server","versions":[{"version":"1","status":"affected"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+
+    for product in ["Windows", "indows"] {
+        let rows = database
+            .search_cves_by_affected(
+                Some("Microsoft".to_owned()),
+                Some(product.to_owned()),
+                false,
+                false,
+                false,
+                1,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "product query {product}");
+        assert_eq!(rows[0].cve_id, "CVE-2099-affected-search");
+    }
+}
+
+#[tokio::test]
 async fn combined_search_joins_cwe_affected_and_cvss_filters_with_and() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
@@ -2421,6 +2511,62 @@ async fn package_query_evaluates_npm_and_pypi_ranges_and_normalizes_names() {
             .status,
         "not_affected"
     );
+}
+
+#[tokio::test]
+async fn package_query_enriches_kev_epss_and_matches_cve_separator_variants() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    database
+        .import_cve_raw_json(
+            r#"{"cveMetadata":{"cveId":"CVE-2099-0001","state":"PUBLISHED","datePublished":"2099-01-01T00:00:00Z","dateUpdated":"2099-01-01T00:00:00Z"},"containers":{"cna":{"title":"Django REST framework fixture","affected":[{"vendor":"example","product":"django-rest-framework","packageName":"django-rest-framework","collectionURL":"https://pypi.org/project/django-rest-framework","defaultStatus":"unaffected","versions":[{"version":"< 3.17.2","status":"affected","versionType":"python"}]}]}}}"#.to_owned(),
+        )
+        .await
+        .unwrap();
+    database
+        .import_osv_record(OsvRawRecord {
+            source_path: None,
+            raw_json: r#"{"schema_version":"1.8.0","id":"GHSA-2099-enriched","modified":"2099-01-01T00:00:00Z","aliases":["CVE-2099-0001"],"affected":[{"package":{"ecosystem":"PyPI","name":"djangorestframework"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"3.17.2"}]}]}]}"#.to_owned(),
+        })
+        .await
+        .unwrap();
+    database
+        .import_kev_json(include_str!("../../../../fixtures/kev/kev-test.json").to_owned())
+        .await
+        .unwrap();
+    database
+        .import_epss_csv(include_str!("../../../../fixtures/epss/epss-test.csv").to_owned())
+        .await
+        .unwrap();
+
+    let findings = database
+        .query_package_enriched_with_evidence("PyPI", "djangorestframework", "3.16.0", None, false)
+        .await
+        .unwrap();
+    assert!(findings.iter().any(|finding| finding.source == "cve-list"));
+    let osv = findings
+        .iter()
+        .find(|finding| finding.primary_id == "GHSA-2099-enriched")
+        .unwrap();
+    assert_eq!(osv.enrichment.kev_status, "available");
+    assert_eq!(osv.enrichment.epss_status, "available");
+    assert!(osv.priority_signals.known_exploited);
+    assert_eq!(osv.priority_signals.suggested_priority, "critical");
+
+    let exact = database
+        .search_cve_summaries_by_vendor_product_exact_with_state_scope(
+            None,
+            None,
+            None,
+            Some("django_rest.framework"),
+            false,
+            crate::CveStateScope::PublishedOnly,
+            10,
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact[0].cve_id, "CVE-2099-0001");
 }
 
 #[tokio::test]

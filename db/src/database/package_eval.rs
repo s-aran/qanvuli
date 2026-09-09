@@ -29,6 +29,16 @@ pub fn normalize_package_name(ecosystem: &str, name: &str) -> String {
     policy_for_ecosystem(ecosystem).normalize_package_name(name)
 }
 
+/// Builds a separator-insensitive key for joining dependency names to CVE List product/package
+/// names. This deliberately has narrower use than ecosystem identity normalization: OSV package
+/// identities keep their ecosystem-specific punctuation semantics.
+pub fn normalize_cve_component_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '_' | '.'))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Builds an ecosystem identity key whose base is ASCII-case-insensitive.
 ///
 /// Scoped ecosystem suffixes remain case-sensitive. Maven repository suffixes
@@ -341,6 +351,11 @@ pub fn evaluate_cve_version_ranges(
     versions: &[CveVersionRange],
 ) -> VersionMatch {
     for version in versions {
+        let inline = match inline_cve_constraint(version) {
+            Ok(inline) => inline,
+            Err(()) => return unsupported(),
+        };
+        let version = inline.as_ref().unwrap_or(version);
         let lower = version
             .version
             .as_deref()
@@ -370,6 +385,72 @@ pub fn evaluate_cve_version_ranges(
         }
     }
     version_match_for_cve_status(cve_status(default_status))
+}
+
+/// Parses CVE List records that place a comma-separated constraint in `version` instead of
+/// using `lessThan` or `lessThanOrEqual`.
+fn inline_cve_constraint(version: &CveVersionRange) -> Result<Option<CveVersionRange>, ()> {
+    if version.less_than.is_some() || version.less_than_or_equal.is_some() {
+        return Ok(None);
+    }
+    let Some(expression) = version.version.as_deref().map(str::trim) else {
+        return Ok(None);
+    };
+    if !expression.starts_with(['<', '>', '=']) {
+        return Ok(None);
+    }
+
+    let mut lower = None;
+    let mut less_than = None;
+    let mut less_than_or_equal = None;
+    for term in expression.split(',').map(str::trim) {
+        if let Some(value) = term.strip_prefix(">=").map(str::trim) {
+            if value.is_empty() || lower.replace(value.to_owned()).is_some() {
+                return Err(());
+            }
+        } else if term.starts_with('>') {
+            // An exclusive lower bound cannot be represented by the CVE List interval shape.
+            return Err(());
+        } else if let Some(value) = term.strip_prefix("<=").map(str::trim) {
+            if value.is_empty() || less_than_or_equal.replace(value.to_owned()).is_some() {
+                return Err(());
+            }
+        } else if let Some(value) = term.strip_prefix('<').map(str::trim) {
+            if value.is_empty() || less_than.replace(value.to_owned()).is_some() {
+                return Err(());
+            }
+        } else if let Some(value) = term
+            .strip_prefix("==")
+            .or_else(|| term.strip_prefix('='))
+            .map(str::trim)
+        {
+            if expression.contains(',') || value.is_empty() {
+                return Err(());
+            }
+            return Ok(Some(CveVersionRange {
+                version: Some(value.to_owned()),
+                status: version.status.clone(),
+                version_type: version.version_type.clone(),
+                less_than: None,
+                less_than_or_equal: None,
+                changes: version.changes.clone(),
+            }));
+        } else {
+            return Err(());
+        }
+    }
+    if less_than.is_some() && less_than_or_equal.is_some() {
+        return Err(());
+    }
+    Ok(Some(CveVersionRange {
+        version: Some(lower.unwrap_or_else(|| "*".to_owned())),
+        status: version.status.clone(),
+        version_type: version.version_type.clone(),
+        // `*` is the existing representation of an open upper bound.
+        less_than: less_than.or_else(|| less_than_or_equal.is_none().then(|| "*".to_owned())),
+        less_than_or_equal,
+        changes: version.changes.clone(),
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -680,6 +761,75 @@ mod tests {
         assert_ne!(
             normalize_package_name("crates.io", "example_crate"),
             "example-crate"
+        );
+    }
+
+    #[test]
+    fn cve_component_normalization_ignores_common_separators() {
+        for (left, right) in [
+            ("djangorestframework", "django-rest-framework"),
+            ("httpcore", "http-core"),
+            ("mysqlclient", "mysql client"),
+            ("font-awesome", "font awesome"),
+            ("pillow-heif", "pillow_heif"),
+        ] {
+            assert_eq!(
+                normalize_cve_component_name(left),
+                normalize_cve_component_name(right)
+            );
+        }
+    }
+
+    #[test]
+    fn cve_inline_constraints_and_unaffected_status_are_evaluated() {
+        let range = |version: &str, status: &str| CveVersionRange {
+            version: Some(version.to_owned()),
+            status: Some(status.to_owned()),
+            version_type: Some("semver".to_owned()),
+            less_than: None,
+            less_than_or_equal: None,
+            changes: Vec::new(),
+        };
+
+        assert_eq!(
+            evaluate_cve_version_ranges(
+                "npm",
+                "3.17.1",
+                Some("unaffected"),
+                &[range("< 3.17.2", "affected")],
+            )
+            .status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_cve_version_ranges(
+                "npm",
+                "2.5.0",
+                Some("unaffected"),
+                &[range(">= 2.0.0, < 2.5.0", "affected")],
+            )
+            .status,
+            "not_affected"
+        );
+        assert_eq!(
+            evaluate_cve_version_ranges(
+                "npm",
+                "9.0.0",
+                Some("unaffected"),
+                &[range(">=0.0.0", "affected")],
+            )
+            .status,
+            "affected"
+        );
+        assert_eq!(
+            evaluate_cve_version_ranges(
+                "npm",
+                "1.0.0",
+                Some("affected"),
+                &[range("=1.0.0", "unaffected")],
+            )
+            .status,
+            "not_affected"
         );
     }
 

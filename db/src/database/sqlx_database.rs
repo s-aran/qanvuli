@@ -4,8 +4,9 @@ use super::{
     maintenance::rebuild_cve_search,
     package_eval::{
         CveVersionChange, CveVersionRange, OsvRange, ecosystem_identity_key,
-        evaluate_cve_version_ranges, evaluate_version, normalize_package_name,
-        package_identity_from_purl, package_identity_purl, parse_package_purl, versions_equivalent,
+        evaluate_cve_version_ranges, evaluate_version, normalize_cve_component_name,
+        normalize_package_name, package_identity_from_purl, package_identity_purl,
+        parse_package_purl, versions_equivalent,
     },
     schema,
     search::fts_query,
@@ -83,14 +84,19 @@ pub(super) fn sql_normalized_package_name(name: &str, ecosystem: &str) -> String
     )
 }
 
-fn sql_ecosystem_matches(left: &str, right: &str) -> String {
+pub(super) fn sql_normalized_cve_component_name(name: &str) -> String {
+    format!(
+        "replace(replace(replace(replace(replace(replace(replace(lower({name}), '-', ''), '_', ''), '.', ''), ' ', ''), char(9), ''), char(10), ''), char(13), '')"
+    )
+}
+
+pub(super) fn sql_ecosystem_key(left: &str) -> String {
     // Ecosystem names are ASCII case-insensitive, but an OSV ecosystem suffix
     // can contain a Maven repository URL whose path is case-sensitive.  Build
     // the same key as `ecosystem_identity_key`: lowercase only the base name.
-    let left_key = format!(
+    format!(
         "CASE WHEN instr({left}, ':')=0 THEN lower({left}) ELSE lower(substr({left}, 1, instr({left}, ':')-1)) || ':' || substr({left}, instr({left}, ':')+1) END"
-    );
-    format!("({left_key}={right} COLLATE BINARY)")
+    )
 }
 
 fn canonical_stored_ecosystem(ecosystem: &str) -> String {
@@ -361,10 +367,12 @@ pub(crate) fn cve_stored_versions(raw_json: &str) -> Result<Vec<CveStoredVersion
 }
 const CVE_NORMALIZE_BATCH_SIZE: usize = 2_000;
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CvePackageIdentity {
     /// The CNA supplied a package name and its collection identifies the queried ecosystem.
     Confirmed,
+    /// The CNA supplied an exact package name, but no ecosystem-specific collection URL.
+    Probable,
     /// Product-only CVE records cannot distinguish a library from a same-named product.
     Ambiguous,
     /// The collection positively identifies a different package ecosystem or product catalog.
@@ -427,15 +435,19 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
 
 fn cve_package_identity(
     ecosystem: &str,
-    _package_name: Option<&str>,
+    package_name: Option<&str>,
     _product: Option<&str>,
     collection_url: Option<&str>,
 ) -> CvePackageIdentity {
     let Some(collection_url) = collection_url else {
-        // `packageName` is more useful than product, but is not a purl and
-        // does not itself state an ecosystem.  Retain it for review without
-        // presenting it as a verified package vulnerability.
-        return CvePackageIdentity::Ambiguous;
+        // The surrounding query has already matched a normalized package name.
+        // packageName is stronger evidence than a product-only record, although
+        // it still does not prove the ecosystem without a collection URL.
+        return if package_name.is_some_and(|name| !name.trim().is_empty()) {
+            CvePackageIdentity::Probable
+        } else {
+            CvePackageIdentity::Ambiguous
+        };
     };
     let Some(collection_host) = collection_url_host(collection_url) else {
         return CvePackageIdentity::Excluded;

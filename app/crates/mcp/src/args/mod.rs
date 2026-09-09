@@ -95,6 +95,7 @@ pub(crate) struct CweArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
+#[schemars(inline)]
 pub(crate) enum CweArgValue {
     Number(i32),
     String(String),
@@ -430,6 +431,12 @@ pub(crate) struct GetEnrichedCveArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetCwesArgs {
+    /// Up to 200 CWE IDs, as numbers or strings such as CWE-79.
+    pub(crate) cwe_ids: Vec<CweArgValue>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GetEnrichedOsvArgs {
     /// Exact OSV advisory ID, such as GHSA-abcd-efgh-ijkl or RUSTSEC-2026-0001.
     pub(crate) osv_id: String,
@@ -458,9 +465,24 @@ pub(crate) struct QueryPackageEnrichedArgs {
     pub(crate) include_evidence: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct EvaluateAffectedArgs {
+    /// CVE, OSV, GHSA, RUSTSEC, PYSEC, or GO advisory ID to evaluate.
+    pub(crate) cve_id: String,
+    /// Package ecosystem used for version comparison, such as npm or PyPI.
+    pub(crate) ecosystem: String,
+    /// Product or package name. Common separators are ignored for the CVE List join.
+    #[serde(alias = "package")]
+    pub(crate) name: String,
+    /// Installed package version.
+    pub(crate) version: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[schemars(inline)]
 pub(crate) struct PackageQueryArgs {
     pub(crate) ecosystem: String,
+    #[serde(alias = "name")]
     pub(crate) package: String,
     pub(crate) version: String,
     pub(crate) purl: Option<String>,
@@ -498,6 +520,12 @@ pub(crate) struct UpdateDbArgs {
     /// Additional OSV JSON filename/advisory prefixes from all.zip, case-insensitive.
     /// Examples: GHSA, PYSEC, RUSTSEC, GO, UBUNTU.
     pub(crate) osv_prefixes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct GetUpdateStatusArgs {
+    /// Job ID returned by update_db.
+    pub(crate) job_id: String,
 }
 
 impl CweArgs {

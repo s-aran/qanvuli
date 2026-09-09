@@ -4,13 +4,67 @@ use ratada::markdown::{StyleSheet, render_block};
 use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
+    widgets::{Paragraph, Wrap},
 };
+use std::{cell::RefCell, collections::VecDeque};
+
+const RENDER_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const RENDER_CACHE_ENTRIES: usize = 8;
+
+#[derive(Default)]
+struct RenderCache {
+    markup: VecDeque<(String, usize, Markup, Vec<Line<'static>>, usize)>,
+    counts: VecDeque<(Vec<Line<'static>>, u16, bool, usize, usize)>,
+}
+
+thread_local! { static RENDER_CACHE: RefCell<RenderCache> = RefCell::new(RenderCache::default()); }
+
+fn lines_bytes(lines: &[Line<'_>]) -> usize {
+    std::mem::size_of_val(lines)
+        + lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.len() + std::mem::size_of::<Span<'_>>())
+            .sum::<usize>()
+}
+
+pub(crate) fn cached_line_count(lines: &[Line<'static>], width: u16, trim: bool) -> usize {
+    RENDER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache
+            .counts
+            .iter()
+            .position(|(cached, w, t, _, _)| cached == lines && *w == width && *t == trim)
+        {
+            let entry = cache.counts.remove(index).unwrap();
+            let count = entry.3;
+            cache.counts.push_back(entry);
+            return count;
+        }
+        let count = Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim })
+            .line_count(width);
+        let bytes = lines_bytes(lines);
+        if bytes <= RENDER_CACHE_BYTES {
+            while cache.counts.len() >= RENDER_CACHE_ENTRIES
+                || cache.counts.iter().map(|entry| entry.4).sum::<usize>() + bytes
+                    > RENDER_CACHE_BYTES
+            {
+                cache.counts.pop_front();
+            }
+            cache
+                .counts
+                .push_back((lines.to_vec(), width, trim, count, bytes));
+        }
+        count
+    })
+}
 
 pub(crate) fn highlighted_line(text: &str, detail_search: &DetailSearch) -> Line<'static> {
     highlight_rich_line(Line::from(text.to_owned()), detail_search)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Markup {
     Html,
     Markdown,
@@ -23,10 +77,38 @@ pub(crate) fn markup_lines(
     detail_search: &DetailSearch,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let lines = match markup {
-        Markup::Html => html_lines(text, width).unwrap_or_else(|| plain_lines(text)),
-        Markup::Markdown => markdown_lines(text, width),
-    };
+    // Cache unhighlighted layout: changing the search query must only replace
+    // the highlight overlay, never reuse an old query's highlighted spans.
+    let lines = RENDER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(index) = cache
+            .markup
+            .iter()
+            .position(|(source, w, m, _, _)| source == text && *w == width && *m == markup)
+        {
+            let entry = cache.markup.remove(index).unwrap();
+            let lines = entry.3.clone();
+            cache.markup.push_back(entry);
+            return lines;
+        }
+        let lines = match markup {
+            Markup::Html => html_lines(text, width).unwrap_or_else(|| plain_lines(text)),
+            Markup::Markdown => markdown_lines(text, width),
+        };
+        let bytes = text.len() + lines_bytes(&lines);
+        if bytes <= RENDER_CACHE_BYTES {
+            while cache.markup.len() >= RENDER_CACHE_ENTRIES
+                || cache.markup.iter().map(|entry| entry.4).sum::<usize>() + bytes
+                    > RENDER_CACHE_BYTES
+            {
+                cache.markup.pop_front();
+            }
+            cache
+                .markup
+                .push_back((text.to_owned(), width, markup, lines.clone(), bytes));
+        }
+        lines
+    });
     lines
         .into_iter()
         .map(|line| highlight_rich_line(line, detail_search))
@@ -165,6 +247,63 @@ mod tests {
         style::{Color, Modifier, Style},
         text::{Line, Span},
     };
+
+    #[test]
+    fn cached_markup_keeps_highlights_fresh_and_bounds_history() {
+        super::RENDER_CACHE.with(|cache| *cache.borrow_mut() = Default::default());
+        let first = markup_lines(
+            "**needle**",
+            40,
+            Markup::Markdown,
+            &DetailSearch::new("needle"),
+        );
+        assert!(
+            first
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(Color::Yellow))
+        );
+        let next = markup_lines(
+            "**needle**",
+            40,
+            Markup::Markdown,
+            &DetailSearch::new("other"),
+        );
+        assert!(
+            !next
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.bg == Some(Color::Yellow))
+        );
+        super::RENDER_CACHE.with(|cache| assert_eq!(cache.borrow().markup.len(), 1));
+        for width in 1..20 {
+            markup_lines(
+                "a long sentence",
+                width,
+                Markup::Markdown,
+                &DetailSearch::new(""),
+            );
+        }
+        super::RENDER_CACHE
+            .with(|cache| assert!(cache.borrow().markup.len() <= super::RENDER_CACHE_ENTRIES));
+    }
+
+    #[test]
+    fn cached_counts_follow_content_width_and_wrapping() {
+        use ratatui::widgets::{Paragraph, Wrap};
+        for content in ["abc def ghi", "replacement\ncontent"] {
+            let lines = vec![ratatui::text::Line::from(content)];
+            for width in [2, 6, 40] {
+                for trim in [false, true] {
+                    let expected = Paragraph::new(lines.clone())
+                        .wrap(Wrap { trim })
+                        .line_count(width);
+                    assert_eq!(super::cached_line_count(&lines, width, trim), expected);
+                    assert_eq!(super::cached_line_count(&lines, width, trim), expected);
+                }
+            }
+        }
+    }
 
     fn text(lines: &[Line<'_>]) -> String {
         lines

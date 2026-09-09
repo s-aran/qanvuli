@@ -507,6 +507,7 @@ pub(crate) async fn import_downloaded_osv_selection(
     db: SqlxDatabase,
     download: DownloadedOsvSelection,
     mode: OsvImportMode,
+    eager_cleanup: bool,
 ) -> Result<usize, String> {
     let queued_elapsed = download.ready_at.elapsed();
     let import_started = Instant::now();
@@ -522,6 +523,7 @@ pub(crate) async fn import_downloaded_osv_selection(
         download.target_osv_ids.as_ref(),
         &download.cursor,
         mode,
+        eager_cleanup,
     )
     .await;
     let imported = result?;
@@ -572,7 +574,7 @@ pub async fn sync_osv_with_refresh(
         .then_some(previous_cursor.as_deref())
         .flatten();
     let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
-    import_downloaded_osv_selection(db, download, OsvImportMode::IncrementalUpdate).await
+    import_downloaded_osv_selection(db, download, OsvImportMode::IncrementalUpdate, false).await
 }
 
 /// Imports an OSV ZIP through the SQLx writer and advances the cursor only after every batch,
@@ -591,6 +593,7 @@ pub async fn import_osv_zip(
         None,
         completion_cursor,
         OsvImportMode::IncrementalUpdate,
+        false,
     )
     .await
 }
@@ -602,6 +605,7 @@ async fn import_osv_zips(
     target_osv_ids: Option<&AHashSet<String>>,
     completion_cursor: &str,
     mode: OsvImportMode,
+    eager_cleanup: bool,
 ) -> Result<usize, String> {
     let initial_replacement = mode == OsvImportMode::InitialReplacement;
     db.begin_osv_sync()
@@ -633,7 +637,20 @@ async fn import_osv_zips(
         )
         .await;
         match read_osv_ids {
-            Ok(ids) => seen_osv_ids.extend(ids),
+            Ok(ids) => {
+                seen_osv_ids.extend(ids);
+                if eager_cleanup && let Err(error) = remove_processed_zip(path) {
+                    return fail_osv_import(
+                        &db,
+                        initial_replacement,
+                        format!(
+                            "failed to eagerly remove imported OSV archive {}: {error}",
+                            path.display()
+                        ),
+                    )
+                    .await;
+                }
+            }
             Err(error) => return fail_osv_import(&db, initial_replacement, error).await,
         }
     }

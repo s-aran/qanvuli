@@ -64,6 +64,12 @@ impl OsvGcsSource {
         let store = GoogleCloudStorageBuilder::new()
             .with_bucket_name(OSV_BUCKET)
             .with_skip_signature(true)
+            .with_client_options(
+                object_store::ClientOptions::new()
+                    .with_connect_timeout(qanvuli_utils::http::CONNECT_TIMEOUT)
+                    .with_read_timeout(qanvuli_utils::http::READ_TIMEOUT)
+                    .with_timeout(qanvuli_utils::http::DOWNLOAD_TIMEOUT),
+            )
             .build()
             .context("failed to build OSV GCS client")?;
         Ok(Self { store })
@@ -116,7 +122,7 @@ impl OsvGcsSource {
             }
             Err(gcs_err) => {
                 let url = object_url(object_path).map_err(OsvDownloadError::InvalidResponse)?;
-                let response = reqwest::get(url.clone())
+                let response = qanvuli_utils::http::client().get(url.clone()).send()
                     .await
                     .map_err(|error| OsvDownloadError::Network(anyhow!(
                         "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}: {error}"
@@ -166,7 +172,7 @@ impl OsvGcsSource {
             Ok(result) => Ok(result.bytes().await?.to_vec()),
             Err(gcs_err) => {
                 let url = object_url(object_path)?;
-                let bytes = reqwest::get(url.clone())
+                let bytes = qanvuli_utils::http::client().get(url.clone()).send()
                     .await
                     .with_context(|| {
                         format!(

@@ -329,6 +329,23 @@ impl SqlxDatabase {
         limit: u64,
         offset: u64,
     ) -> Result<Vec<CveSummary>, sqlx::Error> {
+        if let Some(product_exact) = product_exact {
+            let vendor = vendor_exact.or(vendor).map(str::to_owned);
+            return Ok(self
+                .search_cves_by_affected_product_key(
+                    vendor,
+                    vendor_exact.is_some(),
+                    product_exact.to_owned(),
+                    exclude_wordpress_collection,
+                    include_rejected(scope),
+                    limit as i64,
+                    offset as i64,
+                )
+                .await?
+                .into_iter()
+                .map(summary)
+                .collect());
+        }
         let vendor = vendor_exact.or(vendor).map(str::to_owned);
         let product = product_exact.or(product).map(str::to_owned);
         let exact = vendor_exact.is_some() || product_exact.is_some();

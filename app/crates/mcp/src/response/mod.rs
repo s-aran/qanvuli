@@ -130,7 +130,9 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         let Value::Object(object) = &mut compact else {
             return None;
         };
+        object.insert("truncated".into(), json!(true));
         object.insert("response_truncated".into(), json!(true));
+        append_truncation_reason(object, "response_budget");
         object.insert("returned".into(), json!(returned));
         object.insert("total".into(), json!(total));
         object.insert(
@@ -149,6 +151,18 @@ pub(crate) fn shrink_over_budget(value: &Value, budget: usize) -> Option<Value> 
         }
     }
     (encoded_len(&compact).ok()? <= budget).then_some(compact)
+}
+
+fn append_truncation_reason(object: &mut simd_json::owned::Object, reason: &str) {
+    let reasons = object
+        .entry("truncated_reasons".into())
+        .or_insert_with(|| json!([]));
+    let Value::Array(reasons) = reasons else {
+        return;
+    };
+    if !reasons.iter().any(|value| value == &json!(reason)) {
+        reasons.push(json!(reason));
+    }
 }
 
 fn is_package_batch(value: &Value) -> bool {
@@ -458,6 +472,11 @@ mod tests {
             panic!("object result")
         };
         assert_eq!(object.get("response_truncated"), Some(&json!(true)));
+        assert_eq!(object.get("truncated"), Some(&json!(true)));
+        assert_eq!(
+            object.get("truncated_reasons"),
+            Some(&json!(["response_budget"]))
+        );
         assert!(object.get("returned").is_some());
         assert!(object.get("total").is_some());
     }

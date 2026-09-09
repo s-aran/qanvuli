@@ -1,4 +1,3 @@
-
 use super::*;
 
 #[test]
@@ -402,6 +401,50 @@ async fn osv_zip_import_advances_cursor_after_validation() {
     );
     database.close().await.unwrap();
     let _ = std::fs::remove_file(zip_path);
+}
+
+#[tokio::test]
+async fn eager_cleanup_removes_each_imported_osv_zip() {
+    use qanvuli_core::database::SqlxDatabase;
+    use std::io::Write;
+
+    let zip_path = std::env::temp_dir().join(format!(
+        "qanvuli-sqlx-osv-eager-cleanup-{}-{}.zip",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    let file = std::fs::File::create(&zip_path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    zip.start_file(
+        "GHSA-TEST-0001.json",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
+    zip.write_all(include_bytes!(
+        "../../../../../fixtures/osv/GHSA-TEST-0001.json"
+    ))
+    .unwrap();
+    zip.finish().unwrap();
+
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    let paths = [zip_path.clone()];
+    assert_eq!(
+        import_osv_zips(
+            database.clone(),
+            &paths,
+            None,
+            None,
+            "2099-01-02T00:00:00Z",
+            OsvImportMode::IncrementalUpdate,
+            true,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert!(!zip_path.exists());
+    database.close().await.unwrap();
 }
 
 #[tokio::test]

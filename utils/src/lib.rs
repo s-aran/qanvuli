@@ -6,6 +6,7 @@ macro_rules! eprintln {
 
 pub mod datetime_deserialize;
 pub mod github;
+pub mod http;
 pub mod loader;
 pub mod logging;
 

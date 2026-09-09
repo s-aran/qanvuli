@@ -8,7 +8,7 @@ qanvuli builds and searches a local vulnerability database. It combines CVE List
 
 The project provides a CLI, terminal UI, Rust API, and MCP server. Searches run locally after the source feeds have been imported.
 
-API documentation: [English](./docs/API.md) · [日本語](./docs/API.ja.md)
+API documentation: [English](./docs/API.md) · [日本語](./docs/API_J.md)
 
 ## Features
 
@@ -60,6 +60,7 @@ Use an existing CVE archive or reduce peak disk use:
 ```bash
 qanvuli init --zip ./data/all-cves.zip
 qanvuli init --delete-existing
+qanvuli init --eager-cleanup
 qanvuli init --no-progress
 ```
 
@@ -68,6 +69,8 @@ qanvuli init --no-progress
 An archive supplied with `init --zip` is a user-owned local file and is never removed automatically. `--keep` applies only to the CVE archive downloaded automatically when `--zip` is omitted.
 
 `--delete-existing` (`-D`) deletes stale `*.qanvuli-new-*` replacement candidates and the active database before downloading and building the replacement. This minimizes peak disk usage, but can disrupt another running initialization and any later failure leaves no usable database. Use it only after confirming no other `qanvuli init` is running.
+
+`--eager-cleanup` (`-C`) removes automatically downloaded CVE and OSV archives as soon as their respective import phases succeed, reducing peak disk usage during the remaining initialization phases. Automatically downloaded CWE and CAPEC files are already removed after import. User-supplied `--zip` archives are never removed. `--eager-cleanup` cannot be combined with `--keep`.
 
 Apply unapplied remote CVE deltas and refresh enrichment feeds:
 
@@ -137,6 +140,7 @@ Use `--pretty` for indented JSON.
 
 ```bash
 qanvuli db status
+qanvuli db status --json
 qanvuli db check
 qanvuli db check --scan
 qanvuli db check --full
@@ -151,7 +155,7 @@ Rebuild cross-source identifier links from imported OSV relations:
 qanvuli graph rebuild
 ```
 
-Database files are derived artifacts. Unsupported schemas are not patched in place; rebuild them with `qanvuli init`.
+Database files are derived artifacts. Unsupported schemas are not patched in place; rebuild them with `qanvuli init`. Schema 12 adds indexed normalized package identities and PURLs; databases from schema 11 require this rebuild.
 
 ## Terminal UI
 
@@ -203,6 +207,8 @@ qanvuli mcp
 ```
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
+
+MCP searches use four independent SQLite read connections by default so concurrent tool calls do not queue behind one slow query. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. One update runs at a time; additional update requests are rejected with the active job ID. The most recent 64 job records are retained. File-backed WAL readers remain available during downloads and see committed update batches; multiple reads are not a snapshot of the entire update. HTTP downloads have a 15-second connection deadline, a 60-second idle read deadline, and a one-hour total deadline (blocking downloads use the connection and total deadlines).
 
 The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
 

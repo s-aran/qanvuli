@@ -42,7 +42,7 @@ impl CweCatalogFile {
         etag: Option<&str>,
         last_modified: Option<&str>,
     ) -> Result<CweCatalogDownload, Box<dyn std::error::Error + Send + Sync>> {
-        let client = reqwest::Client::new();
+        let client = qanvuli_utils::http::client();
         let mut request = client.get(&self.url);
         if let Some(etag) = etag {
             request = request.header(reqwest::header::IF_NONE_MATCH, etag);
@@ -80,7 +80,7 @@ impl CweCatalogFile {
         &self,
         path: impl AsRef<Path>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut response = reqwest::Client::new()
+        let mut response = qanvuli_utils::http::client()
             .get(&self.url)
             .send()
             .await?

@@ -17,7 +17,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<CweArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let include_rejected = args.include_rejected;
         let full_description = args.full_description.unwrap_or(false);
         let limit = limit(args.limit);
@@ -40,7 +41,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ProductArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cves = db::search_by_product(
             db,
             args.vendor.as_deref(),
@@ -67,7 +69,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<TextArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cves = db::search_text(
             db,
             &args.query,
@@ -90,7 +93,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<CvssArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cves = db::search_by_cvss(
             db,
             args.min_score,
@@ -128,7 +132,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ProductCvssArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cves = db::search_product_by_cvss(
             db,
             args.vendor.as_deref(),
@@ -158,7 +163,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<EpssArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let limit = limit(args.limit);
         db::search_by_epss(
             db,
@@ -176,7 +182,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<DateArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cves = db::search_recent(
             db,
             args.published_since.as_deref(),
@@ -202,7 +209,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetCveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::find_cve_summary(db, &args.cve_id).await
     }
 
@@ -213,7 +221,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetCveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::find_cve_references(db, &args.cve_id).await
     }
 
@@ -224,7 +233,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ReferenceSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let limit = limit(args.limit);
         let cves = db::search_references(
             db,
@@ -241,7 +251,8 @@ impl CveSearchServer {
         description = "Return local database status including CVE/CWE counts, OSV/KEV/EPSS counts, identifier graph counts, and source sync state."
     )]
     pub(crate) async fn get_database_status(&self) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::database_status(db).await
     }
 
@@ -250,7 +261,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ResolveIdentifierArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::resolve_identifier(db, &args.id).await
     }
 
@@ -261,7 +273,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ResolveIdentifierArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::get_related_identifiers(db, &args.id).await
     }
 
@@ -272,7 +285,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetEnrichedCveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::get_enriched_cve(db, &args.cve_id).await
     }
 
@@ -283,7 +297,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<CveRiskLookupArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::lookup_cve_risk(db, &args.cve_ids, args.verbosity.as_deref()).await
     }
 
@@ -292,7 +307,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetEnrichedOsvArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::get_enriched_osv(db, &args.osv_id).await
     }
 
@@ -303,7 +319,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<QueryPackageEnrichedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::query_package_enriched(
             db,
             &args.ecosystem,
@@ -319,13 +336,32 @@ impl CveSearchServer {
     }
 
     #[tool(
+        description = "Evaluate one installed package version against a CVE or OSV-family advisory ID using all matching local sources. Returns affected=true/false only for a decisive evaluation and null with status='unknown' otherwise."
+    )]
+    pub(crate) async fn evaluate_affected(
+        &self,
+        Parameters(args): Parameters<EvaluateAffectedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db_guard = self.db.read().await?;
+        db::evaluate_affected(
+            &db_guard,
+            &args.cve_id,
+            &args.ecosystem,
+            &args.name,
+            &args.version,
+        )
+        .await
+    }
+
+    #[tool(
         description = "Batch-query up to 200 package/version tuples. Compact summaries are the default and retain vulnerability, review, CVE, CVSS, EPSS, KEV, coverage, and optional fixed-version signals. Set verbosity='full' only for packages that need findings. Evidence is omitted by default."
     )]
     pub(crate) async fn query_packages_enriched(
         &self,
         Parameters(args): Parameters<QueryPackagesEnrichedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::query_packages_enriched(
             db,
             args.packages,
@@ -345,7 +381,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<DateRangeArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let limit = limit(args.limit);
         let cves = db::search_date_range(
             db,
@@ -366,7 +403,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<IdPrefixArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let limit = limit(args.limit);
         let cves = db::search_id_prefix(
             db,
@@ -384,7 +422,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<CweCatalogArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let capec_id = args
             .capec_id
             .map(|value| cwe_arg_to_i32_with_prefix(value, "CAPEC"))
@@ -405,9 +444,26 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetCweArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cwe_id = cwe_arg_to_i32(args.cwe_id)?;
         db::get_cwe(db, cwe_id).await
+    }
+
+    #[tool(
+        description = "Fetch up to 200 CWE catalog entries, including related CAPEC IDs, in one call."
+    )]
+    pub(crate) async fn get_cwes(
+        &self,
+        Parameters(args): Parameters<GetCwesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let db_guard = self.db.read().await?;
+        let cwe_ids = args
+            .cwe_ids
+            .into_iter()
+            .map(cwe_arg_to_i32)
+            .collect::<Result<Vec<_>, _>>()?;
+        db::get_cwes(&db_guard, &cwe_ids).await
     }
 
     #[tool(
@@ -417,7 +473,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<CapecCatalogArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::search_capec_catalog(db, args).await
     }
 
@@ -428,7 +485,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetCapecArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::get_capec(db, args).await
     }
 
@@ -439,7 +497,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<ExplainMatchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cve = db
             .find_cve_summary_with_detail(&args.cve_id)
             .await
@@ -458,7 +517,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<RecentUpdatesArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let limit = limit(args.limit);
         let cves = db::list_recent_updates(
             db,
@@ -485,7 +545,8 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<KnownExploitedArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         db::known_exploited(
             db,
             args.cve_id.as_deref(),
@@ -502,27 +563,66 @@ impl CveSearchServer {
         &self,
         Parameters(args): Parameters<GetCveArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
+        let db_guard = self.db.read().await?;
+        let db = &*db_guard;
         let cve = db::find_cve(db, &args.cve_id).await?;
         response::tool_result(json!(cve.map(response::full_cve)))
     }
 
     #[tool(
-        description = "Apply a local CVE delta or download current updates, then refresh enrichment data. This changes the database and may access upstream feeds."
+        description = "Start a background database update and immediately return a job ID. Only one update may run; another request is rejected with its active job ID. Poll get_update_status for progress. The latest 64 jobs are retained."
     )]
     pub(crate) async fn update_db(
         &self,
         Parameters(args): Parameters<UpdateDbArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let db = self.db.get().await?;
-        db::apply_updates(
-            db,
-            args.zip,
-            args.max_chunks,
-            args.osv_all.unwrap_or(false),
-            args.osv_prefixes.as_deref().unwrap_or(&[]),
+        let job = self.update_jobs.create().await?;
+        let job_id = job.job_id.clone();
+        let db_provider = self.db.clone();
+        let jobs = self.update_jobs.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let db_guard = db_provider.write().await?;
+                jobs.set_updating(&job_id).await;
+                db::apply_updates(
+                    &db_guard,
+                    args.zip,
+                    args.max_chunks,
+                    args.osv_all.unwrap_or(false),
+                    args.osv_prefixes.as_deref().unwrap_or(&[]),
+                )
+                .await?;
+                Ok::<(), McpError>(())
+            }
+            .await;
+            jobs.finish(&job_id, result.err().map(|error| error.to_string()))
+                .await;
+        });
+        response::tool_result(json!({
+            "job_id": job.job_id,
+            "status": job.status,
+            "stage": job.stage,
+            "progress": {
+                "completed_steps": job.completed_steps,
+                "total_steps": job.total_steps,
+            },
+        }))
+    }
+
+    #[tool(description = "Return status and progress for a background update_db job.")]
+    pub(crate) async fn get_update_status(
+        &self,
+        Parameters(args): Parameters<GetUpdateStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let job = self
+            .update_jobs
+            .get(&args.job_id)
+            .await
+            .ok_or_else(|| McpError::invalid_params("unknown update job ID", None))?;
+        response::tool_result(
+            simd_json::serde::to_owned_value(job)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?,
         )
-        .await
     }
 }
 

@@ -12,6 +12,9 @@ use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::{str::FromStr, sync::Arc};
 use tokio::sync::Mutex;
 
+const INTERACTIVE_READ_CACHE_PRAGMA: &str = "PRAGMA cache_size = -32768";
+const INTERACTIVE_READ_MMAP_PRAGMA: &str = "PRAGMA mmap_size = 268435456";
+
 #[derive(Clone, Debug)]
 pub(crate) struct SqliteWriter {
     connection: Arc<Mutex<SqliteConnection>>,
@@ -48,6 +51,36 @@ impl SqliteWriter {
             return Ok(self.clone());
         }
         Self::connect(url).await
+    }
+
+    /// Opens a query-only connection with a larger cache for interactive search workloads.
+    pub(crate) async fn independent_read_connection(&self) -> Result<Self, sqlx::Error> {
+        let url = self.database_url.as_ref();
+        if url.contains(":memory:") || url.to_ascii_lowercase().contains("mode=memory") {
+            // A separate SQLite in-memory connection would have different contents. Do not set
+            // query_only on the shared writer connection either.
+            return Ok(self.clone());
+        }
+        let options = SqliteConnectOptions::from_str(url)?
+            .foreign_keys(true)
+            .statement_cache_capacity(512);
+        let mut connection = SqliteConnection::connect_with(&options).await?;
+        sqlx::query("PRAGMA query_only = ON")
+            .execute(&mut connection)
+            .await?;
+        sqlx::query(INTERACTIVE_READ_CACHE_PRAGMA)
+            .execute(&mut connection)
+            .await?;
+        sqlx::query(INTERACTIVE_READ_MMAP_PRAGMA)
+            .execute(&mut connection)
+            .await?;
+        sqlx::query("PRAGMA temp_store = MEMORY")
+            .execute(&mut connection)
+            .await?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+            database_url: self.database_url.clone(),
+        })
     }
 
     pub(crate) async fn with_connection<T>(
@@ -225,6 +258,68 @@ mod tests {
         }
 
         independent.close().await.unwrap();
+        writer.close().await.unwrap();
+        for candidate in [
+            path.clone(),
+            path.with_extension("sqlite-wal"),
+            path.with_extension("sqlite-shm"),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_reader_is_query_only_and_tuned_for_interactive_search() {
+        let path = std::env::temp_dir().join(format!(
+            "qanvuli-reader-connections-{}-{}.sqlite",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let database_url = format!(
+            "sqlite:///{}?mode=rwc",
+            path.to_string_lossy().replace('\\', "/")
+        );
+        let writer = SqliteWriter::connect(&database_url).await.unwrap();
+        writer.initialize_schema().await.unwrap();
+        let reader = writer.independent_read_connection().await.unwrap();
+
+        let (query_only, cache_size, mmap_size, temp_store): (i64, i64, i64, i64) = reader
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    Ok((
+                        sqlx::query_scalar("PRAGMA query_only")
+                            .fetch_one(&mut *connection)
+                            .await?,
+                        sqlx::query_scalar("PRAGMA cache_size")
+                            .fetch_one(&mut *connection)
+                            .await?,
+                        sqlx::query_scalar("PRAGMA mmap_size")
+                            .fetch_one(&mut *connection)
+                            .await?,
+                        sqlx::query_scalar("PRAGMA temp_store")
+                            .fetch_one(&mut *connection)
+                            .await?,
+                    ))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(query_only, 1);
+        assert_eq!(cache_size, -32 * 1024);
+        assert_eq!(mmap_size, 256 * 1024 * 1024);
+        assert_eq!(temp_store, 2);
+        let rejected = reader
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO app_metadata (key, value) VALUES ('reader', 'write')")
+                        .execute(connection)
+                        .await
+                })
+            })
+            .await;
+        assert!(rejected.is_err());
+
+        reader.close().await.unwrap();
         writer.close().await.unwrap();
         for candidate in [
             path.clone(),

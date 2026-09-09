@@ -1,6 +1,43 @@
 use super::*;
 
 impl SqlxDatabase {
+    pub async fn find_cwe_entries(&self, ids: &[i32]) -> Result<Vec<CweEntry>, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json =
+            serde_json::to_string(ids).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let (rows, links): (Vec<CompatCweRow>, Vec<(i32, i32)>) = self
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let rows = sqlx::query_as(
+                        "SELECT cwe.id,cwe.description,cwe.status,cwe.parent_id FROM json_each(?) input JOIN cwe ON cwe.id=input.value ORDER BY CAST(input.key AS INTEGER)",
+                    )
+                    .bind(&ids_json)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    let links = sqlx::query_as(
+                        "SELECT link.cwe_id,link.capec_id FROM capec_cwe link JOIN json_each(?) input ON input.value=link.cwe_id ORDER BY CAST(input.key AS INTEGER),link.capec_id",
+                    )
+                    .bind(ids_json)
+                    .fetch_all(connection)
+                    .await?;
+                    Ok((rows, links))
+                })
+            })
+            .await?;
+        let mut capec_by_cwe = HashMap::<i32, Vec<i32>>::new();
+        for (cwe_id, capec_id) in links {
+            capec_by_cwe.entry(cwe_id).or_default().push(capec_id);
+        }
+        let mut entries = cwe_entries_with_relation_counts(rows);
+        for entry in &mut entries {
+            entry.capec_ids = capec_by_cwe.remove(&entry.id).unwrap_or_default();
+        }
+        Ok(entries)
+    }
+
     pub async fn find_cwe_entry(&self, id: i32) -> Result<Option<CweEntry>, sqlx::Error> {
         let row: Option<CompatCweRow> = self
             .writer
@@ -253,6 +290,8 @@ impl SqlxDatabase {
         let mut rows = self
             .query_package_matches(ecosystem, package, version, purl)
             .await?;
+        self.enrich_package_finding_batches(std::slice::from_mut(&mut rows))
+            .await?;
         if include_evidence {
             for row in &mut rows {
                 row.evidence.push(Evidence {
@@ -283,6 +322,134 @@ impl SqlxDatabase {
             }
         }
         Ok(rows)
+    }
+
+    /// Attaches KEV, EPSS, and derived priority signals to package findings in one bounded query
+    /// pair, preserving advisories that do not have a CVE alias.
+    pub async fn enrich_package_finding_batches(
+        &self,
+        batches: &mut [Vec<EnrichedFinding>],
+    ) -> Result<(), sqlx::Error> {
+        let cve_ids = batches
+            .iter()
+            .flatten()
+            .flat_map(|finding| finding.cve_ids.iter().cloned())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if cve_ids.is_empty() {
+            for finding in batches.iter_mut().flatten() {
+                finding.enrichment.kev_status = "not_applicable".to_owned();
+                finding.enrichment.epss_status = "not_applicable".to_owned();
+                finding.priority_signals.enrichment_status = "not_applicable".to_owned();
+                finding.priority_signals.suggested_priority =
+                    priority_without_enrichment(&finding.affected.status).to_owned();
+            }
+            return Ok(());
+        }
+
+        let ids_json = serde_json::to_string(&cve_ids)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let (kev_by_cve, epss_by_cve) = self
+            .writer
+            .with_connection(|connection| {
+                Box::pin(async move {
+                    let kev_rows = sqlx::query(
+                        "SELECT k.cve_id,k.vendor_project,k.product,k.vulnerability_name,k.date_added,k.short_description,k.required_action,k.due_date,k.known_ransomware_campaign_use,k.notes,k.fetched_at FROM kev_entries k JOIN json_each(?) j ON j.value=k.cve_id ORDER BY CAST(j.key AS INTEGER)",
+                    )
+                    .bind(&ids_json)
+                    .fetch_all(&mut *connection)
+                    .await?;
+                    let mut kev_by_cve = HashMap::new();
+                    for row in kev_rows {
+                        let kev = KevInfo {
+                            cve_id: row.try_get("cve_id")?,
+                            vendor_project: row.try_get("vendor_project")?,
+                            product: row.try_get("product")?,
+                            vulnerability_name: row.try_get("vulnerability_name")?,
+                            date_added: row.try_get("date_added")?,
+                            short_description: row.try_get("short_description")?,
+                            required_action: row.try_get("required_action")?,
+                            due_date: row.try_get("due_date")?,
+                            known_ransomware_campaign_use: row
+                                .try_get("known_ransomware_campaign_use")?,
+                            notes: row.try_get("notes")?,
+                            fetched_at: row.try_get("fetched_at")?,
+                        };
+                        kev_by_cve.insert(kev.cve_id.clone(), kev);
+                    }
+
+                    let epss_rows = sqlx::query(
+                        "SELECT e.cve_id,e.epss,e.percentile,e.score_date,e.model_version,e.fetched_at FROM epss_current e JOIN json_each(?) j ON j.value=e.cve_id ORDER BY CAST(j.key AS INTEGER)",
+                    )
+                    .bind(ids_json)
+                    .fetch_all(connection)
+                    .await?;
+                    let mut epss_by_cve = HashMap::new();
+                    for row in epss_rows {
+                        let epss = EpssInfo {
+                            cve_id: row.try_get("cve_id")?,
+                            epss: row.try_get("epss")?,
+                            percentile: row.try_get("percentile")?,
+                            score_date: row.try_get("score_date")?,
+                            model_version: row.try_get("model_version")?,
+                            fetched_at: row.try_get("fetched_at")?,
+                        };
+                        epss_by_cve.insert(epss.cve_id.clone(), epss);
+                    }
+                    Ok((kev_by_cve, epss_by_cve))
+                })
+            })
+            .await?;
+
+        for finding in batches.iter_mut().flatten() {
+            let kev = finding
+                .cve_ids
+                .iter()
+                .find_map(|cve_id| kev_by_cve.get(cve_id))
+                .cloned();
+            let epss = finding
+                .cve_ids
+                .iter()
+                .filter_map(|cve_id| epss_by_cve.get(cve_id))
+                .max_by(|left, right| left.epss.total_cmp(&right.epss))
+                .cloned();
+            let has_cve = !finding.cve_ids.is_empty();
+            finding.enrichment.kev_status = if kev.is_some() {
+                "available"
+            } else if has_cve {
+                "not_found"
+            } else {
+                "not_applicable"
+            }
+            .to_owned();
+            finding.enrichment.epss_status = if epss.is_some() {
+                "available"
+            } else if has_cve {
+                "not_found"
+            } else {
+                "not_applicable"
+            }
+            .to_owned();
+            finding.priority_signals.known_exploited = kev.is_some();
+            finding.priority_signals.epss_percentile = epss.as_ref().map(|entry| entry.percentile);
+            finding.priority_signals.enrichment_status = if has_cve {
+                "available"
+            } else {
+                "not_applicable"
+            }
+            .to_owned();
+            let (priority, reasons) = package_priority(
+                &finding.affected.status,
+                kev.is_some(),
+                epss.as_ref().map(|entry| entry.percentile),
+            );
+            finding.priority_signals.suggested_priority = priority.to_owned();
+            finding.priority_signals.reasons = reasons;
+            finding.enrichment.kev = kev;
+            finding.enrichment.epss = epss;
+        }
+        Ok(())
     }
 
     pub async fn cve_risk_summaries(
@@ -400,4 +567,38 @@ impl SqlxDatabase {
             .map(summary)
             .collect())
     }
+}
+
+fn priority_without_enrichment(affected_status: &str) -> &'static str {
+    if affected_status == "affected" {
+        "normal"
+    } else {
+        "review"
+    }
+}
+
+fn package_priority(
+    affected_status: &str,
+    known_exploited: bool,
+    epss_percentile: Option<f64>,
+) -> (&'static str, Vec<String>) {
+    let mut reasons = Vec::new();
+    if known_exploited {
+        reasons.push("listed_in_cisa_kev".to_owned());
+    }
+    if let Some(percentile) = epss_percentile {
+        reasons.push(format!("epss_percentile={percentile:.6}"));
+    }
+    let priority = if affected_status != "affected" {
+        "review"
+    } else if known_exploited {
+        "critical"
+    } else if epss_percentile.is_some_and(|percentile| percentile >= 0.9) {
+        "high"
+    } else if epss_percentile.is_some_and(|percentile| percentile >= 0.5) {
+        "elevated"
+    } else {
+        "normal"
+    };
+    (priority, reasons)
 }

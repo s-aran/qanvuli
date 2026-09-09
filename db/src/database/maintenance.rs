@@ -225,6 +225,8 @@ pub(crate) async fn prepare_osv_bulk_load(
         DROP INDEX IF EXISTS idx_osv_aliases_alias;
         DROP INDEX IF EXISTS idx_osv_cve_search_cve_id;
         DROP INDEX IF EXISTS idx_osv_affected_packages_lookup;
+        DROP INDEX IF EXISTS idx_osv_package_identity;
+        DROP INDEX IF EXISTS idx_osv_package_purl;
         DROP INDEX IF EXISTS idx_osv_affected_packages_osv_id;
         DROP INDEX IF EXISTS idx_osv_published_asc;
         DROP INDEX IF EXISTS idx_osv_published_desc;
@@ -254,6 +256,7 @@ pub(crate) async fn finish_osv_bulk_load(
                 "failed to clear OSV bulk-load statement cache: {error}"
             ))
         })?;
+    super::schema::create_package_identity_indexes(connection).await?;
     sqlx::raw_sql(r#"
         CREATE INDEX IF NOT EXISTS idx_osv_raw_records_content_hash ON osv_raw_records(content_hash);
         CREATE INDEX IF NOT EXISTS idx_osv_aliases_alias ON osv_aliases(alias_id);
@@ -569,6 +572,8 @@ pub(crate) async fn check_required_schema(
         "idx_capec_view_capec_capec",
         "idx_capec_view_category_category",
         "idx_osv_affected_packages_lookup",
+        "idx_osv_package_identity",
+        "idx_osv_package_purl",
         "idx_osv_aliases_alias",
         "idx_osv_ranges_package",
         "idx_osv_range_events_range",
