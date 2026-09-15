@@ -584,14 +584,7 @@ impl CveSearchServer {
             let result = async {
                 let db_guard = db_provider.write().await?;
                 jobs.set_updating(&job_id).await;
-                db::apply_updates(
-                    &db_guard,
-                    args.zip,
-                    args.max_chunks,
-                    args.osv_all.unwrap_or(false),
-                    args.osv_prefixes.as_deref().unwrap_or(&[]),
-                )
-                .await?;
+                db::apply_updates(&db_guard, args.zip, args.max_chunks).await?;
                 Ok::<(), McpError>(())
             }
             .await;

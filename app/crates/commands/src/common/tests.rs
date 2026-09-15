@@ -268,11 +268,11 @@ fn osv_and_ghsa_are_always_included_in_osv_selection() {
     assert!(selection.matches_id("PYSEC-2024-1"));
 
     let restored = OsvImportSelection::from_metadata(Some("OSV")).unwrap();
-    assert!(restored.matches_id("GHSA-aaaa-bbbb-cccc"));
-
-    assert!(!metadata_includes_required_osv_prefixes("OSV"));
-    assert!(metadata_includes_required_osv_prefixes("OSV,GHSA"));
-    assert!(metadata_includes_required_osv_prefixes("all"));
+    assert!(restored.matches_id("OSV-2024-1"));
+    assert!(!restored.matches_id("GHSA-test"));
+    assert_eq!(restored.as_metadata_value(), "OSV");
+    assert!(OsvImportSelection::from_metadata(None).is_none());
+    assert!(OsvImportSelection::from_metadata(Some(" , ")).is_none());
 }
 
 #[test]

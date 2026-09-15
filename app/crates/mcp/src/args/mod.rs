@@ -508,18 +508,13 @@ pub(crate) struct QueryPackagesEnrichedArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct UpdateDbArgs {
     /// Optional local CVE delta zip path to apply. When omitted, the updater downloads applicable CVE delta archives.
     pub(crate) zip: Option<String>,
     /// Optional cap on downloaded update chunks. Intended for testing or bounded maintenance runs.
     #[serde(default, deserialize_with = "deserialize_optional_primitive")]
     pub(crate) max_chunks: Option<usize>,
-    /// Expand local OSV sync coverage to all OSV records.
-    #[serde(default, deserialize_with = "deserialize_optional_primitive")]
-    pub(crate) osv_all: Option<bool>,
-    /// Additional OSV JSON filename/advisory prefixes from all.zip, case-insensitive.
-    /// Examples: GHSA, PYSEC, RUSTSEC, GO, UBUNTU.
-    pub(crate) osv_prefixes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -559,6 +554,16 @@ mod tests {
             "limit": limit,
             "offset": offset,
         })
+    }
+
+    #[test]
+    fn update_rejects_osv_source_selection() {
+        for value in [
+            serde_json::json!({"osv_all": true}),
+            serde_json::json!({"osv_prefixes": ["PYSEC"]}),
+        ] {
+            assert!(serde_json::from_value::<UpdateDbArgs>(value).is_err());
+        }
     }
 
     #[test]
@@ -610,11 +615,9 @@ mod tests {
 
         let update: UpdateDbArgs = serde_json::from_value(serde_json::json!({
             "max_chunks": "12",
-            "osv_all": "true",
         }))
         .unwrap();
         assert_eq!(update.max_chunks, Some(12));
-        assert_eq!(update.osv_all, Some(true));
     }
 
     #[test]

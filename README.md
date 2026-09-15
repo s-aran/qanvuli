@@ -86,7 +86,7 @@ Import a local CVE archive instead:
 qanvuli update --zip ./data/delta.zip
 ```
 
-Without `--zip`, `update` refreshes CWE, CAPEC, the stored OSV selection, KEV, and EPSS after applying CVE deltas. With `--zip`, it imports only the supplied CVE archive. OSV is also refreshed only when OSV family flags are supplied; CWE, CAPEC, KEV, and EPSS are not refreshed in this mode.
+Without `--zip`, `update` refreshes CWE, CAPEC, the stored OSV selection, KEV, and EPSS after applying CVE deltas. With `--zip`, it imports only the supplied CVE archive.
 
 An archive supplied with `update --zip` is user-owned and is preserved on both success and failure. For remote updates, `--keep` retains automatically downloaded CVE delta archives; otherwise they may be removed after successful processing.
 
@@ -94,7 +94,7 @@ Remote `update` is resumable, but it is not one atomic transaction spanning ever
 
 `--osv-refresh-all` ignores the OSV cursor and upserts complete selected snapshots. Missing snapshot entries are not treated as deletions; withdrawn advisories remain available with their withdrawal timestamp.
 
-`init` imports GHSA and OSV (OSS-Fuzz) by default. Add source families with flags such as `--osv-rustsec` or `--osv-pysec`, or select all families with `--osv-all`. `update` reuses the selection stored by `init` and extends it with any supplied family flags. Run `qanvuli init --help` for the complete list.
+`init` imports GHSA and OSV (OSS-Fuzz) by default. Add source families with flags such as `--osv-rustsec` or `--osv-pysec`, or select all families with `--osv-all`. OSV families can only be selected by `init`. `update` and MCP `update_db` reuse the stored selection without adding families; if no selection is stored, OSV synchronization is skipped. Run `qanvuli init --help` for the complete list.
 
 Download a CVE archive without changing the database:
 

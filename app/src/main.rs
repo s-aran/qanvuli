@@ -379,22 +379,24 @@ mod tests {
     }
 
     #[test]
-    fn internal_osv_source_flag_is_rejected_but_dynamic_prefix_is_accepted() {
+    fn osv_source_flags_are_only_accepted_by_init() {
         let error = normalize_osv_prefix_flags(
-            ["qanvuli", "update", "--osv-source", "pysec"]
+            ["qanvuli", "init", "--osv-source", "pysec"]
                 .into_iter()
                 .map(OsString::from),
         )
         .unwrap_err();
         assert!(error.contains("--osv-<prefix>"));
 
-        let normalized = normalize_osv_prefix_flags(
-            ["qanvuli", "update", "--osv-pysec"]
-                .into_iter()
-                .map(OsString::from),
-        )
-        .unwrap();
-        Cli::try_parse_from(normalized).unwrap();
+        for flag in ["--osv-pysec", "--osv-all"] {
+            for command in ["init", "update"] {
+                let normalized = normalize_osv_prefix_flags(
+                    ["qanvuli", command, flag].into_iter().map(OsString::from),
+                )
+                .unwrap();
+                assert_eq!(Cli::try_parse_from(normalized).is_ok(), command == "init");
+            }
+        }
     }
 
     #[test]
