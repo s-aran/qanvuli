@@ -25,7 +25,6 @@ use simd_json::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -1344,26 +1343,19 @@ pub(crate) async fn list_recent_updates(
         .map_err(|err| mcp_error(err.to_string()))
 }
 
-pub(crate) async fn apply_updates(
-    db: &CveDatabase,
-    zip: Option<String>,
-    max_chunks: Option<usize>,
-) -> Result<CallToolResult, McpError> {
+pub(crate) async fn apply_updates(db: &CveDatabase) -> Result<CallToolResult, McpError> {
     db.check_required_schema()
         .await
         .map_err(|err| mcp_error(format!("database rebuild required before update: {err}")))?;
 
-    let local_zip = zip.is_some();
-    let applied = apply_delta_updates(db, zip.map(PathBuf::from), max_chunks)
+    let applied = apply_delta_updates(db, None, None)
         .await
         .map_err(mcp_error)?;
     let cve_changed = !applied.is_empty();
 
-    if !local_zip {
-        sync_all_enrichment_sources_after_update(db, "mcp update_db", cve_changed)
-            .await
-            .map_err(mcp_error)?;
-    }
+    sync_all_enrichment_sources_after_update(db, "mcp update_db", cve_changed)
+        .await
+        .map_err(mcp_error)?;
 
     db.check_search_integrity_quick()
         .await
@@ -1373,11 +1365,9 @@ pub(crate) async fn apply_updates(
         .await
         .map_err(|err| mcp_error(format!("failed to rebuild identifier graph: {err}")))?;
 
-    if !local_zip {
-        for path in &applied {
-            cleanup_processed_cve_archive(path, CveArchiveOwnership::Downloaded, false)
-                .map_err(mcp_error)?;
-        }
+    for path in &applied {
+        cleanup_processed_cve_archive(path, CveArchiveOwnership::Downloaded, false)
+            .map_err(mcp_error)?;
     }
 
     response::tool_result(json!({
