@@ -3,7 +3,7 @@ use crate::{args::*, common::params::*, db, response};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, InitializeResult, ServerCapabilities},
     tool, tool_handler, tool_router,
 };
 use simd_json::json;
@@ -621,11 +621,9 @@ impl CveSearchServer {
 
 #[tool_handler]
 impl ServerHandler for CveSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some("Search and update the local qanvuli CVE database.".into());
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Search and update the local qanvuli CVE database.")
     }
 }
 
