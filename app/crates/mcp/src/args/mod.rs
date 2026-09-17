@@ -511,6 +511,7 @@ pub(crate) struct QueryPackagesEnrichedArgs {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateDbArgs {
     /// Optional local CVE delta zip path to apply. When omitted, the updater downloads applicable CVE delta archives.
+    #[serde(default)]
     pub(crate) zip: Option<String>,
     /// Optional cap on downloaded update chunks. Intended for testing or bounded maintenance runs.
     #[serde(default, deserialize_with = "deserialize_optional_primitive")]
@@ -564,6 +565,17 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<UpdateDbArgs>(value).is_err());
         }
+    }
+
+    #[test]
+    fn update_arguments_are_optional_in_deserialization_and_schema() {
+        let update: UpdateDbArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(update.zip, None);
+        assert_eq!(update.max_chunks, None);
+
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(UpdateDbArgs)).unwrap();
+        let required = schema.get("required").and_then(serde_json::Value::as_array);
+        assert!(required.is_none_or(Vec::is_empty));
     }
 
     #[test]

@@ -213,6 +213,7 @@ fn assert_lists_enriched_package_tool(response: &Value) {
         "query_package_enriched",
         "evaluate_affected",
         "get_cwes",
+        "update_db",
         "get_update_status",
     ] {
         assert!(
@@ -260,6 +261,19 @@ fn assert_lists_enriched_package_tool(response: &Value) {
         cwe_items.get("anyOf").is_some(),
         "CWE array element schema was empty: {cwe_items:#?}"
     );
+
+    let update_schema = tool_schema("update_db");
+    let update_required = update_schema.get("required").and_then(Value::as_array);
+    for optional in ["zip", "max_chunks"] {
+        assert!(
+            update_schema["properties"][optional].is_object(),
+            "update_db schema is missing {optional}: {update_schema:#?}"
+        );
+        assert!(
+            update_required.is_none_or(|required| !required.contains(&Value::from(optional))),
+            "update_db unexpectedly requires {optional}: {update_schema:#?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
