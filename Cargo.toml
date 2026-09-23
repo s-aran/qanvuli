@@ -2,12 +2,39 @@
 edition = "2024"
 version = "0.1.4"
 license = "MIT"
+repository = "https://github.com/s-aran/qanvuli"
 
 [package]
 name = "qanvuli"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
+description = "Build, query, and enrich a local vulnerability database"
+readme = "README.md"
+keywords = ["cve", "security", "sbom", "vulnerability"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "/app/",
+    "/collector/",
+    "/core/",
+    "/db/",
+    "/design/logo.svg",
+    "/docs/API.md",
+    "/docs/API_J.md",
+    "/fixtures/",
+    "/models/",
+    "/tests/",
+    "/utils/",
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/CONTRIBUTING.md",
+    "/LICENSE",
+    "/README.md",
+    "/README_J.md",
+    "/SECURITY.md",
+]
 
 [features]
 default = ["mcp", "tui"]

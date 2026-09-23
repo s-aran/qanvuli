@@ -36,6 +36,15 @@ Set another location with `--db-url` or `QANVULI_DB_URL`.
 
 ## Install
 
+Install the latest source from GitHub:
+
+```bash
+cargo install --git https://github.com/s-aran/qanvuli --locked qanvuli
+qanvuli --help
+```
+
+To install a local checkout instead:
+
 ```bash
 cargo install --path . --locked
 qanvuli --help

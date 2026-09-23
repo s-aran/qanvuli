@@ -3,6 +3,8 @@ name = "qanvuli-app-mcp"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 qanvuli-app-commands = { version = "*", path = "../commands" }

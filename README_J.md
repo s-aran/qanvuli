@@ -38,6 +38,15 @@ sqlite://./db.sqlite?mode=rwc
 
 ## インストール
 
+GitHub にある最新版のソースからインストールするには、次のコマンドを実行します。
+
+```bash
+cargo install --git https://github.com/s-aran/qanvuli --locked qanvuli
+qanvuli --help
+```
+
+手元にチェックアウトしたソースからインストールする場合は、次のコマンドを実行します。
+
 ```bash
 cargo install --path . --locked
 qanvuli --help

@@ -3,6 +3,8 @@ name = "qanvuli-core"
 version = "0.1.4"
 edition = "2024"
 license = "MIT"
+repository.workspace = true
+publish = false
 
 [dependencies]
 ahash = "0.8"
