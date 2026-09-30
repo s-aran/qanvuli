@@ -3,7 +3,7 @@ use crate::{args::*, common::params::*, db, response};
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, InitializeResult, ServerCapabilities},
     tool, tool_handler, tool_router,
 };
 use simd_json::json;
@@ -572,10 +572,7 @@ impl CveSearchServer {
     #[tool(
         description = "Start a background database update and immediately return a job ID. Only one update may run; another request is rejected with its active job ID. Poll get_update_status for progress. The latest 64 jobs are retained."
     )]
-    pub(crate) async fn update_db(
-        &self,
-        Parameters(args): Parameters<UpdateDbArgs>,
-    ) -> Result<CallToolResult, McpError> {
+    pub(crate) async fn update_db(&self) -> Result<CallToolResult, McpError> {
         let job = self.update_jobs.create().await?;
         let job_id = job.job_id.clone();
         let db_provider = self.db.clone();
@@ -584,14 +581,7 @@ impl CveSearchServer {
             let result = async {
                 let db_guard = db_provider.write().await?;
                 jobs.set_updating(&job_id).await;
-                db::apply_updates(
-                    &db_guard,
-                    args.zip,
-                    args.max_chunks,
-                    args.osv_all.unwrap_or(false),
-                    args.osv_prefixes.as_deref().unwrap_or(&[]),
-                )
-                .await?;
+                db::apply_updates(&db_guard).await?;
                 Ok::<(), McpError>(())
             }
             .await;
@@ -628,11 +618,9 @@ impl CveSearchServer {
 
 #[tool_handler]
 impl ServerHandler for CveSearchServer {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some("Search and update the local qanvuli CVE database.".into());
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info
+    fn get_info(&self) -> InitializeResult {
+        InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions("Search and update the local qanvuli CVE database.")
     }
 }
 

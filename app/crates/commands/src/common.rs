@@ -183,47 +183,18 @@ impl OsvImportSelection {
         }
     }
 
-    /// Builds optional OSV import additions for `update`.
-    pub fn update_additions(include_all: bool, prefixes: &[String]) -> Option<Self> {
-        if include_all {
-            return Some(Self::all());
-        }
-        let id_prefixes = prefixes
-            .iter()
-            .map(|prefix| normalize_osv_prefix(prefix))
-            .collect::<BTreeSet<_>>();
-        (!id_prefixes.is_empty()).then_some(Self {
-            all: false,
-            id_prefixes,
-        })
-    }
-
-    /// Returns a selection containing records selected by either side.
-    pub fn merged_with(&self, other: &Self) -> Self {
-        if self.all || other.all {
-            return Self::all();
-        }
-        let mut id_prefixes = self.id_prefixes.clone();
-        id_prefixes.extend(other.id_prefixes.iter().cloned());
-        Self {
-            all: false,
-            id_prefixes,
-        }
-    }
-
     /// Restores an OSV import selection from metadata stored in the database.
     pub fn from_metadata(value: Option<&str>) -> Option<Self> {
         let value = value?.trim();
         if value.eq_ignore_ascii_case("ALL") {
             return Some(Self::all());
         }
-        let mut id_prefixes = value
+        let id_prefixes = value
             .split(',')
             .map(str::trim)
             .filter(|prefix| !prefix.is_empty())
             .map(normalize_osv_prefix)
             .collect::<BTreeSet<_>>();
-        id_prefixes.extend(required_osv_import_prefixes());
         (!id_prefixes.is_empty()).then_some(Self {
             all: false,
             id_prefixes,
@@ -294,18 +265,6 @@ impl OsvImportSelection {
 
 fn required_osv_import_prefixes() -> BTreeSet<String> {
     BTreeSet::from(["GHSA".to_owned(), "OSV".to_owned()])
-}
-
-#[cfg(test)]
-fn metadata_includes_required_osv_prefixes(value: &str) -> bool {
-    if value.trim().eq_ignore_ascii_case("ALL") {
-        return true;
-    }
-    let prefixes = value
-        .split(',')
-        .map(normalize_osv_prefix)
-        .collect::<BTreeSet<_>>();
-    required_osv_import_prefixes().is_subset(&prefixes)
 }
 
 fn normalize_osv_prefix(prefix: &str) -> String {
@@ -568,9 +527,10 @@ pub async fn sync_osv_with_refresh(
         .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
         .await
         .map_err(|error| format!("{label}: failed to read OSV selection: {error}"))?;
-    let selection_expanded = OsvImportSelection::from_metadata(stored_selection.as_deref())
-        .is_none_or(|stored| stored != selection);
-    let incremental_cursor = (!selection_expanded && !refresh_all)
+    if OsvImportSelection::from_metadata(stored_selection.as_deref()).as_ref() != Some(&selection) {
+        return Err(format!("{label}: OSV sources can only be selected by init"));
+    }
+    let incremental_cursor = (!refresh_all)
         .then_some(previous_cursor.as_deref())
         .flatten();
     let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
@@ -1549,20 +1509,15 @@ pub async fn apply_delta_updates_with_progress(
     Ok(paths)
 }
 
-/// Refreshes OSV using the stored selection plus any newly requested coverage.
-pub async fn sync_osv_after_update(
-    db: &SqlxDatabase,
-    label: &str,
-    requested_osv_additions: Option<&OsvImportSelection>,
-) -> Result<(), String> {
+/// Refreshes only the OSV selection stored by init.
+pub async fn sync_osv_after_update(db: &SqlxDatabase, label: &str) -> Result<(), String> {
     let stored = db
         .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
         .await
         .map_err(|error| format!("{label}: failed to read OSV import selection: {error}"))?;
-    let current = OsvImportSelection::from_metadata(stored.as_deref())
-        .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
-    let selection =
-        requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
+    let Some(selection) = OsvImportSelection::from_metadata(stored.as_deref()) else {
+        return Ok(());
+    };
     sync_osv(db.clone(), label, selection).await.map(|_| ())
 }
 
@@ -1570,12 +1525,11 @@ pub async fn sync_osv_after_update(
 pub async fn sync_all_enrichment_sources_after_update(
     db: &SqlxDatabase,
     label: &str,
-    requested_osv_additions: Option<&OsvImportSelection>,
     cve_changed: bool,
 ) -> Result<(), String> {
     sync_cwe_catalog(db.clone()).await?;
     sync_capec_catalog(db.clone()).await?;
-    sync_osv_after_update(db, label, requested_osv_additions).await?;
+    sync_osv_after_update(db, label).await?;
     sync_risk_feeds(db.clone(), label, cve_changed)
         .await
         .map(|_| ())

@@ -508,21 +508,6 @@ pub(crate) struct QueryPackagesEnrichedArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub(crate) struct UpdateDbArgs {
-    /// Optional local CVE delta zip path to apply. When omitted, the updater downloads applicable CVE delta archives.
-    pub(crate) zip: Option<String>,
-    /// Optional cap on downloaded update chunks. Intended for testing or bounded maintenance runs.
-    #[serde(default, deserialize_with = "deserialize_optional_primitive")]
-    pub(crate) max_chunks: Option<usize>,
-    /// Expand local OSV sync coverage to all OSV records.
-    #[serde(default, deserialize_with = "deserialize_optional_primitive")]
-    pub(crate) osv_all: Option<bool>,
-    /// Additional OSV JSON filename/advisory prefixes from all.zip, case-insensitive.
-    /// Examples: GHSA, PYSEC, RUSTSEC, GO, UBUNTU.
-    pub(crate) osv_prefixes: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct GetUpdateStatusArgs {
     /// Job ID returned by update_db.
     pub(crate) job_id: String,
@@ -548,7 +533,7 @@ impl CweArgValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{CvssArgs, CweArgs, GetCapecArgs, QueryPackageEnrichedArgs, UpdateDbArgs};
+    use super::{CvssArgs, CweArgs, GetCapecArgs, QueryPackageEnrichedArgs};
     use rmcp::handler::server::wrapper::Parameters;
 
     fn package_args(limit: serde_json::Value, offset: serde_json::Value) -> serde_json::Value {
@@ -588,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn floating_point_boolean_and_usize_arguments_accept_strings() {
+    fn floating_point_and_boolean_arguments_accept_strings() {
         let cvss: CvssArgs = serde_json::from_value(serde_json::json!({
             "min_score": "7.5",
             "max_score": "9",
@@ -607,14 +592,6 @@ mod tests {
         assert_eq!(capec.include_references, Some(true));
         assert_eq!(capec.include_taxonomy, Some(false));
         assert_eq!(capec.include_history, Some(true));
-
-        let update: UpdateDbArgs = serde_json::from_value(serde_json::json!({
-            "max_chunks": "12",
-            "osv_all": "true",
-        }))
-        .unwrap();
-        assert_eq!(update.max_chunks, Some(12));
-        assert_eq!(update.osv_all, Some(true));
     }
 
     #[test]
