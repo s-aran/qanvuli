@@ -25,6 +25,7 @@ pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
         Line::from("Enter       Search"),
         Line::from("Tab          Change pane"),
         Line::from("Shift+Tab    Change pane backward"),
+        Line::from("Space        Toggle exact vendor/product match"),
         Line::from("F2 / ← / →   Change search mode"),
         Line::from("F3           Advanced search"),
         Line::from("F4           Display settings"),

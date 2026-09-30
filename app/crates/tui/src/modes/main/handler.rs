@@ -50,16 +50,19 @@ pub(crate) fn handle_key(app: &mut App, db: Option<CveDatabase>, key: &KeyEvent)
                 app.start_search(db);
             }
         }
-        KeyCode::Tab => app.toggle_focus(),
-        KeyCode::BackTab => app.previous_focus(),
+        KeyCode::Tab => app.next_main_focus(),
+        KeyCode::BackTab => app.previous_main_focus(),
         KeyCode::Left if app.main.focus == PaneFocus::Right => app.previous_right_tab(),
         KeyCode::Right if app.main.focus == PaneFocus::Right => app.next_right_tab(),
         KeyCode::Left => app.previous_search_mode(),
         KeyCode::Right => app.next_search_mode(),
-        KeyCode::Backspace if app.main.focus == PaneFocus::Left => {
+        KeyCode::Char(' ') if app.main.focus == PaneFocus::Left && app.main.exact_match_focus => {
+            app.toggle_exact_match();
+        }
+        KeyCode::Backspace if app.main.focus == PaneFocus::Left && !app.main.exact_match_focus => {
             app.backspace_query();
         }
-        KeyCode::Char(ch) if app.main.focus == PaneFocus::Left => {
+        KeyCode::Char(ch) if app.main.focus == PaneFocus::Left && !app.main.exact_match_focus => {
             app.push_query(ch);
         }
         KeyCode::Down => {
@@ -111,5 +114,36 @@ mod tests {
 
         assert!(app.overlay.show_help);
         assert!(app.main.query.is_empty());
+    }
+
+    #[test]
+    fn product_exact_checkbox_is_focused_with_tab_and_toggled_with_space() {
+        let mut app = App::new("product".to_owned(), 25);
+        app.main.search_mode = crate::mode::SearchMode::Product;
+        app.main.search_mode_explicit = true;
+
+        handle_key(
+            &mut app,
+            None,
+            &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert_eq!(app.main.focus, PaneFocus::Left);
+        assert!(app.main.exact_match_focus);
+
+        handle_key(
+            &mut app,
+            None,
+            &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        );
+        assert!(app.main.exact_match);
+        assert_eq!(app.main.query, "product");
+
+        handle_key(
+            &mut app,
+            None,
+            &KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert_eq!(app.main.focus, PaneFocus::Right);
+        assert!(!app.main.exact_match_focus);
     }
 }

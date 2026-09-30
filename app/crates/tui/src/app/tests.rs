@@ -125,6 +125,54 @@ async fn hyphenated_product_input_stays_in_product_mode() {
     app.abort_search();
 }
 
+#[tokio::test]
+async fn main_product_and_vendor_exact_match_use_exact_search_fields() {
+    let database = CveDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize_schema().await.unwrap();
+    let mut app = App::new("  example-product  ".to_owned(), 25);
+    app.main.search_mode = SearchMode::Product;
+    app.main.search_mode_explicit = true;
+    app.main.exact_match = true;
+
+    app.start_search(database.clone());
+    match &app.main.searched_request {
+        SearchRequest::Advanced {
+            options,
+            include_cve,
+            include_osv,
+            ..
+        } => {
+            assert_eq!(options.product_exact.as_deref(), Some("example-product"));
+            assert!(options.product.is_none());
+            assert!(options.query.is_none());
+            assert!(*include_cve);
+            assert!(*include_osv);
+        }
+        SearchRequest::Query { .. } => panic!("exact product search used substring matching"),
+    }
+    app.abort_search();
+
+    app.main.query = "Example Vendor".to_owned();
+    app.main.search_mode = SearchMode::Vendor;
+    app.start_search(database);
+    match &app.main.searched_request {
+        SearchRequest::Advanced {
+            options,
+            include_cve,
+            include_osv,
+            ..
+        } => {
+            assert_eq!(options.vendor_exact.as_deref(), Some("Example Vendor"));
+            assert!(options.vendor.is_none());
+            assert!(options.query.is_none());
+            assert!(*include_cve);
+            assert!(!*include_osv);
+        }
+        SearchRequest::Query { .. } => panic!("exact vendor search used substring matching"),
+    }
+    app.abort_search();
+}
+
 #[test]
 fn explicit_and_inferred_search_modes_are_distinct() {
     let mut inferred = App::new(String::new(), 25);

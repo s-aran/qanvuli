@@ -229,7 +229,29 @@ impl App {
         self.sync_advanced_from_main();
         let sort_order = self.main.display.sort_order();
         let term = SearchTerm::new(self.main.search_mode, self.main.query.clone());
-        let request = if !self.main.query.trim().is_empty() {
+        let exact_match = self.main.exact_match
+            && matches!(
+                self.main.search_mode,
+                SearchMode::Product | SearchMode::Vendor
+            )
+            && !self.main.query.trim().is_empty();
+        let request = if exact_match {
+            let query = self.main.query.trim().to_owned();
+            let mut options = self.main_search_options(sort_order);
+            options.query = None;
+            match self.main.search_mode {
+                SearchMode::Product => options.product_exact = Some(query),
+                SearchMode::Vendor => options.vendor_exact = Some(query),
+                _ => unreachable!("exact matching is limited to product and vendor searches"),
+            }
+            SearchRequest::Advanced {
+                options,
+                include_cve: true,
+                include_osv: self.main.search_mode == SearchMode::Product,
+                osv_families: Vec::new(),
+                ecosystems: None,
+            }
+        } else if !self.main.query.trim().is_empty() {
             SearchRequest::Query {
                 term,
                 state_scope: self.main.state_scope,
@@ -1459,6 +1481,24 @@ impl App {
         };
     }
 
+    pub(super) fn next_main_focus(&mut self) {
+        match self.main.focus {
+            PaneFocus::Left
+                if self.main.exact_match_available() && !self.main.exact_match_focus =>
+            {
+                self.main.exact_match_focus = true;
+            }
+            PaneFocus::Left => {
+                self.main.exact_match_focus = false;
+                self.main.focus = PaneFocus::Right;
+            }
+            PaneFocus::Right => {
+                self.main.focus = PaneFocus::Left;
+                self.main.exact_match_focus = false;
+            }
+        }
+    }
+
     pub(super) fn toggle_cwe_focus(&mut self) {
         self.main.focus = match self.main.focus {
             PaneFocus::Left => PaneFocus::Right,
@@ -1471,6 +1511,24 @@ impl App {
             PaneFocus::Left => PaneFocus::Right,
             PaneFocus::Right => PaneFocus::Left,
         };
+    }
+
+    pub(super) fn previous_main_focus(&mut self) {
+        match self.main.focus {
+            PaneFocus::Left if self.main.exact_match_focus => {
+                self.main.exact_match_focus = false;
+            }
+            PaneFocus::Left => {
+                self.main.focus = PaneFocus::Right;
+            }
+            PaneFocus::Right if self.main.exact_match_available() => {
+                self.main.focus = PaneFocus::Left;
+                self.main.exact_match_focus = true;
+            }
+            PaneFocus::Right => {
+                self.main.focus = PaneFocus::Left;
+            }
+        }
     }
 
     pub(super) fn next_right_tab(&mut self) {
@@ -1592,13 +1650,21 @@ impl App {
     pub(super) fn next_search_mode(&mut self) {
         self.main.search_mode = self.main.search_mode.next();
         self.main.search_mode_explicit = true;
+        self.main.clear_unavailable_exact_match_focus();
         self.sync_advanced_from_main();
     }
 
     pub(super) fn previous_search_mode(&mut self) {
         self.main.search_mode = self.main.search_mode.previous();
         self.main.search_mode_explicit = true;
+        self.main.clear_unavailable_exact_match_focus();
         self.sync_advanced_from_main();
+    }
+
+    pub(super) fn toggle_exact_match(&mut self) {
+        if self.main.exact_match_available() {
+            self.main.exact_match = !self.main.exact_match;
+        }
     }
 
     pub(super) fn push_query(&mut self, ch: char) {
@@ -1831,6 +1897,7 @@ impl App {
         self.main.search_mode = self.main.advanced.query_mode;
         self.main.search_mode_explicit = true;
         self.main.state_scope = self.main.advanced.state_scope;
+        self.main.clear_unavailable_exact_match_focus();
         self.scroll_detail_to_top();
     }
 
@@ -1846,6 +1913,7 @@ impl App {
         }
         self.main.search_mode =
             SearchMode::from_query_prefix(&self.main.query).unwrap_or(SearchMode::FreeText);
+        self.main.clear_unavailable_exact_match_focus();
     }
 
     fn main_search_options(&self, sort_order: CveSummarySortOrder) -> CveAdvancedSearch {
