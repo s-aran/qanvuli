@@ -23,7 +23,7 @@ impl StatusLine for MainStatusLine {
             status.to_owned()
         };
         format!(
-            "F1/? help | Enter search | {activity} | {}/{} | {} | DB {db_as_of} {} | {}",
+            "{activity} | {}/{} | {} | DB {db_as_of} {} | {}",
             app.main.display.sort_field.label(),
             app.main.display.sort_direction.label(),
             app.main.state_scope.label(),

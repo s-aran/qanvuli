@@ -20,10 +20,10 @@ use ratatui::{
 };
 
 pub(crate) fn draw_help(frame: &mut ratatui::Frame<'_>) {
-    let area = centered_size(72, 22, frame.area());
+    let area = centered_size(72, 25, frame.area());
     let help = Paragraph::new(vec![
         Line::from("Enter       Search"),
-        Line::from("Tab          Change pane"),
+        Line::from("Tab          Change pane (full width on narrow terminals)"),
         Line::from("Shift+Tab    Change pane backward"),
         Line::from("Space        Toggle exact vendor/product match"),
         Line::from("F2 / ← / →   Change search mode"),

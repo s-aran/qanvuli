@@ -54,7 +54,7 @@ impl SearchMode {
 
     pub(super) fn footer_text(self) -> &'static str {
         match self {
-            Self::FreeText => "free text",
+            Self::FreeText => "free text · AND",
             Self::Product => "product",
             Self::Vendor => "vendor",
             Self::Cwe => "CWE",
