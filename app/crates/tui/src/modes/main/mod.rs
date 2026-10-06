@@ -83,11 +83,15 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
 
     fn screen(width: u16, height: u16, focus: PaneFocus) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut app = App::new(String::new(), 25);
         app.main.focus = focus;
+        render_app(width, height, &mut app)
+    }
+
+    fn render_app(width: u16, height: u16, app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &mut app, &DetailSearch::new("")))
+            .draw(|frame| draw(frame, app, &DetailSearch::new("")))
             .unwrap();
         terminal
             .backend()
@@ -123,5 +127,42 @@ mod tests {
             screen(width, height, PaneFocus::Left);
             screen(width, height, PaneFocus::Right);
         }
+    }
+
+    #[test]
+    fn readme_layout_changes_at_exactly_100_columns() {
+        for width in [80, 99, 100, 120] {
+            let rendered = screen(width, 24, PaneFocus::Left);
+            assert!(rendered.contains("Results 0/0"));
+            assert_eq!(rendered.contains("Metadata"), width >= 100);
+        }
+    }
+
+    #[test]
+    fn readme_queries_show_free_text_and_in_the_search_field() {
+        for query in ["", "openssl", "remote execution"] {
+            let mut app = App::new(query.to_owned(), 25);
+            let rendered = render_app(80, 24, &mut app);
+            assert!(rendered.contains("Search [free text · AND] - limit 25"));
+            if !query.is_empty() {
+                assert!(rendered.contains(&format!("{query}▏")));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_product_view_switches_only_after_the_checkbox() {
+        let mut app = App::new("openssl".to_owned(), 25);
+        app.main.search_mode = crate::mode::SearchMode::Product;
+        app.next_main_focus();
+        let checkbox = render_app(80, 24, &mut app);
+        assert!(checkbox.contains("Results 0/0"));
+        assert!(checkbox.contains("Space toggle exact"));
+        app.next_main_focus();
+        let details = render_app(80, 24, &mut app);
+        assert!(!details.contains("Results 0/0"));
+        assert!(details.contains("Metadata"));
+        app.previous_main_focus();
+        assert!(render_app(80, 24, &mut app).contains("Space toggle exact"));
     }
 }
