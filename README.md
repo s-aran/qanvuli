@@ -22,7 +22,7 @@ API documentation: [English](./docs/API.md) · [日本語](./docs/API_J.md)
 
 ## Requirements
 
-- A Rust toolchain with edition 2024 support.
+- A recent stable Rust toolchain. Current dependencies require at least Rust 1.88; edition 2024 support alone is insufficient. The minimum version for the complete dependency graph has not been established.
 - Network access for feed downloads.
 - Enough temporary and database storage for the CVE archive.
 
@@ -67,13 +67,15 @@ qanvuli init
 Use an existing CVE archive or reduce peak disk use:
 
 ```bash
-qanvuli init --zip ./data/all-cves.zip
+qanvuli init --zip ./data/2026-07-18_all_CVEs_at_midnight.zip.zip
 qanvuli init --delete-existing
 qanvuli init --eager-cleanup
 qanvuli init --no-progress
 ```
 
 `init` normally builds a candidate beside the active database, checks its required schema and bounded search sentinels, and closes it before installation. Before moving the active database to a rollback backup, qanvuli checkpoints its WAL and refuses replacement if the database cannot be closed safely. A failed build leaves the active database unchanged. Run initialization while other SQLite users are stopped.
+
+For `init --zip`, keep the archive's original distribution filename and use the file you actually downloaded; the date above is an example. Normal full initialization derives its update cursor from the leading `YYYY-MM-DD` and requires `_all_` in the filename. Renaming the archive to `all-cves.zip` causes initialization to fail.
 
 An archive supplied with `init --zip` is a user-owned local file and is never removed automatically. `--keep` applies only to the CVE archive downloaded automatically when `--zip` is omitted.
 
@@ -171,23 +173,38 @@ Database files are derived artifacts. Unsupported schemas are not patched in pla
 ```bash
 qanvuli tui
 qanvuli tui openssl
+qanvuli tui 'remote execution'
 ```
 
-Common keys:
+In `free text · AND` mode, space-separated terms are combined with AND. For example, `remote execution` requires both search tokens, in any order. Each token uses prefix matching.
+
+Punctuation also separates tokens, and single ASCII letters or digits are discarded before the remaining tokens are combined. Search mode is detected automatically until you select one explicitly; text containing a hyphen can switch to identifier search. Use `F2` to select `free text · AND` when needed.
+
+The main search screen has a full-width search field and keeps the end of long input visible. Results show the current selection position, and the bottom row shows keys for the current focus. At widths of 100 columns or more, results and details appear side by side. On narrower terminals, the focused pane fills the width; use `Tab` to switch between them.
+
+In vendor/product mode, focus moves from the search field to the exact-match checkbox and then to details. Moving to the checkbox does not switch the visible pane.
+
+Keys on the main search screen:
 
 - `Enter`: search
-- `Tab`: change pane
+- `Tab` / `Shift+Tab`: focus the next / previous control or pane
+- `Space`: toggle exact matching when the vendor/product checkbox is focused
+- `↑` / `↓`: select a result or scroll details, depending on focus
+- `←` / `→`: change the search mode on the left or the detail tab on the right
+- `PageUp` / `PageDown`: move by a page
 - `/`: find in details
 - `F1`: help
 - `F2`: change search mode
 - `F3`: advanced search
-- `F4`: display settings or catalog filters
+- `F4`: display settings
 - `F5`: database maintenance
 - `F8`: raw CVE or OSV JSON
 - `F9`: CWE catalog
 - `F10`: CAPEC catalog
-- `Esc`: close a popup or leave the current mode
-- `Ctrl-C`: quit
+- `Esc`: close a popup; from JSON, CWE, or CAPEC views, return to the main screen; no action on the normal main screen
+- `Ctrl-C`: quit, except while database maintenance is running
+
+Catalogs and popups have their own key bindings. For example, `←` / `→` navigate relationships in the CWE catalog. While database maintenance is running, key input is ignored.
 
 ## CVSS calculator
 
@@ -217,7 +234,7 @@ qanvuli mcp
 
 The stdio server exposes local CVE, CWE, CAPEC, OSV, KEV, and EPSS queries plus database updates. Package queries omit detailed match evidence by default; request evidence only when match details are needed.
 
-MCP searches use four independent SQLite read connections by default so concurrent tool calls do not queue behind one slow query. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. One update runs at a time; additional update requests are rejected with the active job ID. The most recent 64 job records are retained. File-backed WAL readers remain available during downloads and see committed update batches; multiple reads are not a snapshot of the entire update. HTTP downloads have a 15-second connection deadline, a 60-second idle read deadline, and a one-hour total deadline (blocking downloads use the connection and total deadlines).
+MCP searches use four independent SQLite read connections by default to reduce waiting behind slow queries. Connections are assigned in rotation, so a request can still wait when its assigned connection is busy. Set `QANVULI_MCP_READ_CONNECTIONS` to a value from 1 through 8 to tune this for the available memory and storage throughput. One update runs at a time; additional update requests are rejected with the active job ID. The most recent 64 job records are retained. File-backed WAL readers remain available during downloads and see committed update batches; multiple reads are not a snapshot of the entire update. HTTP downloads have a 15-second connection deadline, a 60-second idle read deadline, and a one-hour total deadline (blocking downloads use the connection and total deadlines).
 
 The `analyze_cvss_vector` tool validates a complete version-prefixed CVSS v2.0, v3.0, v3.1, or v4.0 vector and returns its base score, base severity, and expanded metrics without querying the database.
 
