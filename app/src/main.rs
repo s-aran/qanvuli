@@ -292,11 +292,19 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut normalized = Vec::new();
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         let Some(value) = arg.to_str() else {
             normalized.push(arg);
             continue;
         };
+        // Let clap handle help and everything after the end-of-options marker.
+        // In particular, later OSV flags must not prevent help from being shown.
+        if matches!(value, "--help" | "-h" | "--") {
+            normalized.push(arg);
+            normalized.extend(args);
+            break;
+        }
         if value == "--osv-all" || value == "--osv-refresh-all" {
             normalized.push(arg);
             continue;
@@ -351,6 +359,52 @@ fn locale_is_utf8() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_help_is_not_blocked_by_later_osv_validation() {
+        for help in ["--help", "-h"] {
+            for flag in [
+                "--osv-prefix",
+                "--osv-source",
+                "--osv-full-snapshot",
+                "--osv-ghsa=true",
+                "--osv-",
+            ] {
+                let normalized =
+                    normalize_osv_prefix_flags(["qanvuli", "init", help, flag].map(OsString::from))
+                        .unwrap();
+                let error = Cli::try_parse_from(normalized).unwrap_err();
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                assert!(error.to_string().contains("--osv-ghsa"));
+            }
+        }
+    }
+
+    #[test]
+    fn init_help_works_with_osv_sources() {
+        for help in ["--help", "-h"] {
+            let normalized = normalize_osv_prefix_flags(
+                [
+                    "qanvuli",
+                    "init",
+                    "--osv-ghsa",
+                    "--osv-pysec",
+                    "--osv-all",
+                    help,
+                ]
+                .map(OsString::from),
+            )
+            .unwrap();
+            let error = Cli::try_parse_from(normalized).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+        }
+    }
+
+    #[test]
+    fn osv_normalization_respects_end_of_options() {
+        let args = ["qanvuli", "init", "--", "--osv-prefix"].map(OsString::from);
+        assert_eq!(normalize_osv_prefix_flags(args.clone()).unwrap(), args);
+    }
 
     #[test]
     fn osv_refresh_all_is_a_real_option_not_a_dynamic_source_prefix() {
