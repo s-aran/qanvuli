@@ -32,18 +32,77 @@ pub use database::{
 pub const DEFAULT_LIMIT: u64 = 25;
 
 /// Help text for dynamic OSV source prefix flags such as `--osv-ghsa`.
-pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
-  Select sources with repeatable --osv-{prefix} flags. Prefixes are case-insensitive.
+pub const OSV_SOURCE_PREFIX_HELP: &str = r"OSV source DB prefix flags:
+  Select records by advisory ID prefix (not by package ecosystem).
+  GHSA and OSV are always included. Add sources with --osv-{prefix},
+  or use --osv-all for all sources. Prefixes are case-insensitive.
+  Example: qanvuli init --osv-rustsec --osv-pysec
+  --osv-cve selects OSV records; the CVE archive is imported separately.
 
-  --osv-alba --osv-alea --osv-alpine --osv-alsa --osv-asb-a --osv-bell --osv-bit
-  --osv-cga --osv-cleanstart --osv-curl --osv-cve --osv-debian --osv-dhi --osv-dla
-  --osv-drupal --osv-dsa --osv-dtsa --osv-echo --osv-eef --osv-ela --osv-ghsa
-  --osv-go --osv-gsd --osv-hsec --osv-jlsec --osv-kube --osv-lbsec --osv-lsn
-  --osv-mal --osv-mgasa --osv-mini --osv-oesa --osv-opensuse-su --osv-osec
-  --osv-osv --osv-phsa --osv-psf --osv-pub-a --osv-pysec --osv-rhba --osv-rhea
-  --osv-rhsa --osv-rlsa --osv-root --osv-rsec --osv-rustsec --osv-rxsa
-  --osv-suse-fu --osv-suse-ou --osv-suse-ru --osv-suse-su --osv-ubuntu --osv-usn --osv-v8
-"#;
+  Always included (default):
+    --osv-ghsa           GitHub advisories
+    --osv-osv            OSV.dev / OSS-Fuzz
+
+  Language and package ecosystems:
+    --osv-go             Go
+    --osv-hsec           Haskell
+    --osv-jlsec          Julia
+    --osv-osec           OCaml
+    --osv-psf            Python Software Foundation
+    --osv-pysec          PyPI packages
+    --osv-rsec           R Consortium
+    --osv-rustsec        RustSec / Rust crates
+    --osv-mal            Malicious packages
+
+  Linux distributions:
+    --osv-alba           AlmaLinux bug fixes
+    --osv-alea           AlmaLinux enhancements
+    --osv-alsa           AlmaLinux security advisories
+    --osv-alpine         Alpine Linux
+    --osv-debian         Debian CVE tracker
+    --osv-dla            Debian LTS
+    --osv-dsa            Debian
+    --osv-dtsa           Debian testing
+    --osv-ela            Debian extended LTS
+    --osv-lsn            Ubuntu Livepatch
+    --osv-mgasa          Mageia
+    --osv-oesa           openEuler
+    --osv-opensuse-su    openSUSE security updates
+    --osv-phsa           Photon OS
+    --osv-rhba           Red Hat bug fixes
+    --osv-rhea           Red Hat enhancements
+    --osv-rhsa           Red Hat security advisories
+    --osv-rlsa           Rocky Linux
+    --osv-rxsa           Rocky Linux
+    --osv-suse-fu        SUSE feature updates
+    --osv-suse-ou        SUSE optional updates
+    --osv-suse-ru        SUSE recommended updates
+    --osv-suse-su        SUSE security updates
+    --osv-ubuntu         Ubuntu CVE reports
+    --osv-usn            Ubuntu notices
+
+  Products and container images:
+    --osv-asb-a          Android
+    --osv-pub-a          Android
+    --osv-bell           BellSoft
+    --osv-bit            Bitnami
+    --osv-cga            Chainguard
+    --osv-cleanstart     CleanStart
+    --osv-curl           curl
+    --osv-dhi            Docker Hardened Images
+    --osv-drupal         Drupal
+    --osv-echo           Echo
+    --osv-eef            Erlang Ecosystem Foundation
+    --osv-kube           Kubernetes
+    --osv-lbsec          LoopBack
+    --osv-mini           Minimus
+    --osv-root           Root.io
+    --osv-v8             V8 / Chromium
+
+  Cross-ecosystem databases:
+    --osv-cve            NVD records provided by OSV.dev
+    --osv-gsd            Global Security Database
+";
 
 const INGEST_CHUNK_SIZE: usize = 20_000;
 const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
