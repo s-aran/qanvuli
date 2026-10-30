@@ -899,7 +899,10 @@ fn read_osv_zip_batches(
         let mut entry = archive
             .by_index(index)
             .map_err(|err| format!("failed to read OSV zip entry {index}: {err}"))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|err| format!("failed to decode OSV zip entry name {index}: {err}"))?
+            .into_owned();
         if !name.ends_with(".json") {
             continue;
         }
