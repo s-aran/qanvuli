@@ -1506,13 +1506,6 @@ impl App {
         };
     }
 
-    pub(super) fn previous_focus(&mut self) {
-        self.main.focus = match self.main.focus {
-            PaneFocus::Left => PaneFocus::Right,
-            PaneFocus::Right => PaneFocus::Left,
-        };
-    }
-
     pub(super) fn previous_main_focus(&mut self) {
         match self.main.focus {
             PaneFocus::Left if self.main.exact_match_focus => {
