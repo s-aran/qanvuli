@@ -3,6 +3,8 @@ name = "qanvuli-db"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+publish = false
 
 [dependencies]
 anyhow = "1.0"
@@ -22,7 +24,7 @@ serde = { version = "1.0", features = ["derive", "serde_derive"] }
 serde_json = "1.0"
 semver = { version = "1.0", features = ["serde"] }
 pep440_rs = "0.7"
-simd-json = { version = "0.18", features = ["ahash"] }
+simd-json = { version = "0.19", features = ["ahash"] }
 thiserror = "2.0"
 tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"

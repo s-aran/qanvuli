@@ -26,3 +26,14 @@ target
 **/target
 
 cves/
+
+# Local vulnerability data and downloaded feed archives
+/db.sqlite
+/db.sqlite-*
+/db.sqlite.*
+/cwec_*.xml.zip
+/capec_*.xml
+/deltaCves/
+
+# Local editor settings
+/.vscode/

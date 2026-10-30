@@ -213,6 +213,7 @@ fn assert_lists_enriched_package_tool(response: &Value) {
         "query_package_enriched",
         "evaluate_affected",
         "get_cwes",
+        "update_db",
         "get_update_status",
     ] {
         assert!(
@@ -259,6 +260,22 @@ fn assert_lists_enriched_package_tool(response: &Value) {
     assert!(
         cwe_items.get("anyOf").is_some(),
         "CWE array element schema was empty: {cwe_items:#?}"
+    );
+
+    let update_schema = tool_schema("update_db");
+    assert_eq!(
+        update_schema["properties"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(0),
+        "update_db must not expose input properties: {update_schema:#?}"
+    );
+    assert!(
+        update_schema
+            .get("required")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "update_db must not require input properties: {update_schema:#?}"
     );
 }
 

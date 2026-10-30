@@ -1,14 +1,13 @@
 use super::common::{
-    CveArchiveOwnership, IngestProgress, IngestProgressCallback, OSV_SOURCE_PREFIX_HELP,
-    OsvImportSelection, apply_delta_updates, apply_delta_updates_with_progress,
-    cleanup_processed_cve_archive, connect_database, import_cve_zip, import_cve_zip_with_progress,
-    sync_capec_catalog, sync_cwe_catalog, sync_osv_with_refresh, sync_risk_feeds,
+    CveArchiveOwnership, IngestProgress, IngestProgressCallback, OsvImportSelection,
+    apply_delta_updates, apply_delta_updates_with_progress, cleanup_processed_cve_archive,
+    connect_database, import_cve_zip, import_cve_zip_with_progress, sync_capec_catalog,
+    sync_cwe_catalog, sync_osv_with_refresh, sync_risk_feeds,
 };
 use std::path::PathBuf;
 
 /// CLI arguments for `qanvuli update`.
 #[derive(Debug, Default, clap::Args)]
-#[command(after_help = OSV_SOURCE_PREFIX_HELP)]
 pub struct Args {
     /// Print detailed logs instead of progress bars.
     #[arg(long)]
@@ -22,11 +21,6 @@ pub struct Args {
     /// Keep automatically downloaded CVE archives after import. Has no effect on --zip.
     #[arg(long)]
     keep: bool,
-    /// Update all OSV source databases.
-    #[arg(long)]
-    osv_all: bool,
-    #[arg(long = "osv-source", value_name = "PREFIX", hide = true)]
-    osv_prefixes: Vec<String>,
     /// Redownload selected OSV snapshots and upsert every record. Absent records are not deleted.
     #[arg(long)]
     osv_refresh_all: bool,
@@ -41,9 +35,7 @@ impl Args {
     /// Returns the remote resources fetched during this update.
     pub fn download_targets(&self) -> Vec<String> {
         if self.zip.is_some() {
-            return OsvImportSelection::update_additions(self.osv_all, &self.osv_prefixes)
-                .map(|selection| vec![format!("OSV snapshots ({})", selection.description())])
-                .unwrap_or_default();
+            return Vec::new();
         }
 
         vec![
@@ -77,8 +69,6 @@ pub async fn run_update(
     zip: Option<PathBuf>,
     max_chunks: Option<usize>,
     keep: bool,
-    osv_all: bool,
-    osv_prefixes: Vec<String>,
 ) -> Result<(), String> {
     run(
         db_url,
@@ -87,8 +77,6 @@ pub async fn run_update(
             zip,
             max_chunks,
             keep,
-            osv_all,
-            osv_prefixes,
             osv_refresh_all: false,
         },
     )
@@ -125,24 +113,6 @@ async fn run_with_progress(
         )
         .await
         .map_err(|error| format!("failed to record local delta asset: {error}"))?;
-        if let Some(additions) =
-            OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes)
-        {
-            emit_update_progress(&progress, "-", "synchronizing OSV advisories");
-            let stored = db
-                .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
-                .await
-                .map_err(|error| format!("failed to read OSV selection: {error}"))?;
-            let current = OsvImportSelection::from_metadata(stored.as_deref())
-                .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
-            sync_osv_with_refresh(
-                db.clone(),
-                "update",
-                current.merged_with(&additions),
-                args.osv_refresh_all,
-            )
-            .await?;
-        }
         emit_update_progress(&progress, "-", "validating database");
         db.check_search_integrity_quick()
             .await
@@ -175,14 +145,11 @@ async fn run_with_progress(
             .metadata_value(super::common::OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
             .await
             .map_err(|error| format!("failed to read OSV selection: {error}"))?;
-        let selection = OsvImportSelection::from_metadata(saved_selection.as_deref())
-            .unwrap_or_else(|| OsvImportSelection::default_init(args.osv_all, &args.osv_prefixes));
-        let additions = OsvImportSelection::update_additions(args.osv_all, &args.osv_prefixes);
-        let selection = additions.map_or(selection.clone(), |additions| {
-            selection.merged_with(&additions)
-        });
-        emit_update_progress(&progress, "-", "synchronizing OSV advisories");
-        sync_osv_with_refresh(sqlx_db.clone(), "update", selection, args.osv_refresh_all).await?;
+        if let Some(selection) = OsvImportSelection::from_metadata(saved_selection.as_deref()) {
+            emit_update_progress(&progress, "-", "synchronizing OSV advisories");
+            sync_osv_with_refresh(sqlx_db.clone(), "update", selection, args.osv_refresh_all)
+                .await?;
+        }
         emit_update_progress(&progress, "-", "synchronizing risk feeds");
         sync_risk_feeds(sqlx_db.clone(), "update", cve_changed).await?;
         emit_update_progress(&progress, "-", "validating database");
@@ -263,6 +230,16 @@ mod tests {
     struct UpdateCli {
         #[command(flatten)]
         args: Args,
+    }
+
+    #[test]
+    fn update_rejects_osv_source_selection() {
+        for flags in [vec!["--osv-all"], vec!["--osv-source", "pysec"]] {
+            let mut args = vec!["update"];
+            args.extend(flags);
+            assert!(UpdateCli::try_parse_from(args).is_err());
+        }
+        assert!(UpdateCli::try_parse_from(["update", "--osv-refresh-all"]).is_ok());
     }
 
     #[test]

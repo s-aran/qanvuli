@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Weakness_Catalog Name="CWE" Version="test" Date="2099-01-01">
+  <Weaknesses>
+    <Weakness ID="100" Name="Fixture parent" Abstraction="Class" Structure="Simple" Status="Stable">
+      <Description>Stable parent used by the database integration tests.</Description>
+      <Mapping_Notes>
+        <Usage>Allowed</Usage>
+        <Rationale>Deterministic test fixture.</Rationale>
+        <Comments>Not production catalog data.</Comments>
+        <Reasons><Reason Type="Acceptable-Use" /></Reasons>
+      </Mapping_Notes>
+      <Content_History>
+        <Submission>
+          <Submission_Name>qanvuli tests</Submission_Name>
+          <Submission_Date>2099-01-01</Submission_Date>
+          <Submission_Version>1</Submission_Version>
+          <Submission_ReleaseDate>2099-01-01</Submission_ReleaseDate>
+        </Submission>
+      </Content_History>
+    </Weakness>
+    <Weakness ID="101" Name="Fixture child" Abstraction="Base" Structure="Simple" Status="Draft">
+      <Description>Draft child used to verify tree ordering and relation counts.</Description>
+      <Related_Weaknesses>
+        <Related_Weakness Nature="ChildOf" CWE_ID="100" View_ID="1000" />
+      </Related_Weaknesses>
+      <Mapping_Notes>
+        <Usage>Allowed-with-Review</Usage>
+        <Rationale>Deterministic test fixture.</Rationale>
+        <Comments>Not production catalog data.</Comments>
+        <Reasons><Reason Type="Acceptable-Use" /></Reasons>
+      </Mapping_Notes>
+      <Content_History>
+        <Submission>
+          <Submission_Name>qanvuli tests</Submission_Name>
+          <Submission_Date>2099-01-01</Submission_Date>
+          <Submission_Version>1</Submission_Version>
+          <Submission_ReleaseDate>2099-01-01</Submission_ReleaseDate>
+        </Submission>
+      </Content_History>
+    </Weakness>
+    <Weakness ID="102" Name="Fixture deprecated" Abstraction="Variant" Structure="Simple" Status="Deprecated">
+      <Description>Deprecated entry used to verify status filtering.</Description>
+      <Mapping_Notes>
+        <Usage>Discouraged</Usage>
+        <Rationale>Deterministic test fixture.</Rationale>
+        <Comments>Not production catalog data.</Comments>
+        <Reasons><Reason Type="Deprecated" /></Reasons>
+      </Mapping_Notes>
+      <Content_History>
+        <Submission>
+          <Submission_Name>qanvuli tests</Submission_Name>
+          <Submission_Date>2099-01-01</Submission_Date>
+          <Submission_Version>1</Submission_Version>
+          <Submission_ReleaseDate>2099-01-01</Submission_ReleaseDate>
+        </Submission>
+      </Content_History>
+    </Weakness>
+  </Weaknesses>
+</Weakness_Catalog>

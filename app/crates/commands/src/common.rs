@@ -32,18 +32,77 @@ pub use database::{
 pub const DEFAULT_LIMIT: u64 = 25;
 
 /// Help text for dynamic OSV source prefix flags such as `--osv-ghsa`.
-pub const OSV_SOURCE_PREFIX_HELP: &str = r#"OSV source DB prefix flags:
-  Select sources with repeatable --osv-{prefix} flags. Prefixes are case-insensitive.
+pub const OSV_SOURCE_PREFIX_HELP: &str = r"OSV source DB prefix flags:
+  Select records by advisory ID prefix (not by package ecosystem).
+  GHSA and OSV are always included. Add sources with --osv-{prefix},
+  or use --osv-all for all sources. Prefixes are case-insensitive.
+  Example: qanvuli init --osv-rustsec --osv-pysec
+  --osv-cve selects OSV records; the CVE archive is imported separately.
 
-  --osv-alba --osv-alea --osv-alpine --osv-alsa --osv-asb-a --osv-bell --osv-bit
-  --osv-cga --osv-cleanstart --osv-curl --osv-cve --osv-debian --osv-dhi --osv-dla
-  --osv-drupal --osv-dsa --osv-dtsa --osv-echo --osv-eef --osv-ela --osv-ghsa
-  --osv-go --osv-gsd --osv-hsec --osv-jlsec --osv-kube --osv-lbsec --osv-lsn
-  --osv-mal --osv-mgasa --osv-mini --osv-oesa --osv-opensuse-su --osv-osec
-  --osv-osv --osv-phsa --osv-psf --osv-pub-a --osv-pysec --osv-rhba --osv-rhea
-  --osv-rhsa --osv-rlsa --osv-root --osv-rsec --osv-rustsec --osv-rxsa
-  --osv-suse-fu --osv-suse-ou --osv-suse-ru --osv-suse-su --osv-ubuntu --osv-usn --osv-v8
-"#;
+  Always included (default):
+    --osv-ghsa           GitHub advisories
+    --osv-osv            OSV.dev / OSS-Fuzz
+
+  Language and package ecosystems:
+    --osv-go             Go
+    --osv-hsec           Haskell
+    --osv-jlsec          Julia
+    --osv-osec           OCaml
+    --osv-psf            Python Software Foundation
+    --osv-pysec          PyPI packages
+    --osv-rsec           R Consortium
+    --osv-rustsec        RustSec / Rust crates
+    --osv-mal            Malicious packages
+
+  Linux distributions:
+    --osv-alba           AlmaLinux bug fixes
+    --osv-alea           AlmaLinux enhancements
+    --osv-alsa           AlmaLinux security advisories
+    --osv-alpine         Alpine Linux
+    --osv-debian         Debian CVE tracker
+    --osv-dla            Debian LTS
+    --osv-dsa            Debian
+    --osv-dtsa           Debian testing
+    --osv-ela            Debian extended LTS
+    --osv-lsn            Ubuntu Livepatch
+    --osv-mgasa          Mageia
+    --osv-oesa           openEuler
+    --osv-opensuse-su    openSUSE security updates
+    --osv-phsa           Photon OS
+    --osv-rhba           Red Hat bug fixes
+    --osv-rhea           Red Hat enhancements
+    --osv-rhsa           Red Hat security advisories
+    --osv-rlsa           Rocky Linux
+    --osv-rxsa           Rocky Linux
+    --osv-suse-fu        SUSE feature updates
+    --osv-suse-ou        SUSE optional updates
+    --osv-suse-ru        SUSE recommended updates
+    --osv-suse-su        SUSE security updates
+    --osv-ubuntu         Ubuntu CVE reports
+    --osv-usn            Ubuntu notices
+
+  Products and container images:
+    --osv-asb-a          Android
+    --osv-pub-a          Android
+    --osv-bell           BellSoft
+    --osv-bit            Bitnami
+    --osv-cga            Chainguard
+    --osv-cleanstart     CleanStart
+    --osv-curl           curl
+    --osv-dhi            Docker Hardened Images
+    --osv-drupal         Drupal
+    --osv-echo           Echo
+    --osv-eef            Erlang Ecosystem Foundation
+    --osv-kube           Kubernetes
+    --osv-lbsec          LoopBack
+    --osv-mini           Minimus
+    --osv-root           Root.io
+    --osv-v8             V8 / Chromium
+
+  Cross-ecosystem databases:
+    --osv-cve            NVD records provided by OSV.dev
+    --osv-gsd            Global Security Database
+";
 
 const INGEST_CHUNK_SIZE: usize = 20_000;
 const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
@@ -183,47 +242,18 @@ impl OsvImportSelection {
         }
     }
 
-    /// Builds optional OSV import additions for `update`.
-    pub fn update_additions(include_all: bool, prefixes: &[String]) -> Option<Self> {
-        if include_all {
-            return Some(Self::all());
-        }
-        let id_prefixes = prefixes
-            .iter()
-            .map(|prefix| normalize_osv_prefix(prefix))
-            .collect::<BTreeSet<_>>();
-        (!id_prefixes.is_empty()).then_some(Self {
-            all: false,
-            id_prefixes,
-        })
-    }
-
-    /// Returns a selection containing records selected by either side.
-    pub fn merged_with(&self, other: &Self) -> Self {
-        if self.all || other.all {
-            return Self::all();
-        }
-        let mut id_prefixes = self.id_prefixes.clone();
-        id_prefixes.extend(other.id_prefixes.iter().cloned());
-        Self {
-            all: false,
-            id_prefixes,
-        }
-    }
-
     /// Restores an OSV import selection from metadata stored in the database.
     pub fn from_metadata(value: Option<&str>) -> Option<Self> {
         let value = value?.trim();
         if value.eq_ignore_ascii_case("ALL") {
             return Some(Self::all());
         }
-        let mut id_prefixes = value
+        let id_prefixes = value
             .split(',')
             .map(str::trim)
             .filter(|prefix| !prefix.is_empty())
             .map(normalize_osv_prefix)
             .collect::<BTreeSet<_>>();
-        id_prefixes.extend(required_osv_import_prefixes());
         (!id_prefixes.is_empty()).then_some(Self {
             all: false,
             id_prefixes,
@@ -294,18 +324,6 @@ impl OsvImportSelection {
 
 fn required_osv_import_prefixes() -> BTreeSet<String> {
     BTreeSet::from(["GHSA".to_owned(), "OSV".to_owned()])
-}
-
-#[cfg(test)]
-fn metadata_includes_required_osv_prefixes(value: &str) -> bool {
-    if value.trim().eq_ignore_ascii_case("ALL") {
-        return true;
-    }
-    let prefixes = value
-        .split(',')
-        .map(normalize_osv_prefix)
-        .collect::<BTreeSet<_>>();
-    required_osv_import_prefixes().is_subset(&prefixes)
 }
 
 fn normalize_osv_prefix(prefix: &str) -> String {
@@ -568,9 +586,10 @@ pub async fn sync_osv_with_refresh(
         .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
         .await
         .map_err(|error| format!("{label}: failed to read OSV selection: {error}"))?;
-    let selection_expanded = OsvImportSelection::from_metadata(stored_selection.as_deref())
-        .is_none_or(|stored| stored != selection);
-    let incremental_cursor = (!selection_expanded && !refresh_all)
+    if OsvImportSelection::from_metadata(stored_selection.as_deref()).as_ref() != Some(&selection) {
+        return Err(format!("{label}: OSV sources can only be selected by init"));
+    }
+    let incremental_cursor = (!refresh_all)
         .then_some(previous_cursor.as_deref())
         .flatten();
     let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
@@ -880,7 +899,10 @@ fn read_osv_zip_batches(
         let mut entry = archive
             .by_index(index)
             .map_err(|err| format!("failed to read OSV zip entry {index}: {err}"))?;
-        let name = entry.name().to_owned();
+        let name = entry
+            .name()
+            .map_err(|err| format!("failed to decode OSV zip entry name {index}: {err}"))?
+            .into_owned();
         if !name.ends_with(".json") {
             continue;
         }
@@ -1549,20 +1571,15 @@ pub async fn apply_delta_updates_with_progress(
     Ok(paths)
 }
 
-/// Refreshes OSV using the stored selection plus any newly requested coverage.
-pub async fn sync_osv_after_update(
-    db: &SqlxDatabase,
-    label: &str,
-    requested_osv_additions: Option<&OsvImportSelection>,
-) -> Result<(), String> {
+/// Refreshes only the OSV selection stored by init.
+pub async fn sync_osv_after_update(db: &SqlxDatabase, label: &str) -> Result<(), String> {
     let stored = db
         .metadata_value(OSV_IMPORT_ID_PREFIXES_METADATA_KEY)
         .await
         .map_err(|error| format!("{label}: failed to read OSV import selection: {error}"))?;
-    let current = OsvImportSelection::from_metadata(stored.as_deref())
-        .unwrap_or_else(|| OsvImportSelection::default_init(false, &[]));
-    let selection =
-        requested_osv_additions.map_or(current.clone(), |additions| current.merged_with(additions));
+    let Some(selection) = OsvImportSelection::from_metadata(stored.as_deref()) else {
+        return Ok(());
+    };
     sync_osv(db.clone(), label, selection).await.map(|_| ())
 }
 
@@ -1570,12 +1587,11 @@ pub async fn sync_osv_after_update(
 pub async fn sync_all_enrichment_sources_after_update(
     db: &SqlxDatabase,
     label: &str,
-    requested_osv_additions: Option<&OsvImportSelection>,
     cve_changed: bool,
 ) -> Result<(), String> {
     sync_cwe_catalog(db.clone()).await?;
     sync_capec_catalog(db.clone()).await?;
-    sync_osv_after_update(db, label, requested_osv_additions).await?;
+    sync_osv_after_update(db, label).await?;
     sync_risk_feeds(db.clone(), label, cve_changed)
         .await
         .map(|_| ())

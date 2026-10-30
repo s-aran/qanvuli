@@ -4,6 +4,8 @@ pub(crate) struct MainState {
     pub(crate) query: String,
     pub(crate) search_mode: SearchMode,
     pub(crate) search_mode_explicit: bool,
+    pub(crate) exact_match: bool,
+    pub(crate) exact_match_focus: bool,
     pub(crate) state_scope: CveStateScope,
     pub(crate) advanced: AdvancedForm,
     pub(crate) display: DisplaySettings,
@@ -38,6 +40,8 @@ impl MainState {
             query,
             search_mode,
             search_mode_explicit: false,
+            exact_match: false,
+            exact_match_focus: false,
             state_scope: CveStateScope::PublishedOnly,
             advanced: AdvancedForm::default(),
             display: DisplaySettings::default(),
@@ -67,6 +71,16 @@ impl MainState {
             detail_content_width: 80,
             metadata_content_width: 80,
             db_as_of: None,
+        }
+    }
+
+    pub(crate) fn exact_match_available(&self) -> bool {
+        matches!(self.search_mode, SearchMode::Product | SearchMode::Vendor)
+    }
+
+    pub(crate) fn clear_unavailable_exact_match_focus(&mut self) {
+        if !self.exact_match_available() {
+            self.exact_match_focus = false;
         }
     }
 }

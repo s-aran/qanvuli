@@ -40,7 +40,7 @@ where
         .find(|index| {
             archive
                 .by_index(*index)
-                .map(|file| file.name().ends_with(".xml"))
+                .map(|file| file.name().is_ok_and(|name| name.ends_with(".xml")))
                 .unwrap_or(false)
         })
         .ok_or_else(|| anyhow!("CWE catalog zip does not contain an XML file"))?;

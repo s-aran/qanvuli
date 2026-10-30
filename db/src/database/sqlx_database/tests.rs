@@ -632,10 +632,10 @@ async fn imports_and_searches_cwe_catalog_statuses_and_tree_relationships() {
     let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
     database.initialize().await.unwrap();
     let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../collector/src/cwec_v4.20.xml");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/cwe/catalog-test.xml");
     let catalog = qanvuli_models::cwe::read_cwe_catalog_xml(path).unwrap();
     let imported = database.upsert_cwe_catalog(&catalog).await.unwrap();
-    assert!(imported > 1_000);
+    assert_eq!(imported, 3);
 
     let populated: (i64, i64) = database
         .writer
@@ -650,8 +650,7 @@ async fn imports_and_searches_cwe_catalog_statuses_and_tree_relationships() {
         })
         .await
         .unwrap();
-    assert!(populated.0 > 1_000);
-    assert!(populated.1 > 0);
+    assert_eq!(populated, (3, 1));
 
     let all_statuses = [
         "Stable",
@@ -663,7 +662,7 @@ async fn imports_and_searches_cwe_catalog_statuses_and_tree_relationships() {
     ]
     .map(str::to_owned);
     let rows = database
-        .search_cwe_entries("", 2_000, &all_statuses)
+        .search_cwe_entries("", 20, &all_statuses)
         .await
         .unwrap();
     assert!(rows.iter().all(|row| row.status.is_some()));
@@ -678,10 +677,10 @@ async fn imports_and_searches_cwe_catalog_statuses_and_tree_relationships() {
     }
 
     let stable = database
-        .search_cwe_entries("", 2_000, &["Stable".to_owned()])
+        .search_cwe_entries("", 20, &["Stable".to_owned()])
         .await
         .unwrap();
-    assert!(!stable.is_empty());
+    assert_eq!(stable.len(), 1);
     assert!(
         stable
             .iter()
@@ -689,7 +688,7 @@ async fn imports_and_searches_cwe_catalog_statuses_and_tree_relationships() {
     );
     assert!(
         database
-            .search_cwe_entries("", 2_000, &[])
+            .search_cwe_entries("", 20, &[])
             .await
             .unwrap()
             .is_empty()

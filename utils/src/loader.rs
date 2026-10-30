@@ -113,7 +113,8 @@ impl ZipStorage {
                 .by_index(0)
                 .with_context(|| format!("failed to inspect first zip entry in {filename}"))?
                 .name()
-                .to_owned();
+                .with_context(|| format!("failed to decode first zip entry name in {filename}"))?
+                .into_owned();
             if name.ends_with(".zip") && !archive_has_cve_json(&stream) {
                 let nested = extract_nested_cve_zip(&mut stream, &name)?;
                 return Ok(Self {
@@ -204,8 +205,9 @@ impl JsonStorage for ZipStorage {
             self.stream.as_ref().map_or_else(Vec::new, |stream| {
                 stream
                     .file_names()
+                    .filter_map(Result::ok)
                     .filter(|path| is_cve_json_path(path))
-                    .map(|e| e.to_owned())
+                    .map(|path| path.into_owned())
                     .collect()
             })
         } else {
@@ -227,10 +229,10 @@ impl JsonStorage for ZipStorage {
         };
         (0..stream.len())
             .filter_map(|index| {
-                let path = stream.name_for_index(index)?;
-                if is_cve_json_path(path) {
+                let path = stream.name_for_index(index)?.ok()?;
+                if is_cve_json_path(&path) {
                     Some(JsonEntry {
-                        path: path.to_owned(),
+                        path: path.into_owned(),
                         index: Some(index),
                         filesystem_path: None,
                     })
@@ -489,7 +491,10 @@ fn available_storage_bytes(_path: &std::path::Path) -> Option<u64> {
 }
 
 fn archive_has_cve_json(stream: &zip::ZipArchive<Box<dyn ReadSeek>>) -> bool {
-    stream.file_names().any(is_cve_json_path)
+    stream
+        .file_names()
+        .filter_map(Result::ok)
+        .any(|path| is_cve_json_path(&path))
 }
 
 fn is_cve_json_path(path: &str) -> bool {
