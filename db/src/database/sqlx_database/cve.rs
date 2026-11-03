@@ -938,6 +938,16 @@ impl SqlxDatabase {
                 )
             }));
         }
+        if let Some(groupings) = &catalog.groupings {
+            entries.extend(groupings.grouping.iter().map(|grouping| {
+                (
+                    grouping.id,
+                    grouping.name.clone(),
+                    grouping.status.as_ref().to_owned(),
+                    None,
+                )
+            }));
+        }
         if let Some(views) = &catalog.views {
             entries.extend(views.view.iter().map(|view| {
                 (

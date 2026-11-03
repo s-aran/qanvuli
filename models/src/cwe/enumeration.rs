@@ -242,6 +242,12 @@ pub enum LanguageName {
     #[strum(serialize = "x86 Assembly")]
     X86Assembly,
     Other,
+    #[serde(rename = "Algorithm")]
+    #[strum(serialize = "Algorithm")]
+    Algorithm,
+    #[serde(rename = "SystemVerilog")]
+    #[strum(serialize = "SystemVerilog")]
+    SystemVerilog,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -373,6 +379,9 @@ pub enum OperatingSystemName {
     #[serde(rename = "Windows NT")]
     #[strum(serialize = "Windows NT")]
     WindowsNt,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -412,6 +421,9 @@ pub enum Prevalence {
     Sometimes,
     Rarely,
     Undetermined,
+    #[serde(rename = "None")]
+    #[strum(serialize = "None")]
+    None,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -442,6 +454,12 @@ pub enum Reason {
     #[strum(serialize = "Potential Major Changes")]
     PotentialMajorChanges,
     Other,
+    #[serde(rename = "Grouping")]
+    #[strum(serialize = "Grouping")]
+    Grouping,
+    #[serde(rename = "Frequently-Resultant")]
+    #[strum(serialize = "Frequently-Resultant")]
+    FrequentlyResultant,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -455,6 +473,9 @@ pub enum RelatedNature {
     Requires,
     CanAlsoBe,
     PeerOf,
+    #[serde(rename = "Overlaps")]
+    #[strum(serialize = "Overlaps")]
+    Overlaps,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -635,6 +656,15 @@ pub enum TaxonomyName {
     #[strum(serialize = "Weber, Karger, Paradkar")]
     WeberKargerParadkar,
     WASC,
+    #[serde(rename = "OpenSSF Secure Coding Guide for Python")]
+    #[strum(serialize = "OpenSSF Secure Coding Guide for Python")]
+    OpenSSFSecureCodingGuideForPython,
+    #[serde(rename = "OWASP Golang Secure Coding Practices Guide")]
+    #[strum(serialize = "OWASP Golang Secure Coding Practices Guide")]
+    OWASPGolangSecureCodingPracticesGuide,
+    #[serde(rename = "PLC Top 20")]
+    #[strum(serialize = "PLC Top 20")]
+    PLCTop20,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -712,6 +742,15 @@ pub enum TechnicalImpact {
     #[strum(serialize = "Reduce Reliability")]
     ReduceReliability,
     Other,
+    #[serde(rename = "DoS: Prevent Access")]
+    #[strum(serialize = "DoS: Prevent Access")]
+    DoSPreventAccess,
+    #[serde(rename = "DoS: Other")]
+    #[strum(serialize = "DoS: Other")]
+    DoSOther,
+    #[serde(rename = "Undefined Behavior")]
+    #[strum(serialize = "Undefined Behavior")]
+    UndefinedBehavior,
 }
 
 #[derive(Debug, Deserialize, EnumString, AsRefStr)]
@@ -819,4 +858,268 @@ pub enum ViewType {
     Implicit,
     Explicit,
     Graph,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum CustomPhaseDomain {
+    #[serde(rename = "AI")]
+    #[strum(serialize = "AI")]
+    AI,
+    #[serde(rename = "Hardware")]
+    #[strum(serialize = "Hardware")]
+    Hardware,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum Dimension {
+    #[serde(rename = "Behavior-Type")]
+    #[strum(serialize = "Behavior-Type")]
+    BehaviorType,
+    #[serde(rename = "Behavior-Property")]
+    #[strum(serialize = "Behavior-Property")]
+    BehaviorProperty,
+    #[serde(rename = "Resource-Type")]
+    #[strum(serialize = "Resource-Type")]
+    ResourceType,
+    #[serde(rename = "Resource-Property")]
+    #[strum(serialize = "Resource-Property")]
+    ResourceProperty,
+    #[serde(rename = "Input-Type")]
+    #[strum(serialize = "Input-Type")]
+    InputType,
+    #[serde(rename = "Input-Property")]
+    #[strum(serialize = "Input-Property")]
+    InputProperty,
+    #[serde(rename = "Info-Type")]
+    #[strum(serialize = "Info-Type")]
+    InfoType,
+    #[serde(rename = "Info-Property")]
+    #[strum(serialize = "Info-Property")]
+    InfoProperty,
+    #[serde(rename = "Code-Type")]
+    #[strum(serialize = "Code-Type")]
+    CodeType,
+    #[serde(rename = "Code-Property")]
+    #[strum(serialize = "Code-Property")]
+    CodeProperty,
+    #[serde(rename = "Technology")]
+    #[strum(serialize = "Technology")]
+    Technology,
+    #[serde(rename = "Language-Type")]
+    #[strum(serialize = "Language-Type")]
+    LanguageType,
+    #[serde(rename = "Language-Property")]
+    #[strum(serialize = "Language-Property")]
+    LanguageProperty,
+    #[serde(rename = "Framework")]
+    #[strum(serialize = "Framework")]
+    Framework,
+    #[serde(rename = "Common-Name")]
+    #[strum(serialize = "Common-Name")]
+    CommonName,
+    #[serde(rename = "Attack")]
+    #[strum(serialize = "Attack")]
+    Attack,
+    #[serde(rename = "Acronym")]
+    #[strum(serialize = "Acronym")]
+    Acronym,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum AlternateTermRole {
+    #[serde(rename = "Abbreviation")]
+    #[strum(serialize = "Abbreviation")]
+    Abbreviation,
+    #[serde(rename = "Acronym")]
+    #[strum(serialize = "Acronym")]
+    Acronym,
+    #[serde(rename = "Alternate-Spelling")]
+    #[strum(serialize = "Alternate-Spelling")]
+    AlternateSpelling,
+    #[serde(rename = "Attack-Focused")]
+    #[strum(serialize = "Attack-Focused")]
+    AttackFocused,
+    #[serde(rename = "Impact-Oriented")]
+    #[strum(serialize = "Impact-Oriented")]
+    ImpactOriented,
+    #[serde(rename = "Multi-Weakness")]
+    #[strum(serialize = "Multi-Weakness")]
+    MultiWeakness,
+    #[serde(rename = "Multiple-Interpretation")]
+    #[strum(serialize = "Multiple-Interpretation")]
+    MultipleInterpretation,
+    #[serde(rename = "Common-Name")]
+    #[strum(serialize = "Common-Name")]
+    CommonName,
+    #[serde(rename = "Discouraged")]
+    #[strum(serialize = "Discouraged")]
+    Discouraged,
+    #[serde(rename = "Legacy")]
+    #[strum(serialize = "Legacy")]
+    Legacy,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum ObexRationale {
+    #[serde(rename = "Chain")]
+    #[strum(serialize = "Chain")]
+    Chain,
+    #[serde(rename = "Early-Publication")]
+    #[strum(serialize = "Early-Publication")]
+    EarlyPublication,
+    #[serde(rename = "Influential/Newsworthy")]
+    #[strum(serialize = "Influential/Newsworthy")]
+    InfluentialNewsworthy,
+    #[serde(rename = "Language-Variety")]
+    #[strum(serialize = "Language-Variety")]
+    LanguageVariety,
+    #[serde(rename = "Product-Variety")]
+    #[strum(serialize = "Product-Variety")]
+    ProductVariety,
+    #[serde(rename = "Attack-Surface")]
+    #[strum(serialize = "Attack-Surface")]
+    AttackSurface,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum AIPhase {
+    #[serde(rename = "Data Collection")]
+    #[strum(serialize = "Data Collection")]
+    DataCollection,
+    #[serde(rename = "Training")]
+    #[strum(serialize = "Training")]
+    Training,
+    #[serde(rename = "Fine-tuning")]
+    #[strum(serialize = "Fine-tuning")]
+    FineTuning,
+    #[serde(rename = "Testing")]
+    #[strum(serialize = "Testing")]
+    Testing,
+    #[serde(rename = "Tokenization")]
+    #[strum(serialize = "Tokenization")]
+    Tokenization,
+    #[serde(rename = "Prompting")]
+    #[strum(serialize = "Prompting")]
+    Prompting,
+    #[serde(rename = "Output Processing")]
+    #[strum(serialize = "Output Processing")]
+    OutputProcessing,
+    #[serde(rename = "Component Interaction")]
+    #[strum(serialize = "Component Interaction")]
+    ComponentInteraction,
+    #[serde(rename = "Re-training / Feedback")]
+    #[strum(serialize = "Re-training / Feedback")]
+    ReTrainingFeedback,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum HardwarePhase {
+    #[serde(rename = "Hardware Requirements")]
+    #[strum(serialize = "Hardware Requirements")]
+    HardwareRequirements,
+    #[serde(rename = "Hardware Architecture")]
+    #[strum(serialize = "Hardware Architecture")]
+    HardwareArchitecture,
+    #[serde(rename = "Hardware Microarchitecture")]
+    #[strum(serialize = "Hardware Microarchitecture")]
+    HardwareMicroarchitecture,
+    #[serde(rename = "Implementation & Physical Design")]
+    #[strum(serialize = "Implementation & Physical Design")]
+    ImplementationPhysicalDesign,
+    #[serde(rename = "Pre-Manufacturing Verification")]
+    #[strum(serialize = "Pre-Manufacturing Verification")]
+    PreManufacturingVerification,
+    #[serde(rename = "Hardware Manufacturing")]
+    #[strum(serialize = "Hardware Manufacturing")]
+    HardwareManufacturing,
+    #[serde(rename = "Post-Manufacturing Validation")]
+    #[strum(serialize = "Post-Manufacturing Validation")]
+    PostManufacturingValidation,
+    #[serde(rename = "Device Configuration & Personalization")]
+    #[strum(serialize = "Device Configuration & Personalization")]
+    DeviceConfigurationPersonalization,
+    #[serde(rename = "Device / System Integration")]
+    #[strum(serialize = "Device / System Integration")]
+    DeviceSystemIntegration,
+    #[serde(rename = "Field Operations & Sustainment")]
+    #[strum(serialize = "Field Operations & Sustainment")]
+    FieldOperationsSustainment,
+    #[serde(rename = "Reuse")]
+    #[strum(serialize = "Reuse")]
+    Reuse,
+    #[serde(rename = "Decommissioning")]
+    #[strum(serialize = "Decommissioning")]
+    Decommissioning,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum ReferenceAccessRestrictions {
+    #[serde(rename = "None")]
+    #[strum(serialize = "None")]
+    None,
+    #[serde(rename = "Proprietary-Subscription")]
+    #[strum(serialize = "Proprietary-Subscription")]
+    ProprietarySubscription,
+    #[serde(rename = "Minimal-Registration")]
+    #[strum(serialize = "Minimal-Registration")]
+    MinimalRegistration,
+    #[serde(rename = "Removed")]
+    #[strum(serialize = "Removed")]
+    Removed,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum ReferenceMediaType {
+    #[serde(rename = "Text")]
+    #[strum(serialize = "Text")]
+    Text,
+    #[serde(rename = "Common-Proprietary-Text")]
+    #[strum(serialize = "Common-Proprietary-Text")]
+    CommonProprietaryText,
+    #[serde(rename = "Video")]
+    #[strum(serialize = "Video")]
+    Video,
+    #[serde(rename = "Audio")]
+    #[strum(serialize = "Audio")]
+    Audio,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
+}
+
+#[derive(Debug, Deserialize, EnumString, AsRefStr)]
+pub enum ReferenceRationale {
+    #[serde(rename = "Example")]
+    #[strum(serialize = "Example")]
+    Example,
+    #[serde(rename = "Early-Publication")]
+    #[strum(serialize = "Early-Publication")]
+    EarlyPublication,
+    #[serde(rename = "Influential/Newsworthy")]
+    #[strum(serialize = "Influential/Newsworthy")]
+    InfluentialNewsworthy,
+    #[serde(rename = "Manual/Man Pages")]
+    #[strum(serialize = "Manual/Man Pages")]
+    ManualManPages,
+    #[serde(rename = "Mitigation-Based")]
+    #[strum(serialize = "Mitigation-Based")]
+    MitigationBased,
+    #[serde(rename = "Secure-Development-Rules")]
+    #[strum(serialize = "Secure-Development-Rules")]
+    SecureDevelopmentRules,
+    #[serde(rename = "Other")]
+    #[strum(serialize = "Other")]
+    Other,
 }

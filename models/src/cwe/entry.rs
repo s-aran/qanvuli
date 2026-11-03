@@ -1,18 +1,26 @@
 use serde::Deserialize;
 
+use crate::cwe::common::deserialize_vec_text;
 use crate::cwe::common::{
     AffectedResources, AlternateTerms, ApplicablePlatforms, Audience, BackgroundDetails,
-    CommonConsequences, ContentHistory, DemonstrativeExamples, DetectionMethods,
+    CommonConsequences, ContentHistory, DemonstrativeExamples, DetectionMethods, Dimensions,
     ExploitationFactors, FunctionalAreas, MappingNotes, ModesOfIntroduction, Notes,
     ObservedExamples, PotentialMitigations, References, RelatedAttackPatterns, RelatedWeaknesses,
     Relationships, TaxonomyMappings, WeaknessOrdinalities, deserialize_option_text,
 };
-use crate::cwe::enumeration::{Abstraction, Likelihood, Status, Structure, ViewType};
+use crate::cwe::enumeration::{
+    Abstraction, Likelihood, ReferenceAccessRestrictions, ReferenceMediaType, ReferenceRationale,
+    Status, Structure, ViewType,
+};
 use crate::cwe::structured_text::StructuredText;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Weakness {
+    #[serde(rename = "Technical_Nuance")]
+    pub technical_nuance: Option<StructuredText>,
+    #[serde(rename = "Dimensions")]
+    pub dimensions: Option<Dimensions>,
     #[serde(rename = "Description")]
     pub description: String,
     #[serde(rename = "Extended_Description")]
@@ -134,6 +142,28 @@ pub struct View {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExternalReference {
+    #[serde(rename = "Alt_URL")]
+    pub alt_url: Option<String>,
+    #[serde(rename = "Alt_URL_Date")]
+    pub alt_url_date: Option<String>,
+    #[serde(
+        rename = "Media_Type",
+        default,
+        deserialize_with = "deserialize_vec_text"
+    )]
+    pub media_type: Vec<ReferenceMediaType>,
+    #[serde(
+        rename = "Access_Restrictions",
+        default,
+        deserialize_with = "deserialize_option_text"
+    )]
+    pub access_restrictions: Option<ReferenceAccessRestrictions>,
+    #[serde(
+        rename = "Rationale",
+        default,
+        deserialize_with = "deserialize_vec_text"
+    )]
+    pub rationale: Vec<ReferenceRationale>,
     #[serde(rename = "Author", default)]
     pub author: Vec<String>,
     #[serde(rename = "Title")]
@@ -157,3 +187,6 @@ pub struct ExternalReference {
     #[serde(rename = "@Reference_ID")]
     pub reference_id: String,
 }
+
+/// Groupings share the category structure in XML Schema 8.0.
+pub type Grouping = Category;

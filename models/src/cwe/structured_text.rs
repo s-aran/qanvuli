@@ -42,6 +42,7 @@ pub enum XhtmlNode {
     Code(XhtmlElement),
     Pre(XhtmlElement),
     Table(XhtmlElement),
+    Caption(XhtmlElement),
     Thead(XhtmlElement),
     Tbody(XhtmlElement),
     Tr(XhtmlElement),

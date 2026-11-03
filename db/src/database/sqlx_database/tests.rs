@@ -3199,3 +3199,20 @@ async fn bulk_cve_initialization_extracts_ssvc_without_a_separate_feed() {
         Some(crate::SsvcExploitation::PublicPoc)
     );
 }
+
+#[tokio::test]
+async fn imports_cwe_5_groupings() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize().await.unwrap();
+    let catalog = qanvuli_models::cwe::parse_cwe_catalog_xml(include_str!(
+        "../../../../fixtures/cwe/catalog-5.0-test.xml"
+    ))
+    .unwrap();
+    assert_eq!(database.upsert_cwe_catalog(&catalog).await.unwrap(), 2);
+    let rows = database
+        .search_cwe_entries("Fixture grouping", 20, &["Stable".to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, 101);
+}
