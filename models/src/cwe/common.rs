@@ -1,11 +1,12 @@
 use serde::{Deserialize, Deserializer};
 
 use crate::cwe::enumeration::{
-    ArchitectureClass, ArchitectureName, DetectionEffectiveness, DetectionMethod, Effectiveness,
-    FunctionalArea, Importance, LanguageClass, LanguageName, Likelihood, MitigationStrategy,
-    NoteType, OperatingSystemClass, OperatingSystemName, Ordinal, Ordinality, Phase, Prevalence,
-    Reason, RelatedNature, Resource, Scope, Stakeholder, TaxonomyMappingFit, TaxonomyName,
-    TechnicalImpact, TechnologyClass, TechnologyName, Usage,
+    AIPhase, AlternateTermRole, ArchitectureClass, ArchitectureName, CustomPhaseDomain,
+    DetectionEffectiveness, DetectionMethod, Dimension, Effectiveness, FunctionalArea,
+    HardwarePhase, Importance, LanguageClass, LanguageName, Likelihood, MitigationStrategy,
+    NoteType, ObexRationale, OperatingSystemClass, OperatingSystemName, Ordinal, Ordinality, Phase,
+    Prevalence, Reason, RelatedNature, Resource, Scope, Stakeholder, TaxonomyMappingFit,
+    TaxonomyName, TechnicalImpact, TechnologyClass, TechnologyName, Usage,
 };
 use crate::cwe::structured_text::{StructuredCode, StructuredText, XhtmlNode};
 
@@ -65,6 +66,8 @@ pub struct AlternateTerms {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AlternateTerm {
+    #[serde(rename = "Role", default, deserialize_with = "deserialize_vec_text")]
+    pub role: Vec<AlternateTermRole>,
     #[serde(rename = "Term")]
     pub term: String,
     #[serde(rename = "Description")]
@@ -87,6 +90,8 @@ pub struct ApplicablePlatforms {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Language {
+    #[serde(rename = "Note")]
+    pub note: Option<StructuredText>,
     #[serde(rename = "@Name")]
     pub name: Option<LanguageName>,
     #[serde(rename = "@Class")]
@@ -98,6 +103,8 @@ pub struct Language {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatingSystem {
+    #[serde(rename = "Note")]
+    pub note: Option<StructuredText>,
     #[serde(rename = "@Name")]
     pub name: Option<OperatingSystemName>,
     #[serde(rename = "@Version")]
@@ -113,6 +120,8 @@ pub struct OperatingSystem {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Architecture {
+    #[serde(rename = "Note")]
+    pub note: Option<StructuredText>,
     #[serde(rename = "@Name")]
     pub name: Option<ArchitectureName>,
     #[serde(rename = "@Class")]
@@ -124,6 +133,8 @@ pub struct Architecture {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Technology {
+    #[serde(rename = "Note")]
+    pub note: Option<StructuredText>,
     #[serde(rename = "@Name")]
     pub name: Option<TechnologyName>,
     #[serde(rename = "@Class")]
@@ -185,7 +196,7 @@ pub struct Consequence {
 #[serde(deny_unknown_fields)]
 pub struct ContentHistory {
     #[serde(rename = "Submission")]
-    pub submission: Submission,
+    pub submission: Vec<Submission>,
     #[serde(rename = "Modification", default)]
     pub modification: Vec<Modification>,
     #[serde(rename = "Contribution", default)]
@@ -197,8 +208,8 @@ pub struct ContentHistory {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Submission {
-    #[serde(rename = "Submission_Name")]
-    pub submission_name: Option<String>,
+    #[serde(rename = "Submission_Name", default)]
+    pub submission_name: Vec<String>,
     #[serde(rename = "Submission_Organization")]
     pub submission_organization: Option<String>,
     #[serde(rename = "Submission_Date")]
@@ -233,8 +244,8 @@ pub struct Modification {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Contribution {
-    #[serde(rename = "Contribution_Name")]
-    pub contribution_name: Option<String>,
+    #[serde(rename = "Contribution_Name", default)]
+    pub contribution_name: Vec<String>,
     #[serde(rename = "Contribution_Organization")]
     pub contribution_organization: Option<String>,
     #[serde(rename = "Contribution_Date")]
@@ -306,6 +317,10 @@ pub struct DetectionMethods {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DetectionMethodEntry {
+    #[serde(rename = "Phase", default, deserialize_with = "deserialize_vec_text")]
+    pub phase: Vec<Phase>,
+    #[serde(rename = "Custom_Phase", default)]
+    pub custom_phase: Vec<CustomPhase>,
     #[serde(rename = "Method", deserialize_with = "deserialize_text")]
     pub method: DetectionMethod,
     #[serde(rename = "Description")]
@@ -358,6 +373,8 @@ pub struct MappingNotes {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Member {
+    #[serde(rename = "Dimensions")]
+    pub dimensions: Option<Dimensions>,
     #[serde(rename = "@CWE_ID")]
     pub cwe_id: i64,
     #[serde(rename = "@View_ID")]
@@ -374,8 +391,10 @@ pub struct ModesOfIntroduction {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Introduction {
-    #[serde(rename = "Phase", deserialize_with = "deserialize_text")]
-    pub phase: Phase,
+    #[serde(rename = "Custom_Phase", default)]
+    pub custom_phase: Vec<CustomPhase>,
+    #[serde(rename = "Phase", default, deserialize_with = "deserialize_vec_text")]
+    pub phase: Vec<Phase>,
     #[serde(rename = "Note")]
     pub note: Option<StructuredText>,
 }
@@ -390,6 +409,10 @@ pub struct Notes {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Note {
+    #[serde(rename = "@Version")]
+    pub version: Option<String>,
+    #[serde(rename = "@ReleaseDate")]
+    pub release_date: Option<String>,
     #[serde(rename = "$value", default)]
     pub content: Vec<XhtmlNode>,
     #[serde(rename = "@Type")]
@@ -406,6 +429,12 @@ pub struct ObservedExamples {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedExample {
+    #[serde(
+        rename = "Rationale",
+        default,
+        deserialize_with = "deserialize_vec_text"
+    )]
+    pub rationale: Vec<ObexRationale>,
     #[serde(rename = "Reference")]
     pub reference: String,
     #[serde(rename = "Description")]
@@ -424,6 +453,8 @@ pub struct PotentialMitigations {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mitigation {
+    #[serde(rename = "Custom_Phase", default)]
+    pub custom_phase: Vec<CustomPhase>,
     #[serde(rename = "Phase", default, deserialize_with = "deserialize_vec_text")]
     pub phase: Vec<Phase>,
     #[serde(
@@ -500,6 +531,8 @@ pub struct RelatedWeaknesses {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelatedWeakness {
+    #[serde(rename = "Dimensions")]
+    pub dimensions: Option<Dimensions>,
     #[serde(rename = "@Nature")]
     pub nature: RelatedNature,
     #[serde(rename = "@CWE_ID")]
@@ -575,4 +608,37 @@ pub struct WeaknessOrdinality {
     pub ordinality: Ordinality,
     #[serde(rename = "Description")]
     pub description: Option<String>,
+}
+
+/// Domain-specific lifecycle phase introduced in CWE XML Schema 8.0.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomPhase {
+    #[serde(rename = "@Domain")]
+    pub domain: CustomPhaseDomain,
+    #[serde(rename = "$text")]
+    pub phase: CustomPhaseValue,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CustomPhaseValue {
+    AI(AIPhase),
+    Hardware(HardwarePhase),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dimensions {
+    #[serde(rename = "Dimension")]
+    pub dimension: Vec<DimensionElement>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DimensionElement {
+    #[serde(rename = "@Type")]
+    pub dimension_type: Dimension,
+    #[serde(rename = "$text", default)]
+    pub value: String,
 }
