@@ -1,0 +1,160 @@
+<?xml version="1.0" ?>
+<Weakness_Catalog xmlns="http://cwe.mitre.org/cwe-8" xmlns:xhtml="http://www.w3.org/1999/xhtml" Name="CWE" Version="5.0" Date="2026-10-28">
+  <Weaknesses>
+    <Weakness ID="100" Name="Schema 8 fixture" Abstraction="Base" Structure="Simple" Status="Draft">
+      <Description>Synthetic schema regression fixture.</Description>
+      <Technical_Nuance><xhtml:table><xhtml:caption>Technical detail</xhtml:caption><xhtml:tr><xhtml:td>Detail</xhtml:td></xhtml:tr></xhtml:table></Technical_Nuance>
+      <Dimensions>
+        <Dimension Type="Behavior-Type">Comparison</Dimension>
+      </Dimensions>
+      <Related_Weaknesses>
+        <Related_Weakness Nature="Overlaps" CWE_ID="101" View_ID="1000">
+          <Dimensions>
+            <Dimension Type="Behavior-Type">Comparison</Dimension>
+          </Dimensions>
+        </Related_Weakness>
+      </Related_Weaknesses>
+      <Applicable_Platforms>
+        <Language Name="SystemVerilog" Prevalence="None">
+          <Note>Language note.</Note>
+        </Language>
+        <Operating_System Name="Other" Prevalence="Undetermined">
+          <Note>OS note.</Note>
+        </Operating_System>
+        <Architecture Name="Other" Prevalence="Undetermined">
+          <Note>Architecture note.</Note>
+        </Architecture>
+        <Technology Name="Other" Prevalence="Undetermined">
+          <Note>Technology note.</Note>
+        </Technology>
+      </Applicable_Platforms>
+      <Alternate_Terms>
+        <Alternate_Term>
+          <Term>Fixture</Term>
+          <Role>Common-Name</Role>
+          <Role>Acronym</Role>
+        </Alternate_Term>
+      </Alternate_Terms>
+      <Modes_Of_Introduction>
+        <Introduction>
+          <Phase>Implementation</Phase>
+          <Phase>Operation</Phase>
+          <Custom_Phase Domain="AI">Training</Custom_Phase>
+          <Custom_Phase Domain="Hardware">Hardware Architecture</Custom_Phase>
+        </Introduction>
+      </Modes_Of_Introduction>
+      <Detection_Methods>
+        <Detection_Method>
+          <Method>Manual Analysis</Method>
+          <Phase>Testing</Phase>
+          <Custom_Phase Domain="AI">Testing</Custom_Phase>
+          <Description>Review.</Description>
+        </Detection_Method>
+      </Detection_Methods>
+      <Potential_Mitigations>
+        <Mitigation>
+          <Custom_Phase Domain="Hardware">Implementation &amp; Physical Design</Custom_Phase>
+          <Description>Review.</Description>
+        </Mitigation>
+      </Potential_Mitigations>
+      <Observed_Examples>
+        <Observed_Example>
+          <Reference>CVE-2099-1000</Reference>
+          <Description>Fixture</Description>
+          <Link>https://example.org/</Link>
+          <Rationale>Chain</Rationale>
+          <Rationale>Other</Rationale>
+        </Observed_Example>
+      </Observed_Examples>
+      <Mapping_Notes>
+        <Usage>Prohibited</Usage>
+        <Rationale>Fixture</Rationale>
+        <Comments>Fixture</Comments>
+        <Reasons>
+          <Reason Type="Grouping"/>
+        </Reasons>
+      </Mapping_Notes>
+      <Notes>
+        <Note Type="Maintenance" Version="5.0" ReleaseDate="2026-10-28">Fixture</Note>
+      </Notes>
+      <Content_History>
+        <Submission>
+          <Submission_Name>A</Submission_Name>
+          <Submission_Name>B</Submission_Name>
+          <Submission_Date>2026-10-28</Submission_Date>
+          <Submission_Version>5.0</Submission_Version>
+          <Submission_ReleaseDate>2026-10-28</Submission_ReleaseDate>
+        </Submission>
+        <Submission>
+          <Submission_Name>A</Submission_Name>
+          <Submission_Name>B</Submission_Name>
+          <Submission_Date>2026-10-28</Submission_Date>
+          <Submission_Version>5.0</Submission_Version>
+          <Submission_ReleaseDate>2026-10-28</Submission_ReleaseDate>
+        </Submission>
+        <Contribution Type="Content">
+          <Contribution_Name>A</Contribution_Name>
+          <Contribution_Name>B</Contribution_Name>
+          <Contribution_Date>2026-10-28</Contribution_Date>
+          <Contribution_Version>5.0</Contribution_Version>
+          <Contribution_ReleaseDate>2026-10-28</Contribution_ReleaseDate>
+        </Contribution>
+      </Content_History>
+    </Weakness>
+  </Weaknesses>
+  <Groupings>
+    <Grouping ID="101" Name="Fixture grouping" Status="Stable">
+      <Summary>Grouping summary.</Summary>
+      <Relationships>
+        <Has_Member CWE_ID="100" View_ID="1000">
+          <Dimensions>
+            <Dimension Type="Behavior-Type">Comparison</Dimension>
+          </Dimensions>
+        </Has_Member>
+      </Relationships>
+      <Mapping_Notes>
+        <Usage>Prohibited</Usage>
+        <Rationale>Fixture</Rationale>
+        <Comments>Fixture</Comments>
+        <Reasons>
+          <Reason Type="Grouping"/>
+        </Reasons>
+      </Mapping_Notes>
+      <Content_History>
+        <Submission>
+          <Submission_Name>A</Submission_Name>
+          <Submission_Name>B</Submission_Name>
+          <Submission_Date>2026-10-28</Submission_Date>
+          <Submission_Version>5.0</Submission_Version>
+          <Submission_ReleaseDate>2026-10-28</Submission_ReleaseDate>
+        </Submission>
+        <Submission>
+          <Submission_Name>A</Submission_Name>
+          <Submission_Name>B</Submission_Name>
+          <Submission_Date>2026-10-28</Submission_Date>
+          <Submission_Version>5.0</Submission_Version>
+          <Submission_ReleaseDate>2026-10-28</Submission_ReleaseDate>
+        </Submission>
+        <Contribution Type="Content">
+          <Contribution_Name>A</Contribution_Name>
+          <Contribution_Name>B</Contribution_Name>
+          <Contribution_Date>2026-10-28</Contribution_Date>
+          <Contribution_Version>5.0</Contribution_Version>
+          <Contribution_ReleaseDate>2026-10-28</Contribution_ReleaseDate>
+        </Contribution>
+      </Content_History>
+    </Grouping>
+  </Groupings>
+  <External_References>
+    <External_Reference Reference_ID="REF-1">
+      <Title>Fixture reference</Title>
+      <Alt_URL>https://example.org/alternate</Alt_URL>
+      <Alt_URL_Date>2026-10-28</Alt_URL_Date>
+      <Media_Type>Text</Media_Type>
+      <Media_Type>Video</Media_Type>
+      <Access_Restrictions>None</Access_Restrictions>
+      <Rationale>Example</Rationale>
+      <Rationale>Other</Rationale>
+    </External_Reference>
+  </External_References>
+</Weakness_Catalog>
