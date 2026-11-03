@@ -18,12 +18,12 @@ serde_json = "1.0"
 sha2 = "0.11"
 simd-json = { version = "0.19", features = ["ahash"] }
 url = "2"
-zip = { version = "9.1", default-features = false, features = ["deflate"] }
-tokio = { version = "1.53", features = ["macros", "rt", "time"] }
+zip = { version = "9.3", default-features = false, features = ["deflate"] }
+tokio = { version = "1.54", features = ["macros", "rt", "time"] }
 
 [dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
 ] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }
