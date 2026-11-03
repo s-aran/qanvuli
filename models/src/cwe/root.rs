@@ -1,10 +1,12 @@
 use serde::Deserialize;
 
-use crate::cwe::entry::{Category, ExternalReference, View, Weakness};
+use crate::cwe::entry::{Category, ExternalReference, Grouping, View, Weakness};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename = "Weakness_Catalog", deny_unknown_fields)]
 pub struct WeaknessCatalog {
+    #[serde(rename = "Groupings")]
+    pub groupings: Option<Groupings>,
     #[serde(rename = "Weaknesses")]
     pub weaknesses: Option<Weaknesses>,
     #[serde(rename = "Categories")]
@@ -298,4 +300,11 @@ mod tests {
             );
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Groupings {
+    #[serde(rename = "Grouping")]
+    pub grouping: Vec<Grouping>,
 }
