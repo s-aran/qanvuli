@@ -2736,9 +2736,9 @@ dependencies = [
 
 [[package]]
 name = "ratada"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f4659fd29ca39eab6619a17d8c48d5a5e4504306f93fa2303f22bd0b09b0b7b"
+checksum = "569274624608df5140ae31b781c4d1608c4dfaa50f7f02ae7282c80fc2faac1b"
 dependencies = [
  "chrono",
  "clipboard-win",
