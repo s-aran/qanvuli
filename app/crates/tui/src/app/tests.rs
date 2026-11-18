@@ -507,3 +507,19 @@ fn capec_typing_filters_cached_catalog_and_keeps_ancestors() {
     assert_eq!(app.capec.tree_paths, [vec![1], vec![1, 2]]);
     assert_eq!(app.capec.tree_prefixes, ["", "└─ "]);
 }
+
+#[tokio::test]
+async fn abort_database_tasks_joins_previously_cancelled_tasks() {
+    let db = CveDatabase::connect("sqlite::memory:").await.unwrap();
+    let mut app = App::new(String::new(), 30);
+    let task_db = db.clone();
+    app.tasks.count = Some(tokio::spawn(async move {
+        let result = std::future::pending().await;
+        drop(task_db);
+        result
+    }));
+
+    app.abort_search();
+    app.abort_database_tasks().await;
+    db.close().await.unwrap();
+}

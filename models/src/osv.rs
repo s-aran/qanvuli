@@ -209,8 +209,9 @@ pub enum OsvSchemaError {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OsvSeverity {
-    #[serde(rename = "type")]
-    pub severity_type: String,
+    // Some Ubuntu exports provide only a textual score such as "medium".
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub severity_type: Option<String>,
     pub score: String,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -324,7 +325,9 @@ pub enum OsvRangeEventError {
 pub struct OsvReference {
     #[serde(rename = "type", default)]
     pub reference_type: Option<String>,
-    pub url: String,
+    // A few legacy GSD records contain references without a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -343,6 +346,35 @@ pub struct OsvCredit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_gsd_reference_without_url() {
+        let raw = r#"{"id":"GSD-2022-1006324","modified":"2022-01-01T00:00:00Z","references":[{"type":"WEB","url":"https://example.com/advisory"},{"type":"WEB"}]}"#;
+        let advisory = OsvAdvisory::parse_json(raw.as_bytes()).unwrap();
+        advisory.validate_schema_shape().unwrap();
+        assert_eq!(
+            advisory.references[0].url.as_deref(),
+            Some("https://example.com/advisory")
+        );
+        assert_eq!(advisory.references[1].url, None);
+        let json = serde_json::to_value(&advisory).unwrap();
+        assert_eq!(json["references"][1], serde_json::json!({"type": "WEB"}));
+    }
+
+    #[test]
+    fn preserves_ubuntu_severity_without_type() {
+        let raw = r#"{"id":"UBUNTU-CVE-2010-10005","modified":"2025-07-08T14:59:38.254176Z","severity":[{"score":"medium"}],"affected":[{"severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}]}"#;
+        let advisory = OsvAdvisory::parse_json(raw.as_bytes()).unwrap();
+        advisory.validate_schema_shape().unwrap();
+        assert_eq!(advisory.severity[0].severity_type, None);
+        assert_eq!(advisory.severity[0].score, "medium");
+        assert_eq!(
+            advisory.affected[0].severity[0].severity_type.as_deref(),
+            Some("CVSS_V3")
+        );
+        let json = serde_json::to_value(&advisory).unwrap();
+        assert_eq!(json["severity"][0], serde_json::json!({"score": "medium"}));
+    }
 
     #[test]
     fn recognizes_official_osv_database_prefixes_case_insensitively() {

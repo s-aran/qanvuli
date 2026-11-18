@@ -38,6 +38,7 @@ pub const OSV_SOURCE_PREFIX_HELP: &str = r"OSV source DB prefix flags:
   or use --osv-all for all sources. Prefixes are case-insensitive.
   Example: qanvuli init --osv-rustsec --osv-pysec
   --osv-cve selects OSV records; the CVE archive is imported separately.
+  A known prefix can have no records in the public OSV dump.
 
   Always included (default):
     --osv-ghsa           GitHub advisories
@@ -465,6 +466,21 @@ pub(crate) async fn download_osv_selection_from_gcs(
         }
     } else {
         let database_dirs = osv_database_dirs_for_selection(&selection, &selected_modified_rows);
+        if previous_cursor.is_none() {
+            let available: BTreeSet<_> = database_dirs.values().flatten().collect();
+            let missing = selection
+                .id_prefixes
+                .iter()
+                .filter(|prefix| !available.contains(prefix))
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                eprintln!(
+                    "{label}: no records in the public OSV download index for: {}",
+                    missing.join(", ")
+                );
+            }
+        }
         if database_dirs.is_empty() {
             eprintln!(
                 "{label}: OSV modified_id.csv did not contain records for {}; skipping OSV ZIP download",

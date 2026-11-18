@@ -197,6 +197,7 @@ impl Default for OverlayState {
 
 #[derive(Default)]
 pub(crate) struct Tasks {
+    pub(super) cancelled_database_tasks: tokio::task::JoinSet<()>,
     pub(crate) search: Option<PendingSearch>,
     pub(crate) count: Option<JoinHandle<Result<u64, String>>>,
     pub(crate) raw_json: Option<JoinHandle<Result<String, String>>>,
@@ -209,6 +210,16 @@ pub(crate) struct Tasks {
     pub(crate) maintenance: Option<PendingMaintenance>,
     pub(crate) search_started_at: Option<Instant>,
     pub(crate) search_timeout_at: Option<Instant>,
+}
+
+impl Tasks {
+    pub(super) fn cancel_database_task<T: Send + 'static>(&mut self, task: JoinHandle<T>) {
+        while self.cancelled_database_tasks.try_join_next().is_some() {}
+        task.abort();
+        self.cancelled_database_tasks.spawn(async move {
+            let _ = task.await;
+        });
+    }
 }
 
 #[derive(Default)]

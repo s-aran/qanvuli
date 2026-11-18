@@ -1,6 +1,97 @@
 use super::*;
 
 #[tokio::test]
+async fn imports_gsd_references_without_url_and_preserves_raw_json() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize_schema().await.unwrap();
+    database.prepare_osv_bulk_load().await.unwrap();
+    let mut json = serde_json::json!({
+        "id": "GSD-2022-1006324",
+        "modified": "2023-03-14T07:01:09.295187Z",
+        "references": [
+            {"url": "https://example.com/advisory"},
+            {"type": "WEB"}
+        ]
+    });
+    let mut record = OsvRawRecord {
+        source_path: Some("gs://osv-vulnerabilities/GSD/GSD-2022-1006324.json".to_owned()),
+        raw_json: json.to_string(),
+    };
+    database
+        .import_osv_records_bulk_init(vec![record.clone()])
+        .await
+        .unwrap();
+    database.finish_osv_bulk_load().await.unwrap();
+    database.import_osv_record(record.clone()).await.unwrap();
+    let count: i64 = database
+        .writer
+        .with_connection(|connection| {
+            Box::pin(async move {
+                sqlx::query_scalar("SELECT COUNT(*) FROM osv_references")
+                    .fetch_one(connection)
+                    .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+    json["references"] = serde_json::json!([{"type": "WEB"}]);
+    record.raw_json = json.to_string();
+    database
+        .import_osv_records_incremental_with_stats(vec![record.clone()])
+        .await
+        .unwrap();
+    database.import_osv_record(record).await.unwrap();
+    let (count, stored): (i64, String) = database.writer.with_connection(|connection| Box::pin(async move {
+        sqlx::query_as("SELECT (SELECT COUNT(*) FROM osv_references), raw_json FROM osv_raw_records WHERE osv_id = 'GSD-2022-1006324'")
+            .fetch_one(connection).await
+    })).await.unwrap();
+    assert_eq!(count, 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+        json
+    );
+}
+
+#[tokio::test]
+async fn imports_ubuntu_severity_without_type() {
+    let database = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
+    database.initialize_schema().await.unwrap();
+    database.prepare_osv_bulk_load().await.unwrap();
+    let raw_json = r#"{"id":"UBUNTU-CVE-2010-10005","modified":"2025-07-08T14:59:38.254176Z","severity":[{"score":"medium"}]}"#;
+    let record = OsvRawRecord {
+        source_path: Some("gs://osv-vulnerabilities/Ubuntu/UBUNTU-CVE-2010-10005.json".to_owned()),
+        raw_json: raw_json.to_owned(),
+    };
+    assert_eq!(
+        database
+            .import_osv_records_bulk_init(vec![record.clone()])
+            .await
+            .unwrap(),
+        1
+    );
+    database.finish_osv_bulk_load().await.unwrap();
+    database.import_osv_record(record).await.unwrap();
+    let stored: String = database
+        .writer
+        .with_connection(|connection| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT raw_json FROM osv_raw_records WHERE osv_id = 'UBUNTU-CVE-2010-10005'",
+                )
+                .fetch_one(connection)
+                .await
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stored).unwrap()["severity"][0]["score"],
+        "medium"
+    );
+}
+
+#[tokio::test]
 async fn affected_search_and_count_preserve_row_identity_and_pagination() {
     let db = SqlxDatabase::connect("sqlite::memory:").await.unwrap();
     db.initialize_schema().await.unwrap();

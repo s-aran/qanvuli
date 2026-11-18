@@ -272,8 +272,12 @@ impl SqlxDatabase {
         record: OsvRawRecord,
         update_search: bool,
     ) -> Result<(), sqlx::Error> {
-        let advisory = OsvAdvisory::parse_json(record.raw_json.as_bytes())
-            .map_err(|error| sqlx::Error::Protocol(format!("invalid OSV JSON: {error}")))?;
+        let advisory = OsvAdvisory::parse_json(record.raw_json.as_bytes()).map_err(|error| {
+            sqlx::Error::Protocol(format!(
+                "invalid OSV JSON from {}: {error}",
+                record.source_path.as_deref().unwrap_or("unknown source")
+            ))
+        })?;
         advisory
             .validate_schema_shape()
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
@@ -367,7 +371,7 @@ impl SqlxDatabase {
                             }
                         }
                     }
-                    for reference in &advisory.references {
+                    for reference in advisory.references.iter().filter(|reference| reference.url.is_some()) {
                         sqlx::query("INSERT OR IGNORE INTO osv_references(osv_id, reference_type, url) VALUES (?, ?, ?)")
                             .bind(&advisory.id).bind(&reference.reference_type).bind(&reference.url).execute(&mut *transaction).await?;
                     }
@@ -512,8 +516,12 @@ impl SqlxDatabase {
     }
 
     fn osv_batch_input(record: OsvRawRecord) -> Result<OsvBatchInput, String> {
-        let advisory = OsvAdvisory::parse_json(record.raw_json.as_bytes())
-            .map_err(|error| format!("invalid OSV JSON: {error}"))?;
+        let advisory = OsvAdvisory::parse_json(record.raw_json.as_bytes()).map_err(|error| {
+            format!(
+                "invalid OSV JSON from {}: {error}",
+                record.source_path.as_deref().unwrap_or("unknown source")
+            )
+        })?;
         advisory
             .validate_schema_shape()
             .map_err(|error| error.to_string())?;
@@ -679,7 +687,12 @@ impl SqlxDatabase {
                 }
             }
         }
-        for references in advisory.references.chunks(250) {
+        let references = advisory
+            .references
+            .iter()
+            .filter(|reference| reference.url.is_some())
+            .collect::<Vec<_>>();
+        for references in references.chunks(250) {
             let mut query = QueryBuilder::<Sqlite>::new(
                 "INSERT OR IGNORE INTO osv_references(osv_id, reference_type, url) ",
             );
