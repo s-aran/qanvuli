@@ -56,6 +56,8 @@ For development:
 cargo run -- --help
 ```
 
+Set `GITHUB_TOKEN` to authenticate GitHub API requests and release asset downloads. If it is unset or empty, requests remain anonymous. The token is sent only to `https://github.com` and `https://api.github.com`; downloads redirected to another host do not forward it.
+
 ## Initialize and update
 
 Build a replacement database from current feeds:

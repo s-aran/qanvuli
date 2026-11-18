@@ -60,6 +60,8 @@ qanvuli --help
 cargo run -- --help
 ```
 
+環境変数 `GITHUB_TOKEN` を設定すると、GitHub API へのリクエストとリリースアセットのダウンロードにトークンを使用します。未設定または空の場合は匿名で通信します。トークンの送信先は `https://github.com` と `https://api.github.com` に限定し、別ホストへのリダイレクト時には引き継ぎません。
+
 ## 初期化と更新
 
 ### データベースの初期化

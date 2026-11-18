@@ -21,6 +21,46 @@ pub type DownloadProgressCallback = Arc<dyn Fn(u64) + Send + Sync>;
 const RANGE_DOWNLOAD_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const RANGE_DOWNLOAD_MAX_CONNECTIONS: u64 = 4;
 
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn github_client() -> Result<Arc<octocrab::Octocrab>, octocrab::Error> {
+    match github_token() {
+        Some(token) => octocrab::Octocrab::builder()
+            .personal_token(token)
+            .build()
+            .map(Arc::new),
+        None => Ok(octocrab::instance()),
+    }
+}
+
+fn download_headers(url: &str) -> Result<header::HeaderMap, header::InvalidHeaderValue> {
+    download_headers_with_token(url, github_token().as_deref())
+}
+
+fn download_headers_with_token(
+    url: &str,
+    token: Option<&str>,
+) -> Result<header::HeaderMap, header::InvalidHeaderValue> {
+    let mut headers = header::HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static("qanvuli"),
+    );
+    let is_github = reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https" && matches!(url.host_str(), Some("github.com" | "api.github.com"))
+    });
+    if is_github && let Some(token) = token {
+        let mut value = header::HeaderValue::from_str(&format!("Bearer {token}"))?;
+        value.set_sensitive(true);
+        headers.insert(header::AUTHORIZATION, value);
+    }
+    Ok(headers)
+}
+
 #[derive(Debug, Clone)]
 pub struct GitHubReleaseFile {
     pub name: String,
@@ -36,7 +76,7 @@ impl GitHubReleaseFile {
     pub async fn download_bytes(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let content = crate::http::client()
             .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .headers(download_headers(&self.url)?)
             .send()
             .await?
             .error_for_status()?
@@ -48,7 +88,7 @@ impl GitHubReleaseFile {
     pub fn download_bytes_blocking(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let content = crate::http::blocking_client()
             .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .headers(download_headers(&self.url)?)
             .send()?
             .error_for_status()?
             .bytes()?;
@@ -76,7 +116,7 @@ impl GitHubReleaseFile {
         }
         let mut response = crate::http::client()
             .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .headers(download_headers(&self.url)?)
             .send()
             .await?
             .error_for_status()?;
@@ -105,7 +145,7 @@ impl GitHubReleaseFile {
         let probe_client = crate::http::client_builder().http1_only().build()?;
         let probe = probe_client
             .get(&self.url)
-            .header(header::USER_AGENT, "qanvuli")
+            .headers(download_headers(&self.url)?)
             .header(header::ACCEPT_ENCODING, "identity")
             .header(header::RANGE, "bytes=0-0")
             .send()
@@ -192,7 +232,7 @@ impl GitHubReleaseFile {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut response = crate::http::blocking_client()
             .get(&self.url)
-            .header(reqwest::header::USER_AGENT, "qanvuli")
+            .headers(download_headers(&self.url)?)
             .send()?
             .error_for_status()?;
         let mut file = std::fs::File::create(path)?;
@@ -265,8 +305,8 @@ async fn download_range(download: RangeDownload) -> Result<(), String> {
         .build()
         .map_err(|error| format!("failed to create range download client: {error}"))?;
     let mut request = client
-        .get(url)
-        .header(header::USER_AGENT, "qanvuli")
+        .get(&url)
+        .headers(download_headers(&url).map_err(|_| "invalid GITHUB_TOKEN header".to_owned())?)
         .header(header::ACCEPT_ENCODING, "identity")
         .header(header::RANGE, format!("bytes={start}-{end}"));
     if let Some(validator) = validator {
@@ -388,7 +428,7 @@ impl GitHub {
     pub async fn list_releases(
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
-        let octocrab = octocrab::instance();
+        let octocrab = github_client()?;
         let page = github_request(
             octocrab
                 .repos(&self.owner, &self.repo)
@@ -404,7 +444,7 @@ impl GitHub {
     pub async fn list_all_releases(
         &self,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
-        let octocrab = octocrab::instance();
+        let octocrab = github_client()?;
         let page = github_request(
             octocrab
                 .repos(&self.owner, &self.repo)
@@ -435,7 +475,7 @@ impl GitHub {
         &self,
         cursor: DateTime<Utc>,
     ) -> Result<Vec<GitHubRelease>, Box<dyn std::error::Error + Send + Sync>> {
-        let octocrab = octocrab::instance();
+        let octocrab = github_client()?;
         let mut page = github_request(
             octocrab
                 .repos(&self.owner, &self.repo)
@@ -475,7 +515,7 @@ impl GitHub {
     }
 }
 
-// Bound metadata requests too, while preserving the caller-configured Octocrab instance.
+// Bound metadata requests as well as asset downloads.
 async fn github_request<T>(
     future: impl std::future::Future<Output = Result<T, octocrab::Error>>,
 ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
@@ -503,6 +543,36 @@ fn release_items_to_sorted_releases(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticates_only_https_github_downloads() {
+        for url in [
+            "https://github.com/o/r/releases/download/file",
+            "https://api.github.com/repos/o/r",
+        ] {
+            let headers = download_headers_with_token(url, Some("test-token")).unwrap();
+            assert_eq!(headers[header::AUTHORIZATION], "Bearer test-token");
+            assert!(headers[header::AUTHORIZATION].is_sensitive());
+        }
+        for url in [
+            "https://example.com/file",
+            "https://github.com.example.com/file",
+            "http://github.com/file",
+            "invalid",
+        ] {
+            let headers = download_headers_with_token(url, Some("test-token")).unwrap();
+            assert!(!headers.contains_key(header::AUTHORIZATION));
+        }
+        let headers = download_headers_with_token("https://github.com/file", None).unwrap();
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn rejects_invalid_token_header() {
+        assert!(
+            download_headers_with_token("https://github.com/file", Some("bad\ntoken")).is_err()
+        );
+    }
 
     #[test]
     fn parses_valid_byte_content_ranges() {
