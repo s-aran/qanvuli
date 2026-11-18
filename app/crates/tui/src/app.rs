@@ -895,19 +895,19 @@ impl App {
 
     pub(super) fn abort_search(&mut self) {
         if let Some(search) = self.tasks.search.take() {
-            search.handle.abort();
+            self.tasks.cancel_database_task(search.handle);
         }
         if let Some(task) = self.tasks.count.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         if let Some(task) = self.tasks.raw_json.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         if let Some(task) = self.tasks.enrichment.take() {
-            task.handle.abort();
+            self.tasks.cancel_database_task(task.handle);
         }
         if let Some(task) = self.tasks.cwe.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         self.tasks.search_started_at = None;
         self.tasks.search_timeout_at = None;
@@ -953,6 +953,13 @@ impl App {
             task.abort();
             let _ = task.await;
         }
+        while self
+            .tasks
+            .cancelled_database_tasks
+            .join_next()
+            .await
+            .is_some()
+        {}
         self.tasks.search_started_at = None;
         self.tasks.search_timeout_at = None;
         self.overlay.show_timeout_prompt = false;
@@ -1134,7 +1141,7 @@ impl App {
             return;
         };
         if let Some(task) = self.tasks.raw_json.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         self.raw.json = Some("Loading".to_owned());
         self.tasks.raw_json = match (
@@ -1305,7 +1312,7 @@ impl App {
         self.capec.taxonomy_selected = 0;
         self.capec.taxonomy = None;
         if let Some(task) = self.tasks.capec_detail.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         let Some((db, id)) = db.zip(self.selected_capec().map(|entry| entry.id)) else {
             return;
@@ -1987,7 +1994,7 @@ impl App {
 
     fn start_cwe_search(&mut self, db: Option<CveDatabase>) {
         if let Some(task) = self.tasks.cwe.take() {
-            task.abort();
+            self.tasks.cancel_database_task(task);
         }
         self.cwe.scroll = 0;
         self.cwe.relation_return_id = None;
@@ -2232,11 +2239,11 @@ impl App {
         self.main.metadata_scroll = 0;
         self.main.enrichment.clear();
         if let Some(task) = self.tasks.enrichment.take() {
-            task.handle.abort();
+            self.tasks.cancel_database_task(task.handle);
         }
         self.main.metadata_capec_ids.clear();
         if let Some(task) = self.tasks.metadata_capec.take() {
-            task.handle.abort();
+            self.tasks.cancel_database_task(task.handle);
         }
     }
 
@@ -2283,8 +2290,9 @@ impl App {
             return;
         };
         if search.timed_out_once {
-            search.handle.abort();
-            self.tasks.search = None;
+            if let Some(search) = self.tasks.search.take() {
+                self.tasks.cancel_database_task(search.handle);
+            }
             self.tasks.search_started_at = None;
             self.tasks.search_timeout_at = None;
             self.overlay.show_timeout_prompt = false;
