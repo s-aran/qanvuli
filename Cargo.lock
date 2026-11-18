@@ -2455,7 +2455,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "clap",
  "indicatif",
@@ -2470,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-commands"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "chrono",
@@ -2490,7 +2490,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-mcp"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "qanvuli-app-commands",
  "qanvuli-core",
@@ -2503,7 +2503,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-app-tui"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "chrono",
  "clap",
@@ -2521,7 +2521,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-collector"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2539,7 +2539,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-core"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2560,7 +2560,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-db"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2586,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-models"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2606,7 +2606,7 @@ dependencies = [
 
 [[package]]
 name = "qanvuli-utils"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2760,18 +2760,18 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_pcg"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+checksum = "eb95882a1e14462c69aea9984bb261293ccfe6022ef8de0eda18bd5afb0052df"
 dependencies = [
  "rand_core 0.10.1",
 ]
 
 [[package]]
 name = "ratada"
-version = "0.5.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f4659fd29ca39eab6619a17d8c48d5a5e4504306f93fa2303f22bd0b09b0b7b"
+checksum = "569274624608df5140ae31b781c4d1608c4dfaa50f7f02ae7282c80fc2faac1b"
 dependencies = [
  "chrono",
  "clipboard-win",
