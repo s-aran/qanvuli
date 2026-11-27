@@ -80,9 +80,27 @@ impl SqlxDatabase {
         self.writer.rebuild_osv_search().await
     }
 
+    /// Runs rebuild osv search within the caller's synchronization deadline.
+    pub async fn rebuild_osv_search_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.writer.rebuild_osv_search_before(deadline).await
+    }
+
     /// Verifies schema plus a fixed number of indexed search-projection sentinels.
     pub async fn check_search_integrity_quick(&self) -> Result<(), sqlx::Error> {
         self.writer.check_search_integrity_quick().await
+    }
+
+    /// Runs check search integrity quick within the caller's synchronization deadline.
+    pub async fn check_search_integrity_quick_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.writer
+            .check_search_integrity_quick_before(deadline)
+            .await
     }
 
     /// Verifies schema shape/version without requiring derived search data to be healthy.
@@ -115,6 +133,14 @@ impl SqlxDatabase {
 
     pub async fn finish_osv_bulk_load(&self) -> Result<(), sqlx::Error> {
         self.writer.finish_osv_bulk_load().await
+    }
+
+    /// Runs finish osv bulk load within the caller's synchronization deadline.
+    pub async fn finish_osv_bulk_load_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.writer.finish_osv_bulk_load_before(deadline).await
     }
 
     /// Rebuilds identifier edges from normalized OSV relations.

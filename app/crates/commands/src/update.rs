@@ -2,9 +2,9 @@ use super::common::{
     CveArchiveOwnership, IngestProgress, IngestProgressCallback, OsvImportSelection,
     apply_delta_updates, apply_delta_updates_with_progress, cleanup_processed_cve_archive,
     connect_database, import_cve_zip, import_cve_zip_with_progress, sync_capec_catalog,
-    sync_cwe_catalog, sync_osv_with_refresh, sync_risk_feeds,
+    sync_cwe_catalog, sync_osv_with_timeouts, sync_risk_feeds,
 };
-use std::path::PathBuf;
+use std::{num::NonZeroU32, path::PathBuf, time::Duration};
 
 /// CLI arguments for `qanvuli update`.
 #[derive(Debug, Default, clap::Args)]
@@ -24,6 +24,12 @@ pub struct Args {
     /// Redownload selected OSV snapshots and upsert every record. Absent records are not deleted.
     #[arg(long)]
     osv_refresh_all: bool,
+    /// Time limit in seconds for all OSV downloads (default: 14400).
+    #[arg(long, value_name = "SECONDS")]
+    osv_download_timeout_secs: Option<NonZeroU32>,
+    /// Time limit in seconds for OSV database import and validation (default: 14400).
+    #[arg(long, value_name = "SECONDS")]
+    osv_sync_timeout_secs: Option<NonZeroU32>,
 }
 
 impl Args {
@@ -73,11 +79,10 @@ pub async fn run_update(
     run(
         db_url,
         Args {
-            no_progress: false,
             zip,
             max_chunks,
             keep,
-            osv_refresh_all: false,
+            ..Args::default()
         },
     )
     .await
@@ -147,8 +152,19 @@ async fn run_with_progress(
             .map_err(|error| format!("failed to read OSV selection: {error}"))?;
         if let Some(selection) = OsvImportSelection::from_metadata(saved_selection.as_deref()) {
             emit_update_progress(&progress, "-", "synchronizing OSV advisories");
-            sync_osv_with_refresh(sqlx_db.clone(), "update", selection, args.osv_refresh_all)
-                .await?;
+            sync_osv_with_timeouts(
+                sqlx_db.clone(),
+                "update",
+                selection,
+                args.osv_refresh_all,
+                args.osv_download_timeout_secs
+                    .map(|seconds| Duration::from_secs(seconds.get().into()))
+                    .unwrap_or(super::common::OSV_DOWNLOAD_BUDGET),
+                args.osv_sync_timeout_secs
+                    .map(|seconds| Duration::from_secs(seconds.get().into()))
+                    .unwrap_or(super::common::OSV_IMPORT_TIMEOUT),
+            )
+            .await?;
         }
         emit_update_progress(&progress, "-", "synchronizing risk feeds");
         sync_risk_feeds(sqlx_db.clone(), "update", cve_changed).await?;
@@ -240,6 +256,27 @@ mod tests {
             assert!(UpdateCli::try_parse_from(args).is_err());
         }
         assert!(UpdateCli::try_parse_from(["update", "--osv-refresh-all"]).is_ok());
+    }
+
+    #[test]
+    fn update_accepts_independent_positive_osv_timeouts() {
+        let args = UpdateCli::try_parse_from([
+            "update",
+            "--osv-download-timeout-secs",
+            "90",
+            "--osv-sync-timeout-secs",
+            "300",
+        ])
+        .unwrap()
+        .args;
+        assert_eq!(
+            args.osv_download_timeout_secs.map(NonZeroU32::get),
+            Some(90)
+        );
+        assert_eq!(args.osv_sync_timeout_secs.map(NonZeroU32::get), Some(300));
+        for flag in ["--osv-download-timeout-secs", "--osv-sync-timeout-secs"] {
+            assert!(UpdateCli::try_parse_from(["update", flag, "0"]).is_err());
+        }
     }
 
     #[test]

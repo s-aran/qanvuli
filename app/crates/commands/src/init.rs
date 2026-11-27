@@ -200,7 +200,13 @@ async fn run_with_progress(
                     .to_owned()
             })?;
             eprintln!("init: CVE index construction started; beginning OSV prefetch");
-            download_osv_selection_from_gcs("init", osv_selection, None).await
+            download_osv_selection_from_gcs(
+                "init",
+                osv_selection,
+                None,
+                super::common::OSV_DOWNLOAD_BUDGET,
+            )
+            .await
         });
         let cve_result = import_cve_zip_bulk_with_index_signal(
             db_for_build.clone(),
@@ -258,6 +264,7 @@ async fn run_with_progress(
             osv_download_result?,
             OsvImportMode::InitialReplacement,
             eager_cleanup,
+            super::common::OSV_IMPORT_TIMEOUT,
         )
         .await?;
         emit_init_progress(

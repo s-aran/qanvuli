@@ -128,9 +128,19 @@ impl OsvGcsSource {
                         "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} also failed after GCS error: {gcs_err}: {error}"
                     )))?
                     .error_for_status()
-                    .map_err(|error| OsvDownloadError::InvalidResponse(anyhow!(
-                        "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}: {error}"
-                    )))?;
+                    .map_err(|error| {
+                        let retryable = error.status().is_some_and(|status| {
+                            status.is_server_error() || matches!(status.as_u16(), 408 | 429)
+                        });
+                        let error = anyhow!(
+                            "failed to fetch gs://{OSV_BUCKET}/{object_path}; HTTPS fallback {url} returned an error after GCS error: {gcs_err}: {error}"
+                        );
+                        if retryable {
+                            OsvDownloadError::Network(error)
+                        } else {
+                            OsvDownloadError::InvalidResponse(error)
+                        }
+                    })?;
                 let mut stream = response.bytes_stream();
                 while let Some(chunk) = stream.next().await {
                     let chunk = chunk.map_err(|error| {

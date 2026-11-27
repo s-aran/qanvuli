@@ -20,10 +20,9 @@ simd-json = { version = "0.19", features = ["ahash"] }
 url = "2"
 zip = { version = "9.7", default-features = false, features = ["deflate"] }
 tokio = { version = "1.54", features = ["macros", "rt", "time"] }
-
-[dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "sqlite",
 ] }
+[dev-dependencies]
 tokio = { version = "1.54", features = ["macros", "rt-multi-thread"] }

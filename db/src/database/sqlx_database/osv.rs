@@ -321,6 +321,9 @@ impl SqlxDatabase {
             .with_connection(|connection| {
                 Box::pin(async move {
                     let mut transaction = connection.begin().await?;
+                    if update_search {
+                        Self::ensure_osv_search_rowids(&mut transaction).await?;
+                    }
                     sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json')")
                         .execute(&mut *transaction).await?;
                     sqlx::query("INSERT INTO osv_raw_records (osv_id, source_path, provider_published_at, provider_modified_at, fetched_at, content_hash, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(osv_id) DO UPDATE SET source_path=excluded.source_path, provider_published_at=excluded.provider_published_at, provider_modified_at=excluded.provider_modified_at, fetched_at=excluded.fetched_at, content_hash=excluded.content_hash, raw_json=excluded.raw_json")
@@ -429,7 +432,7 @@ impl SqlxDatabase {
                         }
                     }
                     if update_search {
-                        sqlx::query("DELETE FROM osv_text_fts WHERE osv_id=?").bind(&advisory.id).execute(&mut *transaction).await?;
+                        sqlx::query("DELETE FROM osv_text_fts WHERE rowid=(SELECT rowid FROM osv_advisories WHERE osv_id=?)").bind(&advisory.id).execute(&mut *transaction).await?;
                         sqlx::query("INSERT INTO osv_text_fts(rowid, osv_id, summary, details, aliases, packages) VALUES ((SELECT rowid FROM osv_advisories WHERE osv_id=?), ?, ?, ?, ?, ?)")
                             .bind(&advisory.id).bind(&advisory.id).bind(advisory.summary.as_deref().unwrap_or_default()).bind(advisory.details.as_deref().unwrap_or_default()).bind(search_aliases).bind(search_packages).execute(&mut *transaction).await?;
                     }
@@ -463,6 +466,9 @@ impl SqlxDatabase {
             .with_connection(|connection| {
                 Box::pin(async move {
                     let mut transaction = connection.begin().await?;
+                    if update_search {
+                        Self::ensure_osv_search_rowids(&mut transaction).await?;
+                    }
                     sqlx::query("INSERT OR IGNORE INTO db_sources (source, display_name, source_type, default_filename, raw_format) VALUES ('OSV', 'OSV.dev', 'vulnerability_db', 'all.zip', 'json')")
                         .execute(&mut *transaction)
                         .await?;
@@ -513,6 +519,40 @@ impl SqlxDatabase {
                 })
             })
             .await
+    }
+
+    async fn ensure_osv_search_rowids(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> Result<(), sqlx::Error> {
+        // Older importers assigned their own FTS rowids. Check once before relying on
+        // the advisory rowid, which could otherwise point to a different search row.
+        let checked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM app_metadata WHERE key='osv_search_rowids_checked')",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        if checked {
+            return Ok(());
+        }
+
+        let mismatch: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM osv_text_fts AS fts
+                LEFT JOIN osv_advisories AS advisory ON advisory.rowid = fts.rowid
+                WHERE advisory.osv_id IS NOT fts.osv_id
+            )",
+        )
+        .fetch_one(&mut *connection)
+        .await?;
+        if mismatch {
+            super::super::maintenance::rebuild_osv_search(connection).await?;
+        }
+        sqlx::query(
+            "INSERT INTO app_metadata (key, value) VALUES ('osv_search_rowids_checked', '1')",
+        )
+        .execute(connection)
+        .await?;
+        Ok(())
     }
 
     fn osv_batch_input(record: OsvRawRecord) -> Result<OsvBatchInput, String> {
@@ -775,7 +815,7 @@ impl SqlxDatabase {
             }
         }
         if update_search {
-            sqlx::query("DELETE FROM osv_text_fts WHERE osv_id=?")
+            sqlx::query("DELETE FROM osv_text_fts WHERE rowid=(SELECT rowid FROM osv_advisories WHERE osv_id=?)")
                 .bind(&advisory.id)
                 .execute(&mut **transaction)
                 .await?;

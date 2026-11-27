@@ -1,5 +1,33 @@
 use super::*;
 
+#[tokio::test]
+async fn osv_deadline_reports_the_stalled_stage() {
+    let error = osv_deadline::<()>(
+        "read the next ZIP batch",
+        Duration::from_millis(1),
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "OSV timed out after 1ms: read the next ZIP batch");
+}
+
+#[tokio::test]
+async fn osv_retry_stops_after_three_transient_failures() {
+    let attempts = std::sync::atomic::AtomicUsize::new(0);
+    let result = retry_osv(
+        "test",
+        None,
+        |_| true,
+        || async {
+            let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            Err::<(), _>(attempt)
+        },
+    )
+    .await;
+    assert_eq!(result, Err(3));
+}
+
 #[test]
 fn ingest_progress_uses_bounded_chunk_count() {
     assert_eq!(ingest_chunk_count(0, None), 0);
@@ -438,6 +466,7 @@ async fn eager_cleanup_removes_each_imported_osv_zip() {
             "2099-01-02T00:00:00Z",
             OsvImportMode::IncrementalUpdate,
             true,
+            OSV_IMPORT_TIMEOUT,
         )
         .await
         .unwrap(),

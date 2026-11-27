@@ -9,9 +9,14 @@ use super::maintenance::{
 };
 use super::schema;
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
-use std::{str::FromStr, sync::Arc};
+use std::{
+    str::FromStr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::Mutex;
 
+const OSV_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INTERACTIVE_READ_CACHE_PRAGMA: &str = "PRAGMA cache_size = -32768";
 const INTERACTIVE_READ_MMAP_PRAGMA: &str = "PRAGMA mmap_size = 268435456";
 
@@ -95,6 +100,49 @@ impl SqliteWriter {
         operation(&mut connection).await
     }
 
+    async fn with_maintenance_deadline(
+        &self,
+        stage: &str,
+        limit: Duration,
+        operation: impl for<'a> FnOnce(
+            &'a mut SqliteConnection,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + 'a>,
+        >,
+    ) -> Result<(), sqlx::Error> {
+        if limit.is_zero() {
+            return Err(sqlx::Error::Protocol(format!(
+                "{stage} timed out before starting"
+            )));
+        }
+        let deadline = Arc::new(Instant::now() + limit);
+        let mut connection = tokio::time::timeout(limit, self.connection.lock())
+            .await
+            .map_err(|_| {
+                sqlx::Error::Protocol(format!("timed out waiting for SQLite writer: {stage}"))
+            })?;
+        let active_deadline = Arc::downgrade(&deadline);
+        // SQLite executes statements on a separate worker. Interrupt the statement there
+        // so it releases the connection and rolls back before the caller handles the error.
+        connection
+            .lock_handle()
+            .await?
+            .set_progress_handler(1000, move || {
+                active_deadline
+                    .upgrade()
+                    .is_none_or(|deadline| Instant::now() < *deadline)
+            });
+        let result = operation(&mut connection).await;
+        connection.lock_handle().await?.remove_progress_handler();
+        result.map_err(|error| {
+            if Instant::now() >= *deadline {
+                sqlx::Error::Protocol(format!("{stage} timed out after {limit:?} ({error})"))
+            } else {
+                error
+            }
+        })
+    }
+
     /// Closes the writer before database replacement.
     pub(crate) async fn close(self) -> Result<(), sqlx::Error> {
         let mutex = Arc::try_unwrap(self.connection).map_err(|_| {
@@ -169,8 +217,22 @@ impl SqliteWriter {
     }
 
     pub(crate) async fn rebuild_osv_search(&self) -> Result<(), sqlx::Error> {
-        let mut connection = self.connection.lock().await;
-        rebuild_osv_search(&mut connection).await
+        self.rebuild_osv_search_before(tokio::time::Instant::now() + OSV_MAINTENANCE_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn rebuild_osv_search_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.with_maintenance_deadline(
+            "rebuild OSV search",
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(OSV_MAINTENANCE_TIMEOUT),
+            |connection| Box::pin(rebuild_osv_search(connection)),
+        )
+        .await
     }
 
     pub(crate) async fn prepare_cve_bulk_load(&self) -> Result<(), sqlx::Error> {
@@ -192,19 +254,57 @@ impl SqliteWriter {
     }
 
     pub(crate) async fn prepare_osv_bulk_load(&self) -> Result<(), sqlx::Error> {
-        let mut connection = self.connection.lock().await;
-        prepare_osv_bulk_load(&mut connection).await
+        self.with_maintenance_deadline(
+            "prepare OSV bulk load",
+            OSV_MAINTENANCE_TIMEOUT,
+            |connection| Box::pin(prepare_osv_bulk_load(connection)),
+        )
+        .await
     }
 
     pub(crate) async fn finish_osv_bulk_load(&self) -> Result<(), sqlx::Error> {
-        let mut connection = self.connection.lock().await;
-        finish_osv_bulk_load(&mut connection).await
+        self.finish_osv_bulk_load_before(tokio::time::Instant::now() + OSV_MAINTENANCE_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn finish_osv_bulk_load_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.with_maintenance_deadline(
+            "finish OSV bulk load",
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(OSV_MAINTENANCE_TIMEOUT),
+            |connection| Box::pin(finish_osv_bulk_load(connection)),
+        )
+        .await
     }
 
     pub(crate) async fn check_search_integrity_quick(&self) -> Result<(), sqlx::Error> {
-        let mut connection = self.connection.lock().await;
-        check_required_schema(&mut connection).await?;
-        check_search_integrity_quick(&mut connection).await
+        self.check_search_integrity_quick_before(
+            tokio::time::Instant::now() + OSV_MAINTENANCE_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn check_search_integrity_quick_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), sqlx::Error> {
+        self.with_maintenance_deadline(
+            "check search integrity",
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(OSV_MAINTENANCE_TIMEOUT),
+            |connection| {
+                Box::pin(async {
+                    check_required_schema(connection).await?;
+                    check_search_integrity_quick(connection).await
+                })
+            },
+        )
+        .await
     }
 
     pub(crate) async fn check_required_schema(&self) -> Result<(), sqlx::Error> {
@@ -216,6 +316,33 @@ impl SqliteWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn maintenance_timeout_interrupts_sql_and_releases_the_writer() {
+        let writer = SqliteWriter::connect("sqlite::memory:").await.unwrap();
+        let error = writer
+            .with_maintenance_deadline("test query", Duration::from_millis(10), |connection| {
+                Box::pin(async move {
+                    sqlx::query("WITH RECURSIVE numbers(n) AS (VALUES (1) UNION ALL SELECT n + 1 FROM numbers) SELECT sum(n) FROM numbers")
+                        .execute(connection)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test query timed out"));
+        writer
+            .with_connection(|connection| {
+                Box::pin(async {
+                    sqlx::query_scalar::<_, i64>("SELECT 1")
+                        .fetch_one(connection)
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn every_writer_connection_enforces_foreign_keys() {

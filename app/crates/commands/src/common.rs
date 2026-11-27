@@ -108,6 +108,11 @@ pub const OSV_SOURCE_PREFIX_HELP: &str = r"OSV source DB prefix flags:
 const INGEST_CHUNK_SIZE: usize = 20_000;
 const OSV_IMPORT_BATCH_SIZE: usize = 6_000;
 const OSV_IMPORT_PIPELINE_CAPACITY: usize = 1;
+pub(crate) const OSV_DOWNLOAD_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
+pub(crate) const OSV_IMPORT_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
+const OSV_CSV_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const OSV_BATCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const OSV_MAX_ATTEMPTS: u32 = 3;
 const OSV_IMPORT_HEARTBEAT: Duration = Duration::from_secs(10);
 pub(crate) const OSV_IMPORT_ID_PREFIXES_METADATA_KEY: &str = "osv_import_id_prefixes";
 pub(crate) const CVE_DELTA_CURSOR_METADATA_KEY: &str = "cve_delta_cursor";
@@ -416,6 +421,7 @@ pub(crate) async fn download_osv_selection_from_gcs(
     label: &str,
     selection: OsvImportSelection,
     previous_cursor: Option<&str>,
+    timeout: Duration,
 ) -> Result<DownloadedOsvSelection, String> {
     let label = label.to_owned();
     let started = Instant::now();
@@ -428,10 +434,29 @@ pub(crate) async fn download_osv_selection_from_gcs(
         .map_err(|error| format!("{label}: {error}"))?;
     let source = OsvGcsSource::new_public().map_err(|error| format!("{label}: {error}"))?;
     eprintln!("{label}: downloading OSV modified_id.csv");
-    let modified = source
-        .modified_id_csv()
-        .await
-        .map_err(|error| format!("{label}: failed to download OSV modified_id.csv: {error}"))?;
+    let download_deadline = tokio::time::Instant::from_std(started) + timeout;
+    let modified = tokio::time::timeout_at(
+        download_deadline,
+        retry_osv(
+            "download modified_id.csv",
+            Some(download_deadline),
+            |_| true,
+            || async {
+                osv_deadline("download modified_id.csv", OSV_CSV_TIMEOUT, async {
+                    source
+                        .modified_id_csv()
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .await
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        format!("{label}: OSV downloads timed out after {timeout:?} while fetching modified_id.csv")
+    })?
+    .map_err(|error| format!("{label}: failed to download OSV modified_id.csv: {error}"))?;
     let modified_rows = parse_modified_id_csv(&modified);
     let cursor = modified_rows
         .iter()
@@ -503,8 +528,14 @@ pub(crate) async fn download_osv_selection_from_gcs(
     for object_path in &object_paths {
         let download_started = Instant::now();
         eprintln!("{label}: downloading OSV {object_path}");
-        match download_osv_zip_to_temp(&source, object_path, &label, &mut prefer_fallback_temp)
-            .await
+        match download_osv_zip_to_temp(
+            &source,
+            object_path,
+            &label,
+            &mut prefer_fallback_temp,
+            download_deadline,
+        )
+        .await
         {
             Ok(path) => {
                 let bytes = std::fs::metadata(&path)
@@ -542,6 +573,7 @@ pub(crate) async fn import_downloaded_osv_selection(
     download: DownloadedOsvSelection,
     mode: OsvImportMode,
     eager_cleanup: bool,
+    timeout: Duration,
 ) -> Result<usize, String> {
     let queued_elapsed = download.ready_at.elapsed();
     let import_started = Instant::now();
@@ -558,15 +590,18 @@ pub(crate) async fn import_downloaded_osv_selection(
         &download.cursor,
         mode,
         eager_cleanup,
+        timeout,
     )
     .await;
     let imported = result?;
-    db.set_metadata_value(
-        OSV_IMPORT_ID_PREFIXES_METADATA_KEY,
-        &download.selection.as_metadata_value(),
-    )
-    .await
-    .map_err(|error| format!("{}: failed to save OSV selection: {error}", download.label))?;
+    if mode == OsvImportMode::InitialReplacement {
+        db.set_metadata_value(
+            OSV_IMPORT_ID_PREFIXES_METADATA_KEY,
+            &download.selection.as_metadata_value(),
+        )
+        .await
+        .map_err(|error| format!("{}: failed to save OSV selection: {error}", download.label))?;
+    }
     eprintln!(
         "{}: imported {imported} OSV records; download={:?}, queued while other init work ran={queued_elapsed:?}, database import={:?}",
         download.label,
@@ -594,6 +629,25 @@ pub async fn sync_osv_with_refresh(
     selection: OsvImportSelection,
     refresh_all: bool,
 ) -> Result<usize, String> {
+    sync_osv_with_timeouts(
+        db,
+        label,
+        selection,
+        refresh_all,
+        OSV_DOWNLOAD_BUDGET,
+        OSV_IMPORT_TIMEOUT,
+    )
+    .await
+}
+
+pub(crate) async fn sync_osv_with_timeouts(
+    db: SqlxDatabase,
+    label: &str,
+    selection: OsvImportSelection,
+    refresh_all: bool,
+    download_timeout: Duration,
+    sync_timeout: Duration,
+) -> Result<usize, String> {
     let previous_cursor = db
         .osv_sync_cursor()
         .await
@@ -608,8 +662,17 @@ pub async fn sync_osv_with_refresh(
     let incremental_cursor = (!refresh_all)
         .then_some(previous_cursor.as_deref())
         .flatten();
-    let download = download_osv_selection_from_gcs(label, selection, incremental_cursor).await?;
-    import_downloaded_osv_selection(db, download, OsvImportMode::IncrementalUpdate, false).await
+    let download =
+        download_osv_selection_from_gcs(label, selection, incremental_cursor, download_timeout)
+            .await?;
+    import_downloaded_osv_selection(
+        db,
+        download,
+        OsvImportMode::IncrementalUpdate,
+        false,
+        sync_timeout,
+    )
+    .await
 }
 
 /// Imports an OSV ZIP through the SQLx writer and advances the cursor only after every batch,
@@ -629,6 +692,7 @@ pub async fn import_osv_zip(
         completion_cursor,
         OsvImportMode::IncrementalUpdate,
         false,
+        OSV_IMPORT_TIMEOUT,
     )
     .await
 }
@@ -641,15 +705,23 @@ async fn import_osv_zips(
     completion_cursor: &str,
     mode: OsvImportMode,
     eager_cleanup: bool,
+    timeout: Duration,
 ) -> Result<usize, String> {
     let initial_replacement = mode == OsvImportMode::InitialReplacement;
-    db.begin_osv_sync()
-        .await
-        .map_err(|error| format!("failed to begin OSV sync: {error}"))?;
-    if initial_replacement {
-        db.prepare_osv_bulk_load()
+    let deadline = tokio::time::Instant::now() + timeout;
+    osv_deadline("begin sync", timeout.min(OSV_BATCH_TIMEOUT), async {
+        db.begin_osv_sync()
             .await
-            .map_err(|error| format!("failed to prepare OSV bulk load: {error}"))?;
+            .map_err(|error| format!("failed to begin OSV sync: {error}"))
+    })
+    .await?;
+    if initial_replacement && let Err(error) = db.prepare_osv_bulk_load().await {
+        return fail_osv_import(
+            &db,
+            true,
+            format!("failed to prepare OSV bulk load: {error}"),
+        )
+        .await;
     }
 
     let mut totals = OsvImportTotals::default();
@@ -661,16 +733,25 @@ async fn import_osv_zips(
             paths.len(),
             path.display()
         );
-        let read_osv_ids = import_osv_path(
-            &db,
-            path,
-            selection,
-            target_osv_ids,
-            &seen_osv_ids,
-            initial_replacement,
-            &mut totals,
+        let read_osv_ids = tokio::time::timeout_at(
+            deadline,
+            import_osv_path(
+                &db,
+                path,
+                selection,
+                target_osv_ids,
+                &seen_osv_ids,
+                initial_replacement,
+                &mut totals,
+            ),
         )
-        .await;
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "OSV import timed out after {timeout:?} while processing {}",
+                path.display()
+            ))
+        });
         match read_osv_ids {
             Ok(ids) => {
                 seen_osv_ids.extend(ids);
@@ -690,10 +771,16 @@ async fn import_osv_zips(
         }
     }
 
-    if let Err(error) =
-        finish_osv_import(&db, completion_cursor, initial_replacement, &totals).await
+    if let Err(error) = finish_osv_import(
+        &db,
+        completion_cursor,
+        initial_replacement,
+        &totals,
+        deadline,
+    )
+    .await
     {
-        return fail_osv_import(&db, initial_replacement, error).await;
+        return fail_osv_import(&db, false, error).await;
     }
     Ok(totals.examined)
 }
@@ -750,13 +837,13 @@ async fn import_osv_path(
     // One queued batch overlaps ZIP reading with SQLite writes without retaining several
     // batches of raw and parsed advisory JSON at once.
     let (sender, mut receiver) = mpsc::channel(OSV_IMPORT_PIPELINE_CAPACITY);
-    let path = path.to_path_buf();
+    let reader_path = path.to_path_buf();
     let selection = selection.cloned();
     let target_osv_ids = target_osv_ids.cloned();
     let skip_osv_ids = seen_osv_ids.clone();
     let reader = tokio::task::spawn_blocking(move || {
         read_osv_zip_batches(
-            &path,
+            &reader_path,
             target_osv_ids.as_ref(),
             selection.as_ref(),
             Some(&skip_osv_ids),
@@ -764,33 +851,62 @@ async fn import_osv_path(
         )
     });
 
-    let mut import_error = None;
-    while let Some(batch) = receiver.recv().await {
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(error) => {
-                import_error = Some(error);
-                break;
+    let result = async {
+        while let Some(batch) = osv_deadline("read the next ZIP batch", OSV_BATCH_TIMEOUT, async {
+            Ok(receiver.recv().await)
+        })
+        .await?
+        {
+            let (stats, elapsed) = import_osv_batch(db, batch?, initial_replacement).await?;
+            totals.record(&stats, elapsed, initial_replacement);
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    // Closing the receiver also stops a reader waiting to send a batch.
+    drop(receiver);
+    result.map_err(|error| format!("OSV ZIP {}: {error}", path.display()))?;
+    osv_deadline("join ZIP reader", OSV_BATCH_TIMEOUT, async {
+        reader
+            .await
+            .map_err(|error| format!("OSV ZIP reader failed: {error}"))?
+    })
+    .await
+}
+
+async fn retry_osv<T, E: std::fmt::Display, F: std::future::Future<Output = Result<T, E>>>(
+    stage: &str,
+    deadline: Option<tokio::time::Instant>,
+    is_retryable: impl Fn(&E) -> bool,
+    mut operation: impl FnMut() -> F,
+) -> Result<T, E> {
+    for attempt in 1..OSV_MAX_ATTEMPTS {
+        match operation().await {
+            Err(error) if is_retryable(&error) => {
+                let delay = Duration::from_secs(1 << attempt);
+                eprintln!(
+                    "osv: {stage} failed (attempt {attempt}/{OSV_MAX_ATTEMPTS}): {error}; retrying in {delay:?}"
+                );
+                let retry_at = tokio::time::Instant::now() + delay;
+                tokio::time::sleep_until(
+                    deadline.map_or(retry_at, |deadline| retry_at.min(deadline)),
+                )
+                .await;
             }
-        };
-        match import_osv_batch(db, batch, initial_replacement).await {
-            Ok((stats, elapsed)) => totals.record(&stats, elapsed, initial_replacement),
-            Err(error) => {
-                import_error = Some(error);
-                break;
-            }
+            result => return result,
         }
     }
+    operation().await
+}
 
-    // Dropping the receiver first unblocks a reader waiting on bounded backpressure.
-    drop(receiver);
-    let reader_result = reader
+async fn osv_deadline<T>(
+    stage: &str,
+    limit: Duration,
+    operation: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, operation)
         .await
-        .map_err(|_| "OSV zip reader task panicked".to_owned());
-    if let Some(error) = import_error {
-        return Err(error);
-    }
-    reader_result?
+        .map_err(|_| format!("OSV timed out after {limit:?}: {stage}"))?
 }
 
 async fn import_osv_batch(
@@ -800,27 +916,42 @@ async fn import_osv_batch(
 ) -> Result<(qanvuli_core::database::OsvImportStats, Duration), String> {
     let started = Instant::now();
     let batch_size = batch.records.len();
-    let import_future = async {
-        if initial_replacement {
-            db.import_osv_records_bulk_init(batch.records)
-                .await
-                .map(|examined| qanvuli_core::database::OsvImportStats {
-                    examined,
-                    inserted: examined,
-                    updated: 0,
-                    unchanged: 0,
-                })
-        } else {
-            db.import_osv_records_incremental_with_stats(batch.records)
-                .await
-        }
-    };
+    let import_future = osv_deadline("import database batch", OSV_BATCH_TIMEOUT, async {
+        retry_osv(
+            "import database batch",
+            None,
+            |error: &sqlx::Error| {
+                error
+                    .as_database_error()
+                    .and_then(|error| error.code())
+                    .and_then(|code| code.parse::<u32>().ok())
+                    .is_some_and(|code| matches!(code & 0xff, 5 | 6)) // SQLITE_BUSY or SQLITE_LOCKED
+            },
+            || async {
+                if initial_replacement {
+                    db.import_osv_records_bulk_init(batch.records.clone())
+                        .await
+                        .map(|examined| qanvuli_core::database::OsvImportStats {
+                            examined,
+                            inserted: examined,
+                            updated: 0,
+                            unchanged: 0,
+                        })
+                } else {
+                    db.import_osv_records_incremental_with_stats(batch.records.clone())
+                        .await
+                }
+            },
+        )
+        .await
+        .map_err(|error| format!("failed to import OSV batch: {error}"))
+    });
     tokio::pin!(import_future);
     let mut heartbeat = tokio::time::interval(OSV_IMPORT_HEARTBEAT);
     heartbeat.tick().await;
     let stats = loop {
         tokio::select! {
-            result = &mut import_future => break result,
+            result = &mut import_future => break result?,
             _ = heartbeat.tick() => {
                 eprintln!(
                     "osv: importing batch of {batch_size} records; elapsed {:?}...",
@@ -828,8 +959,7 @@ async fn import_osv_batch(
                 );
             }
         }
-    }
-    .map_err(|error| format!("failed to import OSV batch: {error}"))?;
+    };
     Ok((stats, started.elapsed()))
 }
 
@@ -838,11 +968,12 @@ async fn finish_osv_import(
     completion_cursor: &str,
     initial_replacement: bool,
     totals: &OsvImportTotals,
+    deadline: tokio::time::Instant,
 ) -> Result<(), String> {
     eprintln!("osv: rebuilding deferred indexes and search data");
     let index_started = Instant::now();
     if initial_replacement {
-        db.finish_osv_bulk_load()
+        db.finish_osv_bulk_load_before(deadline)
             .await
             .map_err(|error| format!("failed to finish OSV bulk load: {error}"))?;
     } else if totals.changed > 0 {
@@ -860,26 +991,40 @@ async fn finish_osv_import(
         "osv: index/search maintenance completed in {:?}",
         index_started.elapsed()
     );
-    ensure_osv_search_integrity(db).await?;
-    db.complete_osv_sync(completion_cursor)
-        .await
-        .map_err(|error| format!("failed to advance OSV cursor: {error}"))
+    ensure_osv_search_integrity(db, deadline).await?;
+    osv_deadline(
+        "advance sync cursor",
+        deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .min(OSV_BATCH_TIMEOUT),
+        async {
+            db.complete_osv_sync(completion_cursor)
+                .await
+                .map_err(|error| format!("failed to advance OSV cursor: {error}"))
+        },
+    )
+    .await
 }
 
-async fn ensure_osv_search_integrity(db: &SqlxDatabase) -> Result<(), String> {
-    let Err(error) = db.check_search_integrity_quick().await else {
+async fn ensure_osv_search_integrity(
+    db: &SqlxDatabase,
+    deadline: tokio::time::Instant,
+) -> Result<(), String> {
+    let Err(error) = db.check_search_integrity_quick_before(deadline).await else {
         return Ok(());
     };
     // Older incremental imports assigned a fresh FTS rowid on every OSV update. Rebuild once to
     // repair that stale projection; current writes preserve the advisory rowid.
-    if !error.to_string().contains("OSV text FTS") {
+    if !matches!(&error, sqlx::Error::Protocol(message) if
+        message.starts_with("search projection mismatch: OSV text FTS"))
+    {
         return Err(format!("failed OSV database check: {error}"));
     }
     eprintln!("osv: repairing stale OSV search projection");
-    db.rebuild_osv_search()
+    db.rebuild_osv_search_before(deadline)
         .await
         .map_err(|error| format!("failed to repair OSV search projection: {error}"))?;
-    db.check_search_integrity_quick()
+    db.check_search_integrity_quick_before(deadline)
         .await
         .map_err(|error| format!("failed OSV database check after repair: {error}"))
 }
@@ -892,7 +1037,15 @@ async fn fail_osv_import<T>(
     if initial_replacement {
         let _ = db.finish_osv_bulk_load().await;
     }
-    let _ = db.fail_osv_sync(&error).await;
+    if let Err(status_error) = osv_deadline("record sync failure", OSV_BATCH_TIMEOUT, async {
+        db.fail_osv_sync(&error)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .await
+    {
+        eprintln!("osv: failed to record sync failure: {status_error}");
+    }
     Err(error)
 }
 
@@ -911,6 +1064,9 @@ fn read_osv_zip_batches(
     let mut seen_osv_ids = AHashSet::new();
 
     for index in 0..archive.len() {
+        if batch_tx.is_closed() {
+            return Err("OSV import stopped before ZIP reading completed".to_owned());
+        }
         let read_started = Instant::now();
         let mut entry = archive
             .by_index(index)
@@ -995,6 +1151,7 @@ async fn download_osv_zip_to_temp(
     object_path: &str,
     label: &str,
     prefer_fallback_temp: &mut bool,
+    deadline: tokio::time::Instant,
 ) -> Result<PathBuf, String> {
     let object_filename = object_path.replace('/', "-");
     let filename = format!(
@@ -1005,7 +1162,7 @@ async fn download_osv_zip_to_temp(
     if *prefer_fallback_temp {
         let fallback = temporary_zip_file_path_in(binary_temporary_directory(), &filename)
             .map_err(|err| format!("{label}: failed to prepare temporary OSV zip path: {err}"))?;
-        download_osv_zip_object(osv, object_path, &fallback)
+        download_osv_zip_object(osv, object_path, &fallback, deadline)
             .await
             .map_err(|err| {
                 format!(
@@ -1018,9 +1175,9 @@ async fn download_osv_zip_to_temp(
 
     let primary = temporary_zip_file_path(&filename, None)
         .map_err(|err| format!("{label}: failed to prepare temporary OSV zip path: {err}"))?;
-    match download_osv_zip_object(osv, object_path, &primary).await {
+    match download_osv_zip_object(osv, object_path, &primary, deadline).await {
         Ok(()) => Ok(primary),
-        Err(err) => {
+        Err(err) if err.is_local_storage() => {
             let fallback = temporary_zip_file_path_in(binary_temporary_directory(), &filename)
                 .map_err(|fallback_err| {
                     format!(
@@ -1039,14 +1196,9 @@ async fn download_osv_zip_to_temp(
                 primary.display(),
                 fallback.display()
             );
-            let _ = std::fs::remove_file(&primary);
-            if err.is_local_storage() {
-                *prefer_fallback_temp = true;
-                eprintln!(
-                    "{label}: disabling primary temporary storage for remaining OSV downloads"
-                );
-            }
-            download_osv_zip_object(osv, object_path, &fallback)
+            *prefer_fallback_temp = true;
+            eprintln!("{label}: disabling primary temporary storage for remaining OSV downloads");
+            download_osv_zip_object(osv, object_path, &fallback, deadline)
                 .await
                 .map_err(|fallback_err| {
                     format!(
@@ -1056,6 +1208,9 @@ async fn download_osv_zip_to_temp(
                 })?;
             Ok(fallback)
         }
+        Err(error) => Err(format!(
+            "{label}: failed to download OSV {object_path}: {error}"
+        )),
     }
 }
 
@@ -1063,19 +1218,45 @@ async fn download_osv_zip_object(
     osv: &OsvGcsSource,
     object_path: &str,
     output: &Path,
+    deadline: tokio::time::Instant,
 ) -> Result<(), OsvDownloadError> {
-    if object_path == OSV_ALL_ZIP {
-        osv.download_all_zip_to_file(output).await
-    } else {
-        let Some((source_prefix, filename)) = object_path.split_once('/') else {
-            return osv.download_all_zip_to_file(output).await;
-        };
-        if filename == OSV_ALL_ZIP {
-            osv.download_source_zip_to_file(source_prefix, output).await
-        } else {
-            osv.download_all_zip_to_file(output).await
-        }
-    }
+    let source_prefix = object_path
+        .split_once('/')
+        .filter(|(_, filename)| *filename == OSV_ALL_ZIP)
+        .map(|(prefix, _)| prefix);
+    retry_osv(
+        &format!("download {object_path}"),
+        Some(deadline),
+        |error| {
+            tokio::time::Instant::now() < deadline && matches!(error, OsvDownloadError::Network(_))
+        },
+        || async {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(OsvDownloadError::Network(
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "OSV download deadline elapsed",
+                    )
+                    .into(),
+                ));
+            }
+            let attempt_deadline = deadline.min(now + qanvuli_utils::http::DOWNLOAD_TIMEOUT);
+            let result = tokio::time::timeout_at(attempt_deadline, async {
+                match source_prefix {
+                    Some(prefix) => osv.download_source_zip_to_file(prefix, output).await,
+                    None => osv.download_all_zip_to_file(output).await,
+                }
+            })
+            .await
+            .unwrap_or_else(|error| Err(OsvDownloadError::Network(error.into())));
+            if result.is_err() {
+                let _ = tokio::fs::remove_file(output).await;
+            }
+            result
+        },
+    )
+    .await
 }
 
 // Keep enough headroom for concurrent range writes, filesystem accounting, and unrelated small

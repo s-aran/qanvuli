@@ -107,6 +107,12 @@ Remote `update` is resumable, but it is not one atomic transaction spanning ever
 
 `--osv-refresh-all` ignores the OSV cursor and upserts complete selected snapshots. Missing snapshot entries are not treated as deletions; withdrawn advisories remain available with their withdrawal timestamp.
 
+OSV download and database sync timeouts are each 14,400 seconds (4 hours) by default.
+
+```bash
+qanvuli update --osv-download-timeout-secs 1800 --osv-sync-timeout-secs 7200
+```
+
 `init` imports GHSA and OSV (OSS-Fuzz) by default. Add source families with flags such as `--osv-rustsec` or `--osv-pysec`, or select all families with `--osv-all`. OSV families can only be selected by `init`. `update` and MCP `update_db` reuse the stored selection without adding families; if no selection is stored, OSV synchronization is skipped. Run `qanvuli init --help` for the complete list.
 
 Download a CVE archive without changing the database:

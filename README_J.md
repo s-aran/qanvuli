@@ -133,6 +133,12 @@ qanvuli update --zip ./data/delta.zip
 
 `--osv-refresh-all` を指定すると OSV カーソルを無視し、選択したスナップショット内の全項目を挿入または更新（upsert）します。ただし、スナップショットに存在しない項目を削除済みとはみなしません。撤回されたアドバイザリも、撤回日時とともに引き続き参照できます。
 
+OSV のダウンロードと DB 同期のタイムアウトは、既定でそれぞれ 14,400 秒（4 時間）です。
+
+```bash
+qanvuli update --osv-download-timeout-secs 1800 --osv-sync-timeout-secs 7200
+```
+
 ### CVE アーカイブのダウンロード
 
 データベースを変更せずに CVE アーカイブをダウンロードするには、次のコマンドを実行します。
